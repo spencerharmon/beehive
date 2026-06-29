@@ -1,0 +1,5 @@
+{{template "header"}}
+<h1>Environments</h1>
+<p>active: <b>{{.Env.Active}}</b></p>
+<form method="post" action="/env/deploy"><select name="target">{{range .Env.Envs}}<option>{{.}}</option>{{end}}</select><button>deploy</button></form>
+{{template "footer"}}

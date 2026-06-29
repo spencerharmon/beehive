@@ -1,0 +1,4 @@
+{{template "header"}}
+<h1>{{.Name}}</h1>
+{{range $k, $v := .Docs}}<section><h2>{{$k}}</h2><pre>{{$v}}</pre></section>{{end}}
+{{template "footer"}}

@@ -1,0 +1,5 @@
+{{template "header"}}
+<h1>ROI: {{.Name}}</h1>
+{{if .Saved}}<p class="ok">saved</p>{{end}}
+<form method="post" action="/roi/{{.Name}}"><textarea name="body" rows="20" cols="80">{{.Body}}</textarea><br><button>save</button></form>
+{{template "footer"}}

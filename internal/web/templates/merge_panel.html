@@ -1,0 +1,4 @@
+{{template "header"}}
+<h1>Merge to main</h1>
+<form method="post" action="/merge"><select name="name">{{range .Subs}}<option>{{.Name}}</option>{{end}}</select><input name="branch" placeholder="branch"><button>merge</button></form>
+{{template "footer"}}
