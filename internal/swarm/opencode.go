@@ -22,10 +22,12 @@ type Opencode struct {
 	Debug io.Writer // non-nil: log each HTTP request/response
 }
 
-// NewSession creates a server session for the working directory dir (an absolute
-// path; opencode takes the cwd from the ?directory= query, not a body field) and
-// seeds the first user prompt under the system prompt. Returns the first reply.
-func (o *Opencode) NewSession(ctx context.Context, dir, system, first string) (Session, string, error) {
+// Open creates a server session for the working directory dir (an absolute path;
+// opencode takes the cwd from the ?directory= query, not a body field) under the
+// given system prompt, WITHOUT sending a first message. The caller drives turns
+// via Session.Prompt, which lets a recorder start before the first (often long)
+// turn.
+func (o *Opencode) Open(ctx context.Context, dir, system string) (Session, error) {
 	body := map[string]any{
 		"agent": "build", // primary agent that can edit/run, not read-only chat
 		// auto-approve all tool actions so the honeybee runs autonomously
@@ -35,12 +37,22 @@ func (o *Opencode) NewSession(ctx context.Context, dir, system, first string) (S
 		ID string `json:"id"`
 	}
 	if err := o.post(ctx, "/session", dir, body, &created); err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if created.ID == "" {
-		return nil, "", fmt.Errorf("opencode: empty session id")
+		return nil, fmt.Errorf("opencode: empty session id")
 	}
-	s := &ocSession{oc: o, id: created.ID, dir: dir, system: system}
+	return &ocSession{oc: o, id: created.ID, dir: dir, system: system}, nil
+}
+
+// NewSession creates a session and sends the first prompt, returning its reply.
+// Convenience for callers that don't record the first turn (e.g. the editor,
+// which reads the changed file from disk rather than the opencode transcript).
+func (o *Opencode) NewSession(ctx context.Context, dir, system, first string) (Session, string, error) {
+	s, err := o.Open(ctx, dir, system)
+	if err != nil {
+		return nil, "", err
+	}
 	reply, err := s.Prompt(ctx, first)
 	if err != nil {
 		return nil, "", err

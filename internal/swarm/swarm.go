@@ -30,10 +30,11 @@ type Session interface {
 	Close() error
 }
 
-// Client opens opencode sessions. NewSession seeds system+first prompt at cwd
-// and returns the assistant's first reply.
+// Client opens opencode sessions. Open creates a session at cwd with the given
+// system prompt but sends no message yet, so callers can start recording before
+// the (often long) first turn runs.
 type Client interface {
-	NewSession(ctx context.Context, cwd, system, first string) (Session, string, error)
+	Open(ctx context.Context, cwd, system string) (Session, error)
 }
 
 // Runner drives a single honeybee turn loop.
@@ -128,7 +129,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if r.Debug != nil {
 		fmt.Fprintf(r.Debug, "[honeybee] dir=%s submodule=%s kind=%s opening session...\n", absRoot, sel.Submodule.Name, sel.Kind)
 	}
-	sess, _, err := r.Client.NewSession(ctx, absRoot, system, first)
+	sess, err := r.Client.Open(ctx, absRoot, system)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
 	}
@@ -190,11 +191,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 			_ = r.publish(ctx) // surface the heartbeat to peers as we go
 		}
-		if res.Turns > 1 {
-			if _, err := sess.Prompt(ctx, prompt); err != nil {
-				finish("")
-				return res, fmt.Errorf("turn %d prompt: %w", res.Turns, err)
-			}
+		// Drive the turn. Turn 1 sends the seeded `first` prompt; the recorder is
+		// already polling, so even the long bootstrap turn streams to the UI/debug.
+		if _, err := sess.Prompt(ctx, prompt); err != nil {
+			finish("")
+			return res, fmt.Errorf("turn %d prompt: %w", res.Turns, err)
 		}
 		done, err := r.complete(sel, res.Branch)
 		if err != nil {

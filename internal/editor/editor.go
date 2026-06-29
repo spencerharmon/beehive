@@ -16,6 +16,13 @@ import (
 	"github.com/spencerharmon/beehive/internal/swarm"
 )
 
+// agentClient is the slice of the opencode client the editor needs: a session
+// seeded with a system prompt and a first message, returning the reply. Narrowed
+// to an interface so tests can inject a fake. (*swarm.Opencode) satisfies it.
+type agentClient interface {
+	NewSession(ctx context.Context, cwd, system, first string) (swarm.Session, string, error)
+}
+
 // mergeMarker is the control token the agent appends to its reply when the user
 // has explicitly approved merging. beehived performs the merge on its behalf, so
 // "ask the agent to merge" and clicking Merge converge to the same git state.
@@ -46,7 +53,7 @@ type Session struct {
 	remote   string
 	baseMain string
 
-	client swarm.Client
+	client agentClient
 	wt     *git.Repo // worktree git
 
 	mu   sync.Mutex
@@ -62,7 +69,7 @@ type Manager struct {
 	absRoot string
 	cfg     config.Config
 	primary *git.Repo
-	client  swarm.Client
+	client  agentClient
 
 	mu   sync.Mutex
 	byID map[string]*Session

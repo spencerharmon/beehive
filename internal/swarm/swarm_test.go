@@ -19,11 +19,11 @@ type mockClient struct {
 	sess *mockSession
 }
 
-func (m *mockClient) NewSession(ctx context.Context, cwd, system, first string) (Session, string, error) {
+func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, error) {
 	if m.sess == nil {
 		m.sess = &mockSession{}
 	}
-	return m.sess, "", nil
+	return m.sess, nil
 }
 
 type mockSession struct {
