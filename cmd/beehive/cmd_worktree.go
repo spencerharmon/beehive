@@ -6,32 +6,82 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spf13/cobra"
 )
 
+// worktreeCmd manages worktrees of the top-level beehive repo. Each honeybee
+// runs in one of these; this is the operator-facing view and manual control.
 func worktreeCmd() *cobra.Command {
-	c := &cobra.Command{Use: "worktree", Short: "manage per-branch honeybee worktrees"}
-	run := func(cmd *cobra.Command, op, sm, br string) error {
-		root, err := findRoot()
-		if err != nil {
-			return err
-		}
-		script := filepath.Join(root, "scripts", "worktree.sh")
-		ex := exec.CommandContext(cmd.Context(), "sh", script, op, sm, br)
-		ex.Dir = root
-		ex.Stdout, ex.Stderr = os.Stdout, os.Stderr
-		return ex.Run()
-	}
+	c := &cobra.Command{Use: "worktree", Short: "manage top-level beehive repo worktrees"}
+
 	c.AddCommand(&cobra.Command{
-		Use: "add <submodule> <branch>", Short: "create a worktree off the synced tip",
-		Args: cobra.ExactArgs(2),
-		RunE: func(cmd *cobra.Command, a []string) error { return run(cmd, "add", a[0], a[1]) },
-	}, &cobra.Command{
-		Use: "rm <submodule> <branch>", Short: "remove a worktree",
-		Args: cobra.ExactArgs(2),
-		RunE: func(cmd *cobra.Command, a []string) error { return run(cmd, "rm", a[0], a[1]) },
+		Use:   "list",
+		Short: "list beehive repo worktrees",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			wts, err := git.New(root).Worktrees(cmd.Context())
+			if err != nil {
+				return err
+			}
+			for _, w := range wts {
+				br := w.Branch
+				if br == "" {
+					br = "(detached)"
+				}
+				fmt.Printf("%-10s %-40s %s\n", br, w.Path, short(w.HEAD))
+			}
+			return nil
+		},
+	})
+
+	c.AddCommand(&cobra.Command{
+		Use:   "add <branch>",
+		Short: "create a beehive worktree off main under .worktrees/",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			wt := filepath.Join(root, ".worktrees", a[0])
+			if err := git.New(root).WorktreeAdd(cmd.Context(), wt, a[0], "main"); err != nil {
+				return err
+			}
+			fmt.Println(wt)
+			return nil
+		},
+	})
+
+	c.AddCommand(&cobra.Command{
+		Use:   "rm <branch>",
+		Short: "remove a beehive worktree and its branch",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			g := git.New(root)
+			if err := g.WorktreeRemove(cmd.Context(), filepath.Join(root, ".worktrees", a[0])); err != nil {
+				return err
+			}
+			_, _ = g.Run(cmd.Context(), "branch", "-D", a[0])
+			return nil
+		},
 	})
 	return c
+}
+
+func short(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 func honeybeeCmd() *cobra.Command {

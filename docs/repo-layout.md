@@ -32,7 +32,7 @@ submodules/
 
 ## Submodules
 
-Track a branch tip, not a pinned commit. `scripts/submodule-sync.sh` fetches and
+Track a branch tip, not a pinned commit. ``beehive submodule sync`` fetches and
 auto-advances the pointer (all honeybees want latest, hard-reset on force-push).
 Dormant (no ROI.md) submodules are never selected. Worktrees branch off the
 synced tip and are deleted on DONE+merge.

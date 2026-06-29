@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,8 +34,128 @@ func findRoot() (string, error) {
 
 func submoduleCmd() *cobra.Command {
 	c := &cobra.Command{Use: "submodule", Short: "manage beehive submodules"}
-	c.AddCommand(submoduleAddCmd(), submoduleLinkCmd(), submodulePlanCmd())
+	c.AddCommand(submoduleAddCmd(), submoduleLinkCmd(), submodulePlanCmd(),
+		submoduleWorktreeCmd(), submoduleSyncCmd())
 	return c
+}
+
+// submoduleWorktreeCmd manages worktrees of a submodule's target repo, where a
+// honeybee's code edits for a task live (submodules/<sm>/worktrees/<branch>),
+// kept separate from the beehive-layer worktrees.
+func submoduleWorktreeCmd() *cobra.Command {
+	c := &cobra.Command{Use: "worktree", Short: "manage submodule target-repo worktrees"}
+	repoDir := func(root, sm string) string { return filepath.Join(root, "submodules", sm, "repo") }
+
+	c.AddCommand(&cobra.Command{
+		Use:   "add <submodule> <branch>",
+		Short: "sync the tracked tip, then branch a worktree off it",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			if err := syncSubmodule(cmd.Context(), root, a[0]); err != nil {
+				return err
+			}
+			g := git.New(repoDir(root, a[0]))
+			if err := g.WorktreeAdd(cmd.Context(), filepath.Join("..", "worktrees", a[1]), a[1], "HEAD"); err != nil {
+				return err
+			}
+			fmt.Println(filepath.Join("submodules", a[0], "worktrees", a[1]))
+			return nil
+		},
+	})
+	c.AddCommand(&cobra.Command{
+		Use:   "rm <submodule> <branch>",
+		Short: "remove a submodule worktree and its branch",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			g := git.New(repoDir(root, a[0]))
+			if err := g.WorktreeRemove(cmd.Context(), filepath.Join("..", "worktrees", a[1])); err != nil {
+				return err
+			}
+			_, _ = g.Run(cmd.Context(), "branch", "-D", a[1])
+			return nil
+		},
+	})
+	c.AddCommand(&cobra.Command{
+		Use:   "list <submodule>",
+		Short: "list a submodule's worktrees",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			wts, err := git.New(repoDir(root, a[0])).Worktrees(cmd.Context())
+			if err != nil {
+				return err
+			}
+			for _, w := range wts {
+				br := w.Branch
+				if br == "" {
+					br = "(detached)"
+				}
+				fmt.Printf("%-12s %-40s %s\n", br, w.Path, short(w.HEAD))
+			}
+			return nil
+		},
+	})
+	return c
+}
+
+// submoduleSyncCmd advances a submodule to the tip of its tracked branch.
+func submoduleSyncCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sync <submodule>",
+		Short: "fetch and fast-forward a submodule to its tracked branch tip",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			return syncSubmodule(cmd.Context(), root, a[0])
+		},
+	}
+}
+
+// syncSubmodule tracks the tip of a submodule's configured branch (nonstandard:
+// the beehive pointer follows a branch, not a pinned commit). It fetches, takes
+// the remote tip verbatim (auto-clobber: upstream may be force-pushed), and
+// advances the beehive pointer with an auto-commit when it moved.
+func syncSubmodule(ctx context.Context, root, sm string) error {
+	rel := filepath.Join("submodules", sm, "repo")
+	repoDir := filepath.Join(root, rel)
+	if _, err := os.Stat(repoDir); err != nil {
+		return fmt.Errorf("no repo at %s", rel)
+	}
+	rootGit := git.New(root)
+	branch, err := rootGit.Run(ctx, "config", "-f", ".gitmodules", "submodule."+rel+".branch")
+	if err != nil || branch == "" {
+		branch = "main"
+	}
+	g := git.New(repoDir)
+	if _, err := g.Run(ctx, "fetch", "origin", branch, "--prune"); err != nil {
+		return err
+	}
+	if _, err := g.Run(ctx, "checkout", branch); err != nil {
+		return err
+	}
+	if err := g.HardReset(ctx, "origin/"+branch); err != nil {
+		return err
+	}
+	if err := rootGit.CommitPaths(ctx, "submodule sync: "+sm+" -> "+branch+" tip\n\nBeehive: submodule-sync "+sm, rel); err != nil && err != git.ErrNothing {
+		return err
+	}
+	head, _ := g.Run(ctx, "rev-parse", "--short", "HEAD")
+	fmt.Printf("%s on %s at %s\n", rel, branch, head)
+	return nil
 }
 
 func submoduleAddCmd() *cobra.Command {

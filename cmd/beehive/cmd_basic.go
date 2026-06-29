@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spencerharmon/beehive/internal/config"
+	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spf13/cobra"
 )
@@ -21,13 +22,19 @@ func initCmd() *cobra.Command {
 		Use:   "init <path>",
 		Short: "scaffold a beehive repo and install the ROI-protect hook",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
 			if err := repo.Init(path); err != nil {
 				return err
 			}
 			// Hook install is best-effort: only if path is already a git repo.
 			_ = config.InstallROIHook(path)
+			// Allow honeybee worktrees to publish to the checked-out main branch
+			// via `git push . HEAD:main` (local, no-remote convergence).
+			g := git.New(path)
+			if _, err := g.Run(cmd.Context(), "rev-parse", "--git-dir"); err == nil {
+				_, _ = g.Run(cmd.Context(), "config", "receive.denyCurrentBranch", "updateInstead")
+			}
 			fmt.Println("beehive repo at", path)
 			return nil
 		},

@@ -39,13 +39,24 @@ type Client interface {
 // Runner drives a single honeybee turn loop.
 type Runner struct {
 	Repo     *repo.Repo
-	Git      *git.Repo // beehive repo root
+	Git      *git.Repo // beehive worktree (this honeybee's isolated checkout)
 	Client   Client
 	MaxTurns int
 	WallCap  time.Duration
 	TTL      time.Duration
 	Now      func() time.Time
 	Debug    io.Writer // non-nil: stream session activity live
+	// Publish, when set, advances main to this honeybee's worktree branch and
+	// pushes (conflict-free merge of distinct files). Called after each heartbeat
+	// and at session end so peers converge "as we go". Nil in tests = local only.
+	Publish func(context.Context) error
+}
+
+func (r *Runner) publish(ctx context.Context) error {
+	if r.Publish == nil {
+		return nil
+	}
+	return r.Publish(ctx)
 }
 
 func (r *Runner) now() time.Time {
@@ -61,6 +72,7 @@ type Result struct {
 	Turns     int
 	GCMarked  bool
 	Branch    string
+	SessionID string
 }
 
 // branchFor names the worktree branch and doc stem for a task selection.
@@ -120,10 +132,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// activity (reasoning, tool commands + output) to stderr. beehived reads the
 	// repo file, so opencode is polled exactly once regardless of UI viewers.
 	recCtx, recStop := context.WithCancel(ctx)
+	sid := SessionID(res.Branch, r.now())
+	res.SessionID = sid
+	sessionFile := filepath.Join(sel.Submodule.SessionsDir(), sid+".md")
 	rec := &recorder{
 		sess:    sess,
-		path:    filepath.Join(sel.Submodule.SessionsDir(), res.Branch+".md"),
-		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s\n", res.Branch, sel.Submodule.Name, sel.Kind),
+		path:    sessionFile,
+		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch),
 		debug:   r.Debug,
 		toolSt:  map[string]string{},
 		partLen: map[string]int{},
@@ -139,7 +154,8 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		recStop()
 		<-recDone
 		rec.snapshot(ctx) // final flush after the last turn settles
-		r.commitSession(ctx, res.Branch)
+		r.commitSession(ctx, sid, sessionFile)
+		_ = r.publish(ctx)
 	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
 		if sel.Kind == selectt.Work {
@@ -147,6 +163,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				finish()
 				return res, fmt.Errorf("turn %d heartbeat: %w", res.Turns, err)
 			}
+			_ = r.publish(ctx) // surface the heartbeat to peers as we go
 		}
 		if res.Turns > 1 {
 			if _, err := sess.Prompt(ctx, prompt); err != nil {
@@ -177,10 +194,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	return res, nil
 }
 
-// commitSession commits the recorded transcript file to main. Best-effort: a
-// nothing-to-commit is not an error worth failing the run over.
-func (r *Runner) commitSession(ctx context.Context, branch string) {
-	_ = r.Git.Commit(ctx, "session: "+branch+"\n\nBeehive: session "+branch)
+// commitSession commits only the recorded transcript file to main. Path-scoped
+// so concurrent honeybees sharing the checkout never sweep up each other's
+// in-flight session files. Best-effort: nothing-to-commit is not fatal.
+func (r *Runner) commitSession(ctx context.Context, sid, file string) {
+	_ = r.Git.CommitPaths(ctx, "session: "+sid+"\n\nBeehive: session "+sid, file)
 }
 
 // complete is the deterministic per-turn completion check.

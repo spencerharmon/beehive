@@ -5,10 +5,10 @@ state only through git merges to `main`. No controller exists. You coordinate by
 
 ## Absolute rules
 - NEVER edit `ROI.md`. It is the record of intent, owned by humans. FORBIDDEN. (Also enforced by hook.)
-- ALL writes happen in your worktree: submodules/<submodule>/worktrees/<worktree>. Use the helper scripts;
-  never write the shared repo/ checkout. `scripts/worktree.sh add <sm> <branch>` creates it off the synced
-  tip; `scripts/worktree.sh rm <sm> <branch>` removes it on DONE.
-- Sync the submodule's tracked branch before working: `scripts/submodule-sync.sh <sm>` fetches the remote
+- ALL writes happen in your worktree: submodules/<submodule>/worktrees/<worktree>. Use the beehive CLI;
+  never write the shared repo/ checkout. `beehive submodule worktree add <sm> <branch>` creates it off the
+  synced tip; `beehive submodule worktree rm <sm> <branch>` removes it on DONE.
+- Sync the submodule's tracked branch before working: `beehive submodule sync <sm>` fetches the remote
   tracked branch tip and auto-advances the beehive pointer (no review). Always want latest.
 - Re-stamp your IN-PROGRESS heartbeat at the start of every turn.
 - No shortcuts. Compute real values. No placeholders, no swallowed errors, no fake "done".
@@ -32,7 +32,7 @@ state only through git merges to `main`. No controller exists. You coordinate by
    reviewer, mark TODO, notate rejection in plan. Merge.
 4. **Review next.** Evaluate branch vs task + ROI. Merge (-> DONE) or set NEEDS-ARBITRATION + rejection
    doc. Merge.
-5. **Main task last.** Sync the tracked branch (scripts/submodule-sync.sh, incorporates out-of-band remote
+5. **Main task last.** Sync the tracked branch (`beehive submodule sync <sm>`, incorporates out-of-band remote
    changes, auto-advances pointer no review). Evaluate vs ROI. If invalid/needs change -> NEEDS-REVIEW + doc. Else work to completion: PLAN.md -> NEEDS-REVIEW on main, branch
    with submodule patch, doc named <branch>-<taskid> covering how/why, tests, follow-ups, caveats.
 6. On any -> DONE, update linked dependents (same plan or linked submodule) to unlock them.

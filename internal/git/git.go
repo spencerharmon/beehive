@@ -63,6 +63,154 @@ func (r *Repo) Commit(ctx context.Context, msg string) error {
 	return err
 }
 
+// CommitPaths stages and commits only the given pathspecs, leaving any other
+// working-tree changes untouched. Each honeybee works in its own beehive-repo
+// worktree (its own index), so there is no cross-process lock contention; this
+// keeps a commit scoped to exactly the files a step produced. ErrNothing if none
+// of the paths changed.
+func (r *Repo) CommitPaths(ctx context.Context, msg string, paths ...string) error {
+	if len(paths) == 0 {
+		return ErrNothing
+	}
+	args := append([]string{"add", "--"}, paths...)
+	if _, err := r.Run(ctx, args...); err != nil {
+		return err
+	}
+	statusArgs := append([]string{"status", "--porcelain", "--"}, paths...)
+	out, err := r.Run(ctx, statusArgs...)
+	if err != nil {
+		return err
+	}
+	if out == "" {
+		return ErrNothing
+	}
+	commitArgs := append([]string{"commit", "-m", msg, "--"}, paths...)
+	_, err = r.Run(ctx, commitArgs...)
+	return err
+}
+
+// Remote returns the name of the repo's default push remote ("origin" if
+// present, else the first configured remote), or "" when the repo has none.
+func (r *Repo) Remote(ctx context.Context) (string, error) {
+	out, err := r.Run(ctx, "remote")
+	if err != nil {
+		return "", err
+	}
+	names := strings.Fields(out)
+	for _, n := range names {
+		if n == "origin" {
+			return "origin", nil
+		}
+	}
+	if len(names) > 0 {
+		return names[0], nil
+	}
+	return "", nil
+}
+
+// Fetch updates remote-tracking refs for branch from remote.
+func (r *Repo) Fetch(ctx context.Context, remote, branch string) error {
+	_, err := r.Run(ctx, "fetch", remote, branch)
+	return err
+}
+
+// Push pushes refspec to remote.
+func (r *Repo) Push(ctx context.Context, remote, refspec string) error {
+	_, err := r.Run(ctx, "push", remote, refspec)
+	return err
+}
+
+// HardReset discards the worktree and index to ref.
+func (r *Repo) HardReset(ctx context.Context, ref string) error {
+	_, err := r.Run(ctx, "reset", "--hard", ref)
+	return err
+}
+
+// PublishToMain advances main to the current worktree branch's tip and pushes,
+// the conflict-free way honeybees converge. It merges the latest main into the
+// branch first (distinct session/plan files auto-merge), then updates main. With
+// a remote it fetches+merges+pushes remote main; without one it updates local
+// main (requires receive.denyCurrentBranch=updateInstead, set by `beehive init`).
+// Concurrent publishers race only on the main ref: a non-fast-forward push is
+// retried after re-merging the advanced main, never blocking on a write lock.
+func (r *Repo) PublishToMain(ctx context.Context, remote string) error {
+	target := remote
+	if target == "" {
+		target = "."
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		if remote != "" {
+			if err := r.Fetch(ctx, remote, "main"); err != nil {
+				return err
+			}
+			if _, err := r.Run(ctx, "merge", "--no-edit", "FETCH_HEAD"); err != nil {
+				_, _ = r.Run(ctx, "merge", "--abort")
+				return ErrConflict
+			}
+		}
+		_, err := r.Run(ctx, "push", target, "HEAD:refs/heads/main")
+		if err == nil {
+			return nil
+		}
+		if !isNonFastForward(err) {
+			return err
+		}
+		// main advanced under us; merge it in and retry.
+		ref := "main"
+		if remote != "" {
+			ref = remote + "/main"
+		}
+		if _, err := r.Run(ctx, "merge", "--no-edit", ref); err != nil {
+			_, _ = r.Run(ctx, "merge", "--abort")
+			return ErrConflict
+		}
+	}
+	return fmt.Errorf("git: publish to main exhausted retries")
+}
+
+// Worktree is one entry from `git worktree list`.
+type Worktree struct {
+	Path   string
+	Branch string
+	HEAD   string
+}
+
+// Worktrees lists the repo's worktrees (including the primary).
+func (r *Repo) Worktrees(ctx context.Context) ([]Worktree, error) {
+	out, err := r.Run(ctx, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	var wts []Worktree
+	var cur Worktree
+	flush := func() {
+		if cur.Path != "" {
+			wts = append(wts, cur)
+		}
+		cur = Worktree{}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			flush()
+			cur.Path = strings.TrimPrefix(line, "worktree ")
+		case strings.HasPrefix(line, "HEAD "):
+			cur.HEAD = strings.TrimPrefix(line, "HEAD ")
+		case strings.HasPrefix(line, "branch "):
+			cur.Branch = strings.TrimPrefix(strings.TrimPrefix(line, "branch "), "refs/heads/")
+		}
+	}
+	flush()
+	return wts, nil
+}
+
+func isNonFastForward(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "non-fast-forward") ||
+		strings.Contains(s, "fetch first") ||
+		strings.Contains(s, "rejected")
+}
+
 // Clean reports whether the working tree has no staged or unstaged changes.
 func (r *Repo) Clean(ctx context.Context) (bool, error) {
 	out, err := r.Run(ctx, "status", "--porcelain")

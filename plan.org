@@ -142,10 +142,10 @@ on the same state through the use of git merges.
 - Dependency cycles: every dependency-tag write (incl. honeybee commits) runs a cycle check; a tag that
   creates a wait cycle is rejected, and selection detects wait cycles rather than silently skipping both.
 - Worktrees: a per-branch worktree is created at submodules/<submodule>/worktrees/<worktree> for any branch
-  a honeybee works. Helper scripts (scripts/submodule-sync.sh, scripts/worktree.sh) manage create/remove
+  a honeybee works. Helper scripts (`beehive submodule sync`, `beehive submodule worktree`) manage create/remove
   consistently. Worktree deleted on DONE+merge. Keeps concurrent writes isolated on single-host deployments.
 - Branch tracking (nonstandard submodule use): submodules track the tip of a configured branch, not a pinned
-  commit. submodule-sync.sh fetches the remote tracked branch and auto-advances the beehive pointer without
+  commit. `beehive submodule sync` fetches the remote tracked branch and auto-advances the beehive pointer without
   review; all honeybees want latest. Auto-clobber: branch may be force-pushed/rebased, so sync hard-resets to
   the remote tip. Honeybees adapt the plan dynamically (via ROI reconcile + task re-eval) to whatever
   upstream becomes. Worktrees branch off the synced tip.
