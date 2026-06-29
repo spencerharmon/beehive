@@ -51,6 +51,7 @@ type Task struct {
 	Status    Status
 	Attempts  int
 	Deps      []string
+	Weight    int       // selection weight, default 1
 	Heartbeat time.Time // zero when not IN-PROGRESS
 	Body      []string  // body lines verbatim, without trailing blank
 }
@@ -129,6 +130,12 @@ func parseHeader(m []string) (*Task, error) {
 			if v != "" {
 				t.Deps = strings.Split(v, ",")
 			}
+		case "weight":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, fmt.Errorf("plan: bad weight %q for %s", v, t.ID)
+			}
+			t.Weight = n
 		case "heartbeat":
 			ts, err := time.Parse(time.RFC3339, v)
 			if err != nil {
@@ -168,6 +175,9 @@ func (p *Plan) String() string {
 
 func (t *Task) header() string {
 	meta := fmt.Sprintf("attempts=%d deps=%s", t.Attempts, strings.Join(t.Deps, ","))
+	if t.Weight > 1 {
+		meta += fmt.Sprintf(" weight=%d", t.Weight)
+	}
 	if !t.Heartbeat.IsZero() {
 		meta += " heartbeat=" + t.Heartbeat.UTC().Format(time.RFC3339)
 	}

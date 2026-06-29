@@ -20,6 +20,8 @@ type Config struct {
 	GPGHome      string `yaml:"gpg_home"`      // dir containing the keyring
 	GPGRecipient string `yaml:"gpg_recipient"` // recipient for SECRETS.yaml.gpg
 	AgentCmd     string `yaml:"agent_cmd"`     // opencode binary
+	AgentURL     string `yaml:"agent_url"`     // opencode server base URL
+	Model        string `yaml:"model"`         // provider/model for opencode
 	TTLMinutes   int    `yaml:"ttl_minutes"`   // GC heartbeat TTL
 	MaxTurns     int    `yaml:"max_turns"`     // per-honeybee turn cap
 	RejectLimit  int    `yaml:"reject_limit"`  // rejections before NEEDS-HUMAN
@@ -31,6 +33,7 @@ func Defaults(dir string) Config {
 		Dir:         dir,
 		GPGHome:     filepath.Join(dir, "gnupg"),
 		AgentCmd:    "opencode",
+		AgentURL:    "http://127.0.0.1:4096",
 		TTLMinutes:  60,
 		MaxTurns:    15,
 		RejectLimit: 3,
@@ -66,6 +69,9 @@ func Load() (Config, error) {
 	}
 	if c.AgentCmd == "" {
 		c.AgentCmd = "opencode"
+	}
+	if c.AgentURL == "" {
+		c.AgentURL = "http://127.0.0.1:4096"
 	}
 	if c.TTLMinutes == 0 {
 		c.TTLMinutes = 60
