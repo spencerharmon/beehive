@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 )
 
@@ -21,21 +22,26 @@ type Opencode struct {
 	Debug io.Writer // non-nil: log each HTTP request/response
 }
 
-// NewSession creates a server session rooted at cwd and seeds the system prompt
-// (AGENTS.md) plus the first user prompt. Returns the assistant's first reply.
-func (o *Opencode) NewSession(ctx context.Context, cwd, system, first string) (Session, string, error) {
-	body := map[string]any{"directory": cwd}
+// NewSession creates a server session for the working directory dir (an absolute
+// path; opencode takes the cwd from the ?directory= query, not a body field) and
+// seeds the first user prompt under the system prompt. Returns the first reply.
+func (o *Opencode) NewSession(ctx context.Context, dir, system, first string) (Session, string, error) {
+	body := map[string]any{
+		"agent": "build", // primary agent that can edit/run, not read-only chat
+		// auto-approve all tool actions so the honeybee runs autonomously
+		"permission": []map[string]any{{"permission": "*", "pattern": "**", "action": "allow"}},
+	}
 	var created struct {
 		ID string `json:"id"`
 	}
-	if err := o.post(ctx, "/session", body, &created); err != nil {
+	if err := o.post(ctx, "/session", dir, body, &created); err != nil {
 		return nil, "", err
 	}
 	if created.ID == "" {
 		return nil, "", fmt.Errorf("opencode: empty session id")
 	}
-	s := &ocSession{oc: o, id: created.ID, cwd: cwd}
-	reply, err := s.Prompt(ctx, system+"\n\n"+first)
+	s := &ocSession{oc: o, id: created.ID, dir: dir, system: system}
+	reply, err := s.Prompt(ctx, first)
 	if err != nil {
 		return nil, "", err
 	}
@@ -43,9 +49,10 @@ func (o *Opencode) NewSession(ctx context.Context, cwd, system, first string) (S
 }
 
 type ocSession struct {
-	oc  *Opencode
-	id  string
-	cwd string
+	oc     *Opencode
+	id     string
+	dir    string
+	system string
 }
 
 // Prompt sends text and blocks until the assistant turn completes, returning the
@@ -53,9 +60,10 @@ type ocSession struct {
 func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 	prov, model, _ := strings.Cut(s.oc.Model, "/")
 	body := map[string]any{
-		"providerID": prov,
-		"modelID":    model,
-		"parts":      []map[string]any{{"type": "text", "text": text}},
+		"agent":  "build",
+		"system": s.system,
+		"model":  map[string]any{"providerID": prov, "modelID": model},
+		"parts":  []map[string]any{{"type": "text", "text": text}},
 	}
 	var reply struct {
 		Parts []struct {
@@ -63,7 +71,7 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 			Text string `json:"text"`
 		} `json:"parts"`
 	}
-	if err := s.oc.post(ctx, "/session/"+s.id+"/message", body, &reply); err != nil {
+	if err := s.oc.post(ctx, "/session/"+s.id+"/message", s.dir, body, &reply); err != nil {
 		return "", err
 	}
 	var sb strings.Builder
@@ -77,15 +85,21 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 
 func (s *ocSession) Close() error { return nil }
 
-func (o *Opencode) post(ctx context.Context, path string, body, out any) error {
+// post issues a JSON POST. dir, when set, is sent as the ?directory= query that
+// opencode uses to choose the working directory for the session/turn.
+func (o *Opencode) post(ctx context.Context, path, dir string, body, out any) error {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	if o.Debug != nil {
-		fmt.Fprintf(o.Debug, "[opencode] POST %s%s ...\n", o.Base, path)
+	url := o.Base + path
+	if dir != "" {
+		url += "?directory=" + neturl.QueryEscape(dir)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.Base+path, bytes.NewReader(buf))
+	if o.Debug != nil {
+		fmt.Fprintf(o.Debug, "[opencode] POST %s ...\n", url)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
 	if err != nil {
 		return err
 	}

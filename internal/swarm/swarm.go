@@ -74,20 +74,40 @@ func branchFor(sel *selectt.Selection) string {
 }
 
 // Run executes the loop for one selection. It claims work tasks, creates a
-// worktree, runs turns until completion or caps, and tidies up.
+// worktree (Work only), runs turns until completion or caps, and tidies up.
 func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first string) (Result, error) {
 	res := Result{Branch: branchFor(sel)}
-	wtDir := filepath.Join(sel.Submodule.WorktreesDir(), res.Branch)
-	repoDir := sel.Submodule.RepoDir()
-	wg := git.New(repoDir)
-	if err := wg.WorktreeAdd(ctx, filepath.Join("..", "worktrees", res.Branch), res.Branch, "HEAD"); err != nil {
-		return res, fmt.Errorf("worktree add: %w", err)
+	absRoot, err := filepath.Abs(r.Repo.Root)
+	if err != nil {
+		return res, err
 	}
 
-	if r.Debug != nil {
-		fmt.Fprintf(r.Debug, "[honeybee] worktree=%s opening session...\n", wtDir)
+	// Only a main Work task edits the submodule repo and needs a worktree.
+	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
+	var wg *git.Repo
+	wtRel := filepath.Join("..", "worktrees", res.Branch)
+	if sel.Kind == selectt.Work {
+		wg = git.New(sel.Submodule.RepoDir())
+		if err := wg.WorktreeAdd(ctx, wtRel, res.Branch, "HEAD"); err != nil {
+			return res, fmt.Errorf("worktree add: %w", err)
+		}
 	}
-	sess, reply, err := r.Client.NewSession(ctx, wtDir, system, first)
+
+	// Context preamble: the agent works from the beehive repo root and must use
+	// the right paths. ROI/PLAN/docs live in the beehive layer, code in the worktree.
+	preamble := fmt.Sprintf(
+		"# Context\nYou are working from the beehive repo root (cwd). Submodule: %s.\n"+
+			"Coordination files: submodules/%s/ROI.md (read-only), submodules/%s/PLAN.md, submodules/%s/docs/.\n"+
+			"Code worktree (for Work tasks): submodules/%s/worktrees/%s.\n"+
+			"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
+		sel.Submodule.Name, sel.Submodule.Name, sel.Submodule.Name, sel.Submodule.Name,
+		sel.Submodule.Name, res.Branch)
+	first = preamble + first
+
+	if r.Debug != nil {
+		fmt.Fprintf(r.Debug, "[honeybee] dir=%s submodule=%s kind=%s opening session...\n", absRoot, sel.Submodule.Name, sel.Kind)
+	}
+	sess, reply, err := r.Client.NewSession(ctx, absRoot, system, first)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
 	}
@@ -119,7 +139,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if done {
 			res.Completed = true
 			r.persist(ctx, sel, res.Branch, log.String())
-			_ = wg.WorktreeRemove(ctx, filepath.Join("..", "worktrees", res.Branch))
+			if wg != nil {
+				_ = wg.WorktreeRemove(ctx, wtRel)
+			}
 			return res, nil
 		}
 		if r.now().After(deadline) {
