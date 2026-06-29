@@ -22,6 +22,15 @@ type recorder struct {
 	header string
 	debug  io.Writer
 
+	// flush, when set, commits the session file and publishes it to main so the
+	// beehived UI (which reads main's working tree) shows the session live. It is
+	// throttled to flushIvl and only runs when the transcript actually changed, to
+	// bound commit churn. lastMD/lastFlush track that.
+	flush     func(context.Context)
+	flushIvl  time.Duration
+	lastMD    string
+	lastFlush time.Time
+
 	// debug-stream state (incremental, append-only diffing)
 	toolSt  map[string]string // callID -> last status streamed
 	partLen map[string]int    // "<kind>:<partID>" -> chars streamed
@@ -49,11 +58,21 @@ func (rc *recorder) snapshot(ctx context.Context) {
 		return
 	}
 	md := renderTranscript(rc.header, msgs)
+	changed := md != rc.lastMD
 	if err := os.MkdirAll(filepath.Dir(rc.path), 0o755); err == nil {
 		_ = os.WriteFile(rc.path, []byte(md), 0o644)
 	}
+	rc.lastMD = md
 	if rc.debug != nil {
 		rc.streamDebug(msgs)
+	}
+	// Publish progress to main so the session shows up live in the UI, throttled.
+	if changed && rc.flush != nil {
+		now := time.Now()
+		if rc.lastFlush.IsZero() || now.Sub(rc.lastFlush) >= rc.flushIvl {
+			rc.lastFlush = now
+			rc.flush(ctx)
+		}
 	}
 }
 

@@ -161,6 +161,10 @@ func (r *Repo) PublishToMain(ctx context.Context, remote string) error {
 	target := remote
 	if target == "" {
 		target = "."
+		// Pushing to the local repo's checked-out main requires updateInstead, else
+		// it is rejected outright. Ensure it (idempotent, repo-level, shared by all
+		// worktrees) so single-host (no-remote) honeybees can publish.
+		_, _ = r.Run(ctx, "config", "receive.denyCurrentBranch", "updateInstead")
 	}
 	for attempt := 0; attempt < 8; attempt++ {
 		if remote != "" {

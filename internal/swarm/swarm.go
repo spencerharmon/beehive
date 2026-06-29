@@ -57,6 +57,31 @@ type Runner struct {
 	// main after the honeybee started, and exit instead of working a dead task.
 	Remote   string
 	BaseMain string
+
+	// Session transcripts are recorded in a SEPARATE beehive worktree/branch so
+	// they never share an index with the agent's PLAN.md/docs edits (an
+	// out-of-band session commit would otherwise be clobbered by the agent's next
+	// index commit, and vice versa). SessionGit/SessionRoot are that worktree;
+	// SessionPublish advances main with it. Distinct file paths (sessions/ vs
+	// plan/docs) merge conflict-free. Nil/"" in tests = no session worktree (the
+	// transcript is still written to disk, just not committed/published).
+	SessionGit     *git.Repo
+	SessionRoot    string
+	SessionPublish func(context.Context) error
+}
+
+// syncSession commits the live session transcript in the dedicated session
+// worktree and publishes it to main, so the beehived UI shows the session while
+// it runs. The session worktree has exactly one writer (this recorder), so a
+// plain path-scoped commit is safe — no index contention with the agent.
+func (r *Runner) syncSession(ctx context.Context, sid, rel string) {
+	if r.SessionGit == nil {
+		return // tests without a session worktree: file is on disk, not committed
+	}
+	_ = r.SessionGit.CommitPaths(ctx, "session: "+sid+"\n\nBeehive: session "+sid, rel)
+	if r.SessionPublish != nil {
+		_ = r.SessionPublish(ctx)
+	}
 }
 
 func (r *Runner) publish(ctx context.Context) error {
@@ -142,15 +167,26 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	recCtx, recStop := context.WithCancel(ctx)
 	sid := SessionID(res.Branch, r.now())
 	res.SessionID = sid
+	// The session transcript lives at submodules/<sm>/sessions/<sid>.md. It is
+	// written and committed in the dedicated SESSION worktree (SessionRoot), never
+	// the agent's beehive worktree, so session commits and PLAN.md/docs commits
+	// stay on separate branches. Tests without a session worktree fall back to the
+	// agent worktree path and skip committing.
+	sessionRel := filepath.Join("submodules", sel.Submodule.Name, "sessions", sid+".md")
 	sessionFile := filepath.Join(sel.Submodule.SessionsDir(), sid+".md")
+	if r.SessionRoot != "" {
+		sessionFile = filepath.Join(r.SessionRoot, sessionRel)
+	}
 	rec := &recorder{
-		sess:    sess,
-		path:    sessionFile,
-		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch),
-		debug:   r.Debug,
-		toolSt:  map[string]string{},
-		partLen: map[string]int{},
-		started: map[string]bool{},
+		sess:     sess,
+		path:     sessionFile,
+		header:   fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch),
+		debug:    r.Debug,
+		flush:    func(c context.Context) { r.syncSession(c, sid, sessionRel) },
+		flushIvl: 2 * time.Second,
+		toolSt:   map[string]string{},
+		partLen:  map[string]int{},
+		started:  map[string]bool{},
 	}
 	recDone := make(chan struct{})
 	go func() { rec.loop(recCtx); close(recDone) }()
@@ -159,7 +195,8 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
 	// finish stops the recorder, optionally records an abort warning to the
-	// session file (so it shows in the UI), then commits and publishes.
+	// session file (so it shows in the UI), then commits+publishes the session
+	// (its own worktree) and publishes the agent's branch.
 	finish := func(warning string) {
 		recStop()
 		<-recDone
@@ -170,7 +207,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				fmt.Fprintf(r.Debug, "\n⚠️  %s\n", warning)
 			}
 		}
-		r.commitSession(ctx, sid, sessionFile)
+		r.syncSession(ctx, sid, sessionRel)
 		_ = r.publish(ctx)
 	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
@@ -268,13 +305,6 @@ func (r *Runner) taskRemoved(ctx context.Context, sel *selectt.Selection) (bool,
 			sel.Task.ID, sel.Submodule.Name, ref), nil
 	}
 	return false, "", nil
-}
-
-// commitSession commits only the recorded transcript file to main. Path-scoped
-// so concurrent honeybees sharing the checkout never sweep up each other's
-// in-flight session files. Best-effort: nothing-to-commit is not fatal.
-func (r *Runner) commitSession(ctx context.Context, sid, file string) {
-	_ = r.Git.CommitPaths(ctx, "session: "+sid+"\n\nBeehive: session "+sid, file)
 }
 
 // complete is the deterministic per-turn completion check.

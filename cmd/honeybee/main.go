@@ -73,9 +73,20 @@ func run() error {
 	if err := primary.WorktreeAdd(ctx, wtPath, wtBranch, base); err != nil {
 		return fmt.Errorf("create beehive worktree: %w", err)
 	}
+	// A SECOND beehive worktree, on its own branch, dedicated to the session
+	// transcript. Keeping session commits off the agent's branch means the agent's
+	// PLAN.md/docs commits and the recorder's session commits never share an index
+	// (which would clobber each other); both publish to main on distinct paths.
+	sessBranch := wtBranch + "-session"
+	sessPath := filepath.Join(primaryRoot, ".worktrees", sessBranch)
+	if err := primary.WorktreeAdd(ctx, sessPath, sessBranch, base); err != nil {
+		return fmt.Errorf("create session worktree: %w", err)
+	}
 	defer func() {
 		_ = primary.WorktreeRemove(context.Background(), wtPath)
 		_, _ = primary.Run(context.Background(), "branch", "-D", wtBranch)
+		_ = primary.WorktreeRemove(context.Background(), sessPath)
+		_, _ = primary.Run(context.Background(), "branch", "-D", sessBranch)
 	}()
 
 	// Re-root every read and write at the isolated worktree.
@@ -85,6 +96,8 @@ func run() error {
 	}
 	gitRepo := git.New(wtPath)
 	publish := func(ctx context.Context) error { return gitRepo.PublishToMain(ctx, remote) }
+	sessGit := git.New(sessPath)
+	sessPublish := func(ctx context.Context) error { return sessGit.PublishToMain(ctx, remote) }
 
 	sel, err := (&selectt.Selector{
 		Repo: rp, Git: gitRepo, Rand: rand.New(rand.NewSource(time.Now().UnixNano())), TTL: ttl,
@@ -115,6 +128,7 @@ func run() error {
 	runner := &swarm.Runner{
 		Repo: rp, Git: gitRepo, MaxTurns: c.MaxTurns, WallCap: ttl, TTL: ttl, Publish: publish,
 		Remote: remote, BaseMain: baseMain,
+		SessionGit: sessGit, SessionRoot: sessPath, SessionPublish: sessPublish,
 	}
 	oc := &swarm.Opencode{Base: c.AgentURL, Model: c.Model, HTTP: &http.Client{Timeout: 0}}
 	if debug {

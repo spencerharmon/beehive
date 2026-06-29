@@ -159,3 +159,162 @@ func TestTaskRemovedGuard(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// scriptClient returns a session whose Prompt runs onPrompt and whose Messages
+// grow, so the recorder records and flushes.
+type scriptClient struct {
+	onPrompt func()
+	calls    int
+}
+
+func (c *scriptClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	return &scriptSession{c: c}, nil
+}
+
+type scriptSession struct{ c *scriptClient }
+
+func (s *scriptSession) Prompt(ctx context.Context, text string) (string, error) {
+	s.c.calls++
+	if s.c.onPrompt != nil {
+		s.c.onPrompt()
+	}
+	return "", nil
+}
+func (s *scriptSession) Close() error { return nil }
+func (s *scriptSession) Messages(ctx context.Context) ([]Message, error) {
+	return []Message{{ID: "m1", Role: "assistant", Parts: []Part{
+		{Type: "text", Text: strings.Repeat("x", s.c.calls)},
+	}}}, nil
+}
+
+// TestRunPublishesSessionToMain proves a no-remote honeybee, recording in its
+// dedicated SESSION worktree, lands its session file on main's primary working
+// tree — what the beehived UI reads — while the agent's bootstrapped PLAN.md
+// lands via the (separate) agent worktree. Neither clobbers the other.
+func TestRunPublishesSessionToMain(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\nbuild it\n"), 0o644)
+	g.Commit(context.Background(), "seed roi")
+
+	ctx := context.Background()
+	// Agent beehive worktree (PLAN/docs) and a separate session worktree, exactly
+	// as cmd/honeybee creates them.
+	wtPath := filepath.Join(root, ".worktrees", "bee-1")
+	if err := g.WorktreeAdd(ctx, wtPath, "bee-1", "main"); err != nil {
+		t.Fatal(err)
+	}
+	sessPath := filepath.Join(root, ".worktrees", "bee-1-session")
+	if err := g.WorktreeAdd(ctx, sessPath, "bee-1-session", "main"); err != nil {
+		t.Fatal(err)
+	}
+	wrp, _ := repo.Open(wtPath)
+	wg := git.New(wtPath)
+	sessGit := git.New(sessPath)
+	subs, _ := wrp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	cl := &scriptClient{}
+	cl.onPrompt = func() {
+		// The agent bootstraps the plan inside ITS worktree and commits it there,
+		// as opencode would.
+		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		_ = wg.CommitPaths(ctx, "plan: bootstrap", "submodules/sm/PLAN.md")
+	}
+	r := &Runner{
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Publish:        func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
+		SessionGit:     sessGit,
+		SessionRoot:    sessPath,
+		SessionPublish: func(ctx context.Context) error { return sessGit.PublishToMain(ctx, "") },
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("want completed, got %+v", res)
+	}
+	// The session transcript must be written in the SESSION worktree (worktree-
+	// write invariant: the recorder never writes to the primary tree directly).
+	if _, err := os.Stat(filepath.Join(sessPath, "submodules", "sm", "sessions", res.SessionID+".md")); err != nil {
+		t.Fatalf("session not written in session worktree: %v", err)
+	}
+	// Both the session transcript AND the bootstrapped plan must converge on main's
+	// primary working tree, each via its own worktree's publish.
+	if _, err := os.Stat(filepath.Join(root, "submodules", "sm", "sessions", res.SessionID+".md")); err != nil {
+		t.Fatalf("session not published to main working tree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "submodules", "sm", "PLAN.md")); err != nil {
+		t.Fatalf("PLAN.md not published to main working tree: %v", err)
+	}
+}
+
+// TestSessionAndPlanOnSeparateBranches guards the deconfliction invariant: the
+// session transcript is AUTHORED on the session branch and the plan on the agent
+// branch (never the same index), and both converge on main. (After publish the
+// agent branch also carries the session file, but only via an index-aware
+// git-merge from main — not an out-of-band commit — so nothing is clobbered.)
+func TestSessionAndPlanOnSeparateBranches(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+	ctx := context.Background()
+
+	wtPath := filepath.Join(root, ".worktrees", "bee-2")
+	g.WorktreeAdd(ctx, wtPath, "bee-2", "main")
+	sessPath := filepath.Join(root, ".worktrees", "bee-2-session")
+	g.WorktreeAdd(ctx, sessPath, "bee-2-session", "main")
+	wrp, _ := repo.Open(wtPath)
+	wg := git.New(wtPath)
+	sessGit := git.New(sessPath)
+	subs, _ := wrp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	cl := &scriptClient{}
+	cl.onPrompt = func() {
+		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		_ = wg.CommitPaths(ctx, "plan: bootstrap", "submodules/sm/PLAN.md")
+	}
+	r := &Runner{
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Publish:        func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
+		SessionGit:     sessGit,
+		SessionRoot:    sessPath,
+		SessionPublish: func(ctx context.Context) error { return sessGit.PublishToMain(ctx, "") },
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	sessRel := "submodules/sm/sessions/" + res.SessionID + ".md"
+
+	has := func(g *git.Repo, ref, path string) bool {
+		_, err := g.Run(ctx, "cat-file", "-e", ref+":"+path)
+		return err == nil
+	}
+	// The session transcript is authored on the session branch, the plan on the
+	// agent branch — separate indexes, no out-of-band commits.
+	if !has(g, "bee-2", "submodules/sm/PLAN.md") {
+		t.Error("agent branch missing PLAN.md")
+	}
+	if !has(g, "bee-2-session", sessRel) {
+		t.Error("session branch missing the session file")
+	}
+	// The session branch published before the agent's plan reached main, so it
+	// never merged the plan: proof the two are authored independently.
+	if has(g, "bee-2-session", "submodules/sm/PLAN.md") {
+		t.Error("session branch unexpectedly has PLAN.md (indexes intermingled)")
+	}
+	// main: both, neither clobbered.
+	if !has(g, "main", "submodules/sm/PLAN.md") || !has(g, "main", sessRel) {
+		t.Error("main missing plan or session after convergence")
+	}
+}
