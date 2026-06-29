@@ -1,0 +1,7 @@
+<ul class="sessions">
+{{range .Sessions}}<li>
+  <a href="/submodule/{{$.Name}}/session/{{.ID}}">{{.ID}}</a>
+  {{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">idle</span>{{end}}
+  <span class="ago">{{.Ago}} ago</span>
+</li>{{else}}<li>no sessions yet</li>{{end}}
+</ul>

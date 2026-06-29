@@ -49,6 +49,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /submodule/{name}/branches", s.branches)
 	mux.HandleFunc("GET /submodule/{name}/plan", s.plan)
 	mux.HandleFunc("GET /submodule/{name}/sessions", s.sessionsList)
+	mux.HandleFunc("GET /submodule/{name}/sessions/body", s.sessionsListBody)
 	mux.HandleFunc("GET /submodule/{name}/session/{branch}", s.sessionView)
 	mux.HandleFunc("GET /submodule/{name}/session/{branch}/body", s.sessionBody)
 	mux.HandleFunc("GET /roi/{name}", s.roiGet)

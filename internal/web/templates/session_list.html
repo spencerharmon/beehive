@@ -1,6 +1,9 @@
 {{template "header"}}
 <h1>{{.Name}} · sessions</h1>
-<ul>
-{{range .Sessions}}<li><a href="/submodule/{{$.Name}}/session/{{.}}">{{.}}</a></li>{{else}}<li>no sessions yet</li>{{end}}
-</ul>
+<div id="session-list"
+     hx-get="/submodule/{{.Name}}/sessions/body"
+     hx-trigger="load, every 2s"
+     hx-swap="innerHTML">
+  <p>loading…</p>
+</div>
 {{template "footer"}}
