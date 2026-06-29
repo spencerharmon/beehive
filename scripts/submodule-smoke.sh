@@ -3,7 +3,7 @@
 set -eu
 
 bin="$(mktemp -d)/beehive"
-go build -o "$bin" ./cmd/beehive
+CGO_ENABLED=0 go build -o "$bin" ./cmd/beehive
 work="$(mktemp -d)"
 
 "$bin" init "$work/hive"

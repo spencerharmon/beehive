@@ -18,7 +18,7 @@ for bin in beehive beehived honeybee; do
   if [ -f "dist/$bin" ]; then
     install -m 0755 "dist/$bin" "$BINDIR/$bin"
   else
-    go build -o "$BINDIR/$bin" "./cmd/$bin"
+    CGO_ENABLED=0 go build -o "$BINDIR/$bin" "./cmd/$bin"
     chmod 0755 "$BINDIR/$bin"
   fi
 done
