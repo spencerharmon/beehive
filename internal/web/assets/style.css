@@ -4,5 +4,6 @@ nav{margin-bottom:1rem}.card{border:1px solid #ccc;padding:.5rem;margin:.5rem 0}
 .badge.live{background:#1f9d55;color:#fff}
 ul.sessions{list-style:none;padding:0}ul.sessions li{padding:.2rem 0;border-bottom:1px solid #eee}
 .ago{color:#888;font-size:.85em;margin-left:.4rem}
+button.danger{background:#c0392b;color:#fff;border:0;padding:.3rem .7rem;border-radius:.3rem;margin-top:.6rem;cursor:pointer}
 pre{background:#f7f7f7;padding:.5rem;overflow:auto}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:.2rem .5rem}
 .session{white-space:pre-wrap;word-break:break-word;max-height:42rem;overflow:auto;line-height:1.35}

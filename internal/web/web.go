@@ -48,6 +48,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /submodule/{name}", s.explorer)
 	mux.HandleFunc("GET /submodule/{name}/branches", s.branches)
 	mux.HandleFunc("GET /submodule/{name}/plan", s.plan)
+	mux.HandleFunc("POST /submodule/{name}/plan/delete", s.planDelete)
 	mux.HandleFunc("GET /submodule/{name}/sessions", s.sessionsList)
 	mux.HandleFunc("GET /submodule/{name}/sessions/body", s.sessionsListBody)
 	mux.HandleFunc("GET /submodule/{name}/session/{branch}", s.sessionView)
@@ -171,6 +172,61 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p})
+}
+
+// planDelete removes a submodule's PLAN.md and publishes the deletion, so the
+// next honeybee sees ROI present + PLAN absent (NeedsBootstrap) and rebuilds the
+// plan from ROI.md from scratch. Destructive: in-flight task state (claims,
+// heartbeats, attempt counts) in that PLAN is discarded; running honeybees will
+// finish their current turn against their own worktree copy and a stale claim,
+// then the fresh bootstrap supersedes it. Operator-initiated only.
+func (s *Server) planDelete(w http.ResponseWriter, r *http.Request) {
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	planPath := sm.PlanPath()
+	if _, statErr := os.Stat(planPath); os.IsNotExist(statErr) {
+		// Already absent: nothing to commit, just show the (bootstrap-pending) plan.
+		http.Redirect(w, r, "/submodule/"+sm.Name+"/plan", http.StatusSeeOther)
+		return
+	}
+	if err := os.Remove(planPath); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if err := s.commit(r.Context(), "frontend: delete PLAN "+sm.Name+" (force rebootstrap from ROI)"); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if err := s.publishMain(r.Context()); err != nil {
+		http.Error(w, "deleted locally but publish to remote failed: "+err.Error(), 500)
+		return
+	}
+	http.Redirect(w, r, "/submodule/"+sm.Name+"/plan", http.StatusSeeOther)
+}
+
+// publishMain pushes the beehived primary checkout's main to the remote so other
+// hosts' honeybees (which branch off origin/main) see committed changes. No-op
+// when the repo has no remote (single-host: honeybees branch off local main,
+// already updated). On a non-fast-forward it fetches, merges, and retries.
+func (s *Server) publishMain(ctx context.Context) error {
+	remote, err := s.git.Remote(ctx)
+	if err != nil || remote == "" {
+		return err
+	}
+	if err := s.git.Push(ctx, remote, "main"); err == nil {
+		return nil
+	}
+	if err := s.git.Fetch(ctx, remote, "main"); err != nil {
+		return err
+	}
+	if _, err := s.git.Run(ctx, "merge", "--no-edit", "FETCH_HEAD"); err != nil {
+		_, _ = s.git.Run(ctx, "merge", "--abort")
+		return err
+	}
+	return s.git.Push(ctx, remote, "main")
 }
 
 func (s *Server) roiGet(w http.ResponseWriter, r *http.Request) {
