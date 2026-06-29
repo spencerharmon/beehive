@@ -1,0 +1,10 @@
+{{template "header"}}
+<h1>{{.Name}} · {{.Branch}}</h1>
+<p><a href="/submodule/{{.Name}}/sessions">all sessions</a> · <span class="badge">live</span></p>
+<div id="session-body"
+     hx-get="/submodule/{{.Name}}/session/{{.Branch}}/body"
+     hx-trigger="load, every 2s"
+     hx-swap="innerHTML">
+  <p>loading…</p>
+</div>
+{{template "footer"}}

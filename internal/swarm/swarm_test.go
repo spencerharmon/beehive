@@ -39,6 +39,8 @@ func (s *mockSession) Prompt(ctx context.Context, text string) (string, error) {
 }
 func (s *mockSession) Close() error { return nil }
 
+func (s *mockSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+
 func gitInit(t *testing.T, dir string) *git.Repo {
 	g := git.New(dir)
 	ctx := context.Background()

@@ -12,7 +12,6 @@ import (
 	"net/http"
 	neturl "net/url"
 	"strings"
-	"time"
 )
 
 // Opencode talks to an opencode server's session API.
@@ -42,11 +41,6 @@ func (o *Opencode) NewSession(ctx context.Context, dir, system, first string) (S
 		return nil, "", fmt.Errorf("opencode: empty session id")
 	}
 	s := &ocSession{oc: o, id: created.ID, dir: dir, system: system}
-	if o.Debug != nil {
-		tapCtx, cancel := context.WithCancel(ctx)
-		s.cancel = cancel
-		go o.tap(tapCtx, dir, created.ID)
-	}
 	reply, err := s.Prompt(ctx, first)
 	if err != nil {
 		return nil, "", err
@@ -54,12 +48,75 @@ func (o *Opencode) NewSession(ctx context.Context, dir, system, first string) (S
 	return s, reply, nil
 }
 
+// Part is one element of a message: assistant text, model reasoning, or a tool
+// call with its input/output. Step markers are surfaced verbatim by Type.
+type Part struct {
+	ID     string         // opencode part id (stable within a message)
+	Type   string         // text | reasoning | tool | step-start | step-finish
+	Text   string         // text/reasoning content
+	Tool   string         // tool name (Type==tool)
+	CallID string         // tool call id (Type==tool)
+	Status string         // tool state: pending|running|completed|error
+	Input  map[string]any // tool input arguments
+	Output string         // tool stdout/result (completed)
+	Error  string         // tool error (error)
+	Title  string         // tool human title, when provided
+}
+
+// Message is one session turn (user or assistant) with its ordered parts.
+type Message struct {
+	ID    string
+	Role  string
+	Parts []Part
+}
+
 type ocSession struct {
 	oc     *Opencode
 	id     string
 	dir    string
 	system string
-	cancel context.CancelFunc
+}
+
+// Messages returns the full ordered message history of the session, including
+// user prompts, assistant text, reasoning, and tool calls with input+output.
+// Used by the recorder to render a live transcript without re-driving the model.
+func (s *ocSession) Messages(ctx context.Context) ([]Message, error) {
+	var raw []struct {
+		Info struct {
+			ID   string `json:"id"`
+			Role string `json:"role"`
+		} `json:"info"`
+		Parts []struct {
+			ID     string `json:"id"`
+			Type   string `json:"type"`
+			Text   string `json:"text"`
+			Tool   string `json:"tool"`
+			CallID string `json:"callID"`
+			State  struct {
+				Status string         `json:"status"`
+				Input  map[string]any `json:"input"`
+				Output string         `json:"output"`
+				Error  string         `json:"error"`
+				Title  string         `json:"title"`
+			} `json:"state"`
+		} `json:"parts"`
+	}
+	if err := s.oc.get(ctx, "/session/"+s.id+"/message", s.dir, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]Message, 0, len(raw))
+	for _, m := range raw {
+		msg := Message{ID: m.Info.ID, Role: m.Info.Role}
+		for _, p := range m.Parts {
+			msg.Parts = append(msg.Parts, Part{
+				ID: p.ID, Type: p.Type, Text: p.Text, Tool: p.Tool, CallID: p.CallID,
+				Status: p.State.Status, Input: p.State.Input,
+				Output: p.State.Output, Error: p.State.Error, Title: p.State.Title,
+			})
+		}
+		out = append(out, msg)
+	}
+	return out, nil
 }
 
 // Prompt sends text and blocks until the assistant turn completes, returning the
@@ -90,88 +147,7 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 	return sb.String(), nil
 }
 
-func (s *ocSession) Close() error {
-	if s.cancel != nil {
-		s.cancel()
-	}
-	return nil
-}
-
-// tap polls this session's latest assistant message and prints live activity
-// (assistant text as it grows, tool-call state transitions) to Debug. opencode's
-// /event HTTP stream does not emit per-turn events in this server build, so we
-// poll instead. Runs until ctx is cancelled (session Close); best-effort.
-func (o *Opencode) tap(ctx context.Context, dir, sid string) {
-	path := "/session/" + sid + "/message"
-	tick := time.NewTicker(700 * time.Millisecond)
-	defer tick.Stop()
-	printedText := 0
-	lastMsg := ""
-	toolStatus := map[string]string{}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-		}
-		var msgs []struct {
-			Info struct {
-				ID   string `json:"id"`
-				Role string `json:"role"`
-			} `json:"info"`
-			Parts []struct {
-				Type   string `json:"type"`
-				Text   string `json:"text"`
-				Tool   string `json:"tool"`
-				CallID string `json:"callID"`
-				State  struct {
-					Status string `json:"status"`
-				} `json:"state"`
-			} `json:"parts"`
-		}
-		if err := o.get(ctx, path, dir, &msgs); err != nil {
-			continue
-		}
-		if len(msgs) == 0 {
-			continue
-		}
-		last := msgs[len(msgs)-1]
-		if last.Info.Role != "assistant" {
-			continue
-		}
-		if last.Info.ID != lastMsg {
-			lastMsg = last.Info.ID
-			printedText = 0
-		}
-		var sb strings.Builder
-		for _, p := range last.Parts {
-			if p.Type == "text" {
-				sb.WriteString(p.Text)
-			}
-		}
-		if full := sb.String(); len(full) > printedText {
-			fmt.Fprint(o.Debug, full[printedText:])
-			printedText = len(full)
-		}
-		for _, p := range last.Parts {
-			if p.Type != "tool" {
-				continue
-			}
-			if toolStatus[p.CallID] == p.State.Status {
-				continue
-			}
-			toolStatus[p.CallID] = p.State.Status
-			switch p.State.Status {
-			case "pending", "running":
-				fmt.Fprintf(o.Debug, "\n  \u00b7 %s ...\n", p.Tool)
-			case "completed":
-				fmt.Fprintf(o.Debug, "  \u2713 %s\n", p.Tool)
-			case "error":
-				fmt.Fprintf(o.Debug, "  \u2717 %s\n", p.Tool)
-			}
-		}
-	}
-}
+func (s *ocSession) Close() error { return nil }
 
 // get issues a JSON GET with the ?directory= query and decodes into out.
 func (o *Opencode) get(ctx context.Context, path, dir string, out any) error {

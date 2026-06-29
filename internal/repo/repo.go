@@ -48,6 +48,9 @@ func (s Submodule) PlanPath() string     { return filepath.Join(s.Path, PlanFile
 func (s Submodule) ROIPath() string      { return filepath.Join(s.Path, ROIFile) }
 func (s Submodule) WorktreesDir() string { return filepath.Join(s.Path, "worktrees") }
 
+// SessionsDir holds recorded honeybee session transcripts (one .md per branch).
+func (s Submodule) SessionsDir() string { return filepath.Join(s.Path, "sessions") }
+
 // Submodules lists submodule dirs sorted by name.
 func (r *Repo) Submodules() ([]Submodule, error) {
 	base := filepath.Join(r.Root, "submodules")

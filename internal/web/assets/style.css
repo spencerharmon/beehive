@@ -2,3 +2,4 @@ body{font-family:system-ui,sans-serif;margin:2rem;max-width:60rem}
 nav{margin-bottom:1rem}.card{border:1px solid #ccc;padding:.5rem;margin:.5rem 0}
 .badge{background:#eee;padding:0 .4rem;border-radius:.3rem}.ok{color:green}
 pre{background:#f7f7f7;padding:.5rem;overflow:auto}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:.2rem .5rem}
+.session{white-space:pre-wrap;word-break:break-word;max-height:42rem;overflow:auto;line-height:1.35}

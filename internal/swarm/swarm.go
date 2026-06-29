@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/claim"
@@ -23,8 +22,11 @@ import (
 
 // Session is one opencode conversation; context persists across Prompt calls.
 // Prompt blocks until the assistant turn finishes and returns its reply text.
+// Messages returns the full structured history (user/assistant/reasoning/tools)
+// so the recorder can render a live transcript without re-driving the model.
 type Session interface {
 	Prompt(ctx context.Context, text string) (string, error)
+	Messages(ctx context.Context) ([]Message, error)
 	Close() error
 }
 
@@ -107,38 +109,59 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if r.Debug != nil {
 		fmt.Fprintf(r.Debug, "[honeybee] dir=%s submodule=%s kind=%s opening session...\n", absRoot, sel.Submodule.Name, sel.Kind)
 	}
-	sess, reply, err := r.Client.NewSession(ctx, absRoot, system, first)
+	sess, _, err := r.Client.NewSession(ctx, absRoot, system, first)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
 	}
 	defer sess.Close()
 
-	var log strings.Builder
-	r.record(&log, sel, 1, first, reply)
+	// Always-on recorder: one poller streams the session transcript to the repo
+	// (submodules/<sm>/sessions/<branch>.md) and, when Debug is set, tees live
+	// activity (reasoning, tool commands + output) to stderr. beehived reads the
+	// repo file, so opencode is polled exactly once regardless of UI viewers.
+	recCtx, recStop := context.WithCancel(ctx)
+	rec := &recorder{
+		sess:    sess,
+		path:    filepath.Join(sel.Submodule.SessionsDir(), res.Branch+".md"),
+		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s\n", res.Branch, sel.Submodule.Name, sel.Kind),
+		debug:   r.Debug,
+		toolSt:  map[string]string{},
+		partLen: map[string]int{},
+		started: map[string]bool{},
+	}
+	recDone := make(chan struct{})
+	go func() { rec.loop(recCtx); close(recDone) }()
 
 	cl := &claim.Claimer{Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now}
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
+	finish := func() {
+		recStop()
+		<-recDone
+		rec.snapshot(ctx) // final flush after the last turn settles
+		r.commitSession(ctx, res.Branch)
+	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
 		if sel.Kind == selectt.Work {
 			if err := cl.Heartbeat(ctx, sel.Task.ID, r.now()); err != nil {
+				finish()
 				return res, fmt.Errorf("turn %d heartbeat: %w", res.Turns, err)
 			}
 		}
 		if res.Turns > 1 {
-			rep, err := sess.Prompt(ctx, prompt)
-			if err != nil {
+			if _, err := sess.Prompt(ctx, prompt); err != nil {
+				finish()
 				return res, fmt.Errorf("turn %d prompt: %w", res.Turns, err)
 			}
-			r.record(&log, sel, res.Turns, prompt, rep)
 		}
 		done, err := r.complete(sel, res.Branch)
 		if err != nil {
+			finish()
 			return res, err
 		}
 		if done {
 			res.Completed = true
-			r.persist(ctx, sel, res.Branch, log.String())
+			finish()
 			if wg != nil {
 				_ = wg.WorktreeRemove(ctx, wtRel)
 			}
@@ -150,30 +173,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		prompt = "continue"
 	}
 	res.GCMarked = true // turn/wall cap hit, leave IN-PROGRESS heartbeat for GC
-	r.persist(ctx, sel, res.Branch, log.String())
+	finish()
 	return res, nil
 }
 
-// record appends a turn to the transcript and streams it live when Debug is set.
-func (r *Runner) record(log *strings.Builder, sel *selectt.Selection, turn int, prompt, reply string) {
-	fmt.Fprintf(log, "\n## turn %d\n\n> %s\n\n%s\n", turn, prompt, reply)
-	if r.Debug != nil {
-		// Live assistant output (text + tool calls) streams via the opencode
-		// SSE event tap, so only echo the turn header + prompt here.
-		fmt.Fprintf(r.Debug, "\n=== turn %d ===\n> %s\n", turn, prompt)
-	}
-}
-
-// persist records the session transcript in the beehive repo, committed to main.
-func (r *Runner) persist(ctx context.Context, sel *selectt.Selection, branch, body string) {
-	dir := filepath.Join(sel.Submodule.Path, "docs", "sessions")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
-	f := filepath.Join(dir, branch+".md")
-	if err := os.WriteFile(f, []byte("# session "+branch+"\n"+body), 0o644); err != nil {
-		return
-	}
+// commitSession commits the recorded transcript file to main. Best-effort: a
+// nothing-to-commit is not an error worth failing the run over.
+func (r *Runner) commitSession(ctx context.Context, branch string) {
 	_ = r.Git.Commit(ctx, "session: "+branch+"\n\nBeehive: session "+branch)
 }
 
