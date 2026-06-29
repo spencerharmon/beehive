@@ -97,8 +97,13 @@ func (r *Repo) LastCommit(ctx context.Context, path string) (string, error) {
 	return r.Run(ctx, "log", "-1", "--format=%H", "--", path)
 }
 
-// WorktreeAdd creates a worktree at dir on a new branch off base.
+// WorktreeAdd creates a worktree at dir on a new branch off base. It is
+// idempotent: any stale worktree at dir or pre-existing branch from a crashed
+// run is pruned/discarded first so a honeybee can always claim a fresh tree.
 func (r *Repo) WorktreeAdd(ctx context.Context, dir, branch, base string) error {
+	_, _ = r.Run(ctx, "worktree", "remove", "--force", dir)
+	_, _ = r.Run(ctx, "worktree", "prune")
+	_, _ = r.Run(ctx, "branch", "-D", branch)
 	_, err := r.Run(ctx, "worktree", "add", "-b", branch, dir, base)
 	return err
 }
