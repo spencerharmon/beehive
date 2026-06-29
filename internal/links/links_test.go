@@ -57,3 +57,40 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func LinksName() string { return "SUBMODULE-LINKS.yaml" }
+
+func TestCycleExported(t *testing.T) {
+	if c := Cycle([]Edge{{From: "a", To: "b"}, {From: "b", To: "c"}, {From: "c", To: "a"}}); c == nil {
+		t.Fatal("Cycle: want a cycle, got nil")
+	}
+	if c := Cycle([]Edge{{From: "a", To: "b"}, {From: "b", To: "c"}}); c != nil {
+		t.Fatalf("Cycle: acyclic reported %v", c)
+	}
+}
+
+func TestCyclicNodes(t *testing.T) {
+	// a<->b<->c form a 3-cycle; d only depends on the cycle (not on it); e is free.
+	edges := []Edge{
+		{From: "a", To: "b"},
+		{From: "b", To: "c"},
+		{From: "c", To: "a"},
+		{From: "d", To: "a"},
+		{From: "e", To: "f"},
+	}
+	cn := CyclicNodes(edges)
+	for _, n := range []string{"a", "b", "c"} {
+		if !cn[n] {
+			t.Fatalf("node %s must be on a cycle: %v", n, cn)
+		}
+	}
+	for _, n := range []string{"d", "e", "f"} {
+		if cn[n] {
+			t.Fatalf("node %s must not be on a cycle: %v", n, cn)
+		}
+	}
+	if len(CyclicNodes([]Edge{{From: "a", To: "b"}, {From: "b", To: "c"}})) != 0 {
+		t.Fatal("acyclic graph reported cyclic nodes")
+	}
+	if !CyclicNodes([]Edge{{From: "x", To: "x"}})["x"] {
+		t.Fatal("self-loop x must be cyclic")
+	}
+}

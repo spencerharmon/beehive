@@ -84,3 +84,140 @@ func TestReconcilePriority0(t *testing.T) {
 		t.Fatalf("want reconcile, got %+v", s)
 	}
 }
+
+// stampAll seeds each submodule's PLAN.md with the ROI commit sha so the selector
+// sees no reconcile drift and proceeds to Work selection. Call after committing.
+func stampAll(t *testing.T, g *git.Repo, root string, names ...string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, n := range names {
+		head, err := g.LastCommit(ctx, "submodules/"+n+"/ROI.md")
+		if err != nil || head == "" {
+			t.Fatalf("ROI head for %s: %q %v", n, head, err)
+		}
+		p := filepath.Join(root, "submodules", n, "PLAN.md")
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("<!-- Beehive-ROI: "+head+" -->\n"+string(b)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := g.Commit(ctx, "stamp"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const linkAB = "submodules:\n  - a\n  - b\n"
+
+func TestLinkedDepGatesSelection(t *testing.T) {
+	_, g, root := hive(t)
+	// a:A1 depends on linked b:B1, which is not DONE -> A1 is held. Only b:B1 is
+	// selectable, so it must be the pick regardless of submodule order.
+	sub(root, "a", map[string]string{
+		"ROI.md":               "x",
+		"SUBMODULE-LINKS.yaml": linkAB,
+		"PLAN.md":              "## A1 [TODO] <!-- attempts=0 deps=b:B1 -->\ngo\n",
+	})
+	sub(root, "b", map[string]string{
+		"ROI.md":               "x",
+		"SUBMODULE-LINKS.yaml": linkAB,
+		"PLAN.md":              "## B1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	g.Commit(context.Background(), "seed")
+	stampAll(t, g, root, "a", "b")
+	s, err := sel(root, g).Select(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s == nil || s.Submodule.Name != "b" || s.Task.ID != "B1" {
+		t.Fatalf("cross-submodule dep should gate A1; want B1 in b, got %+v", s)
+	}
+}
+
+func TestLinkedDepDoneUnblocks(t *testing.T) {
+	_, g, root := hive(t)
+	// b:B1 is DONE, so a:A1's cross-submodule prerequisite is satisfied. b has no
+	// other selectable task, so A1 in a is the only pick.
+	sub(root, "a", map[string]string{
+		"ROI.md":               "x",
+		"SUBMODULE-LINKS.yaml": linkAB,
+		"PLAN.md":              "## A1 [TODO] <!-- attempts=0 deps=b:B1 -->\ngo\n",
+	})
+	sub(root, "b", map[string]string{
+		"ROI.md":               "x",
+		"SUBMODULE-LINKS.yaml": linkAB,
+		"PLAN.md":              "## B1 [DONE] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	g.Commit(context.Background(), "seed")
+	stampAll(t, g, root, "a", "b")
+	s, err := sel(root, g).Select(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s == nil || s.Submodule.Name != "a" || s.Task.ID != "A1" {
+		t.Fatalf("DONE dep should unblock A1; got %+v", s)
+	}
+}
+
+func TestCrossDepRequiresLink(t *testing.T) {
+	_, g, root := hive(t)
+	// a:A1 depends on b:B1 but a declares NO link to b. Even though B1 is DONE the
+	// dependency is unauthorized, so A1 is held; b has no other task -> nothing
+	// selectable.
+	sub(root, "a", map[string]string{
+		"ROI.md":  "x",
+		"PLAN.md": "## A1 [TODO] <!-- attempts=0 deps=b:B1 -->\ngo\n",
+	})
+	sub(root, "b", map[string]string{
+		"ROI.md":  "x",
+		"PLAN.md": "## B1 [DONE] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	g.Commit(context.Background(), "seed")
+	stampAll(t, g, root, "a", "b")
+	s, err := sel(root, g).Select(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != nil {
+		t.Fatalf("unlinked cross-submodule dep must gate selection, got %+v", s)
+	}
+}
+
+func TestCyclicTasksNotSelected(t *testing.T) {
+	_, g, root := hive(t)
+	// a:A1 -> b:B1 -> a:A1 forms a cross-submodule wait cycle. Both tasks are on
+	// the cycle and must be excluded from selection.
+	sub(root, "a", map[string]string{
+		"ROI.md":               "x",
+		"SUBMODULE-LINKS.yaml": linkAB,
+		"PLAN.md":              "## A1 [TODO] <!-- attempts=0 deps=b:B1 -->\ngo\n",
+	})
+	sub(root, "b", map[string]string{
+		"ROI.md":               "x",
+		"SUBMODULE-LINKS.yaml": linkAB,
+		"PLAN.md":              "## B1 [TODO] <!-- attempts=0 deps=a:A1 -->\ngo\n",
+	})
+	g.Commit(context.Background(), "seed")
+	stampAll(t, g, root, "a", "b")
+
+	rp, _ := repo.Open(root)
+	graph, err := LoadEdges(rp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.Validate() == nil {
+		t.Fatal("Validate: want a cycle in a:A1 <-> b:B1")
+	}
+	if !graph.InCycle("a:A1") || !graph.InCycle("b:B1") {
+		t.Fatalf("both cycle nodes must be flagged: %+v", graph.cyclic)
+	}
+	s, err := sel(root, g).Select(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != nil {
+		t.Fatalf("cyclic tasks must not be selected, got %+v", s)
+	}
+}

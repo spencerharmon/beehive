@@ -2,7 +2,11 @@
 // yields a workable task: weighted-random over submodules, ROI-reconcile as
 // priority 0 (PLAN.md stamp vs ROI.md commit), bootstrap when PLAN absent, then
 // GC > arbitration > review > main by priority, dependency-gated, cycle-skipped,
-// NEEDS-HUMAN excluded. The package name avoids the "select" keyword.
+// NEEDS-HUMAN excluded. Dependency gating spans submodules: a TODO task whose dep
+// names a linked submodule's task ("<submodule>:<taskid>") is held until that
+// task is DONE, and a task on a wait cycle is excluded rather than deadlocked
+// (this package owns the combined cross-submodule graph; see graph.go). The
+// package name avoids the "select" keyword.
 package selectt
 
 import (
@@ -52,10 +56,14 @@ func (s *Selector) Select(ctx context.Context) (*Selection, error) {
 	if err != nil {
 		return nil, err
 	}
+	graph, err := LoadEdges(s.Repo)
+	if err != nil {
+		return nil, err
+	}
 	order := s.weightedOrder(subs)
 	now := time.Now().UTC()
 	for _, sm := range order {
-		sel, err := s.fromSubmodule(ctx, sm, now)
+		sel, err := s.fromSubmodule(ctx, sm, now, graph)
 		if err != nil {
 			return nil, err
 		}
@@ -66,7 +74,7 @@ func (s *Selector) Select(ctx context.Context) (*Selection, error) {
 	return nil, nil
 }
 
-func (s *Selector) fromSubmodule(ctx context.Context, sm repo.Submodule, now time.Time) (*Selection, error) {
+func (s *Selector) fromSubmodule(ctx context.Context, sm repo.Submodule, now time.Time, graph *Graph) (*Selection, error) {
 	if sm.Dormant() {
 		return nil, nil
 	}
@@ -91,12 +99,41 @@ func (s *Selector) fromSubmodule(ctx context.Context, sm repo.Submodule, now tim
 	if err != nil {
 		return nil, err
 	}
-	cands := pl.Candidates(now, s.TTL)
+	cands := graphGate(sm, pl.Candidates(now, s.TTL), graph)
 	if len(cands) == 0 {
 		return nil, nil
 	}
 	t := s.pickTask(cands)
 	return &Selection{Kind: Work, Submodule: sm, Task: t}, nil
+}
+
+// graphGate filters main-tier (TODO) candidates through the combined
+// cross-submodule graph: a task on a wait cycle is excluded, and a task whose
+// cross-submodule prerequisite is unauthorized or not DONE is held. Recovery
+// tiers (GC stale / arbitration / review) pass through untouched — they exist to
+// unstick work, not to start it, so they are never dependency- or cycle-gated.
+func graphGate(sm repo.Submodule, cands []plan.Task, graph *Graph) []plan.Task {
+	out := make([]plan.Task, 0, len(cands))
+	for _, t := range cands {
+		if t.Status == plan.StatusTODO {
+			node := sm.Name + ":" + t.ID
+			if graph.InCycle(node) {
+				continue
+			}
+			blocked := false
+			for _, d := range t.Deps {
+				if !graph.crossDepSatisfied(sm.Name, d) {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				continue
+			}
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // reconcileRange returns "<stamp>..<roiHead>" when ROI.md drifted, else "".

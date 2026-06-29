@@ -101,6 +101,92 @@ func (l *Links) AddDep(from, to string) error {
 // HasCycle reports whether the dependency graph contains a wait cycle.
 func (l *Links) HasCycle() bool { return cycle(l.Deps) != nil }
 
+// Cycle returns a node sequence forming a cycle in edges, or nil if the graph is
+// acyclic. Exported so callers that assemble edges from outside a Links value
+// (e.g. the selector's combined cross-submodule graph) can detect and report a
+// wait cycle without duplicating the traversal.
+func Cycle(edges []Edge) []string { return cycle(edges) }
+
+// CyclicNodes returns the set of nodes that lie on a dependency cycle: every node
+// in a strongly connected component of size > 1, plus any self-loop. A node that
+// merely depends (transitively) on a cycle is not included — only nodes that can
+// never settle. Deterministic (Tarjan SCC over sorted adjacency). The selector
+// uses this to exclude unschedulable tasks from candidate selection.
+func CyclicNodes(edges []Edge) map[string]bool {
+	adj := map[string][]string{}
+	self := map[string]bool{}
+	nodeset := map[string]bool{}
+	for _, e := range edges {
+		adj[e.From] = append(adj[e.From], e.To)
+		nodeset[e.From] = true
+		nodeset[e.To] = true
+		if e.From == e.To {
+			self[e.From] = true
+		}
+	}
+	nodes := make([]string, 0, len(nodeset))
+	for n := range nodeset {
+		nodes = append(nodes, n)
+	}
+	sort.Strings(nodes)
+	for _, n := range nodes {
+		sort.Strings(adj[n])
+	}
+
+	idx := map[string]int{}
+	low := map[string]int{}
+	onStack := map[string]bool{}
+	var stack []string
+	counter := 0
+	out := map[string]bool{}
+	var strongconnect func(string)
+	strongconnect = func(v string) {
+		idx[v] = counter
+		low[v] = counter
+		counter++
+		stack = append(stack, v)
+		onStack[v] = true
+		for _, w := range adj[v] {
+			if _, seen := idx[w]; !seen {
+				strongconnect(w)
+				if low[w] < low[v] {
+					low[v] = low[w]
+				}
+			} else if onStack[w] {
+				if idx[w] < low[v] {
+					low[v] = idx[w]
+				}
+			}
+		}
+		if low[v] != idx[v] {
+			return
+		}
+		var comp []string
+		for {
+			w := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			onStack[w] = false
+			comp = append(comp, w)
+			if w == v {
+				break
+			}
+		}
+		if len(comp) > 1 {
+			for _, w := range comp {
+				out[w] = true
+			}
+		} else if self[comp[0]] {
+			out[comp[0]] = true
+		}
+	}
+	for _, n := range nodes {
+		if _, seen := idx[n]; !seen {
+			strongconnect(n)
+		}
+	}
+	return out
+}
+
 // cycle returns a node sequence forming a cycle, or nil if acyclic (DFS).
 func cycle(edges []Edge) []string {
 	adj := map[string][]string{}

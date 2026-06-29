@@ -118,6 +118,28 @@ func TestSelectable(t *testing.T) {
 	}
 }
 
+func TestSelectableDefersCrossSubmoduleDeps(t *testing.T) {
+	// A "<submodule>:<taskid>" dep is cross-submodule: the plan layer stays
+	// links-free and leaves resolution to the selector, so it must not block
+	// local selectability even though no local task by that id exists.
+	p, err := Parse("## t1 [TODO] <!-- attempts=0 deps=other:dep -->\nbody\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Selectable(p.Task("t1")) {
+		t.Fatal("cross-submodule dep must be deferred to the selector, not block locally")
+	}
+	// A local unmet dep alongside the cross-submodule one still blocks.
+	p2, _ := Parse("## a [TODO] <!-- attempts=0 deps=b,other:dep -->\n## b [TODO] <!-- attempts=0 deps= -->\n")
+	if p2.Selectable(p2.Task("a")) {
+		t.Fatal("local unmet dep b must still block")
+	}
+	p2.Task("b").Status = StatusDone
+	if !p2.Selectable(p2.Task("a")) {
+		t.Fatal("local dep done -> selectable (cross-submodule dep deferred)")
+	}
+}
+
 func TestGolden(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	p, _ := Parse(sample)

@@ -2,6 +2,7 @@ package plan
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -68,12 +69,18 @@ func (t *Task) Reject(limit int, now time.Time) error {
 }
 
 // Selectable reports whether a task can be auto-selected: not terminal, not
-// NEEDS-HUMAN, and all deps DONE in p.
+// NEEDS-HUMAN, and all LOCAL deps DONE in p. A dep id containing ":" names a
+// task in another submodule (<submodule>:<taskid>); the plan layer stays
+// links-free and defers those to the selector, which owns the combined
+// cross-submodule graph (link authorization + DONE status + cycle exclusion).
 func (p *Plan) Selectable(t *Task) bool {
 	if t.Status == StatusDone || t.Status == StatusHuman {
 		return false
 	}
 	for _, d := range t.Deps {
+		if strings.Contains(d, ":") {
+			continue // cross-submodule; resolved by the selector, not here
+		}
 		dep := p.Task(d)
 		if dep == nil || dep.Status != StatusDone {
 			return false
