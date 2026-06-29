@@ -158,7 +158,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 func (r *Runner) record(log *strings.Builder, sel *selectt.Selection, turn int, prompt, reply string) {
 	fmt.Fprintf(log, "\n## turn %d\n\n> %s\n\n%s\n", turn, prompt, reply)
 	if r.Debug != nil {
-		fmt.Fprintf(r.Debug, "\n=== turn %d ===\n> %s\n%s\n", turn, prompt, reply)
+		// Live assistant output (text + tool calls) streams via the opencode
+		// SSE event tap, so only echo the turn header + prompt here.
+		fmt.Fprintf(r.Debug, "\n=== turn %d ===\n> %s\n", turn, prompt)
 	}
 }
 
