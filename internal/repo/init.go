@@ -3,16 +3,19 @@ package repo
 import (
 	"os"
 	"path/filepath"
+
+	"github.com/spencerharmon/beehive/prompts"
 )
 
-// Init scaffolds an empty beehive repo at root: AGENTS.md, INFRASTRUCTURE.md,
-// and submodules/. Deterministic, no LLM. Returns nil if already present.
+// Init scaffolds an empty beehive repo at root: AGENTS.md (the full honeybee
+// protocol), INFRASTRUCTURE.md, and submodules/. Deterministic, no LLM.
+// Existing files are left untouched.
 func Init(root string) error {
 	if err := os.MkdirAll(filepath.Join(root, "submodules"), 0o755); err != nil {
 		return err
 	}
 	files := map[string]string{
-		AgentsFile: "# Honeybee Protocol\n(Authoritative honeybee instructions; see beehive prompts/AGENTS.md.)\n",
+		AgentsFile: prompts.Agents,
 		InfraFile:  "",
 	}
 	for name, body := range files {
