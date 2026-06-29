@@ -228,11 +228,38 @@ func (r *Repo) Worktrees(ctx context.Context) ([]Worktree, error) {
 	return wts, nil
 }
 
+// UpdateLocalMain advances the repo's local main branch (and the primary
+// working tree) to the current worktree branch's tip. main is checked out in the
+// primary worktree, so this uses a push to "." with receive.denyCurrentBranch=
+// updateInstead (ensured here, idempotent). A non-fast-forward is retried after
+// merging the advanced local main; any other rejection (e.g. a dirty primary
+// working tree) is returned verbatim so the caller can surface it.
+func (r *Repo) UpdateLocalMain(ctx context.Context) error {
+	_, _ = r.Run(ctx, "config", "receive.denyCurrentBranch", "updateInstead")
+	for attempt := 0; attempt < 8; attempt++ {
+		_, err := r.Run(ctx, "push", ".", "HEAD:refs/heads/main")
+		if err == nil {
+			return nil
+		}
+		if !isNonFastForward(err) {
+			return err
+		}
+		if _, err := r.Run(ctx, "merge", "--no-edit", "main"); err != nil {
+			_, _ = r.Run(ctx, "merge", "--abort")
+			return ErrConflict
+		}
+	}
+	return fmt.Errorf("git: update local main exhausted retries")
+}
+
 func isNonFastForward(err error) bool {
 	s := err.Error()
+	// Only a genuine non-fast-forward is worth retrying after a re-merge. Other
+	// rejections (protected branch, no push permission, "refusing to update
+	// checked out branch") must surface, not loop — they all contain "rejected".
 	return strings.Contains(s, "non-fast-forward") ||
 		strings.Contains(s, "fetch first") ||
-		strings.Contains(s, "rejected")
+		strings.Contains(s, "tip of your current branch is behind")
 }
 
 // Clean reports whether the working tree has no staged or unstaged changes.

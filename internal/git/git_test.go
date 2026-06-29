@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -58,5 +59,29 @@ func TestMergeConflict(t *testing.T) {
 	r.Commit(ctx, "main")
 	if err := r.Merge(ctx, "x"); err != ErrConflict {
 		t.Fatalf("want ErrConflict, got %v", err)
+	}
+}
+
+func TestIsNonFastForward(t *testing.T) {
+	retry := []string{
+		"! [rejected] main -> main (non-fast-forward)",
+		"Updates were rejected because a pushed branch tip is behind its remote counterpart. fetch first",
+		"tip of your current branch is behind its remote",
+	}
+	for _, s := range retry {
+		if !isNonFastForward(fmt.Errorf("%s", s)) {
+			t.Errorf("want retryable: %q", s)
+		}
+	}
+	// These rejections are terminal: looping is wrong, the real error must surface.
+	noRetry := []string{
+		"remote: error: GH006: Protected branch update failed for refs/heads/main. ! [remote rejected] (protected branch hook declined)",
+		"remote rejected: refusing to update checked out branch refs/heads/main",
+		"Permission denied (publickey). ! [rejected]",
+	}
+	for _, s := range noRetry {
+		if isNonFastForward(fmt.Errorf("%s", s)) {
+			t.Errorf("want terminal (not retryable): %q", s)
+		}
 	}
 }
