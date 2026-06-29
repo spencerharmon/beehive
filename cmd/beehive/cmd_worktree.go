@@ -36,12 +36,17 @@ func worktreeCmd() *cobra.Command {
 
 func honeybeeCmd() *cobra.Command {
 	c := &cobra.Command{Use: "honeybee", Short: "honeybee process control"}
-	c.AddCommand(&cobra.Command{
+	debug := false
+	start := &cobra.Command{
 		Use:   "start <path>",
 		Short: "start a honeybee on a beehive repo",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ex := exec.CommandContext(cmd.Context(), "honeybee")
+			hbArgs := []string{}
+			if debug {
+				hbArgs = append(hbArgs, "--debug")
+			}
+			ex := exec.CommandContext(cmd.Context(), "honeybee", hbArgs...)
 			ex.Dir = args[0]
 			ex.Stdin, ex.Stdout, ex.Stderr = os.Stdin, os.Stdout, os.Stderr
 			if err := ex.Run(); err != nil {
@@ -49,6 +54,8 @@ func honeybeeCmd() *cobra.Command {
 			}
 			return nil
 		},
-	})
+	}
+	start.Flags().BoolVar(&debug, "debug", false, "stream session turns to stderr")
+	c.AddCommand(start)
 	return c
 }
