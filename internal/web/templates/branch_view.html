@@ -1,0 +1,7 @@
+{{template "header"}}
+<h1>{{.Name}} commits</h1>
+<table><tr><th>sha</th><th>subject</th><th>author</th><th>date</th><th>doc</th></tr>
+{{range .Commits}}<tr><td>{{.SHA}}</td><td>{{.Subject}}</td><td>{{.Author}}</td><td>{{.Date}}</td><td>{{.Doc}}</td></tr>{{end}}
+</table>
+<a href="?offset={{.Prev}}">prev</a> · <a href="?offset={{.Next}}">next</a>
+{{template "footer"}}

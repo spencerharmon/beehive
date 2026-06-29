@@ -1,18 +1,34 @@
 // Command beehived is the frontend daemon, the only long-running process.
-// P0 is a stub; P3 ships the htmx views over the repo model.
+// It serves file-derived read views and git-backed writes over the beehive repo.
 package main
 
 import (
-	"fmt"
+	"flag"
+	"log"
+	"net/http"
 
 	"github.com/spencerharmon/beehive/internal/config"
+	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/web"
 )
 
 func main() {
-	c, err := config.Load()
+	root := flag.String("repo", ".", "beehive repo root")
+	addr := flag.String("addr", ":8080", "listen address")
+	flag.Parse()
+
+	cfg, err := config.Load()
 	if err != nil {
-		fmt.Println("config error:", err)
-		return
+		log.Fatalf("config: %v", err)
 	}
-	fmt.Printf("beehived stub; config dir %s, agent %s\n", c.Dir, c.AgentCmd)
+	r, err := repo.Open(*root)
+	if err != nil {
+		log.Fatalf("open repo %s: %v", *root, err)
+	}
+	s, err := web.New(r, cfg)
+	if err != nil {
+		log.Fatalf("web: %v", err)
+	}
+	log.Printf("beehived listening on %s (repo %s)", *addr, *root)
+	log.Fatal(http.ListenAndServe(*addr, s.Routes()))
 }

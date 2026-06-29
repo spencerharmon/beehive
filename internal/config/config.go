@@ -17,11 +17,12 @@ const DefaultDir = "/etc/beehive"
 // Config is the parsed beehive config.
 type Config struct {
 	Dir         string `yaml:"-"`
-	GPGHome     string `yaml:"gpg_home"`     // dir containing the keyring
-	AgentCmd    string `yaml:"agent_cmd"`    // opencode binary
-	TTLMinutes  int    `yaml:"ttl_minutes"`  // GC heartbeat TTL
-	MaxTurns    int    `yaml:"max_turns"`    // per-honeybee turn cap
-	RejectLimit int    `yaml:"reject_limit"` // rejections before NEEDS-HUMAN
+	GPGHome     string `yaml:"gpg_home"`      // dir containing the keyring
+	AgentCmd    string `yaml:"agent_cmd"`     // opencode binary
+	TTLMinutes  int    `yaml:"ttl_minutes"`   // GC heartbeat TTL
+	MaxTurns    int    `yaml:"max_turns"`     // per-honeybee turn cap
+	RejectLimit int    `yaml:"reject_limit"`  // rejections before NEEDS-HUMAN
+	Recipient   string `yaml:"gpg_recipient"` // gpg recipient for SECRETS.yaml.gpg
 }
 
 // Defaults are applied when the config file omits fields.
