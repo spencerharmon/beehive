@@ -1,0 +1,89 @@
+* beehive implementation plan
+All Go. Single module, multiple binaries from one repo. Single static binary distribution per
+component, embeddable assets, deps read from /etc/beehive. No LLM in CLI/frontend; LLM only inside
+the honeybee turn loop, which drives an opencode session via its server API. opencode is provider-agnostic
+(any model: cloud API / local / cluster), so the model choice stays config; one session spans a honeybee's
+lifetime, keeping context across turns. Stateless boundary is the honeybee, not the turn.
+
+** module layout
+#+begin_example
+beehive/
+  go.mod                      module github.com/spencerharmon/beehive
+  cmd/
+    beehive/                  CLI entrypoint (cobra)
+    beehived/                 frontend daemon (long-running)
+    honeybee/                 honeybee process runner
+  internal/
+    repo/                     beehive repo model: load/parse/write static files, init scaffold
+    plan/                     PLAN.md parse + status state machine
+    roi/                      ROI.md read-only loader (never writes)
+    submodule/                git submodule add/update/link, weights, branch-tracking sync (tip not pin)
+    links/                    SUBMODULE-LINKS.yaml model + dependency graph
+    secrets/                  per-submodule + global SECRETS.yaml.gpg encrypt/decrypt/edit, agent-writable
+    git/                      thin exec wrapper: clone, commit, merge, conflict detect, worktree add/remove
+    claim/                    commit-race claim + re-verify, heartbeat re-stamp, TTL/GC marking
+    select/                   deterministic weighted task selection
+    swarm/                    honeybee turn loop, completion checks, opencode session client
+    config/                   /etc/beehive load, gpg keyring, ROI-protect hook install
+    artifacts/                ARTIFACTS.md / INFRASTRUCTURE.md model
+    web/                      http handlers, htmx templates, embedded assets
+  prompts/                    embedded system prompts (//go:embed)
+  docs/                       user-facing docs
+  .github/workflows/          CI
+#+end_example
+
+** components -> packages
+- CLI:        cmd/beehive  -> submodule, links, secrets, plan, git, config
+- frontend:   cmd/beehived -> web, repo, plan, roi, secrets, artifacts, git, config
+- honeybee:   cmd/honeybee -> swarm, select, claim, plan, git, config, prompts
+
+** task-type state machine (internal/plan)
+States: TODO -> IN-PROGRESS -> NEEDS-REVIEW -> {DONE | NEEDS-ARBITRATION} ; NEEDS-ARBITRATION -> {TODO|DONE};
+rejection count > limit (3) -> NEEDS-HUMAN (frontend-only resolve, never auto-selected). PLAN.md carries
+`<!-- Beehive-ROI: <sha> -->`; if ROI.md commit differs, priority-0 reconcile rewrites PLAN before any work.
+IN-PROGRESS carries a heartbeat timestamp re-stamped each turn; stale (>1h) => GC candidate. Dependency tags
+gate selection; tag writes run a cycle check. All transitions commit to beehive main; claimer re-pulls and
+verifies its own stamp won, else abandons. ROI.md diffs from honeybee identity rejected by hook.
+
+** worktree isolation
+All honeybee writes occur in a per-branch worktree at submodules/<submodule>/worktrees/<worktree>, never the
+shared repo/ checkout. Helper scripts (CLI) create/remove worktrees consistently. Worktree deleted on
+DONE+merge. Keeps concurrent writes isolated on single-host deployments.
+
+** phases
+*** P0 foundations
+- go.mod, module skeleton, embed dirs.
+- internal/git: exec wrapper, conflict detection, branch/merge helpers.
+- internal/config: /etc/beehive layout, gpg keyring discovery.
+- internal/repo: parse layout (AGENTS.md, submodules/*, ROI/PLAN/INFRA/ARTIFACTS/LINKS).
+- CI baseline: build, vet, test, gofmt, lint.
+*** P1 CLI deterministic ops
+- beehive init scaffolds repo skeleton; submodule add/link, plan rollback, secret add/update/edit, honeybee start, worktree add/rm helpers.
+- ROI-protect hook installed by CLI/config; rejects honeybee-authored ROI.md diffs.
+- internal/plan parser + status machine + TTL math.
+- internal/secrets gpg single-doc yaml round-trip.
+- internal/links dependency graph + cycle check.
+- unit tests per package; golden files for PLAN.md transitions.
+*** P2 honeybee runner
+- internal/select weighted submodule+task; ROI-reconcile priority 0 (stamp diff); dependency gating + cycle check; GC>arb>review>main; NEEDS-HUMAN excluded.
+- internal/claim commit-race + re-verify (re-pull, assert own stamp), heartbeat re-stamp, TTL/GC detect, attempt counter.
+- internal/swarm turn loop: per-branch worktree create; start one opencode session (AGENTS.md system prompt + bootstrap/select/reconcile prompt), per-turn deterministic completion check, send "continue" to same session if unmet, exit on met, turn cap (15) + wall-clock cap, mark-for-GC, worktree delete on DONE.
+- agent backend: opencode server, cwd=worktree, session resumed between turns (context persists). Model selected via opencode config in /etc/beehive; provider-agnostic.
+*** P3 frontend
+- beehived: file-derived read views, submodule explorer, branch view linking change docs, blue/green + env mgmt, secrets CRUD (gpg), merge-to-main, submodule add/link, infra config edit, NEEDS-HUMAN resolution.
+- htmx + embedded templates, single binary.
+*** P4 docs + release
+- user docs, install (pkg + /etc/beehive keygen), CI release: cross-compile, checksums, gh release.
+
+** completion check (deterministic, per turn)
+Verify: PLAN.md status transitioned; doc file present named <branch>-<taskid>; branch/merge state correct;
+in-progress timestamp removed on terminal. All met -> exit 0. Else -> "continue" until turn cap or wall-clock cap, then GC mark.
+
+** tradeoffs
+- HTMX over SPA: keeps single binary, embeds assets. SPA deferred.
+- Git via exec not go-git: matches submodule/gpg behavior exactly, less surface. go-git deferred.
+- Agent exec is pluggable command, not built-in provider: keeps swarm provider-agnostic.
+- Agent backend = opencode: open source, provider-agnostic, session API gives per-honeybee context
+  continuity across turns. Model is opencode config in /etc/beehive; no LLM SDK linked.
+- Frontend renders branch/commit history per-submodule, sectioned; no cross-submodule branch crawl.
+  Honeybee commits carry stamp `Beehive: <task-id> <doc-path>` for change-doc linkage. Perf deferred.

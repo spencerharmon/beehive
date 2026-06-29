@@ -1,0 +1,251 @@
+* description
+The Beehive is an ai coding agent platform that combines a developer command and control frontend and
+agent swarm architecture that continuously reconciles the code output with the development team's intent.
+
+* features
+** frontend
+Provides an inerface to see the progress, status, any artifacts or interfaces, environment (dev/prod)
+management interfaces. Blue/green deployment management, etc, for one or more beehive projects.
+
+The frontend provides a crud interface with the record of intent.
+
+The frontend is the only long-running process in the beehive. All data it renders is derived from
+files in the beehive repository. The layout allows exploring and interacting, submodule by submodule.
+
+The frontend provides a branch view of submodules with changes linked to their beehive change documents.
+
+The frontend must also be able to merge to main in the beehive repo. Changes to the record of intent,
+manual plan changes, adding submodules, infrastructure configs, etc. can all be done from the UI.
+
+The frontend provides secrets management which is implemented with gpg encryption. Secrets are committed to
+a single global SECRETS.yaml.gpg file whose contents are gpg-encrypted single yaml document (no document
+separators allowed) that can, in turn, be referenced by INFRASTRUCTURE.md files. 
+
+The frontend can add links between submodules so that honeybees operating on either submodule's PLAN.md can
+include references and dependencies on the other's PLAN.md. This workflow would support multi-repo projects
+with interrelated goals and planning or, e.g. forking or patching some upstream repo. This way an agent can
+also include the fork's patches (managed asyncronously) in an INFRASTRUCTURE.md update to incorporate the
+fork in integration testing. Agents must fully understand the honeybee protocol and pattern of plan
+reconciliation in order to break everything down into step-by-step instructions that honeybees exectute
+asyncronously and autonomously. For example:
+- first patch the linked fork
+- then update the linked helm values repo
+- then update the INFRASTRUCTURE.md file
+- then run integration tests linking it all together
+
+These are stepwise, interdependent tasks that must be executed in order to work properly.
+
+
+** cli
+Although everything to manage beehive can be done using basic git commands, the beehive cli provides
+helper functions for basic operations, e.g.:
+beehive init <path>
+beehive submodule add <repo>
+beehive submodule plan rollback <plan identifier>
+beehive submodule link <submodule a> <submodule b>
+beehive secret add -f <yaml file>
+beehive secret update -f <yaml file>
+beehive secret edit
+
+These can edit files, make commits push to remote, etc. All behive commands are deterministic and do not
+depend on an LLM.
+
+Honeybees are also started through the cli via
+beehive honeybee start <path>
+
+
+** honeybee
+A honeybee is a process that comprises an agent working on a single task. Tasks are meant to be
+sized so that they're manageable within the frame of a model's context window in order to avoid unnecessary
+compaction. Plans must be detailed and thorough so that tasks can be broken down into the smallest
+possible units of work and logically separated so that they can be accomplished in parallel.
+Because each agent acts autonomously on the data present in the beehive repo, there's no special
+honeybee controller. Anything that can exec a command can be used. A cronjob, a wrapper script, a
+ci/cd pipeline, etc. This is left intentionally flexible because it's likely to be highly dependent on
+how a dev team consumes LLM models. How you run a honeybee is likely to be very different if you're
+consuming an API from a cloud provider vs running a local model vs queueing jobs on a cluster of self-hosted
+hardware.
+
+Each agent process starts and determines if it has resources available (e.g. on a local server,
+on a kubernetes cluster, etc). If so, a random number is generated to select a submodule based on the
+weight configured in the beehive repository, then the honeybee starts one opencode session with AGENTS.md
+from the beehive repo as system prompt and the prompt "select a task
+from submodules/<submodule>/PLAN.md and begin." At the end of each turn, the honeybee process checks if the PLAN.md item is marked
+done, a commit has been merged, and the corresponding documentation has been written, if so, the process
+exits. If not, the process sends "continue" into the SAME opencode session so context persists across turns;
+based on the system prompt this signals to
+continue reconciling the assigned task. This continues for a configurable number of turns, 15 by default. If
+The limit is reached and the completion criteria are not met, the task is marked for garbage collection
+to investigate. Garbage collection can either complete the task or clean up and mark it TODO, to be picked
+up by a future agent.
+
+
+** honeybee swarm
+the swarm is comprised of individual honeybees, each with the same set of instructions, acting autonomously
+on the same state through the use of git merges.
+
+*** honeybee protocol (executed by LLM)
+0. ROI reconcile (priority 0). The honeybee process deterministically checks if ROI.md changed since PLAN.md
+   was last reconciled: PLAN.md carries a stamp `<!-- Beehive-ROI: <sha> -->` recording the last reconciled
+   ROI.md commit. If ROI.md's current commit differs (scripts/roi-changed.sh), the honeybee MUST reconcile
+   first: launch the reconcile prompt with `git diff <stamp>..HEAD -- ROI.md`, fold changes into PLAN.md
+   (add/modify/retire tasks, in-flight retirees -> NEEDS-REVIEW), restamp, commit to main. ROI.md is never
+   edited. This precedes all other task types.
+1. Any type of task being worked on must be immediately marked in progress with a timestamp. The timestamp
+   is re-stamped (heartbeat) at the start of every turn while work continues. A task whose heartbeat is
+   stale (older than the ttl, 1 hour default) is a garbage collection candidate, not one whose original
+   claim is merely old. On the final plan status update commit the in-progress timestamp is removed as the
+   item status is updated, signaling DONE or ready for further work.
+2. if there are garbage collection tasks, you must pick up a garbage collection task. Either complete the
+   task where the previous honeybee left off or delete the state mark the item TODO, and merge the update to
+   main.
+3. if there are arbitration tasks, you must pick up an arbitration task. An arbitration task is done when
+   the honeybee transitions the task from NEEDS-ARBITRATION to TODO or DONE. The honeybee carrying out the
+   arbitration task may either choose to merge the branch from the first honeybee to carry out the
+   implementation (marking the task DONE) or, siding with the reviewer, mark the task TODO and notate the
+   reviewer's document rejecting the initial implementation in the plan. Each rejection increments an
+   attempt counter on the item; once it exceeds the configured limit (3 default) the item is set
+   NEEDS-HUMAN and is no longer auto-recycled, preventing review/arbitration livelock.
+4. If there are review tasks, you must pick up a review task. A review task is done when either the target
+   branch is merged (marking the task DONE) or the plan item is marked NEEDS-ARBITRATION and this is
+   merged to main.
+5. If a task is marked DONE, any linked dependencies in the same plan or in a linked submodule must also be
+   updated to indicate the dependency is complete, unlocking that task for future honeybees.
+6. If there are no other task types, you must pick up a main task. Before beginning, the task and documentation
+   is evaluated against the current record of intent, the submodule's tracked branch is synced (fetched from
+   the remote tracked branch tip and the beehive pointer auto-advanced without review, since all honeybees
+   want latest) to ensure any out-of-band changes are incorporated. Any changes must be addressed. If the task needs to be
+   modified or if it it no longer relevant, this evaluation gets performed first. The outcome for a modified or
+   ommitted task is the same: a commit transitioning the task item to NEEDS-REVIEW with an accompanying
+   documentation file. Otherwise, the task is worked to completion, which
+   is signaled by the committing of a plan update to the main beehive branch to set the task status to
+   NEEDS-REVIEW, with a branch containing the submodule update with the proposed patch, and documentation
+   (named according to the branch and task identifier) about exactly how and why the patch is implemented
+   how it is, any unit or integration tests, any follow up items added to the plan, and any caveats.
+7. Any items added to the plan must be accompanied by one or more documents detailing the design, code
+   references, and any other context relevant to the implementation. Documents must be terse, containing
+   only necessary details intended for an LLM to consume.
+8. Every honeybee is responsible for updating static files including PLAN.md, ARTIFACTS.md, and
+   INFRASTRUCTURE.md.
+9. A honeybee MUST NEVER update the record of intent (ROI.md). This is FORBIDDEN. Enforced technically: a
+   server/pre-receive hook rejects any ROI.md diff authored by a honeybee identity; only the frontend key
+   may sign ROI changes.
+10. All honeybee writes happen inside a worktree, never the shared submodule checkout. See concurrency
+    safeguards.
+
+*** concurrency safeguards
+- Claim re-verify: a claim sets a single atomic IN-PROGRESS field with a timestamp and commits to main.
+  After push, re-pull main and assert your timestamp is the one present. If not, you lost the race; abandon
+  and reselect. Merge is not assumed to lock; the re-verify is the lock.
+- Heartbeat vs TTL: GC triggers on a stale heartbeat (>ttl), not on original claim age, so long tasks
+  re-stamping each turn are not stolen. A wall-clock cap bounds runaway turns in addition to the 15-turn cap.
+- Dependency cycles: every dependency-tag write (incl. honeybee commits) runs a cycle check; a tag that
+  creates a wait cycle is rejected, and selection detects wait cycles rather than silently skipping both.
+- Worktrees: a per-branch worktree is created at submodules/<submodule>/worktrees/<worktree> for any branch
+  a honeybee works. Helper scripts (scripts/submodule-sync.sh, scripts/worktree.sh) manage create/remove
+  consistently. Worktree deleted on DONE+merge. Keeps concurrent writes isolated on single-host deployments.
+- Branch tracking (nonstandard submodule use): submodules track the tip of a configured branch, not a pinned
+  commit. submodule-sync.sh fetches the remote tracked branch and auto-advances the beehive pointer without
+  review; all honeybees want latest. Auto-clobber: branch may be force-pushed/rebased, so sync hard-resets to
+  the remote tip. Honeybees adapt the plan dynamically (via ROI reconcile + task re-eval) to whatever
+  upstream becomes. Worktrees branch off the synced tip.
+
+*** completion check (deterministic)
+At the end of every turn, the honeybee process (not the LLM) verifies the type-specific terminal criteria:
+PLAN.md status transitioned, doc file present and named for branch+task id, branch/merge state correct,
+in-progress timestamp removed. All met -> exit. Not met -> "continue." Stale heartbeat (>ttl) or wall-clock
+cap reached without completion -> task left for GC.
+
+*** dependency tagging
+Dependencies are tagged on the task item (same plan or linked submodule). Selection skips tasks with unmet
+deps; on a task -> DONE, linked dependents are updated to unlock them for future honeybees.
+
+** beehive repo
+The beehive repo is where the development team's record of intent is stored, it's where the PLAN.md is
+coordinated between agents, where agent sessions are recorded, and any other out-of-tree data is kept.
+Beehive data is never committed to target repos. Target repos are maintained as submodules of the beehive
+repo. 
+** bootstrapping
+A submodule is added in a dormant state with no ROI.md; dormant submodules are never selected. A developer
+authors ROI.md to activate it. If an ROI.md exists without a PLAN.md, the first honeybee to select the
+submodule bootstraps PLAN.md from ROI.md. Developers may edit PLAN.md directly, but rightsizing tasks into
+context-window-sized units is best handled by the honeybees. Two honeybees bootstrapping the same fresh
+submodule resolve via the same commit-race; no extra protocol needed.
+
+** task selection (deterministic, no LLM)
+Runs before the agent launches; always yields a valid, workable task:
+1. Weighted-random over submodules.
+2. ROI reconcile is priority 0: if scripts/roi-changed.sh fires for the chosen submodule, that is the task.
+3. Otherwise prefer task types by priority: GC > arbitration > review > main.
+3. Weighted-random over candidate tasks. A task is a candidate only if all tagged dependencies (same plan or
+   linked submodule) are DONE. Tasks with unmet dependencies are skipped.
+4. No workable task in a submodule -> move to next. Agent always starts with a valid task. Collisions stay
+   rare for a small swarm against many small tasks.
+
+** task-claim protocol (commit-race)
+A claim is a commit to main marking the PLAN.md item in-progress with a timestamp. Honeybees race; first
+commit wins. On merge conflict on the same item, loser selects another task or exits. No locks; merge is the
+lock. In-progress timestamp doubles as the TTL marker for GC, removed on terminal status update.
+
+** cross-submodule coordination.
+Planning and coordination takes place at the submodule layer. When a honeybee is started, it determines which
+submodule will receive work before launching the agent, which executes the honeybee protocol on the
+specified submodule. However, if a submodule link exists, then a honeybee can commit to the plan of another
+submodule. Stepwise interdependent tasks are sequenced by tagging each step's dependency on the prior step:
+a step is not selectable until its dependency is DONE, so the swarm executes ordered cross-repo chains (patch
+fork -> update helm values -> update INFRASTRUCTURE.md -> integration test) without a controller.
+
+* implementation details
+** git repo layout
+Each beehive project has a beehive repo. This contains state and provides an interface for individual
+honeybees to collaborate on a plan.
+Each beehive repo is comprised of a top-level AGENTS.md, which includes the Honeybee Protocol instructions,
+a directory containing submodule directories, each containing the repo directory iself (managed by scripted
+~git submodule update~ commands), the PLAN.md, the record of intent (ROI.md) a docs directory, and optionally
+an ARTIFACTS.md, an INFRASTRUCTURE.md, and a SUBMODULE-LINKS.yaml file.
+The beehive repo can also optionally contain a SECRETS.yaml.gpg file and a top-level INFRASTRUCTURE.md file.
+
+** key distribution
+CLI, frontend, and honeybees read GPG keys from a shared config dir (/etc/beehive). Keys can be generated at
+install time by the package manager or created/managed by the user. Works identically on a single host, via
+config-management deploy, or a container bind mount. Honeybees intentionally retain keyring access because
+they create/update secrets to provision infrastructure autonomously. To deconflict concurrent edits, secrets
+split per submodule: submodules/<name>/SECRETS.yaml.gpg, each one gpg-encrypted yaml doc (no separators)
+referenced by that submodule's INFRASTRUCTURE.md. A top-level SECRETS.yaml.gpg holds global secrets. Cross-
+submodule secret isolation is out of scope: if a submodule must not see another's secrets, start a separate
+beehive repo and let external config management distribute keys. A future deferred feature manages/merges
+multiple beehive repos from one UI.
+
+AGENTS.md
+SECRETS.yaml.gpg
+INFRASTRUCTURE.md
+submodules/
+  web-frontend/
+    repo/
+    worktrees/
+    docs/
+    PLAN.md
+    ROI.md
+    INFRASTRUCTURE.md
+    ARTIFACTS.md
+    SUBMODULE-LINKS.yaml
+  storage-engine/
+    repo/
+    docs/
+    PLAN.md
+    ROI.md
+    INFRASTRUCTURE.md
+    ARTIFACTS.md
+
+
+
+** task types
+Priority order: ROI reconcile (priority 0, not in PLAN.md) > garbage collection > arbitration > review >
+main. GC is highest among PLAN.md types because finishing a
+partially-completed branch can unstick dependent tasks (-> NEEDS-REVIEW or TODO), maximizing the workable
+pool. NEEDS-HUMAN items are never auto-selected; they await frontend resolution. Per-type behavior is
+defined under the honeybee protocol items 0-6.
+
+* deferred features
+- Multi-beehive management: one UI to manage and merge multiple beehive repos, with cross-repo secret
+  isolation via separate keyrings. Enables strict secret separation without one mega-repo.
