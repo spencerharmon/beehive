@@ -7,3 +7,28 @@ ul.sessions{list-style:none;padding:0}ul.sessions li{padding:.2rem 0;border-bott
 button.danger{background:#c0392b;color:#fff;border:0;padding:.3rem .7rem;border-radius:.3rem;margin-top:.6rem;cursor:pointer}
 pre{background:#f7f7f7;padding:.5rem;overflow:auto}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:.2rem .5rem}
 .session{white-space:pre-wrap;word-break:break-word;max-height:42rem;overflow:auto;line-height:1.35}
+
+/* AI editor */
+.editor-grid{display:flex;gap:1rem;align-items:flex-start}
+.editor-grid .chat{flex:1;min-width:18rem;max-height:70vh;overflow:auto}
+.editor-grid .diffpane{flex:1.4;min-width:24rem}
+.msg{padding:.3rem .5rem;margin:.3rem 0;border-radius:.4rem;background:#f4f4f4}
+.msg.user{background:#e7f0ff}
+.msg.agent{background:#eef9ee}
+.msg.err{background:#fdeaea}
+.msg .who{font-size:.7rem;text-transform:uppercase;color:#888;margin-right:.4rem}
+.msg.busy .spinner{color:#888;font-style:italic}
+.muted{color:#999}
+.statusbar{display:flex;align-items:center;gap:.6rem;margin-bottom:.4rem}
+.state{padding:.1rem .5rem;border-radius:.3rem;font-weight:bold}
+.state.dirty{background:#c0392b;color:#fff}
+.state.live{background:#1f9d55;color:#fff}
+button.merge{background:#1f9d55;color:#fff;border:0;padding:.3rem .8rem;border-radius:.3rem;cursor:pointer}
+button.merge.merged{background:#bbb;cursor:default}
+pre.diff{background:#fbfbfb;border:1px solid #e2e2e2;border-radius:.3rem;padding:.4rem;max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
+pre.diff .ln{display:block}
+pre.diff .ln.add{background:#e3f7e3}
+pre.diff .ln.del{background:#fde2e2;text-decoration:line-through}
+pre.diff .ln.eq{background:transparent}
+pre.diff .chg{background:#ffe08a;border-radius:2px}
+pre.diff .ln.del .chg{background:#ff9a9a}

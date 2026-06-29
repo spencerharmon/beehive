@@ -1,0 +1,17 @@
+<div class="editor-grid">
+  <div class="chat">
+    {{range .Log}}<div class="msg {{.Role}}"><span class="who">{{.Role}}</span> {{.Text}}</div>{{else}}<p class="muted">Say what you'd like to change in {{.File}}.</p>{{end}}
+    {{if .Busy}}<div class="msg agent busy"><span class="who">agent</span> <span class="spinner">editing…</span></div>{{end}}
+    {{if .Error}}<div class="msg err">⚠️ {{.Error}}</div>{{end}}
+  </div>
+  <div class="diffpane">
+    <div class="statusbar">
+      {{if .Live}}<span class="state live">State: live</span>{{else}}<span class="state dirty">State: dirty</span>{{end}}
+      {{if .Merged}}<button class="merge merged" disabled>Merged</button>
+      {{else if .Live}}<button class="merge merged" disabled>Merge</button>
+      {{else}}<button class="merge" hx-post="/editor/{{.ID}}/merge" hx-target="#editor" hx-swap="innerHTML">Merge</button>{{end}}
+    </div>
+    <pre class="diff">{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
+{{else}}<span class="muted">no changes proposed yet</span>{{end}}</pre>
+  </div>
+</div>

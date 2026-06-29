@@ -1,5 +1,6 @@
 {{template "header"}}
 <h1>ROI: {{.Name}}</h1>
+<p><a href="/edit?file=submodules/{{.Name}}/ROI.md">edit with AI chat</a> — propose changes conversationally on a branch, then merge.</p>
 {{if .Saved}}<p class="ok">saved</p>{{end}}
 <form method="post" action="/roi/{{.Name}}"><textarea name="body" rows="20" cols="80">{{.Body}}</textarea><br><button>save</button></form>
 {{template "footer"}}

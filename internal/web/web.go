@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/config"
+	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
@@ -26,10 +27,11 @@ var assetFS embed.FS
 
 // Server holds the parsed templates and the repo it serves.
 type Server struct {
-	repo *repo.Repo
-	cfg  config.Config
-	git  *git.Repo
-	tmpl *template.Template
+	repo    *repo.Repo
+	cfg     config.Config
+	git     *git.Repo
+	tmpl    *template.Template
+	editors *editor.Manager
 }
 
 // New builds a Server over the beehive repo at root.
@@ -38,7 +40,11 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t}, nil
+	em, err := editor.NewManager(r.Root, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em}, nil
 }
 
 // Routes returns the mux wired to all handlers.
@@ -64,6 +70,19 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /env", s.envGet)
 	mux.HandleFunc("POST /env/deploy", s.envDeploy)
 	mux.HandleFunc("GET /human", s.human)
+	// AI editor chat (browser): one worktree branch per session.
+	mux.HandleFunc("GET /edit", s.editNew)
+	mux.HandleFunc("GET /editor/{id}", s.editorPage)
+	mux.HandleFunc("GET /editor/{id}/panel", s.editorPanel)
+	mux.HandleFunc("POST /editor/{id}/chat", s.editorChat)
+	mux.HandleFunc("POST /editor/{id}/merge", s.editorMerge)
+	mux.HandleFunc("POST /editor/{id}/close", s.editorClose)
+	// AI editor chat (JSON API): browser-free clients.
+	mux.HandleFunc("POST /api/editor", s.apiEditorOpen)
+	mux.HandleFunc("GET /api/editor/{id}", s.apiEditorGet)
+	mux.HandleFunc("POST /api/editor/{id}/chat", s.apiEditorChat)
+	mux.HandleFunc("POST /api/editor/{id}/merge", s.apiEditorMerge)
+	mux.HandleFunc("GET /api/editor/{id}/diff", s.apiEditorDiff)
 	mux.Handle("GET /assets/", http.FileServer(http.FS(assetFS)))
 	return mux
 }
