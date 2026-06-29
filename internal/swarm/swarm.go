@@ -8,8 +8,10 @@ package swarm
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/claim"
@@ -20,14 +22,16 @@ import (
 )
 
 // Session is one opencode conversation; context persists across Prompt calls.
+// Prompt blocks until the assistant turn finishes and returns its reply text.
 type Session interface {
-	Prompt(ctx context.Context, text string) error
+	Prompt(ctx context.Context, text string) (string, error)
 	Close() error
 }
 
-// Client opens opencode sessions. NewSession seeds system+first prompt at cwd.
+// Client opens opencode sessions. NewSession seeds system+first prompt at cwd
+// and returns the assistant's first reply.
 type Client interface {
-	NewSession(ctx context.Context, cwd, system, first string) (Session, error)
+	NewSession(ctx context.Context, cwd, system, first string) (Session, string, error)
 }
 
 // Runner drives a single honeybee turn loop.
@@ -39,6 +43,7 @@ type Runner struct {
 	WallCap  time.Duration
 	TTL      time.Duration
 	Now      func() time.Time
+	Debug    io.Writer // non-nil: stream session activity live
 }
 
 func (r *Runner) now() time.Time {
@@ -79,11 +84,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		return res, fmt.Errorf("worktree add: %w", err)
 	}
 
-	sess, err := r.Client.NewSession(ctx, wtDir, system, first)
+	sess, reply, err := r.Client.NewSession(ctx, wtDir, system, first)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
 	}
 	defer sess.Close()
+
+	var log strings.Builder
+	r.record(&log, sel, 1, first, reply)
 
 	cl := &claim.Claimer{Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now}
 	deadline := r.now().Add(r.WallCap)
@@ -95,9 +103,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 		}
 		if res.Turns > 1 {
-			if err := sess.Prompt(ctx, prompt); err != nil {
+			rep, err := sess.Prompt(ctx, prompt)
+			if err != nil {
 				return res, fmt.Errorf("turn %d prompt: %w", res.Turns, err)
 			}
+			r.record(&log, sel, res.Turns, prompt, rep)
 		}
 		done, err := r.complete(sel, res.Branch)
 		if err != nil {
@@ -105,6 +115,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		if done {
 			res.Completed = true
+			r.persist(ctx, sel, res.Branch, log.String())
 			_ = wg.WorktreeRemove(ctx, filepath.Join("..", "worktrees", res.Branch))
 			return res, nil
 		}
@@ -114,7 +125,29 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		prompt = "continue"
 	}
 	res.GCMarked = true // turn/wall cap hit, leave IN-PROGRESS heartbeat for GC
+	r.persist(ctx, sel, res.Branch, log.String())
 	return res, nil
+}
+
+// record appends a turn to the transcript and streams it live when Debug is set.
+func (r *Runner) record(log *strings.Builder, sel *selectt.Selection, turn int, prompt, reply string) {
+	fmt.Fprintf(log, "\n## turn %d\n\n> %s\n\n%s\n", turn, prompt, reply)
+	if r.Debug != nil {
+		fmt.Fprintf(r.Debug, "\n=== turn %d ===\n> %s\n%s\n", turn, prompt, reply)
+	}
+}
+
+// persist records the session transcript in the beehive repo, committed to main.
+func (r *Runner) persist(ctx context.Context, sel *selectt.Selection, branch, body string) {
+	dir := filepath.Join(sel.Submodule.Path, "docs", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	f := filepath.Join(dir, branch+".md")
+	if err := os.WriteFile(f, []byte("# session "+branch+"\n"+body), 0o644); err != nil {
+		return
+	}
+	_ = r.Git.Commit(ctx, "session: "+branch+"\n\nBeehive: session "+branch)
 }
 
 // complete is the deterministic per-turn completion check.

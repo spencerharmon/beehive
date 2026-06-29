@@ -18,11 +18,11 @@ type mockClient struct {
 	sess *mockSession
 }
 
-func (m *mockClient) NewSession(ctx context.Context, cwd, system, first string) (Session, error) {
+func (m *mockClient) NewSession(ctx context.Context, cwd, system, first string) (Session, string, error) {
 	if m.sess == nil {
 		m.sess = &mockSession{}
 	}
-	return m.sess, nil
+	return m.sess, "", nil
 }
 
 type mockSession struct {
@@ -30,12 +30,12 @@ type mockSession struct {
 	onTurn  func(turn int)
 }
 
-func (s *mockSession) Prompt(ctx context.Context, text string) error {
+func (s *mockSession) Prompt(ctx context.Context, text string) (string, error) {
 	s.prompts++
 	if s.onTurn != nil {
 		s.onTurn(s.prompts)
 	}
-	return nil
+	return "", nil
 }
 func (s *mockSession) Close() error { return nil }
 

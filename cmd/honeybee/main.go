@@ -29,8 +29,13 @@ func main() {
 
 func run() error {
 	root := "."
-	if len(os.Args) > 1 {
-		root = os.Args[1]
+	debug := false
+	for _, a := range os.Args[1:] {
+		if a == "--debug" {
+			debug = true
+			continue
+		}
+		root = a
 	}
 	c, err := config.Load()
 	if err != nil {
@@ -70,6 +75,9 @@ func run() error {
 	runner := &swarm.Runner{
 		Repo: rp, Git: gitRepo, MaxTurns: c.MaxTurns, WallCap: ttl, TTL: ttl,
 		Client: &swarm.Opencode{Base: c.AgentURL, Model: c.Model, HTTP: &http.Client{Timeout: 0}},
+	}
+	if debug {
+		runner.Debug = os.Stderr
 	}
 	res, err := runner.Run(ctx, sel, prompts.Agents, first)
 	if err != nil {

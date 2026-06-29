@@ -21,23 +21,24 @@ type Opencode struct {
 }
 
 // NewSession creates a server session rooted at cwd and seeds the system prompt
-// (AGENTS.md) plus the first user prompt.
-func (o *Opencode) NewSession(ctx context.Context, cwd, system, first string) (Session, error) {
+// (AGENTS.md) plus the first user prompt. Returns the assistant's first reply.
+func (o *Opencode) NewSession(ctx context.Context, cwd, system, first string) (Session, string, error) {
 	body := map[string]any{"directory": cwd}
 	var created struct {
 		ID string `json:"id"`
 	}
 	if err := o.post(ctx, "/session", body, &created); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if created.ID == "" {
-		return nil, fmt.Errorf("opencode: empty session id")
+		return nil, "", fmt.Errorf("opencode: empty session id")
 	}
 	s := &ocSession{oc: o, id: created.ID, cwd: cwd}
-	if err := s.Prompt(ctx, system+"\n\n"+first); err != nil {
-		return nil, err
+	reply, err := s.Prompt(ctx, system+"\n\n"+first)
+	if err != nil {
+		return nil, "", err
 	}
-	return s, nil
+	return s, reply, nil
 }
 
 type ocSession struct {
@@ -46,14 +47,31 @@ type ocSession struct {
 	cwd string
 }
 
-func (s *ocSession) Prompt(ctx context.Context, text string) error {
+// Prompt sends text and blocks until the assistant turn completes, returning the
+// assistant's concatenated text parts.
+func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 	prov, model, _ := strings.Cut(s.oc.Model, "/")
 	body := map[string]any{
 		"providerID": prov,
 		"modelID":    model,
 		"parts":      []map[string]any{{"type": "text", "text": text}},
 	}
-	return s.oc.post(ctx, "/session/"+s.id+"/message", body, nil)
+	var reply struct {
+		Parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"parts"`
+	}
+	if err := s.oc.post(ctx, "/session/"+s.id+"/message", body, &reply); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	for _, p := range reply.Parts {
+		if p.Type == "text" {
+			sb.WriteString(p.Text)
+		}
+	}
+	return sb.String(), nil
 }
 
 func (s *ocSession) Close() error { return nil }

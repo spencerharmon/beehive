@@ -1,0 +1,21 @@
+[Unit]
+Description=opencode server for beehive honeybees
+Documentation=https://opencode.ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust binary path if opencode is not on PATH for the user session.
+ExecStart=opencode serve --hostname 127.0.0.1 --port 4096
+Restart=on-failure
+RestartSec=2
+# Provider credentials: prefer `opencode auth login` (writes to ~/.config),
+# or drop keys here / in an EnvironmentFile.
+# Environment=ANTHROPIC_API_KEY=...
+# EnvironmentFile=%h/.config/beehive/opencode.env
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
