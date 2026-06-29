@@ -1,0 +1,22 @@
+# nfpm config: build deb/rpm placing the three binaries and /etc/beehive.
+# Build: nfpm pkg --packager deb --target dist/  (after release cross-compile)
+# Keygen runs at install time via the postinstall scriptlet (scripts/install.sh).
+name: beehive
+arch: amd64
+platform: linux
+version: ${BEEHIVE_VERSION}
+maintainer: spencerharmon
+description: AI coding-agent platform — frontend + honeybee swarm reconciling code with intent.
+license: MIT
+contents:
+  - src: dist/beehive-linux-amd64
+    dst: /usr/local/bin/beehive
+  - src: dist/beehived-linux-amd64
+    dst: /usr/local/bin/beehived
+  - src: dist/honeybee-linux-amd64
+    dst: /usr/local/bin/honeybee
+  - src: packaging/config.yaml
+    dst: /etc/beehive/config.yaml
+    type: config|noreplace
+scripts:
+  postinstall: packaging/postinstall.sh

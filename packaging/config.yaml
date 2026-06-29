@@ -1,0 +1,6 @@
+# Default /etc/beehive/config.yaml installed by the package (noreplace).
+gpg_home: /etc/beehive/gnupg
+agent_cmd: opencode
+ttl_minutes: 60
+max_turns: 15
+reject_limit: 3

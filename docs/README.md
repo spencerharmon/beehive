@@ -41,4 +41,14 @@ beehive worktree add|rm <submodule> <branch>
 ## Secrets
 Single `SECRETS.yaml.gpg`, one encrypted yaml doc, referenced by INFRASTRUCTURE.md. gpg-managed.
 
-See `docs/frontend-components.md` and `IMPLEMENTATION.org`.
+## Docs
+- `docs/install.md` — install, packaging, /etc/beehive, release verification
+- `docs/secrets.md` — gpg secrets workflow
+- `docs/honeybee.md` — honeybee operation + turn loop
+- `docs/opencode.md` — agent backend setup
+- `docs/cli.md` — CLI reference
+- `docs/repo-layout.md` — beehive repo layout
+- `docs/frontend-components.md` — frontend routes/components
+- `CONTRIBUTING.md`, `docs/RELEASE-NOTES-TEMPLATE.md`
+
+See `IMPLEMENTATION.org` for the full plan.
