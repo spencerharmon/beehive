@@ -1,7 +1,13 @@
-// Package claim implements the commit-race claim protocol: mark a PLAN.md task
-// IN-PROGRESS with a timestamp, commit to beehive main, then re-pull and assert
-// our own timestamp won. Merge is not a lock; the re-verify is. Also: heartbeat
-// re-stamp each turn, stale/TTL detection for GC, and the rejection counter.
+// Package claim implements the unified commit-race claim protocol. A honeybee
+// stamps a PLAN.md task with its unique session id + a heartbeat timestamp,
+// commits, and publishes to beehive main. Publishing is the race: a competing
+// claim on the same task lands first and the loser's publish conflicts, so the
+// loser learns it lost (ErrLost) and reselects instead of wasting a session.
+//
+// The same mechanism covers EVERY task status (TODO, NEEDS-REVIEW,
+// NEEDS-ARBITRATION): "in progress" is not a status but a derived property
+// (session set + heartbeat fresh within TTL). Heartbeat re-stamps each turn and
+// re-verifies ownership; stale claims are GC-reclaimable by overwrite.
 package claim
 
 import (
@@ -16,16 +22,27 @@ import (
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
-// ErrLost is returned when re-verify finds another bee's stamp won the race.
+// ErrLost means another session won the task: abandon and reselect.
 var ErrLost = errors.New("claim: lost commit race")
 
-// Claimer races to own a task in a submodule PLAN.md.
+// ErrResolved means the task left the status this run was working: it reached a
+// terminal/handoff state (e.g. a worked TODO became NEEDS-REVIEW, or a review
+// became DONE) during the previous turn. NOT a failure — the runner re-checks
+// completion and exits cleanly.
+var ErrResolved = errors.New("claim: task resolved out of its working status")
+
+// Claimer races to own a task in a submodule PLAN.md using this process's
+// Session token. Publish merges the worktree branch to main (nil = local-only,
+// no cross-process race); a publish conflict is read as a lost race.
 type Claimer struct {
-	Repo *repo.Repo
-	Sub  repo.Submodule
-	Git  *git.Repo // beehive repo root
-	TTL  time.Duration
-	Now  func() time.Time // injectable clock; defaults to time.Now
+	Repo    *repo.Repo
+	Sub     repo.Submodule
+	Git     *git.Repo // beehive worktree root
+	TTL     time.Duration
+	Session string
+	Now     func() time.Time
+	Publish func(ctx context.Context) error
+	Remote  string
 }
 
 func (c *Claimer) now() time.Time {
@@ -52,8 +69,23 @@ func stampMsg(taskID, action string) string {
 	return fmt.Sprintf("plan: %s %s\n\nBeehive: %s plan", action, taskID, taskID)
 }
 
-// Claim marks taskID IN-PROGRESS with ts, commits to main, then re-verifies our
-// stamp won. ErrLost means abandon and reselect. ts must be unique to this bee.
+// syncMain pulls beehive main into the worktree so we observe competing claims
+// and resolutions. A merge conflict means a competing edit to our task line:
+// surfaced as ErrLost by callers.
+func (c *Claimer) syncMain(ctx context.Context) error {
+	ref := "main"
+	if c.Remote != "" {
+		if err := c.Git.Fetch(ctx, c.Remote, "main"); err != nil {
+			return err
+		}
+		ref = c.Remote + "/main"
+	}
+	return c.Git.Merge(ctx, ref)
+}
+
+// Claim stamps taskID with our session + ts (no status change), commits, and
+// publishes. A publish/merge conflict, or another live session owning the task,
+// is a lost race (ErrLost). On success our session owns the task on main.
 func (c *Claimer) Claim(ctx context.Context, taskID string, ts time.Time) error {
 	ts = ts.UTC().Truncate(time.Second)
 	p, err := c.load()
@@ -64,36 +96,58 @@ func (c *Claimer) Claim(ctx context.Context, taskID string, ts time.Time) error 
 	if t == nil {
 		return fmt.Errorf("claim: task %q absent", taskID)
 	}
-	t.Status = plan.InProgress
-	t.Heartbeat = ts
+	if t.Active(c.now(), c.TTL) && t.Session != c.Session {
+		return ErrLost // a live bee already holds it
+	}
+	t.Claim(c.Session, ts)
 	if err := c.save(p); err != nil {
 		return err
 	}
-	if err := c.Git.Commit(ctx, stampMsg(taskID, "claim")); err != nil {
+	if err := c.Git.Commit(ctx, stampMsg(taskID, "claim")); err != nil && err != git.ErrNothing {
 		return err
 	}
-	return c.verify(taskID, ts)
+	if c.Publish != nil {
+		if err := c.Publish(ctx); err != nil {
+			if errors.Is(err, git.ErrConflict) {
+				return ErrLost
+			}
+			return err
+		}
+	}
+	return c.verify(ctx, taskID)
 }
 
-// verify re-reads PLAN.md (post-pull caller) and asserts our timestamp owns it.
-func (c *Claimer) verify(taskID string, ts time.Time) error {
+// verify pulls main and asserts our session still owns the task.
+func (c *Claimer) verify(ctx context.Context, taskID string) error {
+	if err := c.syncMain(ctx); err != nil {
+		if errors.Is(err, git.ErrConflict) {
+			return ErrLost
+		}
+		return err
+	}
 	p, err := c.load()
 	if err != nil {
 		return err
 	}
 	t := p.Find(taskID)
-	if t == nil {
-		return ErrLost
-	}
-	if t.Status != plan.InProgress || !t.Heartbeat.Equal(ts.UTC().Truncate(time.Second)) {
+	if t == nil || t.Session != c.Session {
 		return ErrLost
 	}
 	return nil
 }
 
-// Heartbeat re-stamps taskID to keep it from going stale, committing the bump.
-func (c *Claimer) Heartbeat(ctx context.Context, taskID string, ts time.Time) error {
+// Heartbeat re-stamps taskID for this turn. It first pulls main (to observe a
+// competitor or a resolution), then: if the task left `from` status it is
+// ErrResolved; if another live session owns it it is ErrLost; otherwise we
+// re-stamp, commit, and publish (a publish conflict is ErrLost).
+func (c *Claimer) Heartbeat(ctx context.Context, taskID string, from plan.Status, ts time.Time) error {
 	ts = ts.UTC().Truncate(time.Second)
+	if err := c.syncMain(ctx); err != nil {
+		if errors.Is(err, git.ErrConflict) {
+			return ErrLost
+		}
+		return err
+	}
 	p, err := c.load()
 	if err != nil {
 		return err
@@ -102,20 +156,60 @@ func (c *Claimer) Heartbeat(ctx context.Context, taskID string, ts time.Time) er
 	if t == nil {
 		return fmt.Errorf("heartbeat: task %q absent", taskID)
 	}
-	if t.Status != plan.InProgress {
-		return fmt.Errorf("heartbeat: task %q not in progress", taskID)
+	if t.Status != from {
+		return fmt.Errorf("%w: %q is %s", ErrResolved, taskID, t.Status)
 	}
-	t.Heartbeat = ts
+	if t.Session != "" && t.Session != c.Session && t.Active(c.now(), c.TTL) {
+		return ErrLost // another live bee took it while we were away
+	}
+	t.Claim(c.Session, ts)
 	if err := c.save(p); err != nil {
 		return err
 	}
 	if err := c.Git.Commit(ctx, stampMsg(taskID, "heartbeat")); err != nil && err != git.ErrNothing {
 		return err
 	}
-	return c.verify(taskID, ts)
+	if c.Publish != nil {
+		if err := c.Publish(ctx); err != nil {
+			if errors.Is(err, git.ErrConflict) {
+				return ErrLost
+			}
+			return err
+		}
+	}
+	return nil
 }
 
-// Stale reports whether taskID's heartbeat exceeded the TTL (a GC candidate).
+// Release clears the active claim (session + heartbeat) on taskID without
+// changing its status, then commits and publishes. Called on completion so a
+// task the agent moved to its next phase (e.g. NEEDS-REVIEW) shows as unclaimed
+// and a peer can pick it up immediately instead of waiting out the TTL. A publish
+// conflict here is benign (a peer already advanced main) and is swallowed.
+func (c *Claimer) Release(ctx context.Context, taskID string) error {
+	p, err := c.load()
+	if err != nil {
+		return err
+	}
+	t := p.Find(taskID)
+	if t == nil || (t.Session == "" && t.Heartbeat.IsZero()) {
+		return nil
+	}
+	t.Release()
+	if err := c.save(p); err != nil {
+		return err
+	}
+	if err := c.Git.Commit(ctx, stampMsg(taskID, "release")); err != nil && err != git.ErrNothing {
+		return err
+	}
+	if c.Publish != nil {
+		if err := c.Publish(ctx); err != nil && !errors.Is(err, git.ErrConflict) {
+			return err
+		}
+	}
+	return nil
+}
+
+// Stale reports whether taskID holds an expired claim (a GC candidate).
 func (c *Claimer) Stale(taskID string) (bool, error) {
 	p, err := c.load()
 	if err != nil {
@@ -139,12 +233,8 @@ func (c *Claimer) Reject(ctx context.Context, taskID string, limit int) (plan.St
 	if t == nil {
 		return "", fmt.Errorf("reject: task %q absent", taskID)
 	}
-	t.Attempts++
-	t.Heartbeat = time.Time{}
-	if t.Attempts > limit {
-		t.Status = plan.NeedsHuman
-	} else {
-		t.Status = plan.TODO
+	if err := t.Reject(limit, c.now()); err != nil {
+		return "", err
 	}
 	if err := c.save(p); err != nil {
 		return "", err

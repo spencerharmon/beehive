@@ -1,10 +1,10 @@
 <!-- Beehive-ROI: def456 -->
 # Plan
 
-## t1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->
+## t1 [TODO] <!-- attempts=0 deps= session=bee-7 heartbeat=2026-06-29T10:00:00Z -->
 do the first thing
 
-## t2 [IN-PROGRESS] <!-- attempts=1 deps=t1 heartbeat=2026-06-29T10:00:00Z -->
+## t2 [TODO] <!-- attempts=1 deps=t1 session=bee-9 heartbeat=2026-06-29T10:00:00Z -->
 second, depends on t1
 
 ## t3 [DONE] <!-- attempts=2 deps= -->

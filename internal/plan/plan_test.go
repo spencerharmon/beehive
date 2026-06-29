@@ -13,7 +13,7 @@ const sample = `<!-- Beehive-ROI: abc123 -->
 ## t1 [TODO] <!-- attempts=0 deps= -->
 do the first thing
 
-## t2 [IN-PROGRESS] <!-- attempts=1 deps=t1 heartbeat=2026-06-29T10:00:00Z -->
+## t2 [TODO] <!-- attempts=1 deps=t1 session=bee-9 heartbeat=2026-06-29T10:00:00Z -->
 second, depends on t1
 
 ## t3 [NEEDS-REVIEW] <!-- attempts=2 deps= -->
@@ -32,14 +32,29 @@ func TestParseRoundTrip(t *testing.T) {
 		t.Fatalf("tasks=%d", len(p.Tasks))
 	}
 	t2 := p.Task("t2")
-	if t2.Status != StatusInProgress || t2.Attempts != 1 || len(t2.Deps) != 1 || t2.Deps[0] != "t1" {
+	if t2.Status != StatusTODO || t2.Attempts != 1 || len(t2.Deps) != 1 || t2.Deps[0] != "t1" {
 		t.Fatalf("t2 parsed wrong: %+v", t2)
+	}
+	if t2.Session != "bee-9" {
+		t.Fatalf("session=%q", t2.Session)
 	}
 	if t2.Heartbeat.UTC().Format(time.RFC3339) != "2026-06-29T10:00:00Z" {
 		t.Fatalf("heartbeat=%v", t2.Heartbeat)
 	}
 	if got := p.String(); got != sample {
 		t.Fatalf("round trip mismatch:\n%q\nvs\n%q", got, sample)
+	}
+}
+
+// TestLegacyInProgressNormalizes proves an old [IN-PROGRESS] header still loads,
+// mapped to TODO (in-progress is now session+heartbeat, not a status).
+func TestLegacyInProgressNormalizes(t *testing.T) {
+	p, err := Parse("## x [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\nbody\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Task("x").Status != StatusTODO {
+		t.Fatalf("legacy IN-PROGRESS not normalized: %s", p.Task("x").Status)
 	}
 }
 
@@ -52,20 +67,24 @@ func TestBadStatus(t *testing.T) {
 func TestStateMachine(t *testing.T) {
 	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
 	tk := &Task{ID: "a", Status: StatusTODO}
-	if err := tk.Transition(StatusInProgress, now); err != nil {
-		t.Fatal(err)
+	// A claim marks the task active without changing status.
+	tk.Claim("bee-1", now)
+	if !tk.Active(now, time.Hour) {
+		t.Fatal("claimed task not active")
 	}
-	if tk.Heartbeat.IsZero() {
-		t.Fatal("no heartbeat after in-progress")
+	if tk.Status != StatusTODO {
+		t.Fatal("claim must not change status")
 	}
+	// TODO cannot jump straight to DONE.
 	if err := tk.Transition(StatusDone, now); err == nil {
-		t.Fatal("illegal in-progress->done allowed")
+		t.Fatal("illegal TODO->DONE allowed")
 	}
+	// TODO -> NEEDS-REVIEW releases the active claim.
 	if err := tk.Transition(StatusReview, now); err != nil {
 		t.Fatal(err)
 	}
-	if !tk.Heartbeat.IsZero() {
-		t.Fatal("heartbeat not cleared on review")
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("transition must release the claim")
 	}
 	if err := tk.Transition(StatusDone, now); err != nil {
 		t.Fatal(err)
@@ -74,17 +93,25 @@ func TestStateMachine(t *testing.T) {
 
 func TestStaleHeartbeat(t *testing.T) {
 	base := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
-	tk := &Task{ID: "a", Status: StatusInProgress, Heartbeat: base}
 	ttl := time.Hour
+	// Active claim: session + fresh heartbeat.
+	tk := &Task{ID: "a", Status: StatusTODO, Session: "bee-1", Heartbeat: base}
 	if tk.Stale(base.Add(30*time.Minute), ttl) {
 		t.Fatal("fresh treated stale")
+	}
+	if !tk.Active(base.Add(30*time.Minute), ttl) {
+		t.Fatal("fresh claim not active")
 	}
 	if !tk.Stale(base.Add(2*time.Hour), ttl) {
 		t.Fatal("old not stale")
 	}
-	done := &Task{ID: "b", Status: StatusDone}
-	if done.Stale(base.Add(99*time.Hour), ttl) {
-		t.Fatal("done never stale")
+	if tk.Active(base.Add(2*time.Hour), ttl) {
+		t.Fatal("expired claim still active")
+	}
+	// No session => never active or stale, regardless of a leftover heartbeat.
+	unclaimed := &Task{ID: "b", Status: StatusReview, Heartbeat: base}
+	if unclaimed.Stale(base.Add(99*time.Hour), ttl) || unclaimed.Active(base, ttl) {
+		t.Fatal("sessionless task must be neither active nor stale")
 	}
 }
 
@@ -143,7 +170,7 @@ func TestSelectableDefersCrossSubmoduleDeps(t *testing.T) {
 func TestGolden(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	p, _ := Parse(sample)
-	p.Task("t1").Transition(StatusInProgress, now)
+	p.Task("t1").Claim("bee-7", now)
 	p.Task("t3").Transition(StatusDone, now)
 	p.Stamp("def456")
 	got := p.String()

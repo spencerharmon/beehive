@@ -6,46 +6,62 @@ import (
 	"time"
 )
 
-// transitions enumerates the legal status edges. NEEDS-HUMAN is terminal and
-// only reachable via Reject overflow, never a direct transition.
+// transitions enumerates the legal status edges. There is no IN-PROGRESS state:
+// a task is implemented in place at TODO (marked active by a session+heartbeat),
+// then moves straight to NEEDS-REVIEW. NEEDS-HUMAN is terminal and only reachable
+// via Reject overflow.
 var transitions = map[Status]map[Status]bool{
-	StatusTODO:       {StatusInProgress: true},
-	StatusInProgress: {StatusReview: true, StatusTODO: true},
-	StatusReview:     {StatusDone: true, StatusArb: true},
-	StatusArb:        {StatusTODO: true, StatusDone: true},
+	StatusTODO:   {StatusReview: true},
+	StatusReview: {StatusDone: true, StatusArb: true},
+	StatusArb:    {StatusTODO: true, StatusDone: true},
 }
 
 // CanTransition reports whether from->to is legal.
 func CanTransition(from, to Status) bool { return transitions[from][to] }
 
-// Transition moves a task to a new status, enforcing the machine. It clears the
-// heartbeat on any terminal/non-in-progress state and stamps it on IN-PROGRESS.
+// Transition moves a task to a new status, enforcing the machine. A status change
+// is a work-phase change, so it releases the active claim (clears session +
+// heartbeat); the next phase is claimed afresh by whichever bee picks it up.
 func (t *Task) Transition(to Status, now time.Time) error {
 	if !CanTransition(t.Status, to) {
 		return fmt.Errorf("plan: illegal transition %s -> %s for %s", t.Status, to, t.ID)
 	}
 	t.Status = to
-	if to == StatusInProgress {
-		t.Heartbeat = now
-	} else {
-		t.Heartbeat = time.Time{}
-	}
+	t.Session = ""
+	t.Heartbeat = time.Time{}
 	return nil
 }
 
-// Heartbeat re-stamps an IN-PROGRESS task; error otherwise.
-func (t *Task) HeartbeatNow(now time.Time) error {
-	if t.Status != StatusInProgress {
-		return fmt.Errorf("plan: heartbeat on non-in-progress task %s (%s)", t.ID, t.Status)
-	}
+// Claim stamps the task as actively worked by session at now (the unified claim
+// token used for every status). It does not change the status.
+func (t *Task) Claim(session string, now time.Time) {
+	t.Session = session
 	t.Heartbeat = now
-	return nil
 }
 
-// Stale reports whether an IN-PROGRESS task's heartbeat is older than ttl: a GC
-// candidate. Non-in-progress tasks are never stale.
+// Release clears the active claim (session + heartbeat) without changing status,
+// e.g. when a honeybee hands a task back after losing the race or being GC'd.
+func (t *Task) Release() {
+	t.Session = ""
+	t.Heartbeat = time.Time{}
+}
+
+// HeartbeatNow re-stamps the active claim's heartbeat to keep it fresh.
+func (t *Task) HeartbeatNow(now time.Time) { t.Heartbeat = now }
+
+// Active reports whether the task is being worked right now: it carries a session
+// id and a heartbeat fresh within ttl. Independent of status.
+func (t *Task) Active(now time.Time, ttl time.Duration) bool {
+	if t.Session == "" || t.Heartbeat.IsZero() {
+		return false
+	}
+	return now.Sub(t.Heartbeat) <= ttl
+}
+
+// Stale reports whether the task holds a claim whose heartbeat has expired: a GC
+// candidate whose owner died. An unclaimed task is never stale.
 func (t *Task) Stale(now time.Time, ttl time.Duration) bool {
-	if t.Status != StatusInProgress || t.Heartbeat.IsZero() {
+	if t.Session == "" || t.Heartbeat.IsZero() {
 		return false
 	}
 	return now.Sub(t.Heartbeat) > ttl
@@ -53,12 +69,13 @@ func (t *Task) Stale(now time.Time, ttl time.Duration) bool {
 
 // Reject records a rejection: bumps attempts, and once attempts exceed limit the
 // task goes NEEDS-HUMAN (no longer auto-recycled). Otherwise it returns to TODO.
-// Valid from NEEDS-REVIEW or NEEDS-ARBITRATION.
+// Valid from NEEDS-REVIEW or NEEDS-ARBITRATION. Releases the active claim.
 func (t *Task) Reject(limit int, now time.Time) error {
 	if t.Status != StatusReview && t.Status != StatusArb {
 		return fmt.Errorf("plan: reject on non-reviewable task %s (%s)", t.ID, t.Status)
 	}
 	t.Attempts++
+	t.Session = ""
 	t.Heartbeat = time.Time{}
 	if t.Attempts > limit {
 		t.Status = StatusHuman

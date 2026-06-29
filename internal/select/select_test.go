@@ -221,3 +221,78 @@ func TestCyclicTasksNotSelected(t *testing.T) {
 		t.Fatalf("cyclic tasks must not be selected, got %+v", s)
 	}
 }
+
+// stampedPlan writes a submodule with ROI.md + a PLAN.md whose ROI stamp matches
+// the committed ROI head, so reconcile (priority 0) does not preempt the task
+// tiers under test.
+func stampedPlan(t *testing.T, root string, g *git.Repo, name, planBody string) {
+	t.Helper()
+	ctx := context.Background()
+	sub(root, name, map[string]string{"ROI.md": "x", "PLAN.md": "placeholder\n"})
+	g.Commit(ctx, "seed "+name)
+	head, _ := g.LastCommit(ctx, "submodules/"+name+"/ROI.md")
+	os.WriteFile(filepath.Join(root, "submodules", name, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n"+planBody), 0o644)
+	g.Commit(ctx, "stamp "+name)
+}
+
+// TestSelectReviewKind: a NEEDS-REVIEW task must be selected as Kind=Review (not
+// Work) so the runner does NOT claim/clobber it to IN-PROGRESS and the agent
+// reviews instead of re-implementing. Review tier outranks a TODO task.
+func TestSelectReviewKind(t *testing.T) {
+	_, g, root := hive(t)
+	stampedPlan(t, root, g,
+		"a", "## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview me\n## T1 [TODO] <!-- attempts=0 deps= -->\ntodo\n")
+	s, err := sel(root, g).Select(context.Background())
+	if err != nil || s == nil {
+		t.Fatalf("sel %v %v", s, err)
+	}
+	if s.Kind != Review || s.Task.ID != "R1" {
+		t.Fatalf("want Review/R1, got %+v", s)
+	}
+}
+
+// TestSelectArbitrateKind: a NEEDS-ARBITRATION task selects as Kind=Arbitrate.
+func TestSelectArbitrateKind(t *testing.T) {
+	_, g, root := hive(t)
+	stampedPlan(t, root, g,
+		"a", "## A1 [NEEDS-ARBITRATION] <!-- attempts=1 deps= -->\nsettle me\n## T1 [TODO] <!-- attempts=0 deps= -->\ntodo\n")
+	s, err := sel(root, g).Select(context.Background())
+	if err != nil || s == nil {
+		t.Fatalf("sel %v %v", s, err)
+	}
+	if s.Kind != Arbitrate || s.Task.ID != "A1" {
+		t.Fatalf("want Arbitrate/A1, got %+v", s)
+	}
+}
+
+// TestSelectSkipsActiveClaim: a task held by a fresh session+heartbeat is NOT
+// selected — the deterministic first guard against working someone else's task.
+func TestSelectSkipsActiveClaim(t *testing.T) {
+	_, g, root := hive(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+	stampedPlan(t, root, g,
+		"a", "## H1 [TODO] <!-- attempts=0 deps= session=bee-other heartbeat="+now+" -->\nheld\n")
+	s, err := sel(root, g).Select(context.Background())
+	if err != nil {
+		t.Fatalf("sel err %v", err)
+	}
+	if s != nil {
+		t.Fatalf("actively-claimed task must not be selected, got %+v", s)
+	}
+}
+
+// TestSelectReclaimsStaleClaim: a task whose claim heartbeat expired IS selectable
+// (the owner died); the selecting bee's own claim will overwrite the dead stamp.
+func TestSelectReclaimsStaleClaim(t *testing.T) {
+	_, g, root := hive(t)
+	stampedPlan(t, root, g,
+		"a", "## S1 [TODO] <!-- attempts=0 deps= session=bee-dead heartbeat=2000-01-01T00:00:00Z -->\nstale\n")
+	s, err := sel(root, g).Select(context.Background())
+	if err != nil || s == nil {
+		t.Fatalf("sel %v %v", s, err)
+	}
+	if s.Kind != Work || s.Task.ID != "S1" {
+		t.Fatalf("want Work/S1 (reclaimed), got %+v", s)
+	}
+}

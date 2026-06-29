@@ -5,7 +5,6 @@ import "time"
 // Short status aliases for swarm/select/claim consumers.
 const (
 	TODO        = StatusTODO
-	InProgress  = StatusInProgress
 	NeedsReview = StatusReview
 	NeedsArb    = StatusArb
 	Done        = StatusDone
@@ -18,23 +17,31 @@ func (p *Plan) Find(id string) *Task { return p.Task(id) }
 // ROIStamp returns the recorded ROI reconcile sha.
 func (p *Plan) ROIStamp() string { return p.ROI }
 
-// priorityTiers orders selectable types: GC stale IN-PROGRESS > arbitration >
-// review > main (TODO). Candidates returns the highest non-empty tier's tasks.
+// Candidates returns the highest-priority tier of selectable tasks, skipping any
+// task already actively claimed (a fresh session+heartbeat): a bee never selects
+// work another bee is currently holding. A stale claim (expired heartbeat) does
+// not protect a task — it is reclaimable, so it remains a candidate by its
+// status, and the selecting bee's claim overwrites the dead owner's stamp.
+//
+// Priority: arbitration > review > main (TODO with deps satisfied).
 func (p *Plan) Candidates(now time.Time, ttl time.Duration) []Task {
-	var gc, arb, rev, main []Task
+	var arb, rev, main []Task
 	for _, t := range p.Tasks {
-		switch {
-		case t.Stale(now, ttl):
-			gc = append(gc, *t)
-		case t.Status == StatusArb:
+		if t.Active(now, ttl) {
+			continue // someone is on it; leave it alone
+		}
+		switch t.Status {
+		case StatusArb:
 			arb = append(arb, *t)
-		case t.Status == StatusReview:
+		case StatusReview:
 			rev = append(rev, *t)
-		case t.Status == StatusTODO && p.Selectable(t):
-			main = append(main, *t)
+		case StatusTODO:
+			if p.Selectable(t) {
+				main = append(main, *t)
+			}
 		}
 	}
-	for _, tier := range [][]Task{gc, arb, rev, main} {
+	for _, tier := range [][]Task{arb, rev, main} {
 		if len(tier) > 0 {
 			return tier
 		}

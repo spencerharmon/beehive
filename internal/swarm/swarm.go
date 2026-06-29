@@ -7,6 +7,7 @@ package swarm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -47,6 +48,10 @@ type Runner struct {
 	TTL      time.Duration
 	Now      func() time.Time
 	Debug    io.Writer // non-nil: stream session activity live
+	// Session is this honeybee's unique claim token, stamped on the task it works
+	// so peers can tell a task is actively held (session + fresh heartbeat) versus
+	// free. Must match the token main used for the initial Claim.
+	Session string
 	// Publish, when set, advances main to this honeybee's worktree branch and
 	// pushes (conflict-free merge of distinct files). Called after each heartbeat
 	// and at session end so peers converge "as we go". Nil in tests = local only.
@@ -103,6 +108,7 @@ type Result struct {
 	Completed bool
 	Turns     int
 	GCMarked  bool
+	Lost      bool // lost the claim race; the caller should reselect another task
 	Branch    string
 	SessionID string
 	Warning   string // non-empty when the run aborted (e.g. task removed on main)
@@ -132,23 +138,96 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// Only a main Work task edits the submodule repo and needs a worktree.
 	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
 	var wg *git.Repo
-	wtRel := filepath.Join("..", "worktrees", res.Branch)
+	var wtAbs string
 	if sel.Kind == selectt.Work {
-		wg = git.New(sel.Submodule.RepoDir())
-		if err := wg.WorktreeAdd(ctx, wtRel, res.Branch, "HEAD"); err != nil {
+		// Absolute paths rooted at THIS honeybee's worktree (absRoot). A fresh
+		// `git worktree add` of the beehive repo does NOT populate submodules, so
+		// submodules/<sm>/repo is an empty gitlink. If we ran `git worktree add`
+		// against it directly, git would ascend to the superproject and silently
+		// create a bogus SUPERPROJECT worktree at the source path (the exact
+		// confusion that wastes an agent's whole run). Initialize the submodule
+		// checkout first, then branch the source worktree off it.
+		repoDir := sel.Submodule.RepoDir()
+		wtAbs = filepath.Join(sel.Submodule.WorktreesDir(), res.Branch)
+		if !isSourceCheckout(ctx, repoDir) {
+			rel, relErr := filepath.Rel(absRoot, repoDir)
+			if relErr != nil {
+				return res, fmt.Errorf("resolve submodule path: %w", relErr)
+			}
+			if _, err := r.Git.Run(ctx, "submodule", "update", "--init", "--", rel); err != nil {
+				return res, fmt.Errorf("init submodule %s checkout: %w", sel.Submodule.Name, err)
+			}
+		}
+		if !isSourceCheckout(ctx, repoDir) {
+			return res, fmt.Errorf("submodule %s not checked out at %s; refusing to create a worktree that would corrupt the superproject",
+				sel.Submodule.Name, repoDir)
+		}
+		wg = git.New(repoDir)
+		if err := wg.WorktreeAdd(ctx, wtAbs, res.Branch, "HEAD"); err != nil {
 			return res, fmt.Errorf("worktree add: %w", err)
 		}
 	}
 
-	// Context preamble: the agent works from the beehive repo root and must use
-	// the right paths. ROI/PLAN/docs live in the beehive layer, code in the worktree.
-	preamble := fmt.Sprintf(
-		"# Context\nYou are working from the beehive repo root (cwd). Submodule: %s.\n"+
-			"Coordination files: submodules/%s/ROI.md (read-only), submodules/%s/PLAN.md, submodules/%s/docs/.\n"+
-			"Code worktree (for Work tasks): submodules/%s/worktrees/%s.\n"+
-			"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
-		sel.Submodule.Name, sel.Submodule.Name, sel.Submodule.Name, sel.Submodule.Name,
-		sel.Submodule.Name, res.Branch)
+	// Context preamble: shipped in the binary (NOT the on-disk AGENTS.md, which is
+	// frozen at `beehive init` time), so it stays accurate as the tool evolves. It
+	// is kind-specific: a Work agent gets the code-worktree handoff; a Review or
+	// Arbitrate agent is told to JUDGE existing work (and is given the implementer
+	// branch + docs) so it never re-implements a NEEDS-REVIEW task.
+	smName := sel.Submodule.Name
+	var preamble string
+	switch sel.Kind {
+	case selectt.Review:
+		preamble = fmt.Sprintf(
+			"# Context (REVIEW — judge existing work, do NOT reimplement, do NOT set IN-PROGRESS)\n"+
+				"cwd is the beehive repo root. Submodule: %[1]s. Task under review: %[2]s.\n"+
+				"Beehive layer (read/write on main): submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/. ROI.md is read-only.\n"+
+				"Implementer's work is on branch bee-%[2]s in submodules/%[1]s/repo — inspect read-only via git "+
+				"(fetch from origin if the branch is absent locally). Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
+				"the PLAN.md task body has a `Review:` note.\n"+
+				"APPROVE -> merge the submodule pointer bump + PLAN.md task DONE + unlock dependents. "+
+				"REJECT -> PLAN.md task NEEDS-ARBITRATION + rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
+				"The run completes when the task leaves NEEDS-REVIEW. Act autonomously.\n\n",
+			smName, sel.Task.ID)
+	case selectt.Arbitrate:
+		preamble = fmt.Sprintf(
+			"# Context (ARBITRATION — settle the dispute, do NOT reimplement, do NOT set IN-PROGRESS)\n"+
+				"cwd is the beehive repo root. Submodule: %[1]s. Task in arbitration: %[2]s.\n"+
+				"Beehive layer (read/write on main): submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/. ROI.md is read-only.\n"+
+				"Implementer branch bee-%[2]s in submodules/%[1]s/repo; change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
+				"reviewer rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
+				"SIDE WITH IMPLEMENTER -> merge pointer bump + PLAN.md DONE + unlock dependents. "+
+				"SIDE WITH REVIEWER -> PLAN.md TODO (or NEEDS-HUMAN past the limit) with the binding rationale.\n"+
+				"The run completes when the task leaves NEEDS-ARBITRATION. Act autonomously.\n\n",
+			smName, sel.Task.ID)
+	case selectt.Work:
+		preamble = fmt.Sprintf(
+			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
+				"Coordination files (the beehive layer): submodules/%[1]s/ROI.md (read-only), "+
+				"submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/.\n"+
+				"Code worktree (already created and checked out for you): submodules/%[1]s/worktrees/%[2]s/ "+
+				"on branch %[2]s. Edit the submodule's CODE there; never write submodules/%[1]s/repo (the shared checkout).\n"+
+				"On completion of a Work task: PLAN.md -> NEEDS-REVIEW on main; commit the code on branch %[2]s "+
+				"with a `Beehive: %[3]s <doc-path>` stamp and ensure that commit is pushed to the submodule's origin; "+
+				"bump the submodule pointer.\n"+
+				"REQUIRED change doc path: submodules/%[1]s/docs/%[2]s-%[3]s.md (the beehive layer — NOT inside the code "+
+				"worktree). The runner's completion check looks for it exactly there; a doc elsewhere reads as 'not done'.\n"+
+				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
+			smName, res.Branch, taskID(sel))
+	default: // Bootstrap, Reconcile: beehive-layer only, no code worktree.
+		preamble = fmt.Sprintf(
+			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
+				"Beehive layer: submodules/%[1]s/ROI.md (read-only), submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/.\n"+
+				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
+			smName)
+	}
+	if hasTask(sel) {
+		preamble += fmt.Sprintf(
+			"Claim: the runner stamped this task session=%[1]s and re-stamps it each turn. Before doing work "+
+				"each turn, confirm submodules/%[2]s/PLAN.md still shows session=%[1]s on task %[3]s with a fresh "+
+				"heartbeat. If a DIFFERENT session holds it, STOP immediately — you lost the race and the runner "+
+				"will reselect. Do not edit the session/heartbeat yourself.\n\n",
+			r.Session, smName, sel.Task.ID)
+	}
 	first = preamble + first
 
 	if r.Debug != nil {
@@ -191,7 +270,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	recDone := make(chan struct{})
 	go func() { rec.loop(recCtx); close(recDone) }()
 
-	cl := &claim.Claimer{Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now}
+	cl := &claim.Claimer{
+		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
+		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
+	}
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
 	// finish stops the recorder, optionally records an abort warning to the
@@ -210,23 +292,65 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		r.syncSession(ctx, sid, sessionRel)
 		_ = r.publish(ctx)
 	}
+	cleanup := func() {
+		if wg != nil {
+			_ = wg.WorktreeRemove(ctx, wtAbs)
+		}
+	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
 		// Guard: an operator may have deleted the plan or removed this task on main
 		// after we started. Detect it and exit rather than work a task nobody wants.
 		if removed, warning, err := r.taskRemoved(ctx, sel); err == nil && removed {
 			res.Warning = warning
 			finish(warning)
-			if wg != nil {
-				_ = wg.WorktreeRemove(ctx, wtRel)
-			}
+			cleanup()
 			return res, nil
 		}
-		if sel.Kind == selectt.Work {
-			if err := cl.Heartbeat(ctx, sel.Task.ID, r.now()); err != nil {
+		// Unified per-turn heartbeat for every task-bearing kind (Work/Review/
+		// Arbitrate). It re-stamps our session, after first pulling main so we observe
+		// a competitor or a resolution. Three outcomes beyond "ok":
+		if hasTask(sel) {
+			err := cl.Heartbeat(ctx, sel.Task.ID, sel.Task.Status, r.now())
+			switch {
+			case err == nil:
+				// Ownership re-confirmed; the heartbeat already published to peers.
+			case errors.Is(err, claim.ErrResolved):
+				// The task left its working status during the previous turn (the agent
+				// drove it terminal, or someone else resolved it). Re-check completion
+				// and exit cleanly — never a fatal error.
+				done, derr := r.complete(sel, res.Branch)
+				if derr != nil {
+					finish("")
+					return res, derr
+				}
+				res.Completed = done
+				warn := ""
+				if done {
+					warn = r.pushSourceBranch(ctx, wg, res.Branch)
+					_ = cl.Release(ctx, sel.Task.ID)
+				} else {
+					warn = fmt.Sprintf(
+						"task %s left %s but the completion check failed — left for review",
+						sel.Task.ID, sel.Task.Status)
+				}
+				res.Warning = warn
+				finish(warn)
+				cleanup()
+				return res, nil
+			case errors.Is(err, claim.ErrLost):
+				// Another session won the task. Stop now so the honeybee process
+				// reselects the next most useful task instead of wasting turns on a
+				// redundant pass. (Double-guarded: the agent is also instructed to stop
+				// when it sees a foreign session, ending the turn early on its own.)
+				res.Lost = true
+				res.Warning = fmt.Sprintf("lost the claim race for %s to another session; reselecting", sel.Task.ID)
+				finish(res.Warning)
+				cleanup()
+				return res, nil
+			default:
 				finish("")
 				return res, fmt.Errorf("turn %d heartbeat: %w", res.Turns, err)
 			}
-			_ = r.publish(ctx) // surface the heartbeat to peers as we go
 		}
 		// Drive the turn. Turn 1 sends the seeded `first` prompt; the recorder is
 		// already polling, so even the long bootstrap turn streams to the UI/debug.
@@ -241,10 +365,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		if done {
 			res.Completed = true
-			finish("")
-			if wg != nil {
-				_ = wg.WorktreeRemove(ctx, wtRel)
+			if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
+				res.Warning = w
 			}
+			if hasTask(sel) {
+				_ = cl.Release(ctx, sel.Task.ID)
+			}
+			finish(res.Warning)
+			cleanup()
 			return res, nil
 		}
 		if r.now().After(deadline) {
@@ -252,7 +380,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		prompt = "continue"
 	}
-	res.GCMarked = true // turn/wall cap hit, leave IN-PROGRESS heartbeat for GC
+	res.GCMarked = true // turn/wall cap hit; leave the active claim to go stale for GC
 	finish("")
 	return res, nil
 }
@@ -315,9 +443,37 @@ func (r *Runner) complete(sel *selectt.Selection, branch string) (bool, error) {
 		return err == nil, nil
 	case selectt.Reconcile:
 		return r.reconciled(sel)
+	case selectt.Review:
+		// Done once the reviewer moved the task out of NEEDS-REVIEW (-> DONE on
+		// approve, -> NEEDS-ARBITRATION on reject).
+		return r.statusLeft(sel, plan.NeedsReview)
+	case selectt.Arbitrate:
+		// Done once the arbiter moved the task out of NEEDS-ARBITRATION (-> DONE,
+		// -> TODO, or -> NEEDS-HUMAN).
+		return r.statusLeft(sel, plan.NeedsArb)
 	default:
 		return r.workDone(sel, branch)
 	}
+}
+
+// statusLeft reports whether the selected task has moved out of `from`. A task
+// removed from the plan counts as not-our-completion (the removed-guard handles
+// deletions). Used by review/arbitration, whose resolution is purely a PLAN.md
+// state transition rather than a new change doc.
+func (r *Runner) statusLeft(sel *selectt.Selection, from plan.Status) (bool, error) {
+	b, err := os.ReadFile(sel.Submodule.PlanPath())
+	if err != nil {
+		return false, err
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		return false, err
+	}
+	t := p.Find(sel.Task.ID)
+	if t == nil {
+		return false, nil
+	}
+	return t.Status != from, nil
 }
 
 func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
@@ -333,8 +489,10 @@ func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
 	return stamp != "" && stamp == head, nil
 }
 
-// workDone verifies PLAN.md status transitioned terminal, the heartbeat ts is
-// cleared, and the branch+task doc exists under submodule docs/.
+// workDone verifies the PLAN.md status transitioned to a terminal/handoff state
+// for a Work task and the branch+task change doc exists under submodule docs/.
+// The runner's own session/heartbeat stamp is NOT a completion signal (it is
+// released separately), so it is not checked here.
 func (r *Runner) workDone(sel *selectt.Selection, branch string) (bool, error) {
 	b, err := os.ReadFile(sel.Submodule.PlanPath())
 	if err != nil {
@@ -349,8 +507,8 @@ func (r *Runner) workDone(sel *selectt.Selection, branch string) (bool, error) {
 		return false, nil
 	}
 	terminal := t.Status == plan.Done || t.Status == plan.NeedsReview ||
-		t.Status == plan.TODO || t.Status == plan.NeedsArb
-	if !terminal || !t.Heartbeat.IsZero() {
+		t.Status == plan.NeedsArb
+	if !terminal {
 		return false, nil
 	}
 	return r.docPresent(sel, branch)
@@ -376,4 +534,63 @@ func (r *Runner) docPresent(sel *selectt.Selection, branch string) (bool, error)
 
 func pathHasPrefix(name, stem string) bool {
 	return len(name) >= len(stem) && name[:len(stem)] == stem
+}
+
+// taskID is the stable id used in the change-doc stem and Context preamble.
+func taskID(sel *selectt.Selection) string {
+	switch sel.Kind {
+	case selectt.Bootstrap, selectt.Reconcile:
+		return string(sel.Kind)
+	default:
+		return sel.Task.ID
+	}
+}
+
+// hasTask reports whether the selection carries a concrete PLAN task that must be
+// claimed and heartbeated (Work/Review/Arbitrate). Bootstrap/Reconcile operate on
+// PLAN.md itself and hold no task claim.
+func hasTask(sel *selectt.Selection) bool {
+	switch sel.Kind {
+	case selectt.Work, selectt.Review, selectt.Arbitrate:
+		return true
+	default:
+		return false
+	}
+}
+
+// isSourceCheckout reports whether dir is the root of its OWN git work tree (a
+// populated submodule checkout) rather than an empty gitlink. For an empty
+// gitlink, `git rev-parse --show-toplevel` ascends to the parent superproject,
+// so comparing the resolved top-level to dir correctly rejects it — preventing a
+// `git worktree add` from corrupting the superproject.
+func isSourceCheckout(ctx context.Context, dir string) bool {
+	top, err := git.New(dir).Run(ctx, "rev-parse", "--show-toplevel")
+	if err != nil || top == "" {
+		return false
+	}
+	a, err1 := filepath.EvalSymlinks(top)
+	b, err2 := filepath.EvalSymlinks(dir)
+	if err1 != nil || err2 != nil {
+		return top == dir
+	}
+	return a == b
+}
+
+// pushSourceBranch publishes the agent's source-branch commit to the submodule's
+// origin so the bumped submodule pointer resolves for every other host/bee — a
+// pointer naming a commit that lives only in this honeybee's local clone is
+// worthless to peers. Best-effort: a missing remote is a no-op (local install),
+// and a push failure is returned as a warning, never a hard run failure.
+func (r *Runner) pushSourceBranch(ctx context.Context, wg *git.Repo, branch string) string {
+	if wg == nil {
+		return ""
+	}
+	rem, err := wg.Remote(ctx)
+	if err != nil || rem == "" {
+		return ""
+	}
+	if err := wg.Push(ctx, rem, branch); err != nil {
+		return fmt.Sprintf("source branch %s was NOT pushed to %s (%v); the submodule pointer will dangle until pushed", branch, rem, err)
+	}
+	return ""
 }

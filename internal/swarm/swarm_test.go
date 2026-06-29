@@ -29,10 +29,14 @@ func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, err
 type mockSession struct {
 	prompts int
 	onTurn  func(turn int)
+	capture *string // when set, records the first prompt text
 }
 
 func (s *mockSession) Prompt(ctx context.Context, text string) (string, error) {
 	s.prompts++
+	if s.capture != nil && s.prompts == 1 {
+		*s.capture = text
+	}
 	if s.onTurn != nil {
 		s.onTurn(s.prompts)
 	}
@@ -68,7 +72,7 @@ func TestRunCompletes(t *testing.T) {
 
 	rp, _ := repo.Open(root)
 	subs, _ := rp.Submodules()
-	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
 	mc := &mockClient{}
 	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
@@ -100,7 +104,7 @@ func TestRunGCCap(t *testing.T) {
 	g.Commit(context.Background(), "seed")
 	rp, _ := repo.Open(root)
 	subs, _ := rp.Submodules()
-	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
 	if err != nil {
@@ -140,7 +144,7 @@ func TestTaskRemovedGuard(t *testing.T) {
 
 	rp, _ := repo.Open(root)
 	subs, _ := rp.Submodules()
-	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, BaseMain: base}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
@@ -316,5 +320,129 @@ func TestSessionAndPlanOnSeparateBranches(t *testing.T) {
 	// main: both, neither clobbered.
 	if !has(g, "main", "submodules/sm/PLAN.md") || !has(g, "main", sessRel) {
 		t.Error("main missing plan or session after convergence")
+	}
+}
+
+// TestHeartbeatTerminalNotFatal is the regression for the "turn 2 heartbeat:
+// task not in progress -> exit status 1" failure. The agent drives the task to
+// NEEDS-REVIEW during turn 1 but does NOT place the change doc where the
+// completion check looks (submodules/<sm>/docs/<branch>-<taskid>.md), so turn 1
+// does not complete. The OLD runner then crashed on turn 2's heartbeat. The
+// fixed runner must exit cleanly (no error) with a warning naming the expected
+// doc path, leaving the task in NEEDS-REVIEW for a human/reviewer.
+func TestHeartbeatTerminalNotFatal(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	// On turn 1 the agent flips to NEEDS-REVIEW (clearing heartbeat) but writes NO
+	// doc at the expected path -> completion check fails -> loop continues to turn 2.
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run must not error on a terminal-but-incomplete task, got: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("task has no doc at the expected path; must not report Completed: %+v", res)
+	}
+	if !contains(res.Warning, "completion check failed") || !contains(res.Warning, "T1") {
+		t.Fatalf("warning should report the incomplete handoff, got %q", res.Warning)
+	}
+}
+
+// TestWorkPreambleHasDocPath proves the runner's injected Context preamble (which
+// ships in the binary, not the on-disk AGENTS.md) tells the agent the exact
+// change-doc path the completion check requires.
+func TestWorkPreambleHasDocPath(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	cl.sess.capture = &firstPrompt
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !contains(firstPrompt, "submodules/sm/docs/bee-T1-T1.md") {
+		t.Fatalf("preamble missing exact doc path; got:\n%s", firstPrompt)
+	}
+	if !contains(firstPrompt, "submodules/sm/worktrees/bee-T1") {
+		t.Fatalf("preamble missing code worktree path; got:\n%s", firstPrompt)
+	}
+}
+
+// TestReviewCompletesOnStatusChange: a Review session is NOT claimed/clobbered
+// and completes the moment the agent moves the task out of NEEDS-REVIEW (here
+// -> DONE on approve). No code worktree, no heartbeat, no change-doc requirement
+// — proving the runner treats a review as a judgement, not fresh Work.
+func TestReviewCompletesOnStatusChange(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		// Approve: move out of NEEDS-REVIEW to DONE (no doc written).
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("review should complete on status change, got %+v", res)
+	}
+	// The status on disk must NOT have been clobbered to IN-PROGRESS by the runner.
+	if !contains(firstPrompt, "REVIEW") || !contains(firstPrompt, "do NOT reimplement") {
+		t.Fatalf("review preamble missing review framing; got:\n%s", firstPrompt)
+	}
+	if !contains(firstPrompt, "bee-R1") {
+		t.Fatalf("review preamble missing implementer branch ref; got:\n%s", firstPrompt)
 	}
 }

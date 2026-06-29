@@ -7,11 +7,15 @@
 //	<!-- Beehive-ROI: <sha> -->
 //	# Plan
 //
-//	## <id> [<STATUS>] <!-- attempts=N deps=a,b heartbeat=<RFC3339> -->
+//	## <id> [<STATUS>] <!-- attempts=N deps=a,b session=<id> heartbeat=<RFC3339> -->
 //	free-form body lines...
 //
 // The ROI stamp is the first comment; tasks are H2 headers carrying a metadata
-// comment. Body lines between headers belong to the preceding task.
+// comment. Body lines between headers belong to the preceding task. A task is
+// "active" (being worked right now) when it carries a session id and a heartbeat
+// fresh within the TTL — independent of its status. There is no IN-PROGRESS
+// status: every status can be actively worked. (Legacy `[IN-PROGRESS]` headers
+// parse as TODO for backward compatibility.)
 package plan
 
 import (
@@ -25,22 +29,28 @@ import (
 
 // Status is a task state. The machine is:
 //
-//	TODO -> IN-PROGRESS -> NEEDS-REVIEW -> {DONE | NEEDS-ARBITRATION}
+//	TODO -> NEEDS-REVIEW -> {DONE | NEEDS-ARBITRATION}
 //	NEEDS-ARBITRATION -> {TODO | DONE}
 //	rejections > limit -> NEEDS-HUMAN (terminal, frontend-only)
+//
+// "In progress" is NOT a status: a task being worked keeps its phase status
+// (TODO while implementing, NEEDS-REVIEW while under review, ...) and is marked
+// active by a session id + fresh heartbeat instead.
 type Status string
 
 const (
-	StatusTODO       Status = "TODO"
+	StatusTODO   Status = "TODO"
+	StatusReview Status = "NEEDS-REVIEW"
+	StatusArb    Status = "NEEDS-ARBITRATION"
+	StatusDone   Status = "DONE"
+	StatusHuman  Status = "NEEDS-HUMAN"
+	// StatusInProgress is retained only to normalize legacy PLAN.md headers on
+	// parse (-> TODO). It is never produced or selected.
 	StatusInProgress Status = "IN-PROGRESS"
-	StatusReview     Status = "NEEDS-REVIEW"
-	StatusArb        Status = "NEEDS-ARBITRATION"
-	StatusDone       Status = "DONE"
-	StatusHuman      Status = "NEEDS-HUMAN"
 )
 
 var allStatuses = map[Status]bool{
-	StatusTODO: true, StatusInProgress: true, StatusReview: true,
+	StatusTODO: true, StatusReview: true,
 	StatusArb: true, StatusDone: true, StatusHuman: true,
 }
 
@@ -52,7 +62,8 @@ type Task struct {
 	Attempts  int
 	Deps      []string
 	Weight    int       // selection weight, default 1
-	Heartbeat time.Time // zero when not IN-PROGRESS
+	Session   string    // owner's unique claim token; "" when unclaimed
+	Heartbeat time.Time // last claim stamp; zero when unclaimed
 	Body      []string  // body lines verbatim, without trailing blank
 }
 
@@ -110,6 +121,11 @@ func Parse(s string) (*Plan, error) {
 
 func parseHeader(m []string) (*Task, error) {
 	st := Status(m[2])
+	// Legacy normalization: IN-PROGRESS is no longer a status; an in-progress task
+	// is now a TODO carrying a session+heartbeat. Map it so old PLAN.md files load.
+	if st == StatusInProgress {
+		st = StatusTODO
+	}
 	if !allStatuses[st] {
 		return nil, fmt.Errorf("plan: unknown status %q for task %s", m[2], m[1])
 	}
@@ -136,6 +152,8 @@ func parseHeader(m []string) (*Task, error) {
 				return nil, fmt.Errorf("plan: bad weight %q for %s", v, t.ID)
 			}
 			t.Weight = n
+		case "session":
+			t.Session = v
 		case "heartbeat":
 			ts, err := time.Parse(time.RFC3339, v)
 			if err != nil {
@@ -177,6 +195,9 @@ func (t *Task) header() string {
 	meta := fmt.Sprintf("attempts=%d deps=%s", t.Attempts, strings.Join(t.Deps, ","))
 	if t.Weight > 1 {
 		meta += fmt.Sprintf(" weight=%d", t.Weight)
+	}
+	if t.Session != "" {
+		meta += " session=" + t.Session
 	}
 	if !t.Heartbeat.IsZero() {
 		meta += " heartbeat=" + t.Heartbeat.UTC().Format(time.RFC3339)

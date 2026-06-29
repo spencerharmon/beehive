@@ -29,7 +29,9 @@ type Kind string
 const (
 	Reconcile Kind = "reconcile" // priority 0: ROI.md drifted from PLAN stamp
 	Bootstrap Kind = "bootstrap" // ROI present, PLAN absent
-	Work      Kind = "work"      // a concrete PLAN task
+	Work      Kind = "work"      // a concrete TODO PLAN task (or a stale IN-PROGRESS task to GC)
+	Review    Kind = "review"    // a NEEDS-REVIEW task: judge an implementer's branch, do not reimplement
+	Arbitrate Kind = "arbitrate" // a NEEDS-ARBITRATION task: settle a reviewer/implementer dispute
 )
 
 // Selection is the deterministic result handed to the swarm before launch.
@@ -104,7 +106,19 @@ func (s *Selector) fromSubmodule(ctx context.Context, sm repo.Submodule, now tim
 		return nil, nil
 	}
 	t := s.pickTask(cands)
-	return &Selection{Kind: Work, Submodule: sm, Task: t}, nil
+	// Tier the selection by the task's own status so the runner claims the right
+	// kind of session. A NEEDS-REVIEW / NEEDS-ARBITRATION task becomes Review /
+	// Arbitrate (judge existing work); everything else is Work. Candidates already
+	// excluded actively-claimed tasks, so a selected task is either unclaimed or
+	// holds a stale claim the runner's own claim will overwrite.
+	kind := Work
+	switch t.Status {
+	case plan.StatusReview:
+		kind = Review
+	case plan.StatusArb:
+		kind = Arbitrate
+	}
+	return &Selection{Kind: kind, Submodule: sm, Task: t}, nil
 }
 
 // graphGate filters main-tier (TODO) candidates through the combined
