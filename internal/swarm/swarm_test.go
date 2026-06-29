@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,3 +110,52 @@ func TestRunGCCap(t *testing.T) {
 		t.Fatalf("want gc cap, got %+v", res)
 	}
 }
+
+// TestTaskRemovedGuard: an operator removes the honeybee's task from PLAN.md on
+// main after it started; the next turn's guard detects it and aborts with a
+// warning recorded in the session file.
+func TestTaskRemovedGuard(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	ctx := context.Background()
+	base, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Operator removes T1 from the plan on main after we captured base.
+	os.WriteFile(planPath, []byte("## T2 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "operator: drop T1")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, BaseMain: base}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Warning == "" || res.Completed {
+		t.Fatalf("want abort warning, got %+v", res)
+	}
+	body, _ := os.ReadFile(filepath.Join(subs[0].SessionsDir(), res.SessionID+".md"))
+	if !filepath.IsAbs(subs[0].SessionsDir()) {
+		t.Fatalf("sessions dir not absolute: %s", subs[0].SessionsDir())
+	}
+	if !contains(string(body), "warning") {
+		t.Fatalf("session file missing warning: %q", string(body))
+	}
+}
+
+func contains(s, sub string) bool { return strings.Contains(s, sub) }

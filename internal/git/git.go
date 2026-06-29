@@ -126,6 +126,30 @@ func (r *Repo) HardReset(ctx context.Context, ref string) error {
 	return err
 }
 
+// RevParse resolves ref to a full commit SHA.
+func (r *Repo) RevParse(ctx context.Context, ref string) (string, error) {
+	out, err := r.Run(ctx, "rev-parse", ref)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// Show returns the contents of path at ref (git show ref:path). An error means
+// the path does not exist at that ref (e.g. the file was deleted).
+func (r *Repo) Show(ctx context.Context, ref, path string) (string, error) {
+	return r.Run(ctx, "show", ref+":"+path)
+}
+
+// DiffPaths reports whether path changed between commits a and b.
+func (r *Repo) DiffPaths(ctx context.Context, a, b, path string) (bool, error) {
+	out, err := r.Run(ctx, "diff", "--name-only", a, b, "--", path)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
 // PublishToMain advances main to the current worktree branch's tip and pushes,
 // the conflict-free way honeybees converge. It merges the latest main into the
 // branch first (distinct session/plan files auto-merge), then updates main. With

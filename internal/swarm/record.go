@@ -57,6 +57,19 @@ func (rc *recorder) snapshot(ctx context.Context) {
 	}
 }
 
+// appendWarning records an abort notice at the end of the session file so it is
+// visible in the UI and committed. Called only after the recorder goroutine has
+// stopped (no concurrent writer to rc.path).
+func (rc *recorder) appendWarning(msg string) {
+	_ = os.MkdirAll(filepath.Dir(rc.path), 0o755)
+	f, err := os.OpenFile(rc.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "\n## \u26a0\ufe0f warning\n\n%s\n", msg)
+}
+
 // renderTranscript produces the full markdown transcript for the session file
 // and the web UI. Everything is recorded: reasoning, tool input, tool output.
 func renderTranscript(header string, msgs []Message) string {

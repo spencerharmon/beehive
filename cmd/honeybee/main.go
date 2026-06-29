@@ -64,6 +64,10 @@ func run() error {
 		}
 		base = remote + "/main"
 	}
+	baseMain, err := primary.RevParse(ctx, base)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", base, err)
+	}
 	wtBranch := swarm.SessionID("bee", time.Now())
 	wtPath := filepath.Join(primaryRoot, ".worktrees", wtBranch)
 	if err := primary.WorktreeAdd(ctx, wtPath, wtBranch, base); err != nil {
@@ -110,6 +114,7 @@ func run() error {
 
 	runner := &swarm.Runner{
 		Repo: rp, Git: gitRepo, MaxTurns: c.MaxTurns, WallCap: ttl, TTL: ttl, Publish: publish,
+		Remote: remote, BaseMain: baseMain,
 	}
 	oc := &swarm.Opencode{Base: c.AgentURL, Model: c.Model, HTTP: &http.Client{Timeout: 0}}
 	if debug {
@@ -122,6 +127,9 @@ func run() error {
 	res, err := runner.Run(ctx, sel, prompts.Agents, first)
 	if err != nil {
 		return err
+	}
+	if res.Warning != "" {
+		fmt.Fprintf(os.Stderr, "honeybee: WARNING %s\n", res.Warning)
 	}
 	fmt.Printf("honeybee: kind=%s branch=%s session=%s turns=%d done=%v gc=%v\n",
 		sel.Kind, res.Branch, res.SessionID, res.Turns, res.Completed, res.GCMarked)

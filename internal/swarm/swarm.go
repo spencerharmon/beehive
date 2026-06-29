@@ -50,6 +50,12 @@ type Runner struct {
 	// pushes (conflict-free merge of distinct files). Called after each heartbeat
 	// and at session end so peers converge "as we go". Nil in tests = local only.
 	Publish func(context.Context) error
+	// Remote is the beehive repo's push remote ("" = local only). BaseMain is the
+	// main-branch SHA this honeybee branched from at startup. Together they let
+	// each turn detect that an operator deleted the plan or removed this task on
+	// main after the honeybee started, and exit instead of working a dead task.
+	Remote   string
+	BaseMain string
 }
 
 func (r *Runner) publish(ctx context.Context) error {
@@ -73,6 +79,7 @@ type Result struct {
 	GCMarked  bool
 	Branch    string
 	SessionID string
+	Warning   string // non-empty when the run aborted (e.g. task removed on main)
 }
 
 // branchFor names the worktree branch and doc stem for a task selection.
@@ -150,35 +157,53 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	cl := &claim.Claimer{Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now}
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
-	finish := func() {
+	// finish stops the recorder, optionally records an abort warning to the
+	// session file (so it shows in the UI), then commits and publishes.
+	finish := func(warning string) {
 		recStop()
 		<-recDone
 		rec.snapshot(ctx) // final flush after the last turn settles
+		if warning != "" {
+			rec.appendWarning(warning)
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "\n⚠️  %s\n", warning)
+			}
+		}
 		r.commitSession(ctx, sid, sessionFile)
 		_ = r.publish(ctx)
 	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
+		// Guard: an operator may have deleted the plan or removed this task on main
+		// after we started. Detect it and exit rather than work a task nobody wants.
+		if removed, warning, err := r.taskRemoved(ctx, sel); err == nil && removed {
+			res.Warning = warning
+			finish(warning)
+			if wg != nil {
+				_ = wg.WorktreeRemove(ctx, wtRel)
+			}
+			return res, nil
+		}
 		if sel.Kind == selectt.Work {
 			if err := cl.Heartbeat(ctx, sel.Task.ID, r.now()); err != nil {
-				finish()
+				finish("")
 				return res, fmt.Errorf("turn %d heartbeat: %w", res.Turns, err)
 			}
 			_ = r.publish(ctx) // surface the heartbeat to peers as we go
 		}
 		if res.Turns > 1 {
 			if _, err := sess.Prompt(ctx, prompt); err != nil {
-				finish()
+				finish("")
 				return res, fmt.Errorf("turn %d prompt: %w", res.Turns, err)
 			}
 		}
 		done, err := r.complete(sel, res.Branch)
 		if err != nil {
-			finish()
+			finish("")
 			return res, err
 		}
 		if done {
 			res.Completed = true
-			finish()
+			finish("")
 			if wg != nil {
 				_ = wg.WorktreeRemove(ctx, wtRel)
 			}
@@ -190,8 +215,58 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		prompt = "continue"
 	}
 	res.GCMarked = true // turn/wall cap hit, leave IN-PROGRESS heartbeat for GC
-	finish()
+	finish("")
 	return res, nil
+}
+
+// taskRemoved checks whether the operator deleted the plan or removed this
+// honeybee's task on the beehive's main branch after the honeybee started. It
+// pulls the remote (if any), and only if main advanced and PLAN.md actually
+// changed does it re-read the plan: a missing PLAN.md or a missing task means
+// this honeybee should stop. Transient git/network errors are non-fatal (the
+// run continues) so a blip never kills a healthy honeybee. Work tasks only.
+func (r *Runner) taskRemoved(ctx context.Context, sel *selectt.Selection) (bool, string, error) {
+	if sel.Kind != selectt.Work || r.BaseMain == "" {
+		return false, "", nil
+	}
+	ref := "main"
+	if r.Remote != "" {
+		if err := r.Git.Fetch(ctx, r.Remote, "main"); err != nil {
+			return false, "", err
+		}
+		ref = r.Remote + "/main"
+	}
+	cur, err := r.Git.RevParse(ctx, ref)
+	if err != nil {
+		return false, "", err
+	}
+	if cur == r.BaseMain {
+		return false, "", nil // nothing changed since we started
+	}
+	planRel := "submodules/" + sel.Submodule.Name + "/" + repo.PlanFile
+	changed, err := r.Git.DiffPaths(ctx, r.BaseMain, cur, planRel)
+	if err != nil {
+		return false, "", err
+	}
+	if !changed {
+		return false, "", nil
+	}
+	content, err := r.Git.Show(ctx, ref, planRel)
+	if err != nil {
+		return true, fmt.Sprintf(
+			"PLAN.md for %s was deleted on %s after this honeybee started; task %s no longer exists. Exiting.",
+			sel.Submodule.Name, ref, sel.Task.ID), nil
+	}
+	p, err := plan.Parse(content)
+	if err != nil {
+		return false, "", err
+	}
+	if p.Find(sel.Task.ID) == nil {
+		return true, fmt.Sprintf(
+			"task %s was removed from %s PLAN.md on %s after this honeybee started. Exiting.",
+			sel.Task.ID, sel.Submodule.Name, ref), nil
+	}
+	return false, "", nil
 }
 
 // commitSession commits only the recorded transcript file to main. Path-scoped
