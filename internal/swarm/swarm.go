@@ -84,6 +84,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		return res, fmt.Errorf("worktree add: %w", err)
 	}
 
+	if r.Debug != nil {
+		fmt.Fprintf(r.Debug, "[honeybee] worktree=%s opening session...\n", wtDir)
+	}
 	sess, reply, err := r.Client.NewSession(ctx, wtDir, system, first)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)

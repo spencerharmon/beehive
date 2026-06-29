@@ -74,11 +74,14 @@ func run() error {
 
 	runner := &swarm.Runner{
 		Repo: rp, Git: gitRepo, MaxTurns: c.MaxTurns, WallCap: ttl, TTL: ttl,
-		Client: &swarm.Opencode{Base: c.AgentURL, Model: c.Model, HTTP: &http.Client{Timeout: 0}},
 	}
+	oc := &swarm.Opencode{Base: c.AgentURL, Model: c.Model, HTTP: &http.Client{Timeout: 0}}
 	if debug {
 		runner.Debug = os.Stderr
+		oc.Debug = os.Stderr
+		fmt.Fprintf(os.Stderr, "[honeybee] agent_url=%s model=%q kind=%s\n", c.AgentURL, c.Model, sel.Kind)
 	}
+	runner.Client = oc
 	res, err := runner.Run(ctx, sel, prompts.Agents, first)
 	if err != nil {
 		return err

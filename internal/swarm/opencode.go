@@ -18,6 +18,7 @@ type Opencode struct {
 	Base  string // server base URL
 	Model string // "provider/model"
 	HTTP  *http.Client
+	Debug io.Writer // non-nil: log each HTTP request/response
 }
 
 // NewSession creates a server session rooted at cwd and seeds the system prompt
@@ -81,6 +82,9 @@ func (o *Opencode) post(ctx context.Context, path string, body, out any) error {
 	if err != nil {
 		return err
 	}
+	if o.Debug != nil {
+		fmt.Fprintf(o.Debug, "[opencode] POST %s%s ...\n", o.Base, path)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.Base+path, bytes.NewReader(buf))
 	if err != nil {
 		return err
@@ -92,10 +96,16 @@ func (o *Opencode) post(ctx context.Context, path string, body, out any) error {
 	}
 	resp, err := cl.Do(req)
 	if err != nil {
+		if o.Debug != nil {
+			fmt.Fprintf(o.Debug, "[opencode] POST %s error: %v\n", path, err)
+		}
 		return err
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(resp.Body)
+	if o.Debug != nil {
+		fmt.Fprintf(o.Debug, "[opencode] POST %s -> %d (%d bytes)\n", path, resp.StatusCode, len(rb))
+	}
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("opencode %s: %d: %s", path, resp.StatusCode, strings.TrimSpace(string(rb)))
 	}
