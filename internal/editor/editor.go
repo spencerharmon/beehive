@@ -277,19 +277,21 @@ func (s *Session) merge(ctx context.Context) error {
 	if cerr := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); cerr != nil && cerr != git.ErrNothing {
 		return cerr
 	}
-	// Land on local main: this is what beehived's views read and what makes the
-	// proposal "live". Reliable and offline-safe.
-	if err := s.wt.UpdateLocalMain(ctx); err != nil {
-		return err
-	}
-	// Remote sync is best-effort: a protected or unreachable origin/main must not
-	// fail a merge that already succeeded locally. Surface it as a soft warning.
 	if s.remote != "" {
-		if _, err := s.wt.Run(ctx, "push", s.remote, "HEAD:refs/heads/main"); err != nil {
-			s.setErr("merged to local main; remote push failed (push it yourself if needed): " + err.Error())
+		// A configured remote is authoritative: publish to remote main (hard fail if
+		// the remote rejects). Then fast-forward local main so beehived's own views
+		// and the dirty/live state reflect it immediately; a dirty primary tree only
+		// downgrades that local sync to a soft warning — the remote already has it.
+		if err := s.wt.PublishToMain(ctx, s.remote); err != nil {
+			return err
 		}
+		if err := s.wt.UpdateLocalMain(ctx); err != nil {
+			s.setErr("pushed to remote main; local working tree not updated: " + err.Error())
+		}
+		return nil
 	}
-	return nil
+	// No remote: local main is the only target and is what makes the proposal live.
+	return s.wt.UpdateLocalMain(ctx)
 }
 
 // Diff returns the file content on main (base) and in the worktree (proposed).

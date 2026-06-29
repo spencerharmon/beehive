@@ -167,3 +167,54 @@ func TestSessionAgentPerformedMerge(t *testing.T) {
 		t.Fatalf("agent merge did not reach main: %q", string(onMain))
 	}
 }
+
+func TestSessionMergeAutoPushesRemote(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	// Bare remote that accepts pushes to main.
+	bare := t.TempDir()
+	bg := git.New(bare)
+	if _, err := bg.Run(ctx, "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatal(err)
+	}
+	g := git.New(root)
+	if _, err := g.Run(ctx, "remote", "add", "origin", bare); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Run(ctx, "push", "-q", "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	file := "submodules/sm/ROI.md"
+	fc := &fakeClient{reply: "added a goal."}
+	fc.editFn = func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(file))
+		b, _ := os.ReadFile(p)
+		_ = os.WriteFile(p, append(b, []byte("remote goal\n")...), 0o644)
+	}
+	m := newTestManager(t, root, fc)
+	sess, err := m.Open(ctx, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.remote != "origin" {
+		t.Fatalf("want remote origin, got %q", sess.remote)
+	}
+	if _, err := sess.Chat(ctx, "add a goal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Merge(ctx); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if st := sess.State(ctx); st != "live" {
+		t.Fatalf("want live after merge, got %s (err=%s)", st, sess.Err())
+	}
+	// The change must be on the remote's main.
+	out, err := bg.Run(ctx, "show", "main:"+file)
+	if err != nil {
+		t.Fatalf("read remote main: %v", err)
+	}
+	if !strings.Contains(out, "remote goal") {
+		t.Fatalf("remote main missing the change:\n%s", out)
+	}
+}
