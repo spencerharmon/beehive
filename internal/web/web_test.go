@@ -698,3 +698,62 @@ func TestEditorDiffAddDelClasses(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionLivenessBranchGone is the regression for sessions that kept showing
+// "running" / "(waiting for session output…)" long after the honeybee exited. A
+// stub whose stream branch is gone is an ended session (its finalize never
+// replaced the stub), not a live one.
+func TestSessionLivenessBranchGone(t *testing.T) {
+	s, root := setup(t)
+	ctx := context.Background()
+	gitRun := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	// A base commit so we have something to branch from.
+	os.WriteFile(filepath.Join(root, "seed"), []byte("x"), 0o644)
+	gitRun("add", "-A")
+	gitRun("commit", "-q", "-m", "seed")
+	// Fresh stream branch for the "live" session (tip time ~now).
+	gitRun("branch", "bee-live-stream")
+
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(sessDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("bee-live.md", repo.SessionStub("bee-live-stream")) // branch exists, fresh -> live
+	write("bee-dead.md", repo.SessionStub("bee-dead-stream")) // branch gone -> NOT live
+	write("bee-final.md", "# final transcript\nall done.\n")  // non-stub -> NOT live
+
+	infos := s.sessionInfos(ctx, sessDir, time.Now())
+	got := map[string]bool{}
+	for _, in := range infos {
+		got[in.ID] = in.Live
+	}
+	if !got["bee-live"] {
+		t.Errorf("bee-live: want Live=true (fresh stream branch)")
+	}
+	if got["bee-dead"] {
+		t.Errorf("bee-dead: want Live=false (stream branch gone), got true — the orphaned-stub bug")
+	}
+	if got["bee-final"] {
+		t.Errorf("bee-final: want Live=false (finished non-stub), got true")
+	}
+
+	// Body of the ended session must say so, not pretend it is still starting up.
+	w := get(t, s, "/submodule/alpha/session/bee-dead/body")
+	if w.Code != 200 {
+		t.Fatalf("body status %d", w.Code)
+	}
+	if b := w.Body.String(); !strings.Contains(b, "session ended") {
+		t.Errorf("ended-session body should explain the branch is gone, got: %q", b)
+	}
+}

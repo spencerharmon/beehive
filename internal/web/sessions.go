@@ -97,7 +97,17 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		if live, ok := s.readSessionBranch(r.Context(), streamBranch, sessRel); ok {
 			body = live
 		} else {
-			body = "(waiting for session output…)"
+			rem, _ := s.git.Remote(r.Context())
+			if _, exists := s.branchTipTime(r.Context(), streamBranch, rem); exists {
+				// Branch exists but the transcript file isn't on it yet: a session that
+				// just started and hasn't written its first commit. Genuinely waiting.
+				body = "(waiting for session output…)"
+			} else {
+				// Stub on main but the stream branch is gone: the session ended without
+				// its finalize replacing the stub (crash, or an orphaned publish). Say so
+				// rather than implying it is still spinning up.
+				body = "(session ended — live stream branch is gone; no final transcript was published)"
+			}
 		}
 	}
 	s.render(w, "session_body.html", map[string]interface{}{"Body": body})
@@ -146,11 +156,15 @@ func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []
 		live := false
 		if raw, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
 			if branch, isStub := repo.ParseSessionStub(string(raw)); isStub {
-				// Running: date by the streaming branch tip; live while the branch exists.
-				live = true
+				// A stub means a session streamed to an isolated branch. It is running
+				// only while that branch still exists and its tip is fresh. If the branch
+				// is gone, the session ended (its finalize replaced the stub on success,
+				// or was orphaned/crashed leaving the stub) — never "live".
 				if t, ok := s.branchTipTime(ctx, branch, rem); ok {
 					mod = t
 					live = now.Sub(t) < sessionLiveWindow
+				} else {
+					live = false
 				}
 			}
 		}
