@@ -437,3 +437,31 @@ pre.diff .ln.del .chg { background: var(--diff-chg-del-bg); }
   .editor-grid { flex-direction: column; }
   .editor-grid .chat, .editor-grid .diffpane { min-width: 0; width: 100%; }
 }
+
+/* Rendered markdown (editor-markdown-render) ------------------------------
+ * VIEW panes render repo markdown -> sanitized HTML inside .markdown. Styling
+ * reuses the design-system tokens so rendered docs match the rest of the UI in
+ * light + dark. Block elements (headings, p, pre, table) inherit the global
+ * rules above; this scope adds the inline/list/quote affordances and trims the
+ * leading margin so a doc opens flush with its heading. */
+.markdown { line-height: var(--leading); word-break: break-word; }
+.markdown > :first-child { margin-top: 0; }
+.markdown ul, .markdown ol { margin: 0 0 var(--space-4); padding-left: var(--space-5); }
+.markdown li { margin: var(--space-1) 0; }
+.markdown li > ul, .markdown li > ol { margin-bottom: 0; }
+.markdown :not(pre) > code {
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.1em 0.35em;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+.markdown blockquote {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-1) var(--space-4);
+  border-left: 3px solid var(--border);
+  color: var(--text-muted);
+}
+.markdown hr { border: none; border-top: var(--border-width) solid var(--border); margin: var(--space-5) 0; }
+.markdown img { max-width: 100%; }

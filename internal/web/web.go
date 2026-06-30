@@ -156,13 +156,16 @@ func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	docs := map[string]string{}
+	// Explorer is a read-only VIEW pane: render each doc markdown -> sanitized
+	// HTML (renderMarkdown drops raw HTML / unsafe links). The raw source stays
+	// reachable through the per-file editor (ROI editor / chat editor links).
+	docs := map[string]template.HTML{}
 	for label, f := range map[string]string{
 		"PLAN": repo.PlanFile, "ROI": repo.ROIFile,
 		"INFRA": repo.InfraFile, "ARTIFACTS": repo.Artifacts,
 	} {
 		if b, err := os.ReadFile(filepath.Join(sm.Path, f)); err == nil {
-			docs[label] = string(b)
+			docs[label] = renderMarkdown(string(b))
 		}
 	}
 	s.render(w, "explorer.html", map[string]interface{}{"Name": sm.Name, "Docs": docs})
@@ -261,7 +264,11 @@ func (s *Server) roiGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b, _ := os.ReadFile(sm.ROIPath())
-	s.render(w, "roi_editor.html", map[string]interface{}{"Name": sm.Name, "Body": string(b)})
+	// The textarea carries the RAW source verbatim (the edit round-trip); the
+	// preview renders the same source to sanitized HTML for reading.
+	s.render(w, "roi_editor.html", map[string]interface{}{
+		"Name": sm.Name, "Body": string(b), "Rendered": renderMarkdown(string(b)),
+	})
 }
 
 func (s *Server) roiPost(w http.ResponseWriter, r *http.Request) {
@@ -279,7 +286,7 @@ func (s *Server) roiPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.render(w, "roi_editor.html", map[string]interface{}{"Name": sm.Name, "Body": body, "Saved": true})
+	s.render(w, "roi_editor.html", map[string]interface{}{"Name": sm.Name, "Body": body, "Saved": true, "Rendered": renderMarkdown(body)})
 }
 
 func (s *Server) secretsGet(w http.ResponseWriter, r *http.Request) {
