@@ -83,6 +83,33 @@ func splitStamp(stamp string) (task, doc string) {
 	return "", ""
 }
 
+// changeDocsByTask scans a SINGLE submodule repo's history for Beehive change-doc
+// stamps ("Beehive: <taskid> <docpath>") and returns task id -> change-doc path,
+// the NEWEST stamping commit winning (git log is newest-first, so the first
+// occurrence of a task id is kept). It is how the plan view links each task to
+// the change doc its implementing commit recorded — the same stamp the branch
+// view reads. Reads only repoDir, so it never crawls another submodule; a missing
+// or empty history yields an empty map (no links, never an error to the page).
+func changeDocsByTask(ctx context.Context, repoDir string) map[string]string {
+	g := git.New(repoDir)
+	// %b is the commit body carrying the stamp; %x1e separates records.
+	out, err := g.Run(ctx, "log", "--pretty=format:%b%x1e")
+	if err != nil {
+		return nil
+	}
+	docs := map[string]string{}
+	for _, rec := range strings.Split(out, "\x1e") {
+		task, doc := splitStamp(docFromMessage(ctx, rec))
+		if task == "" || doc == "" {
+			continue
+		}
+		if _, seen := docs[task]; !seen { // newest-first: keep the latest stamp
+			docs[task] = doc
+		}
+	}
+	return docs
+}
+
 // resolveDocHref returns a link to view docPath's change doc when it names a
 // real file under the submodule's docs/ dir, else "". Only the basename is used
 // and it is traversal-guarded, so a link can never escape submodules/<sm>/docs/

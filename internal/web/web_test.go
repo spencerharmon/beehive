@@ -272,6 +272,165 @@ func TestParsePlanMissingFile(t *testing.T) {
 	}
 }
 
+// TestPlanItemViewHelpers locks the pure view projections plan-view-pills adds:
+// the design-system status pill class (base shape + lower-cased slug hue), the
+// claim state derived from session+heartbeat freshness (NOT a status), and the
+// compact heartbeat label (empty when unclaimed).
+func TestPlanItemViewHelpers(t *testing.T) {
+	for status, want := range map[string]string{
+		StatusTODO:   "status status-todo",
+		StatusReview: "status status-needs-review",
+		StatusArb:    "status status-needs-arbitration",
+		StatusDone:   "status status-done",
+		StatusHuman:  "status status-needs-human",
+	} {
+		if got := (PlanItem{Status: status}).StatusClass(); got != want {
+			t.Fatalf("StatusClass(%q) = %q, want %q", status, got, want)
+		}
+	}
+	hb := mustTime(t, "2026-06-30T11:30:00Z")
+	active := PlanItem{Active: true, Session: "bee-A", Heartbeat: hb}
+	if active.ClaimState() != "active" || active.HeartbeatLabel() != "2026-06-30 11:30Z" {
+		t.Fatalf("active: state=%q label=%q", active.ClaimState(), active.HeartbeatLabel())
+	}
+	stale := PlanItem{Stale: true, Session: "bee-B", Heartbeat: hb}
+	if stale.ClaimState() != "stale" {
+		t.Fatalf("stale state = %q, want stale", stale.ClaimState())
+	}
+	if unc := (PlanItem{}); unc.ClaimState() != "" || unc.HeartbeatLabel() != "" {
+		t.Fatalf("unclaimed: state=%q label=%q, want empty", unc.ClaimState(), unc.HeartbeatLabel())
+	}
+}
+
+// TestResolveDeps proves the dependency indicator: each dep is marked
+// satisfied/pending against the plan's own DONE set, and a dep id absent from
+// the plan (e.g. a cross-submodule reference) stays unsatisfied.
+func TestResolveDeps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "PLAN.md")
+	src := "<!-- Beehive-ROI: x -->\n# Plan\n\n" +
+		"## a [DONE] <!-- attempts=0 deps= -->\ndone dep\n\n" +
+		"## b [TODO] <!-- attempts=0 deps=a,missing -->\nneeds a (done) and missing (absent)\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := parsePlan(path, time.Now(), time.Hour)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var b PlanItem
+	for _, it := range p.Items {
+		if it.ID == "b" {
+			b = it
+		}
+	}
+	if len(b.DepStates) != 2 {
+		t.Fatalf("b deps = %+v, want 2 (a, missing)", b.DepStates)
+	}
+	if b.DepStates[0].Name != "a" || !b.DepStates[0].Done {
+		t.Fatalf("dep a should be satisfied (DONE): %+v", b.DepStates[0])
+	}
+	if b.DepStates[1].Name != "missing" || b.DepStates[1].Done {
+		t.Fatalf("dep missing should be unsatisfied (absent): %+v", b.DepStates[1])
+	}
+}
+
+// TestPlanViewPills locks the rendered plan view (plan-view-pills): a status pill
+// per status (design-system .status-<slug>), the .active overlay on a fresh
+// session+heartbeat claim (and NOT on a stale one — there is no IN-PROGRESS
+// status), satisfied vs pending dependency chips, the claim label + heartbeat,
+// and a resolved change-doc link. White-box render so active/stale is
+// deterministic (no wall clock).
+func TestPlanViewPills(t *testing.T) {
+	s, _ := setup(t)
+	hb := mustTime(t, "2026-06-30T11:30:00Z")
+	pl := Plan{ROIStamp: "abc123", Items: []PlanItem{
+		{
+			ID: "imp", Status: StatusTODO, Desc: "implement it",
+			DepStates: []Dep{{Name: "dep-done", Done: true}, {Name: "dep-todo", Done: false}},
+			Session:   "bee-A", Heartbeat: hb, Active: true,
+			DocHref: "/submodule/alpha/doc/bee-imp.md",
+		},
+		{ID: "rev", Status: StatusReview, Desc: "review me", Session: "bee-B", Heartbeat: hb, Stale: true},
+		{ID: "fin", Status: StatusDone, Desc: "shipped", Doc: "docs/tasks/fin.md"},
+		{ID: "arb", Status: StatusArb, Desc: "contested"},
+		{ID: "hum", Status: StatusHuman, Desc: "stuck"},
+	}}
+	out := renderTmpl(t, s, "plan_items.html", map[string]interface{}{"Name": "alpha", "Plan": pl})
+
+	// (1) a status pill per status (slug = lower-cased status).
+	for _, want := range []string{
+		"status status-todo", "status status-needs-review", "status status-done",
+		"status status-needs-arbitration", "status status-needs-human",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing status pill %q:\n%s", want, out)
+		}
+	}
+	// (2) the active overlay rides the FRESH-claim pill, not the stale one.
+	if !strings.Contains(out, `class="status status-todo active">TODO`) {
+		t.Fatalf("active claim did not get the .active pill overlay:\n%s", out)
+	}
+	if strings.Contains(out, "status-needs-review active") {
+		t.Fatalf("stale claim must NOT get the .active overlay:\n%s", out)
+	}
+	// (3) dependency chips: satisfied (DONE) is a .live badge, pending is plain.
+	if !strings.Contains(out, `class="badge live" title="satisfied (DONE)">dep-done`) {
+		t.Fatalf("satisfied dep chip missing:\n%s", out)
+	}
+	if !strings.Contains(out, `class="badge" title="pending">dep-todo`) {
+		t.Fatalf("pending dep chip missing:\n%s", out)
+	}
+	// (4) claim label + session + heartbeat freshness for active and stale.
+	for _, want := range []string{
+		`class="badge live">active`, "bee-A", "2026-06-30 11:30Z",
+		`class="badge">stale`, "bee-B",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("claim rendering missing %q:\n%s", want, out)
+		}
+	}
+	// (5) the change-doc link resolves; a task with only a design Doc and no
+	// resolved change doc falls back to muted text (no dead link).
+	if !strings.Contains(out, `<a href="/submodule/alpha/doc/bee-imp.md">change doc</a>`) {
+		t.Fatalf("change-doc link missing:\n%s", out)
+	}
+	if !strings.Contains(out, `<span class="muted">docs/tasks/fin.md</span>`) {
+		t.Fatalf("design-doc fallback text missing:\n%s", out)
+	}
+}
+
+// TestPlanChangeDocLink drives the change-doc linkage end-to-end through the
+// handler: it scans the submodule repo's Beehive stamps and links a task to the
+// change doc its implementing commit recorded when that doc exists under the
+// submodule's docs/, and never links a stamp whose doc is absent.
+func TestPlanChangeDocLink(t *testing.T) {
+	s, root := setup(t)
+	docsDir := filepath.Join(root, "submodules", "alpha", "docs")
+	os.MkdirAll(docsDir, 0o755)
+	os.WriteFile(filepath.Join(docsDir, "bee-t1.md"), []byte("# t1 change doc\n"), 0o644)
+	// t1's implementing commit stamps an existing doc; t2's stamps a missing one.
+	commitRepoAt(t, filepath.Join(root, "submodules", "alpha", "repo"),
+		"impl t1\n\nBeehive: t1 docs/bee-t1.md",
+		"impl t2\n\nBeehive: t2 docs/bee-missing.md")
+
+	w := get(t, s, "/submodule/alpha/plan")
+	if w.Code != 200 {
+		t.Fatalf("plan %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `href="/submodule/alpha/doc/bee-t1.md"`) {
+		t.Fatalf("t1 change-doc link missing:\n%s", body)
+	}
+	if strings.Contains(body, "/doc/bee-missing.md") {
+		t.Fatalf("absent change doc must not be linked:\n%s", body)
+	}
+	// Pills still render (status-driven, time-independent).
+	if !strings.Contains(body, "status-todo") || !strings.Contains(body, "status-needs-human") {
+		t.Fatalf("status pills missing from plan view:\n%s", body)
+	}
+}
+
 func mustTime(t *testing.T, s string) time.Time {
 	t.Helper()
 	ts, err := time.Parse(time.RFC3339, s)
