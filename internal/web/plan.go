@@ -20,21 +20,68 @@ const (
 	StatusHuman  = string(plan.StatusHuman)  // "NEEDS-HUMAN"
 )
 
+// Dep is one of a task's dependencies projected for the plan view: the
+// depended-on task id and whether it is satisfied (that task is DONE in this
+// plan). A dep id absent from this plan (e.g. a cross-submodule reference the
+// per-plan view cannot resolve) is shown unsatisfied — satisfaction is resolved
+// within the plan's own DONE set.
+type Dep struct {
+	Name string
+	Done bool
+}
+
 // PlanItem is one task row projected from a plan.Task for the templates. The
 // view needs Desc/Doc, which plan.Task does not carry, so they are derived from
 // the task body (first non-empty line / a "Doc:" convention line). Active/Stale
 // are the unified claim state (session + heartbeat freshness vs the TTL).
+// DepStates and DocHref are view-only enrichments: DepStates marks each dep
+// satisfied/pending against this plan, and DocHref links the change doc the
+// implementing commit stamped (set by the handler, which has the repo + docs/).
 type PlanItem struct {
 	ID        string
 	Status    string
 	Desc      string // first non-empty body line (plan.Task has no Desc field)
 	Deps      []string
+	DepStates []Dep // deps resolved to satisfied/pending against this plan's DONE set
 	Weight    int
 	Session   string    // claim owner; "" when unclaimed
 	Heartbeat time.Time // last claim stamp; zero when unclaimed
 	Active    bool      // claim fresh within the TTL (the unified "in progress")
 	Stale     bool      // claim past the TTL (GC-reclaimable; owner presumed dead)
 	Doc       string    // linked change-doc path from a body "Doc:" line, "" if none
+	DocHref   string    // link to view the change doc (from the commit stamp), "" if unresolved
+}
+
+// StatusClass is the design-system pill class for the task's status: the base
+// `status` shape class plus a `status-<slug>` hue class where slug is the
+// lower-cased status (NEEDS-REVIEW -> status-needs-review). Emitting the base
+// class too keeps an unknown/empty status shaped (neutral) rather than unstyled.
+func (it PlanItem) StatusClass() string {
+	return "status status-" + strings.ToLower(it.Status)
+}
+
+// ClaimState is the unified claim phase surfaced as a label: "active" (fresh
+// session+heartbeat within the TTL), "stale" (claim past the TTL — owner
+// presumed dead), or "" when unclaimed. Derived from session+heartbeat
+// freshness, never from a status (there is no IN-PROGRESS status).
+func (it PlanItem) ClaimState() string {
+	switch {
+	case it.Active:
+		return "active"
+	case it.Stale:
+		return "stale"
+	default:
+		return ""
+	}
+}
+
+// HeartbeatLabel renders the claim heartbeat as a compact UTC timestamp for the
+// view, or "" when the task is unclaimed (zero heartbeat).
+func (it PlanItem) HeartbeatLabel() string {
+	if it.Heartbeat.IsZero() {
+		return ""
+	}
+	return it.Heartbeat.UTC().Format("2006-01-02 15:04Z")
 }
 
 // Claim renders the unified claim state for the plan view's claim column:
@@ -80,7 +127,27 @@ func parsePlan(path string, now time.Time, ttl time.Duration) (Plan, error) {
 	for _, t := range parsed.Tasks {
 		p.Items = append(p.Items, projectTask(t, now, ttl))
 	}
+	resolveDeps(p.Items)
 	return p, nil
+}
+
+// resolveDeps fills each item's DepStates, marking which of its deps are DONE in
+// this plan (a satisfied/pending dependency indicator for the view). It is a
+// second pass because satisfaction needs every task's status. A dep id absent
+// from the plan (e.g. a cross-submodule reference) stays unsatisfied — the plan
+// view resolves dependency satisfaction within its own plan.
+func resolveDeps(items []PlanItem) {
+	done := make(map[string]bool, len(items))
+	for _, it := range items {
+		if it.Status == StatusDone {
+			done[it.ID] = true
+		}
+	}
+	for i := range items {
+		for _, d := range items[i].Deps {
+			items[i].DepStates = append(items[i].DepStates, Dep{Name: d, Done: done[d]})
+		}
+	}
 }
 
 // projectTask maps a plan.Task to the view's PlanItem, deriving Desc (first

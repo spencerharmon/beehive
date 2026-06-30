@@ -250,6 +250,14 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	// Link each task to the change doc its implementing commit stamped
+	// (Beehive: <taskid> <docpath>): scan this submodule's history once for the
+	// stamps, then resolve each to a viewable doc under the submodule's docs/
+	// (resolveDocHref guards traversal + existence, so a link is never dead).
+	docs := changeDocsByTask(r.Context(), sm.RepoDir())
+	for i := range p.Items {
+		p.Items[i].DocHref = resolveDocHref(sm, docs[p.Items[i].ID])
+	}
 	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p})
 }
 
