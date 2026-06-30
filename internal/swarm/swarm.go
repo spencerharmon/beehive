@@ -97,67 +97,95 @@ type Runner struct {
 // streamSession commits the current transcript to the isolated session branch
 // and, when distributed, pushes that branch to the remote — so a beehived
 // (possibly on another host) reading the branch sees the session in near real
-// time. No merge to main here; that happens once at session end. Best-effort:
-// a failed push never fails the run.
-func (r *Runner) streamSession(ctx context.Context, rel string) {
+// time. No merge to main here; that happens once at session end. Periodic
+// recorder calls ignore errors; finalization surfaces them so branch deletion is
+// gated on a real transcript copy.
+func (r *Runner) streamSession(ctx context.Context, rel string) error {
 	if r.SessionGit == nil {
-		return
+		return nil
 	}
 	if err := r.SessionGit.CommitPaths(ctx, "session: stream", rel); err != nil {
-		return // ErrNothing (no change) or a transient error: skip this tick
+		if err != git.ErrNothing {
+			return err
+		}
+		// A previous stream commit may have succeeded locally while its push failed.
+		// Push even with no new commit so finalization failure never strands the only
+		// transcript copy on an unadvertised local branch.
+		if r.SessionPush != nil {
+			return r.SessionPush(ctx)
+		}
+		return nil
 	}
 	if r.SessionPush != nil {
-		_ = r.SessionPush(ctx)
+		return r.SessionPush(ctx)
 	}
+	return nil
 }
 
 // startSession plants the stub on main (the session branch's first commit, so
 // the end merge can't conflict on the file) and returns the stub commit to
-// squash onto. No-op (returns "") when there is no session worktree (tests).
-func (r *Runner) startSession(ctx context.Context, file, rel string) string {
+// squash onto. No-op (returns "", nil) when there is no session worktree (tests).
+func (r *Runner) startSession(ctx context.Context, file, rel string) (string, error) {
 	if r.SessionGit == nil || r.SessionRoot == "" || r.SessionBranch == "" {
-		return ""
+		return "", nil
 	}
 	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
-		return ""
+		return "", fmt.Errorf("create session directory: %w", err)
 	}
 	if err := os.WriteFile(file, []byte(repo.SessionStub(r.SessionBranch)), 0o644); err != nil {
-		return ""
+		return "", fmt.Errorf("write session stub: %w", err)
 	}
 	if err := r.SessionGit.CommitPaths(ctx, "session: start "+r.SessionBranch, rel); err != nil {
-		return ""
+		return "", fmt.Errorf("commit session stub: %w", err)
 	}
-	stub, err := r.SessionGit.Head(ctx)
+	stub, err := r.SessionGit.RevParse(ctx, "HEAD")
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("resolve session stub commit: %w", err)
 	}
 	if r.SessionPublish != nil {
-		_ = r.SessionPublish(ctx) // land the stub on main so the session is discoverable
+		if err := r.SessionPublish(ctx); err != nil {
+			return "", fmt.Errorf("publish session stub: %w", err)
+		}
 	}
 	if r.SessionPush != nil {
-		_ = r.SessionPush(ctx)
+		if err := r.SessionPush(ctx); err != nil {
+			return "", fmt.Errorf("push session branch: %w", err)
+		}
 	}
-	return stub
+	return stub, nil
 }
 
 // finalizeSession squashes the rapid streaming commits down to a single commit
 // on top of the stub (keeping main history clean) and merges the durable final
 // transcript to main once. stub is the commit startSession returned; "" (tests /
 // no session worktree) makes this a no-op.
-func (r *Runner) finalizeSession(ctx context.Context, sid, rel, stub string) {
+func (r *Runner) finalizeSession(ctx context.Context, sid, rel, stub string) error {
 	if r.SessionGit == nil || stub == "" {
-		return
+		return nil
 	}
 	// Collapse stub..HEAD into one commit: --soft keeps the final file staged.
 	if _, err := r.SessionGit.Run(ctx, "reset", "--soft", stub); err != nil {
-		return
+		return fmt.Errorf("reset session branch to stub: %w", err)
 	}
 	if err := r.SessionGit.CommitPaths(ctx, "session: "+sid+"\n\nBeehive: session "+sid, rel); err != nil && err != git.ErrNothing {
-		return
+		return fmt.Errorf("commit final session transcript: %w", err)
 	}
 	if r.SessionPublish != nil {
-		_ = r.SessionPublish(ctx)
+		if err := r.SessionPublish(ctx); err != nil {
+			return fmt.Errorf("publish final session transcript: %w", err)
+		}
 	}
+	return nil
+}
+
+type sessionTranscriptError struct{ err error }
+
+func (e sessionTranscriptError) Error() string { return e.err.Error() }
+func (e sessionTranscriptError) Unwrap() error { return e.err }
+
+func isSessionTranscriptError(err error) bool {
+	var st sessionTranscriptError
+	return errors.As(err, &st)
 }
 
 func (r *Runner) publish(ctx context.Context) error {
@@ -183,6 +211,10 @@ type Result struct {
 	Branch    string
 	SessionID string
 	Warning   string // non-empty when the run aborted (e.g. task removed on main)
+	// SessionPublished is true once final session transcript replaced live stub on
+	// main. Callers may delete stream branch only when this is true; otherwise that
+	// branch is only remaining transcript source.
+	SessionPublished bool
 }
 
 // branchFor names the worktree branch and doc stem for a task selection.
@@ -344,12 +376,15 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		started: map[string]bool{},
 	}
 	if r.SessionGit != nil {
-		rec.commit = func(c context.Context) { r.streamSession(c, sessionRel) }
+		rec.commit = func(c context.Context) { _ = r.streamSession(c, sessionRel) }
 		rec.commitIvl = time.Second
 	}
 	// Plant the stub on main and capture the squash base BEFORE the recorder starts
 	// overwriting the file with the transcript.
-	stubCommit := r.startSession(ctx, sessionFile, sessionRel)
+	stubCommit, err := r.startSession(ctx, sessionFile, sessionRel)
+	if err != nil {
+		return res, err
+	}
 	recDone := make(chan struct{})
 	go func() { rec.loop(recCtx); close(recDone) }()
 
@@ -366,15 +401,24 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	finish := func(warning string) error {
 		recStop()
 		<-recDone
-		rec.snapshot(ctx) // final flush after the last turn settles
+		if err := rec.snapshot(ctx); err != nil { // final flush after the last turn settles
+			return sessionTranscriptError{err: fmt.Errorf("write final session transcript: %w", err)}
+		}
 		if warning != "" {
-			rec.appendWarning(warning)
+			if err := rec.appendWarning(warning); err != nil {
+				return sessionTranscriptError{err: fmt.Errorf("append session warning: %w", err)}
+			}
 			if r.Debug != nil {
 				fmt.Fprintf(r.Debug, "\n⚠️  %s\n", warning)
 			}
 		}
-		r.streamSession(ctx, sessionRel) // commit final transcript (incl. warning) to the branch
-		r.finalizeSession(ctx, sid, sessionRel, stubCommit)
+		if err := r.streamSession(ctx, sessionRel); err != nil { // commit final transcript (incl. warning) to the branch
+			return sessionTranscriptError{err: fmt.Errorf("stream final session transcript: %w", err)}
+		}
+		if err := r.finalizeSession(ctx, sid, sessionRel, stubCommit); err != nil {
+			return sessionTranscriptError{err: err}
+		}
+		res.SessionPublished = true
 		// Publish the work to main and RETURN the result. A failure means the change
 		// never landed on main; callers that treat the task as complete MUST gate on
 		// this so a rejected publish can never read as DONE. Always surfaced to the log.
@@ -401,7 +445,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// after we started. Detect it and exit rather than work a task nobody wants.
 		if removed, warning, err := r.taskRemoved(ctx, sel); err == nil && removed {
 			res.Warning = warning
-			finish(warning)
+			if ferr := finish(warning); ferr != nil {
+				cleanup()
+				return res, ferr
+			}
 			cleanup()
 			return res, nil
 		}
@@ -419,17 +466,22 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				// and exit cleanly — never a fatal error.
 				done, derr := r.complete(sel, res.Branch)
 				if derr != nil {
-					finish("")
+					if ferr := finish(""); ferr != nil {
+						return res, errors.Join(derr, ferr)
+					}
 					return res, derr
 				}
 				if done {
 					// Publish first; only release + report complete if main advanced.
 					if ferr := finish(""); ferr != nil {
+						cleanup()
+						if isSessionTranscriptError(ferr) {
+							return res, ferr
+						}
 						res.GCMarked = true
 						res.Warning = fmt.Sprintf(
 							"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
 							sel.Task.ID, ferr)
-						cleanup()
 						return res, nil
 					}
 					res.Completed = true
@@ -443,7 +495,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				res.Warning = fmt.Sprintf(
 					"task %s left %s but the completion check failed — left for review",
 					sel.Task.ID, sel.Task.Status)
-				finish(res.Warning)
+				if ferr := finish(res.Warning); ferr != nil {
+					cleanup()
+					return res, ferr
+				}
 				cleanup()
 				return res, nil
 			case errors.Is(err, claim.ErrLost):
@@ -453,11 +508,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				// when it sees a foreign session, ending the turn early on its own.)
 				res.Lost = true
 				res.Warning = fmt.Sprintf("lost the claim race for %s to another session; reselecting", sel.Task.ID)
-				finish(res.Warning)
+				if ferr := finish(res.Warning); ferr != nil {
+					cleanup()
+					return res, ferr
+				}
 				cleanup()
 				return res, nil
 			default:
-				finish("")
+				if ferr := finish(""); ferr != nil {
+					return res, errors.Join(fmt.Errorf("turn %d heartbeat: %w", res.Turns, err), ferr)
+				}
 				return res, fmt.Errorf("turn %d heartbeat: %w", res.Turns, err)
 			}
 		}
@@ -477,16 +537,23 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			if timedOut {
 				res.GCMarked = true
 				res.Warning = fmt.Sprintf("turn %d exceeded the %s per-turn timeout (stalled agent); abandoning for GC", res.Turns, r.TurnTimeout)
-				finish(res.Warning)
+				if ferr := finish(res.Warning); ferr != nil {
+					cleanup()
+					return res, ferr
+				}
 				cleanup()
 				return res, nil
 			}
-			finish("")
+			if ferr := finish(""); ferr != nil {
+				return res, errors.Join(fmt.Errorf("turn %d prompt: %w", res.Turns, perr), ferr)
+			}
 			return res, fmt.Errorf("turn %d prompt: %w", res.Turns, perr)
 		}
 		done, err := r.complete(sel, res.Branch)
 		if err != nil {
-			finish("")
+			if ferr := finish(""); ferr != nil {
+				return res, errors.Join(err, ferr)
+			}
 			return res, err
 		}
 		if done {
@@ -495,11 +562,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			// claimed (stale -> GC -> retry) so the work is re-driven, never silently
 			// dropped as a phantom DONE.
 			if ferr := finish(res.Warning); ferr != nil {
+				cleanup()
+				if isSessionTranscriptError(ferr) {
+					return res, ferr
+				}
 				res.GCMarked = true
 				res.Warning = fmt.Sprintf(
 					"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
 					sel.Task.ID, ferr)
-				cleanup()
 				return res, nil
 			}
 			res.Completed = true
@@ -527,7 +597,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// here (that clears the claim and would hide the abandonment) and must NOT flip
 	// status. cleanup() only removes the worktree dir; it never writes PLAN.md.
 	res.GCMarked = true
-	finish("")
+	if ferr := finish(""); ferr != nil {
+		cleanup()
+		return res, ferr
+	}
 	cleanup()
 	return res, nil
 }

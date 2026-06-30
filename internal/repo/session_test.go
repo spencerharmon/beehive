@@ -20,4 +20,9 @@ func TestParseSessionStubRejectsTranscript(t *testing.T) {
 	if branch, ok := ParseSessionStub(transcript); ok {
 		t.Fatalf("transcript misread as stub -> %q", branch)
 	}
+
+	mentionsMarker := "# session bee-T1-1\n\nbeehive-session-branch: bee-deleted-session\n"
+	if branch, ok := ParseSessionStub(mentionsMarker); ok {
+		t.Fatalf("transcript body marker misread as stub -> %q", branch)
+	}
 }

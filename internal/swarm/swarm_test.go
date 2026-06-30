@@ -334,6 +334,76 @@ func TestRunPublishesSessionToMain(t *testing.T) {
 	}
 }
 
+func TestRunKeepsSessionUnpublishedWhenFinalPublishFails(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\nbuild it\n"), 0o644)
+	g.Commit(context.Background(), "seed roi")
+
+	ctx := context.Background()
+	wtPath := filepath.Join(root, ".worktrees", "bee-fail")
+	if err := g.WorktreeAdd(ctx, wtPath, "bee-fail", "main"); err != nil {
+		t.Fatal(err)
+	}
+	sessPath := filepath.Join(root, ".worktrees", "bee-fail-session")
+	if err := g.WorktreeAdd(ctx, sessPath, "bee-fail-session", "main"); err != nil {
+		t.Fatal(err)
+	}
+	wrp, _ := repo.Open(wtPath)
+	wg := git.New(wtPath)
+	sessGit := git.New(sessPath)
+	subs, _ := wrp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	cl := &scriptClient{}
+	cl.onPrompt = func() {
+		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		_ = wg.CommitPaths(ctx, "plan: bootstrap", "submodules/sm/PLAN.md")
+	}
+	publishCalls := 0
+	r := &Runner{
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Publish:    func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
+		SessionGit: sessGit, SessionRoot: sessPath, SessionBranch: "bee-fail-session",
+		SessionPublish: func(ctx context.Context) error {
+			publishCalls++
+			if publishCalls == 2 {
+				return errors.New("final session publish failed")
+			}
+			return sessGit.PublishToMain(ctx, "")
+		},
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err == nil || !strings.Contains(err.Error(), "final session publish failed") {
+		t.Fatalf("run error = %v, want final publish error", err)
+	}
+	if res.Completed || res.SessionPublished {
+		t.Fatalf("final session publish failure must block completion and branch deletion, got %+v", res)
+	}
+	if publishCalls != 2 {
+		t.Fatalf("SessionPublish calls = %d, want start + final", publishCalls)
+	}
+
+	sessRel := "submodules/sm/sessions/" + res.SessionID + ".md"
+	mainBody, err := g.Show(ctx, "main", sessRel)
+	if err != nil {
+		t.Fatalf("main missing session stub: %v", err)
+	}
+	if _, ok := repo.ParseSessionStub(mainBody); !ok {
+		t.Fatalf("main session body should remain live stub after failed final publish, got %q", mainBody)
+	}
+	branchBody, err := g.Show(ctx, "bee-fail-session", sessRel)
+	if err != nil {
+		t.Fatalf("session branch missing final transcript: %v", err)
+	}
+	if strings.Contains(branchBody, repo.SessionStub("bee-fail-session")) || !strings.Contains(branchBody, "# session "+res.SessionID) {
+		t.Fatalf("session branch should retain final transcript, got %q", branchBody)
+	}
+}
+
 // TestSessionAndPlanOnSeparateBranches guards the deconfliction invariant: the
 // session transcript is AUTHORED on the session branch and the plan on the agent
 // branch (never the same index), and both converge on main. (After publish the

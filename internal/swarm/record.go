@@ -48,28 +48,32 @@ func (rc *recorder) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			rc.snapshot(ctx)
+			_ = rc.snapshot(ctx)
 		}
 	}
 }
 
 // snapshot fetches the session, writes the rendered transcript to the worktree
 // file, commits it to the isolated session branch (throttled), and (when debug)
-// streams new activity. Best-effort: transient poll errors are skipped.
-func (rc *recorder) snapshot(ctx context.Context) {
+// streams new activity. The recorder loop treats errors as transient; final
+// session publication checks them so it never publishes a stale or missing file.
+func (rc *recorder) snapshot(ctx context.Context) error {
 	msgs, err := rc.sess.Messages(ctx)
-	if err != nil || len(msgs) == 0 {
-		return
+	if err != nil {
+		return err
 	}
 	md := renderTranscript(rc.header, msgs)
 	if md == rc.lastMD {
 		if rc.debug != nil {
 			rc.streamDebug(msgs)
 		}
-		return
+		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(rc.path), 0o755); err == nil {
-		_ = os.WriteFile(rc.path, []byte(md), 0o644)
+	if err := os.MkdirAll(filepath.Dir(rc.path), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(rc.path, []byte(md), 0o644); err != nil {
+		return err
 	}
 	rc.lastMD = md
 	if rc.debug != nil {
@@ -83,19 +87,23 @@ func (rc *recorder) snapshot(ctx context.Context) {
 			rc.commit(ctx)
 		}
 	}
+	return nil
 }
 
 // appendWarning records an abort notice at the end of the session file so it is
 // visible in the UI and committed. Called only after the recorder goroutine has
 // stopped (no concurrent writer to rc.path).
-func (rc *recorder) appendWarning(msg string) {
-	_ = os.MkdirAll(filepath.Dir(rc.path), 0o755)
+func (rc *recorder) appendWarning(msg string) error {
+	if err := os.MkdirAll(filepath.Dir(rc.path), 0o755); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(rc.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		return
+		return err
 	}
 	defer f.Close()
-	fmt.Fprintf(f, "\n## \u26a0\ufe0f warning\n\n%s\n", msg)
+	_, err = fmt.Fprintf(f, "\n## \u26a0\ufe0f warning\n\n%s\n", msg)
+	return err
 }
 
 // renderTranscript produces the full markdown transcript for the session file

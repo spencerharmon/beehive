@@ -121,15 +121,21 @@ func run() error {
 	if err := primary.WorktreeAdd(ctx, sessPath, sessBranch, base); err != nil {
 		return fmt.Errorf("create session worktree: %w", err)
 	}
+	sessionBranchDisposable := false
 	defer func() {
 		_ = primary.WorktreeRemove(context.Background(), wtPath)
 		_, _ = primary.Run(context.Background(), "branch", "-D", wtBranch)
-		// Drop the now-merged session branch locally and on the remote (best-effort).
-		if remote != "" {
+		// Drop the session branch only after Runner confirms the final transcript
+		// replaced the live stub on main. On any publish/finalize failure, keep local
+		// and remote stream branches so beehived can still show the transcript instead
+		// of an orphaned-stub ended message.
+		if sessionBranchDisposable && remote != "" {
 			_, _ = primary.Run(context.Background(), "push", remote, "--delete", sessBranch)
 		}
 		_ = primary.WorktreeRemove(context.Background(), sessPath)
-		_, _ = primary.Run(context.Background(), "branch", "-D", sessBranch)
+		if sessionBranchDisposable {
+			_, _ = primary.Run(context.Background(), "branch", "-D", sessBranch)
+		}
 	}()
 
 	// Re-root every read and write at the isolated worktree.
@@ -243,6 +249,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		sessionBranchDisposable = res.SessionPublished
 		if res.Lost {
 			tried[key] = true
 			if res.Warning != "" {

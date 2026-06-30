@@ -27,19 +27,19 @@ func SessionStub(branch string) string {
 // content is a real transcript (a finished session), so the caller renders it
 // directly instead of resolving a branch.
 func ParseSessionStub(content string) (branch string, ok bool) {
-	// The marker is the first line; scan a small prefix to be tolerant of a BOM
-	// or leading whitespace without reading a whole large transcript.
-	head := content
-	if len(head) > 256 {
-		head = head[:256]
+	// The marker is the first line. Leading BOM/whitespace is tolerated, but a
+	// real transcript that merely mentions the marker in its body is not a stub.
+	head := strings.TrimLeft(strings.TrimPrefix(content, "\ufeff"), " \t\r\n")
+	if i := strings.IndexByte(head, '\n'); i >= 0 {
+		head = head[:i]
 	}
-	i := strings.Index(head, sessionStubPrefix)
-	if i < 0 {
+	head = strings.TrimSpace(head)
+	const marker = "<!-- " + sessionStubPrefix
+	if !strings.HasPrefix(head, marker) {
 		return "", false
 	}
-	rest := head[i+len(sessionStubPrefix):]
-	rest = strings.TrimLeft(rest, " 	") // skip the space after the colon
-	if j := strings.IndexAny(rest, " \t\r\n>"); j >= 0 {
+	rest := strings.TrimLeft(head[len(marker):], " \t") // skip the space after the colon
+	if j := strings.IndexAny(rest, " \t>"); j >= 0 {
 		// stop at whitespace or the closing of the HTML comment
 		rest = rest[:j]
 	}
