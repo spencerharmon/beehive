@@ -240,3 +240,35 @@ func TestSubmoduleLinkRejectsCycle(t *testing.T) {
 		t.Fatal("rejected cycle edge was persisted")
 	}
 }
+
+// TestAssetsStyleServed locks the design-system contract: the stylesheet is
+// still embedded and served at /assets/style.css, exposes a token root with a
+// dark-mode override, and defines a status pill class per task state plus the
+// `.active` overlay. Downstream views (dashboard-cards, plan-view-pills) emit
+// these exact class names, so a rename here must break this test on purpose.
+func TestAssetsStyleServed(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/assets/style.css")
+	if w.Code != 200 {
+		t.Fatalf("style.css status %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/css") {
+		t.Fatalf("content-type = %q, want text/css", ct)
+	}
+	body := w.Body.String()
+	must := []string{
+		":root",                      // token root
+		"prefers-color-scheme: dark", // dark mode overrides
+		".status-todo",
+		".status-needs-review",
+		".status-needs-arbitration",
+		".status-done",
+		".status-needs-human",
+		".active", // session+heartbeat overlay (no IN-PROGRESS status)
+	}
+	for _, m := range must {
+		if !strings.Contains(body, m) {
+			t.Fatalf("style.css missing %q", m)
+		}
+	}
+}

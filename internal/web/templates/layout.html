@@ -1,6 +1,8 @@
 {{define "header"}}<!doctype html>
-<html><head><meta charset="utf-8"><title>beehive</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>beehive</title>
 <script src="https://unpkg.com/htmx.org@1.9.10"></script>
 <link rel="stylesheet" href="/assets/style.css"></head>
-<body><nav><a href="/">dashboard</a> · <a href="/secrets">secrets</a> · <a href="/merge">merge</a> · <a href="/env">env</a> · <a href="/human">human</a></nav><main>{{end}}
+<body>
+<header class="topbar"><nav class="nav"><a class="brand" href="/">beehive</a><span class="nav-links"><a href="/">dashboard</a><a href="/secrets">secrets</a><a href="/merge">merge</a><a href="/env">env</a><a href="/human">human</a></span></nav></header>
+<main class="container">{{end}}
 {{define "footer"}}</main></body></html>{{end}}

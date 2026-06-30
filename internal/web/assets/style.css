@@ -1,34 +1,439 @@
-body{font-family:system-ui,sans-serif;margin:2rem;max-width:60rem}
-nav{margin-bottom:1rem}.card{border:1px solid #ccc;padding:.5rem;margin:.5rem 0}
-.badge{background:#eee;padding:0 .4rem;border-radius:.3rem}.ok{color:green}
-.badge.live{background:#1f9d55;color:#fff}
-ul.sessions{list-style:none;padding:0}ul.sessions li{padding:.2rem 0;border-bottom:1px solid #eee}
-.ago{color:#888;font-size:.85em;margin-left:.4rem}
-button.danger{background:#c0392b;color:#fff;border:0;padding:.3rem .7rem;border-radius:.3rem;margin-top:.6rem;cursor:pointer}
-pre{background:#f7f7f7;padding:.5rem;overflow:auto}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:.2rem .5rem}
-.session{white-space:pre-wrap;word-break:break-word;max-height:42rem;overflow:auto;line-height:1.35}
+/* beehive design system — single embedded stylesheet (no SPA, no CDN).
+ *
+ * Everything is driven by CSS custom properties declared on :root and flipped
+ * wholesale in the prefers-color-scheme: dark block, so light/dark differ ONLY
+ * in token values, never in rules. Downstream frontend tasks (dashboard-cards,
+ * plan-view-pills, branch-graph-sectioned, htmx-polish) consume the tokens and
+ * the status/active classes below; keep those class names stable.
+ *
+ * Status class contract (emit one per task; slug = lower-cased status):
+ *   TODO              -> .status-todo
+ *   NEEDS-REVIEW      -> .status-needs-review
+ *   NEEDS-ARBITRATION -> .status-needs-arbitration
+ *   DONE              -> .status-done
+ *   NEEDS-HUMAN       -> .status-needs-human
+ * "Active" (actively worked) is NOT a status — there is no IN-PROGRESS status.
+ * It is derived from a fresh session+heartbeat within the TTL and applied as an
+ * ADDITIVE modifier: add `.active` alongside the status pill (or to the row /
+ * card). It renders a pulsing ring + dot.
+ */
 
-/* AI editor */
-.editor-grid{display:flex;gap:1rem;align-items:flex-start}
-.editor-grid .chat{flex:1;min-width:18rem;max-height:70vh;overflow:auto}
-.editor-grid .diffpane{flex:1.4;min-width:24rem}
-.msg{padding:.3rem .5rem;margin:.3rem 0;border-radius:.4rem;background:#f4f4f4}
-.msg.user{background:#e7f0ff}
-.msg.agent{background:#eef9ee}
-.msg.err{background:#fdeaea}
-.msg .who{font-size:.7rem;text-transform:uppercase;color:#888;margin-right:.4rem}
-.msg.busy .spinner{color:#888;font-style:italic}
-.muted{color:#999}
-.statusbar{display:flex;align-items:center;gap:.6rem;margin-bottom:.4rem}
-.state{padding:.1rem .5rem;border-radius:.3rem;font-weight:bold}
-.state.dirty{background:#c0392b;color:#fff}
-.state.live{background:#1f9d55;color:#fff}
-button.merge{background:#1f9d55;color:#fff;border:0;padding:.3rem .8rem;border-radius:.3rem;cursor:pointer}
-button.merge.merged{background:#bbb;cursor:default}
-pre.diff{background:#fbfbfb;border:1px solid #e2e2e2;border-radius:.3rem;padding:.4rem;max-height:70vh;overflow:auto;white-space:pre-wrap;word-break:break-word}
-pre.diff .ln{display:block}
-pre.diff .ln.add{background:#e3f7e3}
-pre.diff .ln.del{background:#fde2e2;text-decoration:line-through}
-pre.diff .ln.eq{background:transparent}
-pre.diff .chg{background:#ffe08a;border-radius:2px}
-pre.diff .ln.del .chg{background:#ff9a9a}
+:root {
+  color-scheme: light dark;
+
+  /* Typography ------------------------------------------------------------ */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+  --leading: 1.55;
+  --leading-tight: 1.25;
+
+  /* Spacing scale --------------------------------------------------------- */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+
+  /* Radius / border ------------------------------------------------------- */
+  --radius-sm: 0.25rem;
+  --radius: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-pill: 999px;
+  --border-width: 1px;
+
+  /* Surface + text colours (light) --------------------------------------- */
+  --bg: hsl(210 22% 98%);
+  --surface: hsl(0 0% 100%);
+  --surface-2: hsl(210 20% 95%);
+  --text: hsl(216 28% 16%);
+  --text-muted: hsl(215 14% 44%);
+  --border: hsl(214 20% 86%);
+  --accent: hsl(214 82% 50%);
+  --accent-contrast: hsl(0 0% 100%);
+  --success: hsl(146 58% 36%);
+  --danger: hsl(2 68% 48%);
+  --shadow: 0 1px 2px hsl(216 28% 16% / 0.06), 0 2px 8px hsl(216 28% 16% / 0.05);
+
+  /* Status hues (one per state; shared lightness/saturation tokens below) -- */
+  --hue-todo: 215;          /* slate-blue: queued */
+  --hue-review: 38;         /* amber: awaiting review */
+  --hue-arbitration: 2;     /* red: conflict to resolve */
+  --hue-done: 146;          /* green: delivered */
+  --hue-human: 286;         /* violet: needs a human */
+  --hue-active: 174;        /* teal: actively worked */
+
+  /* Pill rendering tokens (light). Slug classes only swap the hue. -------- */
+  --pill-s: 70%;
+  --pill-bg-l: 93%;
+  --pill-border-l: 80%;
+  --pill-fg-s: 60%;
+  --pill-fg-l: 30%;
+
+  /* Editor chat bubbles (light) ------------------------------------------ */
+  --msg-bg: var(--surface-2);
+  --msg-user-bg: hsl(215 90% 94%);
+  --msg-agent-bg: hsl(146 52% 92%);
+  --msg-err-bg: hsl(2 84% 95%);
+
+  /* Diff line backgrounds (light) ---------------------------------------- */
+  --diff-add-bg: hsl(146 58% 90%);
+  --diff-del-bg: hsl(2 78% 93%);
+  --diff-chg-bg: hsl(45 100% 74%);
+  --diff-chg-del-bg: hsl(2 88% 78%);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: hsl(220 18% 10%);
+    --surface: hsl(220 16% 14%);
+    --surface-2: hsl(220 14% 19%);
+    --text: hsl(210 20% 92%);
+    --text-muted: hsl(214 13% 62%);
+    --border: hsl(220 12% 27%);
+    --accent: hsl(212 90% 64%);
+    --accent-contrast: hsl(220 30% 8%);
+    --success: hsl(146 50% 52%);
+    --danger: hsl(2 72% 60%);
+    --shadow: 0 1px 2px hsl(0 0% 0% / 0.3), 0 2px 10px hsl(0 0% 0% / 0.35);
+
+    --pill-s: 48%;
+    --pill-bg-l: 24%;
+    --pill-border-l: 36%;
+    --pill-fg-s: 70%;
+    --pill-fg-l: 80%;
+
+    --msg-user-bg: hsl(215 48% 24%);
+    --msg-agent-bg: hsl(146 32% 20%);
+    --msg-err-bg: hsl(2 46% 26%);
+
+    --diff-add-bg: hsl(146 38% 22%);
+    --diff-del-bg: hsl(2 44% 28%);
+    --diff-chg-bg: hsl(45 64% 34%);
+    --diff-chg-del-bg: hsl(2 52% 40%);
+  }
+}
+
+/* Reset / base ----------------------------------------------------------- */
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+h1, h2, h3 { font-weight: 700; letter-spacing: -0.01em; }
+h1 { font-size: var(--text-2xl); line-height: var(--leading-tight); margin: 0 0 var(--space-4); }
+h2 { font-size: var(--text-xl); line-height: var(--leading-tight); margin: var(--space-5) 0 var(--space-3); }
+h3 { font-size: var(--text-lg); margin: 0 0 var(--space-2); }
+p { margin: 0 0 var(--space-4); }
+b { font-weight: 600; }
+small, .small { font-size: var(--text-sm); }
+
+/* Layout: sticky top bar + centered content ------------------------------ */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--surface);
+  border-bottom: var(--border-width) solid var(--border);
+  box-shadow: var(--shadow);
+}
+.nav {
+  max-width: 66rem;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-5);
+}
+.brand {
+  font-weight: 800;
+  font-size: var(--text-lg);
+  color: var(--text);
+  letter-spacing: -0.02em;
+}
+.brand:hover { text-decoration: none; }
+.brand::before {
+  content: "";
+  display: inline-block;
+  width: 0.62em;
+  height: 0.62em;
+  margin-right: 0.5em;
+  border-radius: 2px;
+  background: hsl(var(--hue-review) 90% 55%);
+  transform: rotate(45deg);
+}
+.nav-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  font-size: var(--text-sm);
+}
+.nav-links a { color: var(--text-muted); }
+.nav-links a:hover { color: var(--accent); text-decoration: none; }
+
+.container {
+  max-width: 66rem;
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-5) var(--space-7);
+}
+
+/* Cards ------------------------------------------------------------------ */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: var(--space-4);
+  margin: var(--space-4) 0;
+}
+.card {
+  background: var(--surface);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  box-shadow: var(--shadow);
+}
+.card h3 { margin-bottom: var(--space-2); }
+.card h3 a { color: var(--text); }
+
+/* Badges (neutral pills; .live = success) -------------------------------- */
+.badge {
+  display: inline-block;
+  padding: 0.12em 0.6em;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  line-height: 1.5;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  border: var(--border-width) solid var(--border);
+  vertical-align: baseline;
+}
+.badge.live {
+  background: hsl(var(--hue-done) 58% 40%);
+  border-color: transparent;
+  color: #fff;
+}
+.ago { color: var(--text-muted); font-size: var(--text-xs); }
+.ok { color: var(--success); font-weight: 600; }
+.muted { color: var(--text-muted); }
+
+/* Status pills ----------------------------------------------------------- *
+ * Shape rule lists every slug so a bare `.status-done` renders fully; the
+ * slug rules that follow only set the hue (--sh). `.status` alone is a neutral
+ * pill (default hue). Keep the slug list in sync with the contract at top.   */
+.status,
+.status-todo,
+.status-needs-review,
+.status-needs-arbitration,
+.status-done,
+.status-needs-human {
+  --sh: var(--hue-todo);
+  display: inline-block;
+  padding: 0.14em 0.62em;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+  vertical-align: baseline;
+  background: hsl(var(--sh) var(--pill-s) var(--pill-bg-l));
+  color: hsl(var(--sh) var(--pill-fg-s) var(--pill-fg-l));
+  border: var(--border-width) solid hsl(var(--sh) var(--pill-s) var(--pill-border-l));
+}
+.status-todo { --sh: var(--hue-todo); }
+.status-needs-review { --sh: var(--hue-review); }
+.status-needs-arbitration { --sh: var(--hue-arbitration); }
+.status-done { --sh: var(--hue-done); }
+.status-needs-human { --sh: var(--hue-human); }
+
+/* Active overlay: additive modifier for a fresh session+heartbeat claim.
+ * Best applied to the status pill, a card, or a table row. Renders a teal
+ * ring plus a pulsing dot; motion is disabled under reduced-motion. -------- */
+.active {
+  position: relative;
+  border-color: hsl(var(--hue-active) 62% 45%) !important;
+  box-shadow: 0 0 0 1px hsl(var(--hue-active) 70% 45% / 0.45),
+              0 0 12px hsl(var(--hue-active) 80% 50% / 0.22);
+}
+.active::before {
+  content: "";
+  display: inline-block;
+  width: 0.5em;
+  height: 0.5em;
+  margin-right: 0.4em;
+  border-radius: 50%;
+  background: hsl(var(--hue-active) 75% 42%);
+  vertical-align: baseline;
+  animation: bee-pulse 1.8s ease-out infinite;
+}
+@keyframes bee-pulse {
+  0%   { box-shadow: 0 0 0 0 hsl(var(--hue-active) 75% 45% / 0.55); }
+  70%  { box-shadow: 0 0 0 0.5em hsl(var(--hue-active) 75% 45% / 0); }
+  100% { box-shadow: 0 0 0 0 hsl(var(--hue-active) 75% 45% / 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .active::before { animation: none; }
+}
+
+/* Forms + controls ------------------------------------------------------- */
+form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-4) 0;
+}
+
+button {
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--accent-contrast);
+  background: var(--accent);
+  border: var(--border-width) solid transparent;
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-4);
+}
+button:hover { filter: brightness(1.06); }
+button:disabled { opacity: 0.55; cursor: default; filter: none; }
+button.danger { background: var(--danger); margin-top: var(--space-3); }
+button.merge { background: var(--success); }
+button.merge.merged { background: var(--surface-2); color: var(--text-muted); }
+
+input, select, textarea {
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--surface);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+}
+textarea {
+  width: 100%;
+  max-width: 100%;
+  font-family: var(--font-mono);
+  line-height: var(--leading);
+}
+input:focus, select:focus, textarea:focus, button:focus-visible, a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Tables ----------------------------------------------------------------- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+  margin: var(--space-4) 0;
+}
+th, td {
+  border: var(--border-width) solid var(--border);
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+tr:hover td { background: var(--surface-2); }
+
+/* Sessions list ---------------------------------------------------------- */
+ul.sessions { list-style: none; padding: 0; margin: var(--space-4) 0; }
+ul.sessions li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  border-bottom: var(--border-width) solid var(--border);
+}
+ul.sessions .ago { margin-left: auto; }
+
+/* Preformatted / transcript ---------------------------------------------- */
+pre {
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading);
+}
+.session {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 42rem;
+  overflow: auto;
+}
+section { margin: var(--space-5) 0; }
+
+/* AI editor -------------------------------------------------------------- */
+.editor-grid { display: flex; gap: var(--space-4); align-items: flex-start; }
+.editor-grid .chat { flex: 1; min-width: 18rem; max-height: 70vh; overflow: auto; }
+.editor-grid .diffpane { flex: 1.4; min-width: 24rem; }
+.msg {
+  padding: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+  border-radius: var(--radius);
+  background: var(--msg-bg);
+}
+.msg.user { background: var(--msg-user-bg); }
+.msg.agent { background: var(--msg-agent-bg); }
+.msg.err { background: var(--msg-err-bg); }
+.msg .who {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-right: var(--space-2);
+}
+.msg.busy .spinner { color: var(--text-muted); font-style: italic; }
+
+.statusbar { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
+.state { padding: 0.12em 0.6em; border-radius: var(--radius-pill); font-weight: 700; font-size: var(--text-xs); }
+.state.dirty { background: var(--danger); color: #fff; }
+.state.live { background: var(--success); color: #fff; }
+
+pre.diff {
+  background: var(--surface);
+  max-height: 70vh;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+pre.diff .ln { display: block; padding: 0 0.3em; }
+pre.diff .ln.add { background: var(--diff-add-bg); }
+pre.diff .ln.del { background: var(--diff-del-bg); text-decoration: line-through; }
+pre.diff .ln.eq { background: transparent; }
+pre.diff .chg { background: var(--diff-chg-bg); border-radius: 2px; }
+pre.diff .ln.del .chg { background: var(--diff-chg-del-bg); }
+
+/* Narrow screens: stack the editor panes --------------------------------- */
+@media (max-width: 48rem) {
+  .editor-grid { flex-direction: column; }
+  .editor-grid .chat, .editor-grid .diffpane { min-width: 0; width: 100%; }
+}
