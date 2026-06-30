@@ -25,7 +25,7 @@ The repo root is a beehive repo; each tracked target lives at `submodules/<name>
 
 Repo root (beehive-managed defaults unless noted):
 
-- `AGENTS.md` — this file. Generic operating guide + skills. Managed.
+- `AGENTS.md` — this file. Generic operating guide + the `skills/` index. Managed.
 - `HONEYBEE.md` — the honeybee runtime protocol the runner injects each pass. Managed.
 - `BOOTSTRAP.md` — step-by-step guide to stand up a new install (locals, infra,
   submodules, scheduler). Managed.
@@ -51,55 +51,28 @@ Per submodule (`submodules/<name>/`):
   submodule-local rules overlay). Render whether or not present; absent ones are
   created on first edit.
 
-## Skills (standard procedures)
+## Skills (the `skills/` directory)
 
-### Modify an ROI
-`ROI.md` is human/operator-owned and hook-protected against honeybee edits. To
-change a target's intent, edit `submodules/<name>/ROI.md` directly (as the operator,
-or via the UI editor), commit it, and let the next **reconcile** pass fold the diff
-into `PLAN.md` (it compares `ROI.md`'s head against `PLAN.md`'s `Beehive-ROI` stamp).
-Never edit `PLAN.md` by hand to "apply" an ROI change — reconcile owns that and will
-re-weight tasks on the logarithmic priority scale.
+Standard procedures are NOT inlined here. Each lives as its own file under the
+repo-root **`skills/`** directory, is individually tracked and maintained, and is
+refreshed by `beehive instruction update` (the skill files are part of the managed
+set). **Read a skill file into context only when your task matches it** — do not load
+them all up front. Resolve a skill's path against `skills/` at the repo root.
 
-### Add a submodule
-`beehive submodule add <name> <git-url>` registers the target's source as a
-submodule under `submodules/<name>/repo/`, scaffolds the beehive layer, and updates
-`.gitmodules`. Then author `submodules/<name>/ROI.md` (the intent). The next
-**bootstrap** pass (ROI present, PLAN absent) decomposes it into a weighted `PLAN.md`.
-Use `beehive submodule link <a> <b>` to record cross-submodule dependencies.
+| Skill | Read it when | File |
+|-------|--------------|------|
+| Modify an ROI | a target's intent must change | `skills/modify-roi.md` |
+| Add a submodule | bringing a new target under the swarm | `skills/add-submodule.md` |
+| Remove a submodule | retiring a target | `skills/remove-submodule.md` |
+| Bootstrap | standing up a new target or whole install | `skills/bootstrap.md` |
+| Rebootstrap | rebuilding a target's plan from scratch | `skills/rebootstrap.md` |
+| Cleanup | clearing stale worktrees/branches/claims/drift | `skills/cleanup.md` |
+| Update instructions | refreshing managed files to new binary defaults | `skills/update-instructions.md` |
 
-### Remove a submodule
-Use `beehive submodule rm <name>` (deregisters the gitlink, removes the
-`submodules/<name>/` tree and its `.gitmodules` entry). Removing intent for a target
-that still has in-flight work: retire its `PLAN.md` tasks first (reconcile moves
-in-flight retirees to `NEEDS-REVIEW`) so nothing is silently dropped.
-
-### Bootstrap
-Standing up a new target: add the submodule, write `ROI.md`, and a bootstrap pass
-will create `PLAN.md`. Standing up a whole install: follow `BOOTSTRAP.md`.
-
-### Rebootstrap
-To rebuild a target's plan from scratch (e.g. ROI was rewritten wholesale), remove
-`submodules/<name>/PLAN.md` and let a bootstrap pass regenerate it from `ROI.md`.
-In-flight worktrees/claims should be drained first; surviving `docs/` remain as
-history. Prefer a normal reconcile for incremental ROI edits — rebootstrap is the
-heavy hammer.
-
-### Cleanup operations
-Stale worktrees, orphan gitlinks, drifted submodule checkouts, and abandoned
-session branches accumulate. Use the `beehive-hygiene` skill / `beehive submodule
-sync <name>` to resync a drifted submodule checkout to its recorded gitlink, and
-prune stale `worktrees/` and dead session branches. Healthy state: clean tree, every
-gitlink checked out, no zombie task claims past TTL.
-
-### Update instructions
-`beehive instruction update [--clobber]` rewrites the managed instruction files
-(`AGENTS.md`, `HONEYBEE.md`, `BOOTSTRAP.md`) to the binary's current defaults:
-- An unchanged or missing file is written in place.
-- A file you have modified is, without `--clobber`, offered for confirmation
-  (overwrite y/N); with `--clobber` it is backed up to `<name>.<epoch>.bak` and
-  replaced. The backup and the new copy are both committed.
-`LOCALS.md` and per-repo content are never touched.
+The binary ships a default for every skill above; a site may add its own skill files
+to `skills/` (an update never deletes them) or customize a shipped one (an update
+backs the customized copy up before replacing it). Keep this index in sync when you
+add a local skill so agents can discover it.
 
 ## Absolute rules (apply to every agent)
 

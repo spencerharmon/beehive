@@ -23,13 +23,28 @@ type File struct {
 	Default string
 }
 
-// Files returns the managed instruction-file set, in install order.
+// Files returns the managed instruction-file set, in install order: the root docs
+// first, then every skill under skills/. Names may contain a directory (skills/...);
+// callers create parent dirs as needed.
 func Files() []File {
-	return []File{
+	files := []File{
 		{Name: "AGENTS.md", Default: prompts.Agents},
 		{Name: "HONEYBEE.md", Default: prompts.Honeybee},
 		{Name: "BOOTSTRAP.md", Default: prompts.BootstrapGuide},
 	}
+	for _, s := range prompts.Skills() {
+		files = append(files, File{Name: filepath.ToSlash(filepath.Join("skills", s.Name)), Default: s.Body})
+	}
+	return files
+}
+
+// writeFile writes body to <root>/<name>, creating parent directories (skills/).
+func writeFile(root, name string, body []byte) error {
+	dst := filepath.Join(root, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(dst, body, 0o644)
 }
 
 // Status is the per-file outcome of a scan or update.
@@ -71,7 +86,7 @@ func Scan(root string) (map[string]Status, error) {
 }
 
 func stat(root string, f File) (Status, []byte, error) {
-	b, err := os.ReadFile(filepath.Join(root, f.Name))
+	b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(f.Name)))
 	if os.IsNotExist(err) {
 		return Missing, nil, nil
 	}
@@ -110,12 +125,11 @@ func Update(ctx context.Context, root string, clobber bool, confirm Confirm) ([]
 		if err != nil {
 			return nil, err
 		}
-		dst := filepath.Join(root, f.Name)
 		switch st {
 		case Clean:
 			results = append(results, Result{Name: f.Name, Action: "up-to-date"})
 		case Missing:
-			if err := os.WriteFile(dst, []byte(f.Default), 0o644); err != nil {
+			if err := writeFile(root, f.Name, []byte(f.Default)); err != nil {
 				return nil, err
 			}
 			commitPaths = append(commitPaths, f.Name)
@@ -130,10 +144,10 @@ func Update(ctx context.Context, root string, clobber bool, confirm Confirm) ([]
 				continue
 			}
 			bak := fmt.Sprintf("%s.%d.bak", f.Name, time.Now().Unix())
-			if err := os.WriteFile(filepath.Join(root, bak), cur, 0o644); err != nil {
+			if err := writeFile(root, bak, cur); err != nil {
 				return nil, err
 			}
-			if err := os.WriteFile(dst, []byte(f.Default), 0o644); err != nil {
+			if err := writeFile(root, f.Name, []byte(f.Default)); err != nil {
 				return nil, err
 			}
 			commitPaths = append(commitPaths, bak, f.Name)
@@ -154,13 +168,13 @@ func Update(ctx context.Context, root string, clobber bool, confirm Confirm) ([]
 func Install(root string) ([]string, error) {
 	var created []string
 	for _, f := range Files() {
-		dst := filepath.Join(root, f.Name)
+		dst := filepath.Join(root, filepath.FromSlash(f.Name))
 		if _, err := os.Stat(dst); err == nil {
 			continue
 		} else if !os.IsNotExist(err) {
 			return created, err
 		}
-		if err := os.WriteFile(dst, []byte(f.Default), 0o644); err != nil {
+		if err := writeFile(root, f.Name, []byte(f.Default)); err != nil {
 			return created, err
 		}
 		created = append(created, f.Name)

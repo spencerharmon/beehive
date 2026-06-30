@@ -51,6 +51,20 @@ func TestInstallThenUpdate(t *testing.T) {
 			t.Fatalf("%s not installed: %v", f.Name, err)
 		}
 	}
+	// The managed set must include the skills/ directory files, not just the three
+	// root docs, and they must land under skills/.
+	var skillCount int
+	for _, f := range Files() {
+		if strings.HasPrefix(f.Name, "skills/") {
+			skillCount++
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(f.Name))); err != nil {
+				t.Fatalf("skill %s not installed under skills/: %v", f.Name, err)
+			}
+		}
+	}
+	if skillCount == 0 {
+		t.Fatal("managed set has no skills/ files; skills must be individually tracked")
+	}
 	// Install does not commit (the init caller owns that); track them so a later
 	// clobber commit can leave a clean tree.
 	commitAll(t, root, "init instructions")

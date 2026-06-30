@@ -1,7 +1,13 @@
 // Package prompts embeds the system + user prompts used by the honeybee runner.
 package prompts
 
-import _ "embed"
+import (
+	"embed"
+	_ "embed"
+	"io/fs"
+	"sort"
+	"strings"
+)
 
 //go:embed AGENTS.md
 var Agents string
@@ -37,3 +43,39 @@ var Reconcile string
 
 //go:embed continue.md
 var Continue string
+
+// skillsFS holds the default skill files. Each is a managed instruction file
+// installed under the repo's skills/ directory; AGENTS.md indexes them and an agent
+// reads the relevant one into context on demand. Defaults are refreshed by
+// `beehive instruction update`.
+//
+//go:embed skills/*.md
+var skillsFS embed.FS
+
+// Skill is one default skill file: its base name (e.g. "cleanup.md") and body.
+type Skill struct {
+	Name string
+	Body string
+}
+
+// Skills returns the embedded default skill files, sorted by name. The install path
+// for each is skills/<Name> under the repo root.
+func Skills() []Skill {
+	ents, err := fs.ReadDir(skillsFS, "skills")
+	if err != nil {
+		panic("prompts: reading embedded skills: " + err.Error())
+	}
+	var out []Skill
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		b, err := skillsFS.ReadFile("skills/" + e.Name())
+		if err != nil {
+			panic("prompts: reading embedded skill " + e.Name() + ": " + err.Error())
+		}
+		out = append(out, Skill{Name: e.Name(), Body: string(b)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
