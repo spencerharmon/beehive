@@ -296,3 +296,70 @@ func TestSelectReclaimsStaleClaim(t *testing.T) {
 		t.Fatalf("want Work/S1 (reclaimed), got %+v", s)
 	}
 }
+
+// TestReconcileRangeEmptyBase proves that with no prior ROI stamp the reconcile
+// diff base is git's empty-tree sha (a valid revision) — NOT the bogus "ROOT"
+// sentinel — so `git diff <empty-tree>..<head>` yields the full initial ROI as
+// additions instead of erroring on an unknown revision.
+func TestReconcileRangeEmptyBase(t *testing.T) {
+	_, g, root := hive(t)
+	// ROI.md present and committed, PLAN.md present but UNSTAMPED -> empty base.
+	sub(root, "a", map[string]string{"ROI.md": "x", "PLAN.md": "## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	ctx := context.Background()
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	var sm repo.Submodule
+	for _, s := range subs {
+		if s.Name == "a" {
+			sm = s
+		}
+	}
+	head, err := g.LastCommit(ctx, "submodules/a/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	rng, err := sel(root, g).reconcileRange(ctx, sm)
+	if err != nil {
+		t.Fatalf("reconcileRange: %v", err)
+	}
+	if want := emptyTree + ".." + head; rng != want {
+		t.Fatalf("empty-base range: got %q want %q", rng, want)
+	}
+	// The range must be a VALID git diff argument ("ROOT" was not): the empty-tree
+	// base makes the whole ROI show up as additions.
+	if _, err := g.Run(ctx, "diff", "--stat", rng); err != nil {
+		t.Fatalf("range %q is not a valid git diff arg: %v", rng, err)
+	}
+}
+
+// TestReconcilePrefixStampNoDrift proves a SHORT ROI stamp that prefixes the full
+// head sha is treated as up-to-date (reconcileRange returns "" — no drift), the
+// selection-side mirror of Runner.reconciled's prefix match.
+func TestReconcilePrefixStampNoDrift(t *testing.T) {
+	_, g, root := hive(t)
+	sub(root, "a", map[string]string{"ROI.md": "x", "PLAN.md": "placeholder\n"})
+	ctx := context.Background()
+	g.Commit(ctx, "seed")
+	head, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+	// Stamp PLAN.md with only the first 12 chars of the full ROI head sha.
+	os.WriteFile(filepath.Join(root, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head[:12]+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	var sm repo.Submodule
+	for _, s := range subs {
+		if s.Name == "a" {
+			sm = s
+		}
+	}
+	rng, err := sel(root, g).reconcileRange(ctx, sm)
+	if err != nil {
+		t.Fatalf("reconcileRange: %v", err)
+	}
+	if rng != "" {
+		t.Fatalf("short prefix stamp must read as no-drift, got range %q", rng)
+	}
+}

@@ -34,6 +34,12 @@ const (
 	Arbitrate Kind = "arbitrate" // a NEEDS-ARBITRATION task: settle a reviewer/implementer dispute
 )
 
+// emptyTree is git's canonical empty-tree object sha. It is the reconcile diff
+// base when PLAN.md carries no prior ROI stamp: `git diff <emptyTree>..<head>`
+// yields the entire initial ROI as additions. The previous "ROOT" sentinel was
+// not a valid git revision, so the resulting range was unusable.
+const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
 // Selection is the deterministic result handed to the swarm before launch.
 type Selection struct {
 	Kind      Kind
@@ -169,7 +175,7 @@ func (s *Selector) reconcileRange(ctx context.Context, sm repo.Submodule) (strin
 	}
 	from := stamp
 	if from == "" {
-		from = "ROOT"
+		from = emptyTree
 	}
 	return from + ".." + head, nil
 }
