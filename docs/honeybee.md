@@ -2,7 +2,8 @@
 
 A honeybee is one process working one task to completion, then exiting. There is
 no controller — anything that can run a command (cron, script, CI, k8s job) can
-start honeybees. The swarm coordinates only through git merges.
+start honeybees. The swarm coordinates only through git merges. See
+`docs/orchestration.md` for a scheduled-swarm example (systemd timer).
 
 ## Start
 

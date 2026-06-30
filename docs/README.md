@@ -45,6 +45,7 @@ Single `SECRETS.yaml.gpg`, one encrypted yaml doc, referenced by INFRASTRUCTURE.
 - `docs/install.md` — install, packaging, /etc/beehive, release verification
 - `docs/secrets.md` — gpg secrets workflow
 - `docs/honeybee.md` — honeybee operation + turn loop
+- `docs/orchestration.md` — scheduling passes (systemd timer example)
 - `docs/opencode.md` — agent backend setup
 - `docs/cli.md` — CLI reference
 - `docs/repo-layout.md` — beehive repo layout
