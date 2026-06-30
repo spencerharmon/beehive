@@ -72,6 +72,17 @@ beehived -repo /path/to/beehive-repo
 # http://localhost:8955
 ```
 
+## Install systemd user units
+
+For user-local config and services:
+
+```sh
+./scripts/install-systemd-user.sh --repo /path/to/beehive-repo --now
+```
+
+This creates `~/.config/beehive/config.yaml`, creates/generates a real gpg key under `~/.config/beehive/gnupg`, installs `beehived.service`, `beehive-honeybee.service`, and `beehive-honeybee.timer` under `~/.config/systemd/user`, reloads systemd user units, enables them, and starts them when `--now` is present.
+
+
 Expose on all interfaces:
 
 ```sh

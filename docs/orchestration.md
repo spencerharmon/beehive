@@ -18,6 +18,47 @@ Assumptions in examples below:
 
 Replace paths for your host.
 
+## Installer script
+
+For a user-local install, let the helper create config, keyring, and units:
+
+```sh
+./scripts/install-systemd-user.sh --repo ~/beehive-infra --now
+```
+
+What it does:
+
+- Creates `~/.config/beehive/config.yaml` if missing.
+- Creates `~/.config/beehive/gnupg` with mode `0700`.
+- Generates a real gpg key in that keyring when no secret key exists.
+- Writes `~/.config/systemd/user/beehived.service`.
+- Writes `~/.config/systemd/user/beehive-honeybee.service`.
+- Writes `~/.config/systemd/user/beehive-honeybee.timer`.
+- Runs `systemctl --user daemon-reload`.
+- Enables units by default; `--now` starts frontend and timer.
+
+Common variants:
+
+```sh
+# Write + enable units, but do not start them yet.
+./scripts/install-systemd-user.sh --repo ~/beehive-infra
+
+# Write units only; no enable/start.
+./scripts/install-systemd-user.sh --repo ~/beehive-infra --no-enable
+
+# Headless host: keep user manager alive after logout.
+./scripts/install-systemd-user.sh --repo ~/beehive-infra --linger --now
+
+# Custom schedule and bind address.
+./scripts/install-systemd-user.sh \
+  --repo ~/beehive-infra \
+  --addr 127.0.0.1:8955 \
+  --calendar '*:0/15' \
+  --now
+```
+
+The default config dir is `~/.config/beehive`; override with `--config-dir` or `BEEHIVE_CONFIG_DIR`.
+
 ## Frontend daemon unit
 
 `~/.config/systemd/user/beehived.service`:
@@ -32,7 +73,6 @@ After=network-online.target
 Type=simple
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=BEEHIVE_CONFIG_DIR=%h/.config/beehive
-WorkingDirectory=%h/beehive-infra
 ExecStart=/usr/bin/env beehived -addr 0.0.0.0:8955 -repo %h/beehive-infra
 Restart=on-failure
 RestartSec=5s

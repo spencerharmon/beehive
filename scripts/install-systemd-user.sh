@@ -1,0 +1,253 @@
+#!/usr/bin/env sh
+# Install beehive systemd user units and user-local config/keyring.
+#
+# Creates:
+#   ~/.config/beehive/config.yaml
+#   ~/.config/beehive/gnupg/       (with a real gpg key if no secret key exists)
+#   ~/.config/systemd/user/beehived.service
+#   ~/.config/systemd/user/beehive-honeybee.service
+#   ~/.config/systemd/user/beehive-honeybee.timer
+#
+# Safe to re-run: existing config.yaml and gpg keys are not clobbered. Unit files
+# are regenerated from arguments so path/port/schedule changes take effect after
+# daemon-reload.
+set -eu
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/install-systemd-user.sh --repo PATH [options]
+
+Required:
+  --repo PATH              beehive orchestration repo served by beehived and honeybee
+
+Options:
+  --config-dir PATH        config/keyring dir (default: $HOME/.config/beehive)
+  --addr ADDR              beehived listen address (default: 0.0.0.0:8955)
+  --calendar SPEC          honeybee timer OnCalendar value (default: *:0/7)
+  --on-active DURATION     honeybee timer OnActiveSec value (default: 2min)
+  --runtime-max SEC        transient honeybee RuntimeMaxSec (default: 21600)
+  --path PATH              PATH used by units (default: $HOME/.local/bin:/usr/local/bin:/usr/bin:/bin)
+  --no-debug               omit --debug from honeybee command
+  --no-enable              write units and daemon-reload, but do not enable them
+  --now                    start beehived.service and beehive-honeybee.timer after enabling
+  --linger                 run loginctl enable-linger for this user
+  -h, --help               show this help
+
+Environment defaults:
+  BEEHIVE_REPO             repo path if --repo is omitted
+  BEEHIVE_CONFIG_DIR       config dir if --config-dir is omitted
+EOF
+}
+
+repo="${BEEHIVE_REPO:-}"
+config_dir="${BEEHIVE_CONFIG_DIR:-$HOME/.config/beehive}"
+addr="0.0.0.0:8955"
+calendar="*:0/7"
+on_active="2min"
+runtime_max="21600"
+unit_path="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+debug=1
+enable_units=1
+start_now=0
+enable_linger=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo)
+      [ "$#" -ge 2 ] || { echo "--repo requires PATH" >&2; exit 2; }
+      repo="$2"; shift 2 ;;
+    --config-dir)
+      [ "$#" -ge 2 ] || { echo "--config-dir requires PATH" >&2; exit 2; }
+      config_dir="$2"; shift 2 ;;
+    --addr)
+      [ "$#" -ge 2 ] || { echo "--addr requires ADDR" >&2; exit 2; }
+      addr="$2"; shift 2 ;;
+    --calendar)
+      [ "$#" -ge 2 ] || { echo "--calendar requires SPEC" >&2; exit 2; }
+      calendar="$2"; shift 2 ;;
+    --on-active)
+      [ "$#" -ge 2 ] || { echo "--on-active requires DURATION" >&2; exit 2; }
+      on_active="$2"; shift 2 ;;
+    --runtime-max)
+      [ "$#" -ge 2 ] || { echo "--runtime-max requires seconds" >&2; exit 2; }
+      runtime_max="$2"; shift 2 ;;
+    --path)
+      [ "$#" -ge 2 ] || { echo "--path requires PATH" >&2; exit 2; }
+      unit_path="$2"; shift 2 ;;
+    --no-debug)
+      debug=0; shift ;;
+    --no-enable)
+      enable_units=0; shift ;;
+    --now)
+      start_now=1; enable_units=1; shift ;;
+    --linger)
+      enable_linger=1; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 2 ;;
+  esac
+done
+
+[ -n "$repo" ] || { echo "--repo PATH is required (or set BEEHIVE_REPO)" >&2; exit 2; }
+[ -n "$HOME" ] || { echo "HOME is not set" >&2; exit 2; }
+
+case "$config_dir" in
+  /*) ;;
+  *) echo "--config-dir must be absolute: $config_dir" >&2; exit 2 ;;
+esac
+case "$runtime_max" in
+  *[!0-9]*|'') echo "--runtime-max must be integer seconds: $runtime_max" >&2; exit 2 ;;
+esac
+
+if [ ! -d "$repo" ]; then
+  echo "repo path does not exist: $repo" >&2
+  exit 2
+fi
+repo=$(CDPATH= cd "$repo" && pwd)
+
+unit_dir="$HOME/.config/systemd/user"
+gpg_home="$config_dir/gnupg"
+
+# systemd expands % specifiers in unit files. Escape literal percent signs from
+# operator-provided paths/values before writing them.
+escape_unit() {
+  printf '%s' "$1" | sed 's/%/%%/g'
+}
+
+unit_repo=$(escape_unit "$repo")
+unit_config_dir=$(escape_unit "$config_dir")
+unit_addr=$(escape_unit "$addr")
+unit_path_escaped=$(escape_unit "$unit_path")
+unit_calendar=$(escape_unit "$calendar")
+unit_on_active=$(escape_unit "$on_active")
+
+mkdir -p "$config_dir" "$gpg_home" "$unit_dir"
+chmod 0700 "$gpg_home"
+
+if [ ! -f "$config_dir/config.yaml" ]; then
+  cat > "$config_dir/config.yaml" <<EOF
+gpg_home: $gpg_home
+agent_cmd: opencode
+ttl_minutes: 60
+max_turns: 15
+reject_limit: 3
+EOF
+  echo "wrote $config_dir/config.yaml"
+else
+  echo "config exists; leaving untouched: $config_dir/config.yaml"
+fi
+
+if ! command -v gpg >/dev/null 2>&1; then
+  echo "gpg is required to create/check $gpg_home" >&2
+  exit 1
+fi
+
+if ! gpg --homedir "$gpg_home" --list-secret-keys 2>/dev/null | grep -q .; then
+  gpg --homedir "$gpg_home" --batch --gen-key <<EOF
+%no-protection
+Key-Type: eddsa
+Key-Curve: ed25519
+Subkey-Type: ecdh
+Subkey-Curve: cv25519
+Name-Real: beehive
+Name-Comment: user secrets keyring
+Name-Email: beehive@localhost
+Expire-Date: 0
+%commit
+EOF
+  echo "generated beehive gpg key in $gpg_home"
+else
+  echo "gpg key already present in $gpg_home; leaving untouched"
+fi
+
+cat > "$unit_dir/beehived.service" <<EOF
+[Unit]
+Description=Beehive frontend daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment="PATH=$unit_path_escaped"
+Environment="BEEHIVE_CONFIG_DIR=$unit_config_dir"
+ExecStart=/usr/bin/env beehived -addr "$unit_addr" -repo "$unit_repo"
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+EOF
+
+honeybee_debug_arg=""
+if [ "$debug" -eq 1 ]; then
+  honeybee_debug_arg=" --debug"
+fi
+
+cat > "$unit_dir/beehive-honeybee.service" <<EOF
+[Unit]
+Description=Launch a beehive honeybee pass
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment="PATH=$unit_path_escaped"
+Environment="BEEHIVE_CONFIG_DIR=$unit_config_dir"
+ExecStart=/usr/bin/systemd-run --user --collect --quiet \\
+  -p SyslogIdentifier=honeybee \\
+  -p RuntimeMaxSec=$runtime_max \\
+  /usr/bin/env "PATH=$unit_path_escaped" "BEEHIVE_CONFIG_DIR=$unit_config_dir" \\
+  beehive honeybee start "$unit_repo"$honeybee_debug_arg
+EOF
+
+cat > "$unit_dir/beehive-honeybee.timer" <<EOF
+[Unit]
+Description=Schedule beehive honeybee passes
+
+[Timer]
+OnActiveSec=$unit_on_active
+OnCalendar=$unit_calendar
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "systemctl not found; unit files written but user manager not reloaded" >&2
+  exit 1
+fi
+
+systemctl --user daemon-reload
+
+if [ "$enable_units" -eq 1 ]; then
+  systemctl --user enable beehived.service beehive-honeybee.timer
+fi
+
+if [ "$start_now" -eq 1 ]; then
+  systemctl --user start beehived.service beehive-honeybee.timer
+fi
+
+if [ "$enable_linger" -eq 1 ]; then
+  if ! command -v loginctl >/dev/null 2>&1; then
+    echo "loginctl not found; cannot enable lingering" >&2
+    exit 1
+  fi
+  loginctl enable-linger "$USER"
+fi
+
+echo "installed systemd user units in $unit_dir"
+echo "config: $config_dir"
+echo "gpg_home: $gpg_home"
+echo "repo: $repo"
+if [ "$start_now" -eq 0 ]; then
+  if [ "$enable_units" -eq 1 ]; then
+    echo "units enabled but not started; use --now or run: systemctl --user start beehived.service beehive-honeybee.timer"
+  else
+    echo "units written but not enabled; run: systemctl --user enable beehived.service beehive-honeybee.timer"
+  fi
+fi
