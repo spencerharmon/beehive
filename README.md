@@ -89,6 +89,16 @@ beehive honeybee start submodules/project
 beehived -repo .
 ```
 
+## Systemd user units
+
+Example user units for `beehived.service`, `beehive-honeybee.service`, and `beehive-honeybee.timer` live in `docs/orchestration.md`. They run the frontend on port `8955` and launch honeybee passes as transient `run-*.service` units so long passes do not block the timer.
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now beehived.service
+systemctl --user enable --now beehive-honeybee.timer
+```
+
 Core files:
 
 - `ROI.md` — human-owned record of intent. Agents must not edit it.
