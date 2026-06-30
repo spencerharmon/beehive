@@ -48,7 +48,7 @@ type Infra struct {
 	Active  string   // value of the Active: marker, "" if absent
 	Envs    []string // values of the Environments: marker, nil if absent
 	body    []string // every line verbatim (newline stripped), for round-trip
-	present bool      // the document existed (vs a synthesized empty model)
+	present bool     // the document existed (vs a synthesized empty model)
 }
 
 // Deployment is the resolved blue/green state: the document's markers with
