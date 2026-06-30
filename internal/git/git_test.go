@@ -310,3 +310,60 @@ func TestRemoteConfigSnapshotRestore(t *testing.T) {
 		t.Fatalf("origin url not restored: %q", u)
 	}
 }
+
+// TestPublishToMainHealsDirtyLocalTree proves the reset fallback: when the local
+// checked-out main worktree is dirty (a tracked file modified out-of-band, the
+// same way a lagging submodule checkout dirties it), a publish from a linked
+// worktree branch is not lost — PublishToMain resets the projection tree to HEAD
+// and lands the commit. Mirrors the production single-host (no-remote) path.
+func TestPublishToMainHealsDirtyLocalTree(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	// Seed main with a tracked file and a committed baseline.
+	if err := os.WriteFile(filepath.Join(r.Dir, "f"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Commit(ctx, "base"); err != nil {
+		t.Fatalf("base commit: %v", err)
+	}
+	base, _ := r.Head(ctx)
+
+	// A honeybee worktree on its own branch with a new commit to publish.
+	wt := filepath.Join(t.TempDir(), "wt")
+	if err := r.WorktreeAdd(ctx, wt, "bee-x", "main"); err != nil {
+		t.Fatalf("worktree add: %v", err)
+	}
+	w := New(wt)
+	if err := os.WriteFile(filepath.Join(wt, "g"), []byte("work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(ctx, "work"); err != nil {
+		t.Fatalf("work commit: %v", err)
+	}
+	want, _ := w.Head(ctx)
+
+	// Dirty the primary main worktree out-of-band: updateInstead will refuse the
+	// push until the tree is reset. (A drifted submodule checkout looks identical.)
+	if err := os.WriteFile(filepath.Join(r.Dir, "f"), []byte("DIRTY-DRIFT\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if clean, _ := r.Clean(ctx); clean {
+		t.Fatal("precondition: main tree should be dirty")
+	}
+
+	// Publish must NOT be lost: the heal resets the dirty tree and lands the commit.
+	if err := w.PublishToMain(ctx, ""); err != nil {
+		t.Fatalf("publish (heal expected): %v", err)
+	}
+	head, _ := r.Head(ctx)
+	if head != want {
+		t.Fatalf("main did not advance to the published commit: head=%s want=%s base=%s", head, want, base)
+	}
+	if clean, _ := r.Clean(ctx); !clean {
+		t.Fatal("main tree still dirty after heal+publish")
+	}
+	// The out-of-band drift was reset (file reflects committed history, advanced).
+	if got, _ := os.ReadFile(filepath.Join(r.Dir, "g")); string(got) != "work\n" {
+		t.Fatalf("published content missing in main worktree: %q", got)
+	}
+}

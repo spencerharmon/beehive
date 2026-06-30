@@ -8,7 +8,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -244,6 +246,7 @@ func (r *Repo) PublishToMain(ctx context.Context, remote string) error {
 		// worktrees) so single-host (no-remote) honeybees can publish.
 		_, _ = r.Run(ctx, "config", "receive.denyCurrentBranch", "updateInstead")
 	}
+	healed := false
 	for attempt := 0; attempt < 8; attempt++ {
 		if remote != "" {
 			if err := r.Fetch(ctx, remote, "main"); err != nil {
@@ -258,20 +261,130 @@ func (r *Repo) PublishToMain(ctx context.Context, remote string) error {
 		if err == nil {
 			return nil
 		}
-		if !isNonFastForward(err) {
-			return err
+		if isNonFastForward(err) {
+			// main advanced under us; merge it in and retry.
+			ref := "main"
+			if remote != "" {
+				ref = remote + "/main"
+			}
+			if _, merr := r.Run(ctx, "merge", "--no-edit", ref); merr != nil {
+				_, _ = r.Run(ctx, "merge", "--abort")
+				return ErrConflict
+			}
+			continue
 		}
-		// main advanced under us; merge it in and retry.
-		ref := "main"
-		if remote != "" {
-			ref = remote + "/main"
+		// Local checked-out main refused the push because its working tree is
+		// dirty (updateInstead will not overwrite a dirty tree). That tree is a
+		// pure projection of committed history — honeybees author only in their
+		// own worktrees and publish by pushing — so any dirtiness is derived
+		// drift, most commonly a submodule checkout lagging its just-bumped
+		// gitlink because updateInstead does not recurse submodules. Reset the
+		// projection tree to HEAD and re-materialize submodules, then retry once.
+		// Never silent: if the tree cannot be made clean, surface the error.
+		if target == "." && !healed && isDirtyTreeRejection(err) {
+			healed = true
+			if herr := r.healLocalMain(ctx); herr != nil {
+				return fmt.Errorf("git: publish blocked by dirty local main and heal failed: %w", herr)
+			}
+			continue
 		}
-		if _, err := r.Run(ctx, "merge", "--no-edit", ref); err != nil {
-			_, _ = r.Run(ctx, "merge", "--abort")
-			return ErrConflict
-		}
+		return err
 	}
 	return fmt.Errorf("git: publish to main exhausted retries")
+}
+
+// isDirtyTreeRejection reports whether a push to a local checked-out branch was
+// refused because updateInstead found the target working tree dirty (versus a
+// non-fast-forward race or a permission/protection rejection).
+func isDirtyTreeRejection(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "Working directory has") || // "...unstaged/staged changes"
+		strings.Contains(s, "would be overwritten") ||
+		strings.Contains(s, "needs merge") ||
+		strings.Contains(s, "is not up to date")
+}
+
+// healLocalMain restores the main worktree (the updateInstead push target) to a
+// clean projection of its committed HEAD so the next push is accepted. It resets
+// tracked-file drift and force re-checks-out every .gitmodules-declared submodule
+// to its recorded gitlink (iterating only declared paths so an orphan gitlink —
+// a committed honeybee worktree with no .gitmodules URL — cannot fatal the sync).
+// Returns an error (never swallows) if the tree is still dirty afterward.
+func (r *Repo) healLocalMain(ctx context.Context) error {
+	dir, err := r.mainWorktreeDir(ctx)
+	if err != nil {
+		return err
+	}
+	m := &Repo{Dir: dir}
+	if _, err := m.Run(ctx, "reset", "--hard", "HEAD"); err != nil {
+		return err
+	}
+	_, _ = m.Run(ctx, "submodule", "sync", "--quiet")
+	paths, err := m.declaredSubmodulePaths(ctx)
+	if err != nil {
+		return err
+	}
+	var failed []string
+	for _, p := range paths {
+		// --init in case the checkout was never populated; --force to discard the
+		// stale checkout updateInstead left behind. submodule update fetches the
+		// recorded commit into the submodule when it is missing.
+		if _, err := m.Run(ctx, "submodule", "update", "--init", "--force", "--", p); err != nil {
+			failed = append(failed, p)
+		}
+	}
+	out, serr := m.Run(ctx, "status", "--porcelain")
+	if serr != nil {
+		return serr
+	}
+	if strings.TrimSpace(out) != "" {
+		if len(failed) > 0 {
+			return fmt.Errorf("git: main worktree still dirty after heal (submodule resync failed for %s)", strings.Join(failed, ", "))
+		}
+		return fmt.Errorf("git: main worktree still dirty after heal: %s", strings.SplitN(strings.TrimSpace(out), "\n", 2)[0])
+	}
+	return nil
+}
+
+// mainWorktreeDir returns the path of the worktree that has main checked out
+// (the target updateInstead pushes into), found from `git worktree list`.
+func (r *Repo) mainWorktreeDir(ctx context.Context) (string, error) {
+	wts, err := r.Worktrees(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, w := range wts {
+		if w.Branch == "main" {
+			return w.Path, nil
+		}
+	}
+	if len(wts) > 0 {
+		return wts[0].Path, nil // primary worktree is listed first
+	}
+	return "", fmt.Errorf("git: no worktrees listed")
+}
+
+// declaredSubmodulePaths returns the submodule paths declared in .gitmodules
+// (none when there is no .gitmodules), so callers can sync real submodules
+// without tripping over orphan gitlinks that have no declaration.
+func (r *Repo) declaredSubmodulePaths(ctx context.Context) ([]string, error) {
+	if _, statErr := os.Stat(filepath.Join(r.Dir, ".gitmodules")); statErr != nil {
+		return nil, nil
+	}
+	out, err := r.Run(ctx, "config", "-f", ".gitmodules", "--get-regexp", `\.path$`)
+	if err != nil {
+		return nil, nil // no entries
+	}
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		// "submodule.<name>.path <path>"
+		if i := strings.LastIndex(line, " "); i >= 0 {
+			if p := strings.TrimSpace(line[i+1:]); p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
+	return paths, nil
 }
 
 // Worktree is one entry from `git worktree list`.
@@ -318,18 +431,28 @@ func (r *Repo) Worktrees(ctx context.Context) ([]Worktree, error) {
 // working tree) is returned verbatim so the caller can surface it.
 func (r *Repo) UpdateLocalMain(ctx context.Context) error {
 	_, _ = r.Run(ctx, "config", "receive.denyCurrentBranch", "updateInstead")
+	healed := false
 	for attempt := 0; attempt < 8; attempt++ {
 		_, err := r.Run(ctx, "push", ".", "HEAD:refs/heads/main")
 		if err == nil {
 			return nil
 		}
-		if !isNonFastForward(err) {
-			return err
+		if isNonFastForward(err) {
+			if _, merr := r.Run(ctx, "merge", "--no-edit", "main"); merr != nil {
+				_, _ = r.Run(ctx, "merge", "--abort")
+				return ErrConflict
+			}
+			continue
 		}
-		if _, err := r.Run(ctx, "merge", "--no-edit", "main"); err != nil {
-			_, _ = r.Run(ctx, "merge", "--abort")
-			return ErrConflict
+		// Dirty projection tree (e.g. submodule drift); reset it and retry once.
+		if !healed && isDirtyTreeRejection(err) {
+			healed = true
+			if herr := r.healLocalMain(ctx); herr != nil {
+				return fmt.Errorf("git: update local main blocked by dirty tree and heal failed: %w", herr)
+			}
+			continue
 		}
+		return err
 	}
 	return fmt.Errorf("git: update local main exhausted retries")
 }
