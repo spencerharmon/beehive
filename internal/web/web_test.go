@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/editor"
@@ -37,8 +38,16 @@ func setup(t *testing.T) (*Server, string) {
 	sm := filepath.Join(root, "submodules", "alpha")
 	os.MkdirAll(sm, 0o755)
 	os.WriteFile(filepath.Join(sm, repo.ROIFile), []byte("# alpha\n"), 0o644)
+	// Real H2-header PLAN.md format (internal/plan), NOT the legacy bullet form:
+	// `## <id> [STATUS] <!-- attempts=N deps=a,b weight=W session=<id>
+	// heartbeat=<RFC3339> -->` with a free-form body (Desc = first line, Doc =
+	// the "Doc:" line). t1 carries a session+heartbeat claim.
 	os.WriteFile(filepath.Join(sm, repo.PlanFile), []byte(
-		"<!-- Beehive-ROI: abc123 -->\n- TODO t1 build deps: t0 doc: br-t1.md\n- NEEDS-HUMAN t2 stuck\n- DONE t3 ok\n"), 0o644)
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## t1 [TODO] <!-- attempts=0 deps=t0 weight=16 session=bee-1 heartbeat=2026-06-30T11:00:00Z -->\n"+
+			"build the thing\nFiles: a.go\nDoc: br-t1.md\nAccept: works\n\n"+
+			"## t2 [NEEDS-HUMAN] <!-- attempts=4 deps= -->\nstuck task\nDoc: br-t2.md\n\n"+
+			"## t3 [DONE] <!-- attempts=0 deps= -->\nok done\nDoc: br-t3.md\n"), 0o644)
 	r, _ := repo.Open(root)
 	s, err := New(r, config.Defaults(root))
 	if err != nil {
@@ -136,13 +145,140 @@ func TestPlanAndHuman(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/submodule/alpha/plan")
 	b := w.Body.String()
-	if !strings.Contains(b, "abc123") || !strings.Contains(b, "t1") {
-		t.Fatalf("plan: %s", b)
+	// Real H2-header plan: ROI stamp, ids, the derived Doc, the deps cell, and the
+	// derived claim label must all surface (none of which the old bullet parser,
+	// fed a real plan, produced — it parsed zero rows).
+	for _, want := range []string{"abc123", "t1", "TODO", "NEEDS-HUMAN", "DONE", "br-t1.md", "t0"} {
+		if !strings.Contains(b, want) {
+			t.Fatalf("plan view missing %q:\n%s", want, b)
+		}
 	}
 	h := get(t, s, "/human")
 	if !strings.Contains(h.Body.String(), "t2") || strings.Contains(h.Body.String(), "t1<") {
 		t.Fatalf("human: %s", h.Body)
 	}
+}
+
+// TestParsePlanRealFormat is the core of web-plan-parser-unify: the web parser is
+// now a thin adapter over internal/plan, so a REAL H2-header PLAN.md (the format
+// the runner actually writes, with session/heartbeat claim metadata) parses —
+// where the old bullet parser yielded zero items. It asserts task count,
+// statuses, deps, heartbeat, the derived Doc, and the NEEDS-HUMAN/pending counts,
+// and that active vs stale is derived from session+heartbeat freshness vs the TTL
+// (there is no IN-PROGRESS status). now is fixed so active/stale is deterministic.
+func TestParsePlanRealFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "PLAN.md")
+	// t1: claimed, heartbeat 30m before now + ttl 60m => ACTIVE.
+	// t2: claimed, heartbeat 3h before now => STALE (past TTL).
+	// t3: NEEDS-HUMAN, unclaimed. t4: DONE, unclaimed.
+	src := "<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n" +
+		"## t1 [TODO] <!-- attempts=0 deps=t0,t9 weight=16 session=bee-A heartbeat=2026-06-30T11:30:00Z -->\n" +
+		"implement t1\nFiles: a.go\nDoc: docs/tasks/t1.md\n\n" +
+		"## t2 [NEEDS-REVIEW] <!-- attempts=1 deps= session=bee-B heartbeat=2026-06-30T09:00:00Z -->\n" +
+		"review me\nDoc: docs/tasks/t2.md\n\n" +
+		"## t3 [NEEDS-HUMAN] <!-- attempts=4 deps= -->\nstuck\n\n" +
+		"## t4 [DONE] <!-- attempts=0 deps= -->\ndone\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now := mustTime(t, "2026-06-30T12:00:00Z")
+	ttl := time.Hour
+
+	p, err := parsePlan(path, now, ttl)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if p.ROIStamp != "deadbeef" {
+		t.Fatalf("ROIStamp = %q, want deadbeef", p.ROIStamp)
+	}
+	if len(p.Items) != 4 {
+		t.Fatalf("got %d items, want 4: %+v", len(p.Items), p.Items)
+	}
+	byID := map[string]PlanItem{}
+	for _, it := range p.Items {
+		byID[it.ID] = it
+	}
+
+	t1 := byID["t1"]
+	if t1.Status != StatusTODO {
+		t.Fatalf("t1 status = %q, want TODO", t1.Status)
+	}
+	if len(t1.Deps) != 2 || t1.Deps[0] != "t0" || t1.Deps[1] != "t9" {
+		t.Fatalf("t1 deps = %v, want [t0 t9]", t1.Deps)
+	}
+	if t1.Desc != "implement t1" {
+		t.Fatalf("t1 desc = %q, want 'implement t1'", t1.Desc)
+	}
+	if t1.Doc != "docs/tasks/t1.md" {
+		t.Fatalf("t1 doc = %q", t1.Doc)
+	}
+	if !t1.Heartbeat.Equal(mustTime(t, "2026-06-30T11:30:00Z")) {
+		t.Fatalf("t1 heartbeat = %v", t1.Heartbeat)
+	}
+	// Active vs stale is the session+heartbeat freshness, NOT a status.
+	if !t1.Active || t1.Stale {
+		t.Fatalf("t1 should be ACTIVE (fresh claim): active=%v stale=%v", t1.Active, t1.Stale)
+	}
+	if got := t1.Claim(); got != "active bee-A" {
+		t.Fatalf("t1 claim = %q, want 'active bee-A'", got)
+	}
+
+	t2 := byID["t2"]
+	if t2.Status != StatusReview {
+		t.Fatalf("t2 status = %q, want NEEDS-REVIEW", t2.Status)
+	}
+	if t2.Active || !t2.Stale {
+		t.Fatalf("t2 should be STALE (expired claim): active=%v stale=%v", t2.Active, t2.Stale)
+	}
+	if got := t2.Claim(); got != "stale bee-B" {
+		t.Fatalf("t2 claim = %q, want 'stale bee-B'", got)
+	}
+
+	// t3 NEEDS-HUMAN, t4 DONE: both unclaimed => neither active nor stale.
+	for _, id := range []string{"t3", "t4"} {
+		if it := byID[id]; it.Active || it.Stale || it.Claim() != "" {
+			t.Fatalf("%s unclaimed but active=%v stale=%v claim=%q", id, it.Active, it.Stale, it.Claim())
+		}
+	}
+
+	// Count semantics the views use: pending = not DONE; human = NEEDS-HUMAN.
+	pending, human := 0, 0
+	for _, it := range p.Items {
+		if it.Status != StatusDone {
+			pending++
+		}
+		if it.Status == StatusHuman {
+			human++
+		}
+	}
+	if pending != 3 {
+		t.Fatalf("pending = %d, want 3 (t1,t2,t3)", pending)
+	}
+	if human != 1 {
+		t.Fatalf("needs-human = %d, want 1 (t3)", human)
+	}
+}
+
+// TestParsePlanMissingFile: an absent PLAN.md is an empty plan, not an error
+// (a freshly-added, pre-bootstrap submodule).
+func TestParsePlanMissingFile(t *testing.T) {
+	p, err := parsePlan(filepath.Join(t.TempDir(), "nope.md"), time.Now(), time.Hour)
+	if err != nil {
+		t.Fatalf("missing file should be empty plan, got err %v", err)
+	}
+	if len(p.Items) != 0 || p.ROIStamp != "" {
+		t.Fatalf("missing file should yield empty plan, got %+v", p)
+	}
+}
+
+func mustTime(t *testing.T, s string) time.Time {
+	t.Helper()
+	ts, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatalf("bad time %q: %v", s, err)
+	}
+	return ts
 }
 
 func TestExplorerAndUnknown(t *testing.T) {
