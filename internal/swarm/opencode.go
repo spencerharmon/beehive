@@ -12,6 +12,16 @@ import (
 	"net/http"
 	neturl "net/url"
 	"strings"
+	"time"
+)
+
+// Turn-idle poll cadence. opencode's POST /session/{id}/message returns as soon
+// as the turn is ACCEPTED, so a turn is settled by polling the message list until
+// the assistant message reports completed. The gap backs off geometrically from
+// min to max so a long turn isn't hammered while a short one settles promptly.
+const (
+	defaultPollMin = 250 * time.Millisecond
+	defaultPollMax = 2 * time.Second
 )
 
 // Opencode talks to an opencode server's session API.
@@ -22,6 +32,12 @@ type Opencode struct {
 	MaxTokens   int     // max output tokens; 0 = backend default (omitted from the request)
 	HTTP        *http.Client
 	Debug       io.Writer // non-nil: log each HTTP request/response
+
+	// pollMin/pollMax bound the turn-idle backoff (see Prompt/awaitTurn). Zero =
+	// the package defaults; tests set tiny values to keep the wait loop fast. Kept
+	// unexported because production never needs to tune them.
+	pollMin time.Duration
+	pollMax time.Duration
 }
 
 // Open creates a server session for the working directory dir (an absolute path;
@@ -133,8 +149,19 @@ func (s *ocSession) Messages(ctx context.Context) ([]Message, error) {
 	return out, nil
 }
 
-// Prompt sends text and blocks until the assistant turn completes, returning the
+// Prompt sends text and blocks until the assistant turn goes idle, returning the
 // assistant's concatenated text parts.
+//
+// opencode's POST /session/{id}/message returns as soon as the turn is ACCEPTED
+// (fire-and-forget), echoing the assistant message stub but NOT waiting for the
+// model to act. Returning there would let the caller — and, in the runner, the
+// deterministic completion check — race ahead of the agent, so every turn would
+// "finish" in milliseconds. We therefore capture the assistant message id +
+// completion marker from the accept reply; if it is already finished (a server
+// that ran the turn synchronously) we use it directly, otherwise we poll the
+// message list until that assistant message reports completed. ctx (the runner's
+// per-turn timeout / WallCap) bounds the wait and poll errors are surfaced, never
+// swallowed.
 func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 	prov, model, _ := strings.Cut(s.oc.Model, "/")
 	body := map[string]any{
@@ -153,6 +180,12 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 		body["maxTokens"] = s.oc.MaxTokens
 	}
 	var reply struct {
+		Info struct {
+			ID   string `json:"id"`
+			Time struct {
+				Completed float64 `json:"completed"`
+			} `json:"time"`
+		} `json:"info"`
 		Parts []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
@@ -161,13 +194,103 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 	if err := s.oc.post(ctx, "/session/"+s.id+"/message", s.dir, body, &reply); err != nil {
 		return "", err
 	}
+	// Synchronous server: the accept reply already carries time.completed, so the
+	// turn is done and its parts are authoritative — no need to poll.
+	if reply.Info.Time.Completed != 0 {
+		var sb strings.Builder
+		for _, p := range reply.Parts {
+			if p.Type == "text" {
+				sb.WriteString(p.Text)
+			}
+		}
+		return sb.String(), nil
+	}
+	// Fire-and-forget accept: wait for the assistant message to settle.
+	return s.awaitTurn(ctx, reply.Info.ID)
+}
+
+// awaitTurn polls the session message list until the assistant message for the
+// just-accepted turn reports completed (info.time.completed set), then returns
+// its concatenated text. assistantID is the id opencode echoed for this turn;
+// when empty (a server that did not echo it) it falls back to the last assistant
+// message in the list. Bounded geometric backoff; honors ctx cancellation; poll
+// errors are surfaced, not swallowed.
+func (s *ocSession) awaitTurn(ctx context.Context, assistantID string) (string, error) {
+	wait, max := s.oc.pollMin, s.oc.pollMax
+	if wait <= 0 {
+		wait = defaultPollMin
+	}
+	if max <= 0 {
+		max = defaultPollMax
+	}
+	if max < wait {
+		max = wait
+	}
+	for {
+		text, done, err := s.turnText(ctx, assistantID)
+		if err != nil {
+			return "", err
+		}
+		if done {
+			return text, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(wait):
+		}
+		if wait *= 2; wait > max {
+			wait = max
+		}
+	}
+}
+
+// turnText fetches the session message list and reports whether the tracked
+// assistant turn has completed, returning its concatenated text when so. opencode
+// stamps a message's info.time.completed when its turn finishes; an in-flight
+// assistant message has no completed timestamp. A turn that has not yet created
+// its assistant message (or whose message is still in flight) reports done=false.
+func (s *ocSession) turnText(ctx context.Context, assistantID string) (text string, done bool, err error) {
+	var raw []struct {
+		Info struct {
+			ID   string `json:"id"`
+			Role string `json:"role"`
+			Time struct {
+				Completed float64 `json:"completed"`
+			} `json:"time"`
+		} `json:"info"`
+		Parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"parts"`
+	}
+	if err := s.oc.get(ctx, "/session/"+s.id+"/message", s.dir, &raw); err != nil {
+		return "", false, err
+	}
+	idx := -1
+	for i := range raw {
+		if raw[i].Info.Role != "assistant" {
+			continue
+		}
+		if assistantID != "" {
+			if raw[i].Info.ID == assistantID {
+				idx = i
+				break
+			}
+			continue
+		}
+		idx = i // no id to track: follow the last assistant message
+	}
+	if idx < 0 || raw[idx].Info.Time.Completed == 0 {
+		return "", false, nil // not created yet, or still in flight
+	}
 	var sb strings.Builder
-	for _, p := range reply.Parts {
+	for _, p := range raw[idx].Parts {
 		if p.Type == "text" {
 			sb.WriteString(p.Text)
 		}
 	}
-	return sb.String(), nil
+	return sb.String(), true, nil
 }
 
 func (s *ocSession) Close() error { return nil }

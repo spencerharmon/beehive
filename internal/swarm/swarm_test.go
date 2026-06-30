@@ -524,6 +524,101 @@ func TestReviewCompletesOnStatusChange(t *testing.T) {
 	}
 }
 
+// gateClient/gateSession model a turn that is BUSY for a while before going idle:
+// Prompt signals it started, blocks until the test releases it, then produces the
+// completion artifacts and returns. Because ocSession.Prompt now blocks until the
+// turn is idle, the runner's deterministic completion check runs ONLY after Prompt
+// returns — so a busy turn can never be observed as complete. This stub drives
+// that contract at the runner level.
+type gateClient struct{ sess *gateSession }
+
+func (c *gateClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	return c.sess, nil
+}
+
+type gateSession struct {
+	started chan struct{}
+	release chan struct{}
+	onIdle  func()
+	busied  bool
+}
+
+func (s *gateSession) Prompt(ctx context.Context, text string) (string, error) {
+	if !s.busied {
+		s.busied = true
+		close(s.started) // turn 1 has entered: it is now "busy"
+		select {
+		case <-s.release: // stay busy until the test lets the turn settle
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+		if s.onIdle != nil {
+			s.onIdle() // completion artifacts appear only as the turn goes idle
+		}
+	}
+	return "", nil
+}
+func (s *gateSession) Close() error                                    { return nil }
+func (s *gateSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+
+// TestCompletionWaitsForTurnIdle proves the runner does not run its completion
+// check while the turn is busy: with a stub Client whose Prompt blocks (busy),
+// Run must not report completion until the turn is released (idle) — even though
+// the completion artifacts are written exactly at the busy->idle transition.
+func TestCompletionWaitsForTurnIdle(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	sess := &gateSession{started: make(chan struct{}), release: make(chan struct{}), onIdle: func() {
+		// Land the completion artifacts only as the turn settles.
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}
+	r := &Runner{Repo: rp, Git: g, Client: &gateClient{sess: sess}, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour}
+
+	type out struct {
+		res Result
+		err error
+	}
+	done := make(chan out, 1)
+	go func() {
+		res, err := r.Run(context.Background(), sel, "sys", "first")
+		done <- out{res, err}
+	}()
+
+	<-sess.started // turn 1 is now busy (Prompt is blocked)
+	// While busy, the run must NOT have completed: the completion check cannot run
+	// until Prompt returns. Give it a window to (wrongly) proceed.
+	select {
+	case o := <-done:
+		t.Fatalf("Run completed while the turn was still busy: %+v / %v", o.res, o.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(sess.release) // let the turn settle (idle); artifacts now exist
+	o := <-done
+	if o.err != nil {
+		t.Fatalf("run: %v", o.err)
+	}
+	if !o.res.Completed || o.res.GCMarked {
+		t.Fatalf("want completed after the turn settled, got %+v", o.res)
+	}
+}
+
 // blockingSession's Prompt never returns until its context is canceled, modeling
 // a stalled opencode call.
 type blockingClient struct{}
