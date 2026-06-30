@@ -3,6 +3,31 @@
 // settings. Config is layered, most-specific wins (see Resolve): built-in
 // Defaults -> host file (/etc/beehive) -> in-repo global -> per-submodule
 // override. Single host, config-managed, or bind-mount.
+//
+// # Multi-repo registry
+//
+// An optional host file <dir>/repos.yaml (RegistryFile) declares the set of
+// beehive repos one frontend daemon manages, each with its OWN gpg keyring for
+// strict secret isolation. Shape:
+//
+//	repos:
+//	  - name: alpha                      # unique handle (frontend switcher)
+//	    root: /srv/alpha                 # beehive repo root
+//	    gpg_home: /srv/alpha/gnupg       # per-repo keyring dir (unique)
+//	    gpg_recipient: alpha@example.com # per-repo recipient key (unique)
+//	    model: anthropic/claude          # optional per-repo agent overrides
+//	  - name: beta
+//	    root: /srv/beta
+//	    gpg_home: /srv/beta/gnupg
+//	    gpg_recipient: beta@example.com
+//
+// Single -> multi migration: with no repos.yaml the daemon synthesizes a
+// one-entry registry from the single --repo root + resolved keyring
+// (SingleEntryRegistry, via ResolveRegistry), so an unconfigured host stays
+// byte-identical to the legacy single-repo path. To go multi-repo, write
+// repos.yaml listing each repo with a DISTINCT gpg_home and gpg_recipient —
+// Registry.Validate rejects a shared keyring or reused key so no secret can
+// ever cross repos.
 package config
 
 import (

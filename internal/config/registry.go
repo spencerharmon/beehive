@@ -72,6 +72,67 @@ func LoadRegistryFrom(dir string) (Registry, error) {
 	return reg, nil
 }
 
+// ResolveRegistry returns the registry a daemon rooted at root should serve. If
+// a host repos.yaml is present it is loaded and Validate'd (the multi-repo case;
+// an invalid registry — e.g. a shared keyring — is a startup error). If absent,
+// a one-entry registry is synthesized from the single resolved config at root
+// (SingleEntryRegistry) so an unconfigured single-host install is unchanged.
+//
+// This is the single bridge the daemon entrypoint calls to learn what it serves;
+// web routing and secrets wiring consume the resolved registry in later subtasks.
+func ResolveRegistry(root string) (Registry, error) {
+	reg, err := LoadRegistry()
+	if err != nil {
+		return Registry{}, err
+	}
+	if !reg.Empty() {
+		return reg, nil
+	}
+	cfg, err := Resolve(root, "")
+	if err != nil {
+		return Registry{}, err
+	}
+	return SingleEntryRegistry(cfg, root), nil
+}
+
+// SingleEntryRegistry synthesizes the legacy single-repo registry: a one-entry
+// Registry projecting an already-resolved single Config + repo root into the
+// multi-repo shape. It is the inverse of RepoEntry.Config — for the synthesized
+// entry e, e.Config(cfg) == cfg — so a bare single-host install (no repos.yaml)
+// is served byte-identically to before, just through the registry abstraction.
+//
+// The entry carries the resolved config's OWN keyring (GPGHome + GPGRecipient,
+// the "legacy keyring preserved" requirement) and its agent settings as per-repo
+// values. The synthesized registry is intentionally NOT Validate'd: a single
+// repo cannot violate cross-repo isolation, and a bare install legitimately has
+// no GPGRecipient. Isolation is enforced only on a real, operator-authored
+// repos.yaml (see LoadRegistry/Validate).
+func SingleEntryRegistry(cfg Config, root string) Registry {
+	return Registry{Repos: []RepoEntry{{
+		Name:         legacyRepoName(root),
+		Root:         root,
+		GPGHome:      cfg.GPGHome,
+		GPGRecipient: cfg.GPGRecipient,
+		AgentURL:     cfg.AgentURL,
+		Model:        cfg.Model,
+		Temperature:  cfg.Temperature,
+		MaxTokens:    cfg.MaxTokens,
+	}}}
+}
+
+// legacyRepoName derives a stable handle for the synthesized single entry from
+// the repo root's base name (a usable name for the future frontend switcher),
+// falling back to "default" for roots with no usable base (".", "..", the path
+// separator, or empty) so the handle is never blank.
+func legacyRepoName(root string) string {
+	switch name := filepath.Base(filepath.Clean(root)); name {
+	case ".", "..", string(filepath.Separator), "":
+		return "default"
+	default:
+		return name
+	}
+}
+
 // Empty reports legacy single-repo mode (no registered repos).
 func (r Registry) Empty() bool { return len(r.Repos) == 0 }
 
