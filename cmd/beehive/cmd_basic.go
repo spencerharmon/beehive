@@ -20,15 +20,17 @@ func versionCmd() *cobra.Command {
 func initCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "init <path>",
-		Short: "scaffold a beehive repo and install the ROI-protect hook",
+		Short: "scaffold a beehive repo and install the git hooks (ROI-protect + submodule-sync)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
 			if err := repo.Init(path); err != nil {
 				return err
 			}
-			// Hook install is best-effort: only if path is already a git repo.
-			_ = config.InstallROIHook(path)
+			// Hook install is best-effort: only if path is already a git repo
+			// (a fresh clone always is). Lays down ALL hooks idempotently, so a
+			// re-run upgrades stale hooks; .git/hooks is never tracked by git.
+			_ = config.InstallHooks(path)
 			// Allow honeybee worktrees to publish to the checked-out main branch
 			// via `git push . HEAD:main` (local, no-remote convergence).
 			g := git.New(path)
@@ -45,13 +47,13 @@ func hookCmd() *cobra.Command {
 	c := &cobra.Command{Use: "hook", Short: "git hook management"}
 	c.AddCommand(&cobra.Command{
 		Use:   "install <repo>",
-		Short: "install the ROI-protect pre-commit hook",
+		Short: "install (or re-install) all beehive git hooks: ROI-protect pre-commit + submodule-sync post-receive",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if err := config.InstallROIHook(args[0]); err != nil {
+			if err := config.InstallHooks(args[0]); err != nil {
 				return err
 			}
-			fmt.Println("ROI-protect hook installed")
+			fmt.Println("beehive git hooks installed (pre-commit + post-receive)")
 			return nil
 		},
 	})
