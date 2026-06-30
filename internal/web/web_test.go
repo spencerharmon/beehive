@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/spencerharmon/beehive/internal/config"
+	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
@@ -340,6 +342,83 @@ func TestAssetsStyleServed(t *testing.T) {
 	for _, m := range must {
 		if !strings.Contains(body, m) {
 			t.Fatalf("style.css missing %q", m)
+		}
+	}
+}
+
+// TestRenderMarkdownSanitized is the core of editor-markdown-render: markdown
+// renders to the expected HTML (headings/lists/code/emphasis) AND repo content
+// is sanitized — a <script> block is dropped (not passed through) and a
+// javascript: link protocol is stripped. The renderer is pure-Go/CGO-free
+// (goldmark, no html.WithUnsafe).
+func TestRenderMarkdownSanitized(t *testing.T) {
+	src := "# Title\n\nIntro **bold** text.\n\n- one\n- two\n\n```\ncode block\n```\n\nInline `x` here.\n\n<script>alert('xss')</script>\n\n[evil](javascript:alert(1))\n\n[ok](https://example.com)\n"
+	out := string(renderMarkdown(src))
+	for _, want := range []string{"<h1>Title</h1>", "<li>one</li>", "<code>", "<strong>bold</strong>", `href="https://example.com"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("rendered markdown missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "<script>") {
+		t.Fatalf("script tag was not sanitized out:\n%s", out)
+	}
+	if strings.Contains(out, "javascript:") {
+		t.Fatalf("dangerous link protocol was not stripped:\n%s", out)
+	}
+}
+
+// TestExplorerRendersMarkdown proves the explorer VIEW pane now renders doc
+// markdown to HTML inside a .markdown container instead of dumping raw source
+// into a <pre>. The alpha ROI ("# alpha") must surface as an <h1>.
+func TestExplorerRendersMarkdown(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/submodule/alpha")
+	if w.Code != 200 {
+		t.Fatalf("explorer %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `<div class="markdown">`) {
+		t.Fatalf("explorer not rendering into a .markdown container:\n%s", body)
+	}
+	if !strings.Contains(body, "<h1>alpha</h1>") {
+		t.Fatalf("ROI markdown heading not rendered:\n%s", body)
+	}
+	if strings.Contains(body, "<pre># alpha") {
+		t.Fatalf("explorer still dumping raw markdown source:\n%s", body)
+	}
+}
+
+// TestROIViewRendersAndRawVerbatim locks the dual contract for the editor: the
+// ROI VIEW shows a rendered preview while the editable textarea keeps the RAW
+// source verbatim (the edit round-trip must not be lost to rendering).
+func TestROIViewRendersAndRawVerbatim(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/roi/alpha")
+	if w.Code != 200 {
+		t.Fatalf("roi get %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `class="markdown"`) || !strings.Contains(body, "<h1>alpha</h1>") {
+		t.Fatalf("ROI view missing rendered preview:\n%s", body)
+	}
+	if !strings.Contains(body, "<textarea") || !strings.Contains(body, "# alpha") {
+		t.Fatalf("ROI editable textarea missing verbatim raw source:\n%s", body)
+	}
+}
+
+// TestEditorDiffAddDelClasses confirms the chat-diff pane renders unified-diff
+// rows with add/del/eq classes (styled by the design-system --diff-* tokens).
+func TestEditorDiffAddDelClasses(t *testing.T) {
+	s, _ := setup(t)
+	rows := []editor.DiffRow{
+		{Kind: "eq", HTML: template.HTML("context")},
+		{Kind: "del", HTML: template.HTML("old")},
+		{Kind: "add", HTML: template.HTML("new")},
+	}
+	out := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Rows": rows})
+	for _, want := range []string{`class="ln eq"`, `class="ln del"`, `class="ln add"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("editor diff missing %q:\n%s", want, out)
 		}
 	}
 }
