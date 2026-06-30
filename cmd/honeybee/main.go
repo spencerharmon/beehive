@@ -239,7 +239,7 @@ func run() error {
 			fmt.Fprintf(os.Stderr, "[honeybee] agent_url=%s model=%q kind=%s worktree=%s remote=%q\n",
 				eff.AgentURL, eff.Model, sel.Kind, wtPath, remote)
 		}
-		res, err := runner.Run(ctx, sel, prompts.Agents, firstPrompt(sel))
+		res, err := runner.Run(ctx, sel, honeybeeProtocol(primaryRoot), firstPrompt(sel))
 		if err != nil {
 			return err
 		}
@@ -288,6 +288,24 @@ func claimable(k selectt.Kind) bool {
 	default:
 		return false
 	}
+}
+
+// honeybeeProtocol returns the honeybee runtime protocol (the system prompt). It
+// reads HONEYBEE.md from the beehive repo root — the on-disk, operator-editable
+// copy is authoritative — and falls back to the binary's embedded default only
+// when that file is absent (e.g. a repo not yet migrated by `beehive instruction
+// update`).
+func honeybeeProtocol(root string) string {
+	b, err := os.ReadFile(filepath.Join(root, "HONEYBEE.md"))
+	if err == nil && len(b) > 0 {
+		return string(b)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "honeybee: reading HONEYBEE.md: %v; using built-in default\n", err)
+	} else {
+		fmt.Fprintln(os.Stderr, "honeybee: HONEYBEE.md absent; using built-in default (run `beehive instruction update`)")
+	}
+	return prompts.Honeybee
 }
 
 func firstPrompt(sel *selectt.Selection) string {

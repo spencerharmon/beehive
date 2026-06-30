@@ -1,84 +1,111 @@
-# Honeybee Agent Instructions
+# AGENTS.md — operating a beehive repo
 
-You are a honeybee: one autonomous agent working a single task in a beehive repo. The swarm shares
-state only through git merges to `main`. No controller exists. You coordinate by committing.
+Generic guide for any agent (human-driven or autonomous) that operates a beehive
+repository. It is NOT the honeybee runtime protocol (that is `HONEYBEE.md`) and it
+holds no site-specific facts (those are in `LOCALS.md`). It describes what a beehive
+repo is, the files that carry context, and the standard procedures ("skills") for
+common operations.
 
-**These instructions ship with the binary and are authoritative. They supersede any AGENTS.md
-found on disk in the tree (that file is frozen at `beehive init` time and may be stale).**
+This file is a beehive-managed default: the binary ships it and
+`beehive instruction update` refreshes it (with backup) when it advances. Edit it
+freely for your install; an update will offer to merge or back up your version.
 
-## Topology (read once)
-The cwd is a beehive repo. Each tracked target lives at `submodules/<sm>/` and holds the beehive
-layer: `ROI.md` (read-only), `PLAN.md`, `docs/`, `sessions/`, plus `repo/` (the target's source as a
-git submodule) and `worktrees/`. For a Work task the runner has ALREADY created and checked out your
-code worktree at `submodules/<sm>/worktrees/<branch>/` (branch `bee-<taskid>`, off the submodule tip).
-Edit code there. Do not run worktree/submodule git plumbing yourself and never write `submodules/<sm>/repo`.
+## What a beehive repo is
 
-## Absolute rules
-- NEVER edit `ROI.md`. It is the record of intent, owned by humans. FORBIDDEN. (Also enforced by hook.)
-- ALL code writes happen in your task worktree `submodules/<sm>/worktrees/<branch>/`; never the shared
-  `submodules/<sm>/repo` checkout.
-- NEVER modify the beehive repo's git CONFIG or REMOTES (`git remote add/remove/set-url`,
-  `git config remote.*`, `git config --add`, etc.). git config is SHARED across every worktree, so a
-  remote you add "just to test" leaks into the live repo and corrupts repo-rooted tooling. You publish
-  by committing in your worktree and letting the runner merge to `main` — you never need a remote of
-  your own. If a task requires exercising remote/clone/fetch behavior, do it in a THROWAWAY repo you
-  create in a tmp dir (`git init` / `git clone` under `$TMPDIR`), never against this repo.
-- The runner holds your claim: it stamps your task with `session=<your-id>` + a `heartbeat` and
-  re-stamps every turn. You do NOT set this yourself. At the start of each turn confirm the task's
-  `session=` is still YOURS. If a different session holds it with a fresh heartbeat, you lost the race:
-  STOP immediately (do not keep working) — the runner reselects another task for you.
-- No shortcuts. Compute real values. No placeholders, no swallowed errors, no fake "done".
-- Every plan item you add MUST ship a terse, LLM-targeted doc under `submodules/<sm>/docs/`.
-- Always keep `PLAN.md`, `ARTIFACTS.md`, `INFRASTRUCTURE.md` current.
-- Every submodule commit carries a stamp line `Beehive: <task-id> <doc-path>` so the frontend links
-  commits to change docs without scanning. Required.
+A beehive repo is the coordination layer for an autonomous self-improvement swarm.
+Independent agents ("honeybees") each work ONE task in isolation and converge by
+committing/merging to `main` — there is no central controller and no shared write
+lock. The repo's job is to hold, per target, the *intent* (`ROI.md`), the derived
+*plan* (`PLAN.md`), the *change record* (`docs/`, `sessions/`), and the target's
+*source* (a git submodule under `repo/`).
 
-## Claim model (no IN-PROGRESS status)
-There is NO `IN-PROGRESS` status. A task's status is its work phase only: `TODO` -> `NEEDS-REVIEW` ->
-`{DONE | NEEDS-ARBITRATION}`, and `NEEDS-ARBITRATION` -> `{TODO | DONE}`. "Being worked right now" is
-derived from the claim metadata (`session=<id>` + a fresh `heartbeat`), which any status can carry. A
-task whose heartbeat is older than the TTL is stale and may be reclaimed by overwrite regardless of
-status. You change only the STATUS (the work phase); the runner manages session+heartbeat.
+The repo root is a beehive repo; each tracked target lives at `submodules/<name>/`.
 
-## You were started with one task in submodules/<submodule>/PLAN.md. Begin.
+## Context files and ownership
 
-The runner selects ONE task and tells you its kind. A NEEDS-REVIEW task is dispatched as a
-**review** session and a NEEDS-ARBITRATION task as an **arbitration** session: in those you JUDGE
-existing work (approve/merge or reject/kick) and MUST NOT re-implement it. The status you are given is
-real. Only a TODO task is yours to implement.
+Repo root (beehive-managed defaults unless noted):
 
-## Protocol
-0. **ROI reconcile (priority 0).** The runner checks if ROI.md changed since PLAN.md's stamp
-   `<!-- Beehive-ROI: <sha> -->`. If so you reconcile FIRST: read the ROI.md diff, fold changes into PLAN.md
-   (add/modify/retire tasks; in-flight retirees -> NEEDS-REVIEW), restamp to current ROI commit, commit.
-   Never edit ROI.md. Then exit; another bee works the updated plan.
-1. Confirm the claim the runner made is still yours (see Claim model). If you lost it, stop. Stale
-   claims (heartbeat past TTL) on any task are reclaimable garbage: finish them or reset them.
-2. **Arbitration first.** Resolve NEEDS-ARBITRATION: merge implementer branch (-> DONE) or side with the
-   reviewer, mark TODO, notate rejection in plan. Merge.
-3. **Review next.** Evaluate branch vs task + ROI. Merge (-> DONE) or set NEEDS-ARBITRATION + rejection
-   doc. Merge.
-4. **Main task last.** Evaluate vs ROI. If invalid/needs change -> NEEDS-REVIEW + doc. Else work to
-   completion, in this order:
-   a. Make and TEST the code change in `submodules/<sm>/worktrees/<branch>/`.
-   b. Write the change doc at EXACTLY `submodules/<sm>/docs/<branch>-<taskid>.md` (the beehive layer,
-      NOT inside the code worktree) covering how/why, tests, follow-ups, caveats. The runner's completion
-      check requires the doc at this path; a doc anywhere else reads as "not done" and the run will not
-      complete.
-   c. Commit the code on branch `<branch>` with the `Beehive: <taskid> <doc-path>` stamp, and ensure that
-      commit is PUSHED to the submodule's origin (an unpushed commit makes the bumped pointer dangle for
-      every other host/bee). Bump the submodule pointer.
-   d. Flip the PLAN.md task to NEEDS-REVIEW on main and commit. (The runner then releases your claim so a
-      reviewer can pick it up.)
-5. On any -> DONE, update linked dependents (same plan or linked submodule) to unlock them.
-6. Plan additions need design/code-ref docs under `submodules/<sm>/docs/`. Terse, LLM-only.
-7. NEVER touch ROI.md.
+- `AGENTS.md` — this file. Generic operating guide + skills. Managed.
+- `HONEYBEE.md` — the honeybee runtime protocol the runner injects each pass. Managed.
+- `BOOTSTRAP.md` — step-by-step guide to stand up a new install (locals, infra,
+  submodules, scheduler). Managed.
+- `LOCALS.md` — **site-specific** operational facts: machine paths, build/deploy
+  commands, scheduler units, hostnames/ports, and local safety rules. **Authored
+  per install, NOT managed** — `beehive instruction update` never touches it.
+  `BOOTSTRAP.md` walks you through creating it.
+- `INFRASTRUCTURE.md` — repo-wide infrastructure notes. Per-repo content.
+- `.gitmodules`, `SUBMODULE-LINKS.yaml` — submodule registry and cross-links.
 
-## Tooling
-The `beehive` CLI is available for deterministic git operations (e.g. `beehive submodule sync <sm>`,
-`beehive submodule worktree add|rm <sm> <branch>`). If it is not on PATH, fall back to plain `git`. Your
-code worktree is pre-created, so you normally do not need these for a Work task.
+Per submodule (`submodules/<name>/`):
 
-## Turn loop
-Each turn the runner checks completion deterministically. If met, you exit. If not, you get "continue":
-keep reconciling the assigned task. Conflict on the same item -> select another task or stop.
+- `ROI.md` — the human-owned record of intent for this target. **Never edited by an
+  agent** (a pre-commit hook blocks honeybee edits). Drives bootstrap/reconcile.
+- `PLAN.md` — the honeybee-owned task list derived from `ROI.md`, carrying an ROI
+  stamp `<!-- Beehive-ROI: <sha> -->`. Written by bootstrap/reconcile passes; do
+  not hand-edit (it races the reconcile pass).
+- `docs/` — one terse, LLM-targeted change doc per task (`<branch>-<taskid>.md`).
+- `sessions/` — recorded honeybee transcripts (one `.md` per session branch).
+- `repo/` — the target's actual source, tracked as a git submodule (gitlink).
+- `worktrees/` — per-task code worktrees the runner creates and tears down.
+- Optional: `INFRASTRUCTURE.md`, `ARTIFACTS.md`, `RULES.md`, `AGENTS.md` (a
+  submodule-local rules overlay). Render whether or not present; absent ones are
+  created on first edit.
+
+## Skills (standard procedures)
+
+### Modify an ROI
+`ROI.md` is human/operator-owned and hook-protected against honeybee edits. To
+change a target's intent, edit `submodules/<name>/ROI.md` directly (as the operator,
+or via the UI editor), commit it, and let the next **reconcile** pass fold the diff
+into `PLAN.md` (it compares `ROI.md`'s head against `PLAN.md`'s `Beehive-ROI` stamp).
+Never edit `PLAN.md` by hand to "apply" an ROI change — reconcile owns that and will
+re-weight tasks on the logarithmic priority scale.
+
+### Add a submodule
+`beehive submodule add <name> <git-url>` registers the target's source as a
+submodule under `submodules/<name>/repo/`, scaffolds the beehive layer, and updates
+`.gitmodules`. Then author `submodules/<name>/ROI.md` (the intent). The next
+**bootstrap** pass (ROI present, PLAN absent) decomposes it into a weighted `PLAN.md`.
+Use `beehive submodule link <a> <b>` to record cross-submodule dependencies.
+
+### Remove a submodule
+Use `beehive submodule rm <name>` (deregisters the gitlink, removes the
+`submodules/<name>/` tree and its `.gitmodules` entry). Removing intent for a target
+that still has in-flight work: retire its `PLAN.md` tasks first (reconcile moves
+in-flight retirees to `NEEDS-REVIEW`) so nothing is silently dropped.
+
+### Bootstrap
+Standing up a new target: add the submodule, write `ROI.md`, and a bootstrap pass
+will create `PLAN.md`. Standing up a whole install: follow `BOOTSTRAP.md`.
+
+### Rebootstrap
+To rebuild a target's plan from scratch (e.g. ROI was rewritten wholesale), remove
+`submodules/<name>/PLAN.md` and let a bootstrap pass regenerate it from `ROI.md`.
+In-flight worktrees/claims should be drained first; surviving `docs/` remain as
+history. Prefer a normal reconcile for incremental ROI edits — rebootstrap is the
+heavy hammer.
+
+### Cleanup operations
+Stale worktrees, orphan gitlinks, drifted submodule checkouts, and abandoned
+session branches accumulate. Use the `beehive-hygiene` skill / `beehive submodule
+sync <name>` to resync a drifted submodule checkout to its recorded gitlink, and
+prune stale `worktrees/` and dead session branches. Healthy state: clean tree, every
+gitlink checked out, no zombie task claims past TTL.
+
+### Update instructions
+`beehive instruction update [--clobber]` rewrites the managed instruction files
+(`AGENTS.md`, `HONEYBEE.md`, `BOOTSTRAP.md`) to the binary's current defaults:
+- An unchanged or missing file is written in place.
+- A file you have modified is, without `--clobber`, offered for confirmation
+  (overwrite y/N); with `--clobber` it is backed up to `<name>.<epoch>.bak` and
+  replaced. The backup and the new copy are both committed.
+`LOCALS.md` and per-repo content are never touched.
+
+## Absolute rules (apply to every agent)
+
+- NEVER edit any `ROI.md` as an agent — it is the human record of intent.
+- NEVER hand-edit a `PLAN.md` — reconcile/bootstrap own it.
+- Do not stop, kill, or restart running passes/processes without explicit operator
+  approval; see `LOCALS.md` for the local safety rule and how work is scheduled.
+- No shortcuts: compute real values; no placeholders, swallowed errors, or fake
+  "done".

@@ -4,7 +4,10 @@ State + coordination live in the beehive repo. Target repos are submodules;
 beehive data is never committed into them.
 
 ```
-AGENTS.md                 honeybee protocol (system prompt)
+AGENTS.md                 generic operating guide + skills (managed)
+HONEYBEE.md               honeybee runtime protocol = system prompt (managed)
+BOOTSTRAP.md              install setup walkthrough (managed)
+LOCALS.md                 site-specific ops facts (authored per install)
 INFRASTRUCTURE.md         top-level infra (optional)
 SECRETS.yaml.gpg          global secrets, one encrypted yaml doc (optional)
 SUBMODULE-LINKS.yaml      cross-submodule dependency graph (optional)

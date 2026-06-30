@@ -3,10 +3,7 @@ package repo
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
-
-	"github.com/spencerharmon/beehive/prompts"
 )
 
 func TestInitOpen(t *testing.T) {
@@ -52,29 +49,20 @@ func TestSubmoduleStates(t *testing.T) {
 	}
 }
 
-// TestInitWritesSlimAgents: Init writes the slim repo-local AGENTS.md (a repo
-// marker + local rules), NOT the full protocol. The full protocol ships in the
-// binary as the runtime system prompt so it never freezes in an init'd repo.
-func TestInitWritesSlimAgents(t *testing.T) {
+// TestInitScaffolds: Init creates the submodules/ tree, an empty INFRASTRUCTURE.md,
+// and installs the managed instruction files (AGENTS.md/HONEYBEE.md/BOOTSTRAP.md)
+// from the binary defaults so a freshly-init'd repo is immediately valid.
+func TestInitScaffolds(t *testing.T) {
 	root := t.TempDir()
 	if err := Init(root); err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(filepath.Join(root, AgentsFile))
-	if err != nil {
-		t.Fatal(err)
+	if fi, err := os.Stat(filepath.Join(root, "submodules")); err != nil || !fi.IsDir() {
+		t.Fatalf("submodules/ not created: %v", err)
 	}
-	got := string(b)
-	if got != prompts.RepoAgents {
-		t.Fatal("on-disk AGENTS.md should be the slim repo template")
-	}
-	if got == prompts.Agents {
-		t.Fatal("on-disk AGENTS.md must NOT be the full binary protocol")
-	}
-	if strings.Contains(got, "## Protocol") {
-		t.Fatalf("slim AGENTS.md leaked the full protocol:\n%s", got)
-	}
-	if !strings.Contains(got, "local rules") {
-		t.Fatalf("slim AGENTS.md missing local-rules marker:\n%s", got)
+	for _, name := range []string{InfraFile, AgentsFile, "HONEYBEE.md", "BOOTSTRAP.md"} {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("%s not created by Init: %v", name, err)
+		}
 	}
 }

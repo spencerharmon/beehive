@@ -22,8 +22,8 @@ The runner (deterministic, no LLM) does, before launch:
 
 ## Turn loop
 
-One opencode session per honeybee: `AGENTS.md` as system prompt, first user
-prompt = bootstrap/reconcile/select. cwd = worktree. After each turn the runner
+One opencode session per honeybee: `HONEYBEE.md` (read from the repo root) as
+the system prompt, first user prompt = bootstrap/reconcile/select. cwd = worktree. After each turn the runner
 checks completion: PLAN status transitioned, doc file named `<branch>-<taskid>`
 present, branch/merge correct, in-progress timestamp removed. Met → exit. Unmet
 → send `continue` to the **same** session (context persists). Cap: 15 turns +

@@ -28,6 +28,7 @@ func main() {
 		hookCmd(),
 		lintCmd(),
 		auditCmd(),
+		instructionCmd(),
 	)
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "beehive:", err)

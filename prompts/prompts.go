@@ -6,13 +6,19 @@ import _ "embed"
 //go:embed AGENTS.md
 var Agents string
 
-// RepoAgents is the slim, repo-local AGENTS.md written to disk by `beehive init`.
-// Unlike Agents (the full protocol injected as the runtime system prompt), this
-// is committed into the repo and therefore frozen at init time, so it must stay
-// minimal: a repo marker plus local rules, deferring the protocol to the binary.
+// Honeybee is the honeybee runtime protocol. It is the binary's DEFAULT copy of
+// HONEYBEE.md; `beehive init` / `beehive instruction update` write it to the repo
+// root, and the runner reads the on-disk file (falling back to this default only
+// when the file is absent). The on-disk file — not the binary — is authoritative.
 //
-//go:embed repo_agents.md
-var RepoAgents string
+//go:embed HONEYBEE.md
+var Honeybee string
+
+// BootstrapGuide is the default BOOTSTRAP.md (install setup walkthrough). Distinct
+// from Bootstrap, which is the per-pass bootstrap PROMPT injected at runtime.
+//
+//go:embed bootstrap_guide.md
+var BootstrapGuide string
 
 //go:embed bootstrap.md
 var Bootstrap string

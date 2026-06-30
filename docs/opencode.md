@@ -18,7 +18,7 @@ context window fits a rightsized task (tasks are sized to avoid compaction).
 
 ## Runner contract
 
-- system prompt: beehive `AGENTS.md`
+- system prompt: beehive `HONEYBEE.md` (repo root; falls back to the binary default)
 - first user prompt: `bootstrap.md` | `reconcile.md` | `select.md`
 - cwd: the per-branch worktree
 - between turns: `continue.md` into the same session
