@@ -726,3 +726,140 @@ func TestReconciledPrefixMatch(t *testing.T) {
 		})
 	}
 }
+
+// TestWorkSyncsWorktreeBaseToTrackedTip proves the Work setup fetches and
+// hard-resets the submodule checkout to the tracked-branch tip BEFORE branching
+// the code worktree, so a honeybee starts from the live code rather than the
+// stale recorded pointer — and that the resulting pointer move is committed in
+// the beehive worktree (the reviewless auto-advance). The submodule's origin gets
+// an EXTRA commit after the local checkout is cloned, exactly the stale-pointer
+// scenario the task targets.
+func TestWorkSyncsWorktreeBaseToTrackedTip(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	ctx := context.Background()
+
+	// A temp origin for the submodule with a base commit, then an EXTRA commit
+	// added AFTER the local checkout clones it — so the clone's recorded pointer
+	// (base) lags the tracked tip.
+	origin := t.TempDir()
+	og := gitInit(t, origin)
+	os.WriteFile(filepath.Join(origin, "f"), []byte("base"), 0o644)
+	if err := og.Commit(ctx, "base"); err != nil {
+		t.Fatalf("origin base: %v", err)
+	}
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	os.WriteFile(filepath.Join(origin, "f"), []byte("tip"), 0o644)
+	if err := og.Commit(ctx, "tip"); err != nil {
+		t.Fatalf("origin tip: %v", err)
+	}
+	originTip, err := og.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("origin tip rev: %v", err)
+	}
+
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	// Seed records the submodule gitlink at the stale base (the clone's HEAD).
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	var wtBase string
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		// Capture the code worktree's base commit before completion reclaims it.
+		if b, err := git.New(wtDir).RevParse(ctx, "HEAD"); err == nil {
+			wtBase = b
+		}
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("want completed, got %+v", res)
+	}
+	// 1) The code worktree must branch off the SYNCED tip, not the stale pointer.
+	if wtBase == "" {
+		t.Fatal("worktree base was never captured; the worktree was not created")
+	}
+	if wtBase != originTip {
+		t.Fatalf("worktree base %s != origin tip %s: the checkout was not synced before branching", wtBase, originTip)
+	}
+	// 2) The beehive pointer move must have been committed in r.Git.
+	ptr, err := g.Run(ctx, "rev-parse", "HEAD:submodules/sm/repo")
+	if err != nil {
+		t.Fatalf("read committed gitlink: %v", err)
+	}
+	if ptr != originTip {
+		t.Fatalf("committed submodule pointer %s != origin tip %s: the sync pointer bump was not committed", ptr, originTip)
+	}
+}
+
+// TestWorkNoRemoteKeepsRecordedPointer proves the sync is a no-op without a
+// submodule remote (single-host install / nested test checkout): the worktree
+// still branches off the recorded pointer (HEAD) and NO spurious pointer-bump
+// commit is made.
+func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	ctx := context.Background()
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir) // no remote configured
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(ctx, "base")
+	subTip, err := git.New(repoDir).RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("sub tip: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	var wtBase string
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		if b, err := git.New(wtDir).RevParse(ctx, "HEAD"); err == nil {
+			wtBase = b
+		}
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if wtBase != subTip {
+		t.Fatalf("worktree base %s != recorded sub tip %s", wtBase, subTip)
+	}
+	// No remote => the sync makes NO pointer-bump commit: the recorded gitlink in
+	// the beehive worktree stays the original pointer (per-turn heartbeat commits
+	// re-stamp PLAN.md but never touch the unchanged submodule gitlink).
+	ptr, err := g.Run(ctx, "rev-parse", "HEAD:submodules/sm/repo")
+	if err != nil {
+		t.Fatalf("read committed gitlink: %v", err)
+	}
+	if ptr != subTip {
+		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
