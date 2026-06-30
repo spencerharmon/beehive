@@ -75,7 +75,7 @@ func Defaults(dir string) Config {
 		TTLMinutes:         60,
 		MaxTurns:           15,
 		RejectLimit:        3,
-		TurnTimeoutMinutes: 20,
+		TurnTimeoutMinutes: 60,
 	}
 }
 
