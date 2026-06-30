@@ -102,10 +102,29 @@ Packages are built with [nfpm](https://nfpm.goreleaser.com) from `packaging/nfpm
 
 ## Release artifacts
 
-CI cross-compiles `linux`/`darwin` × `amd64`/`arm64` on `v*` tags, emits `SHA256SUMS-<os>-<arch>` and a cosign keyless signature. Verify:
+CI cross-compiles `linux`/`darwin` × `amd64`/`arm64` on `v*` tags with
+`CGO_ENABLED=0` (linux binaries are fully static ELF; darwin binaries are
+CGO-free but link libSystem per macOS). Each `SHA256SUMS-<os>-<arch>` is signed
+keyless with cosign — a signature (`.sig`) and Fulcio certificate (`.pem`) — and
+a `verify-release` CI job re-verifies every published set from a clean runner.
+
+Verify locally after downloading a set:
 
 ```sh
-cosign verify-blob --signature SHA256SUMS-linux-amd64.sig SHA256SUMS-linux-amd64
+gh release download <tag> --dir dist \
+  --pattern '*-linux-amd64' --pattern 'SHA256SUMS-linux-amd64*'
+scripts/verify-release.sh linux amd64 dist
+```
+
+or run cosign directly:
+
+```sh
+cosign verify-blob \
+  --certificate SHA256SUMS-linux-amd64.pem \
+  --signature   SHA256SUMS-linux-amd64.sig \
+  --certificate-identity-regexp '^https://github.com/spencerharmon/beehive/\.github/workflows/.+@refs/tags/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS-linux-amd64
 sha256sum -c SHA256SUMS-linux-amd64
 ```
 
