@@ -719,6 +719,17 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	gitRun("commit", "-q", "-m", "seed")
 	// Fresh stream branch for the "live" session (tip time ~now).
 	gitRun("branch", "bee-live-stream")
+	// A stream branch whose tip is OLD (a running session mid-quiet-turn). Liveness
+	// must come from the branch existing, not from recent transcript writes.
+	cs := exec.Command("git", "commit", "-q", "--allow-empty", "-m", "stale tip")
+	cs.Dir = root
+	cs.Env = append(os.Environ(),
+		"GIT_COMMITTER_DATE=2001-01-01T00:00:00", "GIT_AUTHOR_DATE=2001-01-01T00:00:00")
+	if out, err := cs.CombinedOutput(); err != nil {
+		t.Fatalf("stale commit: %v\n%s", err, out)
+	}
+	gitRun("branch", "bee-stale-stream")
+	gitRun("reset", "-q", "--hard", "HEAD~1") // working tree back at seed
 
 	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
 	if err := os.MkdirAll(sessDir, 0o755); err != nil {
@@ -729,9 +740,10 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("bee-live.md", repo.SessionStub("bee-live-stream")) // branch exists, fresh -> live
-	write("bee-dead.md", repo.SessionStub("bee-dead-stream")) // branch gone -> NOT live
-	write("bee-final.md", "# final transcript\nall done.\n")  // non-stub -> NOT live
+	write("bee-live.md", repo.SessionStub("bee-live-stream"))   // branch exists, fresh -> live
+	write("bee-stale.md", repo.SessionStub("bee-stale-stream")) // branch exists, OLD tip -> still live
+	write("bee-dead.md", repo.SessionStub("bee-dead-stream"))   // branch gone -> NOT live
+	write("bee-final.md", "# final transcript\nall done.\n")    // non-stub -> NOT live
 
 	infos := s.sessionInfos(ctx, sessDir, time.Now())
 	got := map[string]bool{}
@@ -740,6 +752,9 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	}
 	if !got["bee-live"] {
 		t.Errorf("bee-live: want Live=true (fresh stream branch)")
+	}
+	if !got["bee-stale"] {
+		t.Errorf("bee-stale: want Live=true (branch exists though tip is old) — the false-idle bug")
 	}
 	if got["bee-dead"] {
 		t.Errorf("bee-dead: want Live=false (stream branch gone), got true — the orphaned-stub bug")

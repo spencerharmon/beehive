@@ -14,16 +14,12 @@ import (
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
-// sessionLiveWindow: a session whose branch tip moved more recently than this is
-// treated as a still-running honeybee (the recorder commits ~1s while active).
-const sessionLiveWindow = 15 * time.Second
-
 // sessionInfo describes one recorded session for the list view.
 type sessionInfo struct {
 	ID       string // file stem, e.g. bee-T3-1751210912
 	Modified time.Time
 	Ago      string // human "3s"/"5m" since last write
-	Live     bool   // recently written = honeybee still running
+	Live     bool   // stream branch still exists = honeybee still running
 }
 
 // sessionsList is the page shell; the listing body auto-refreshes via HTMX so
@@ -156,13 +152,14 @@ func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []
 		live := false
 		if raw, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
 			if branch, isStub := repo.ParseSessionStub(string(raw)); isStub {
-				// A stub means a session streamed to an isolated branch. It is running
-				// only while that branch still exists and its tip is fresh. If the branch
-				// is gone, the session ended (its finalize replaced the stub on success,
-				// or was orphaned/crashed leaving the stub) — never "live".
+				// A stub streams to an isolated branch that the honeybee deletes on exit
+				// (deferred, even on error/orphaned publish). So branch existence tracks
+				// the live process directly: live iff the branch still exists. Do NOT gate
+				// on tip recency — a running session can go many seconds (a long quiet
+				// turn) without writing transcript, and must not flip to idle meanwhile.
 				if t, ok := s.branchTipTime(ctx, branch, rem); ok {
 					mod = t
-					live = now.Sub(t) < sessionLiveWindow
+					live = true
 				} else {
 					live = false
 				}
