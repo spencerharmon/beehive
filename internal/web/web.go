@@ -39,6 +39,14 @@ type Server struct {
 	git     *git.Repo
 	tmpl    *template.Template
 	editors *editor.Manager
+
+	// Viewer-pull state (remote-host-session-view): a background puller
+	// fast-forwards the beehive repo's main from the remote so a beehived
+	// following an off-box honeybee sees the session commits another host pushed,
+	// and the session pane surfaces how stale that copy is. pull guards the fields;
+	// now is the staleness clock (nil = time.Now, injected in tests).
+	pull pullState
+	now  func() time.Time
 }
 
 // New builds a Server over the beehive repo at root.
@@ -51,7 +59,7 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em}, nil
+	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em, now: time.Now}, nil
 }
 
 // Routes returns the mux wired to all handlers.

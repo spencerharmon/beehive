@@ -103,7 +103,7 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 	b, err := os.ReadFile(filepath.Join(sm.SessionsDir(), branch+".md"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.render(w, "session_body.html", map[string]interface{}{"Body": "(waiting for session output…)"})
+			s.render(w, "session_body.html", map[string]interface{}{"Body": "(waiting for session output…)", "Pull": s.sessionPull(r.Context())})
 			return
 		}
 		http.Error(w, err.Error(), 500)
@@ -127,7 +127,17 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.render(w, "session_body.html", map[string]interface{}{"Body": body})
+	s.render(w, "session_body.html", map[string]interface{}{"Body": body, "Pull": s.sessionPull(r.Context())})
+}
+
+// sessionPull is the freshness banner for the session pane: when the beehive repo
+// has a remote, the viewer is fast-forwarding main to follow off-box honeybees,
+// so the pane reports how long since the last successful pull (and any ff-only
+// failure). On a single-host repo (no remote) there is nothing to follow and the
+// banner stays hidden (Remote=false).
+func (s *Server) sessionPull(ctx context.Context) pullStatus {
+	rem, _ := s.git.Remote(ctx)
+	return s.pullStatusAt(s.clock(), rem != "")
 }
 
 // readSessionBranch returns the transcript file as it stands on the isolated

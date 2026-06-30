@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 func main() {
 	root := flag.String("repo", ".", "beehive repo root")
 	addr := flag.String("addr", ":8955", "listen address")
+	pullEvery := flag.Duration("pull-interval", web.DefaultPullInterval, "how often to git pull --ff-only the beehive repo to follow off-box sessions (repos with a remote only)")
 	flag.Parse()
 
 	// Resolve the registry the daemon serves: a present host repos.yaml (a
@@ -44,6 +46,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("web: %v", err)
 	}
+	// Follow off-box honeybees: periodically fast-forward the beehive repo's main
+	// from the remote so the session panes re-render the transcripts other hosts
+	// pushed. A no-remote (single-host) repo makes this a no-op. The process owns
+	// the puller for its whole lifetime.
+	s.StartPuller(context.Background(), *pullEvery)
 	log.Printf("beehived listening on %s (repo %s)", *addr, entry.Root)
 	log.Fatal(http.ListenAndServe(*addr, s.Routes()))
 }

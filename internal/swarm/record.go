@@ -29,10 +29,13 @@ type recorder struct {
 	// commit, when set, persists the current transcript (commit to the isolated
 	// session branch, push to remote when distributed). Throttled to commitIvl and
 	// only run when the transcript changed, to bound commit churn while staying
-	// near real-time. lastCommit tracks the throttle.
+	// near real-time. lastCommit tracks the throttle. now is the clock the
+	// throttle reads (nil = time.Now); tests inject a deterministic clock to prove
+	// commits coalesce to at most one per interval (no per-turn commit spam).
 	commit     func(context.Context)
 	commitIvl  time.Duration
 	lastCommit time.Time
+	now        func() time.Time
 
 	// debug-stream state (incremental, append-only diffing)
 	toolSt  map[string]string // callID -> last status streamed
@@ -79,15 +82,26 @@ func (rc *recorder) snapshot(ctx context.Context) error {
 	if rc.debug != nil {
 		rc.streamDebug(msgs)
 	}
-	// Stream to the session branch so beehived sees it near real time, throttled.
+	// Stream to the session branch so beehived sees it near real time, throttled
+	// so a fast burst of transcript changes coalesces into one commit per interval.
 	if rc.commit != nil {
-		now := time.Now()
+		now := rc.clock()
 		if rc.lastCommit.IsZero() || now.Sub(rc.lastCommit) >= rc.commitIvl {
 			rc.lastCommit = now
 			rc.commit(ctx)
 		}
 	}
 	return nil
+}
+
+// clock reads the throttle clock, defaulting to wall time. A nil now keeps the
+// production path on time.Now; tests inject a fake clock for deterministic
+// coalescing assertions.
+func (rc *recorder) clock() time.Time {
+	if rc.now != nil {
+		return rc.now()
+	}
+	return time.Now()
 }
 
 // appendWarning records an abort notice at the end of the session file so it is
