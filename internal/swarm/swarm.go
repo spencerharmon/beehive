@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/claim"
@@ -596,7 +597,11 @@ func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return stamp != "" && stamp == head, nil
+	// The PLAN.md ROI stamp is often abbreviated while head is the full %H sha,
+	// so an exact compare ~never matches and reconcile reports "never done".
+	// Match by prefix (mirrors select.reconcileRange's check) so a short stamp
+	// that prefixes the full head clears the reconcile, firing exactly once.
+	return stamp != "" && strings.HasPrefix(head, stamp), nil
 }
 
 // workDone verifies the PLAN.md status transitioned to a terminal/handoff state

@@ -575,3 +575,59 @@ func TestTurnTimeoutAbandonsForGC(t *testing.T) {
 		t.Fatalf("warning should name the per-turn timeout, got %q", res.Warning)
 	}
 }
+
+// TestReconciledPrefixMatch proves the Reconcile completion check (Runner.reconciled)
+// matches the PLAN.md ROI stamp against the full ROI head sha by PREFIX. The stamp
+// is frequently abbreviated while head is the full %H sha, so the prior exact `==`
+// compare never fired and reconcile reported "never done". A short stamp that
+// prefixes the full head must clear (fire once); a full stamp still clears; a
+// non-prefix or empty stamp must NOT clear.
+func TestReconciledPrefixMatch(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	r := &Runner{Repo: rp, Git: g}
+	planPath := filepath.Join(sm, "PLAN.md")
+
+	cases := []struct {
+		name  string
+		stamp string
+		want  bool
+	}{
+		{"short-prefix", head[:12], true}, // the real-world case the old `==` missed
+		{"full-sha", head, true},
+		{"non-prefix", "deadbeefcafe", false},
+		{"empty", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := "## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"
+			if c.stamp != "" {
+				body = "<!-- Beehive-ROI: " + c.stamp + " -->\n" + body
+			}
+			if err := os.WriteFile(planPath, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got, err := r.reconciled(sel)
+			if err != nil {
+				t.Fatalf("reconciled: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("stamp %q: got reconciled=%v want %v (head %s)", c.stamp, got, c.want, head)
+			}
+		})
+	}
+}
