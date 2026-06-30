@@ -858,6 +858,43 @@ func TestEditorDiffAddDelClasses(t *testing.T) {
 	}
 }
 
+// TestEditorDeleteGuardConfirmButton locks the destructive-deletion UI guard
+// (editor-safety-guards): when the pending proposal would wipe a human-owned
+// file (DeleteRisk), the panel surfaces a warning and a DISTINCT confirm control
+// that posts the explicit confirm=delete authorization plus a browser confirm
+// prompt — never the plain one-click Merge. A normal dirty diff keeps the plain
+// Merge button with no deletion confirmation.
+func TestEditorDeleteGuardConfirmButton(t *testing.T) {
+	s, _ := setup(t)
+
+	// Protected whole-file deletion: warning + a confirm button carrying the
+	// explicit confirm=delete value and an extra browser confirm prompt.
+	risky := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{
+		"ID": "e1", "File": "ROI.md", "DeleteRisk": true,
+	})
+	for _, want := range []string{
+		`hx-vals='{"confirm":"delete"}'`, // explicit server-side authorization
+		"hx-confirm=",                    // extra browser confirmation prompt
+		"human-owned",                    // the warning naming why it is blocked
+		`hx-post="/editor/e1/merge"`,     // still the merge endpoint
+	} {
+		if !strings.Contains(risky, want) {
+			t.Fatalf("delete-risk panel missing %q:\n%s", want, risky)
+		}
+	}
+
+	// A normal dirty diff: plain Merge, NOT the deletion-confirm control.
+	normal := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{
+		"ID": "e1", "File": "ROI.md",
+	})
+	if !strings.Contains(normal, `hx-post="/editor/e1/merge"`) {
+		t.Fatalf("normal panel missing the plain merge control:\n%s", normal)
+	}
+	if strings.Contains(normal, `"confirm":"delete"`) || strings.Contains(normal, "human-owned") {
+		t.Fatalf("normal (non-deletion) merge must not carry a delete confirmation:\n%s", normal)
+	}
+}
+
 // TestSessionLivenessBranchGone is the regression for sessions that kept showing
 // "running" / "(waiting for session output…)" long after the honeybee exited. A
 // stub whose stream branch is gone is an ended session (its finalize never

@@ -2,6 +2,7 @@ package editor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -34,6 +35,41 @@ var editableBasenames = map[string]bool{
 	repo.ROIFile:   true,
 	repo.InfraFile: true,
 	repo.LinksFile: true,
+}
+
+// ErrDeleteNeedsConfirm is returned by Merge when the pending proposal would
+// delete a human-owned file wholesale (an empty/absent worktree file against a
+// non-empty base). The merge is default-BLOCKED; a separate, explicit
+// confirmation (MergeConfirm) is required so a wrong-base "phantom deletion" can
+// never auto-merge — the incident that motivated the editor safety guards.
+var ErrDeleteNeedsConfirm = errors.New("editor: refusing to merge a whole-file deletion of a human-owned file without explicit confirmation")
+
+// humanOwnedBasenames are the files the swarm must never delete or rewrite
+// without a human in the loop. ROI.md is the human record of intent (the
+// pre-commit/pre-receive hooks already forbid honeybee edits to it); the editor
+// adds a delete-confirmation guard on top. Beehive-owned coordination files
+// (INFRASTRUCTURE.md, SUBMODULE-LINKS.yaml) are editable without this gate.
+var humanOwnedBasenames = map[string]bool{
+	repo.ROIFile: true,
+}
+
+// humanOwned reports whether file (repo-relative) is human-owned/protected,
+// aligned with the ROI hook's protected-path notion (ROI.md at minimum).
+func humanOwned(file string) bool {
+	return humanOwnedBasenames[filepath.Base(filepath.ToSlash(file))]
+}
+
+// isWholeFileDeletion reports whether proposed removes a non-empty base entirely
+// (empty or absent proposed vs a non-empty base) — a red flag, not a normal diff.
+func isWholeFileDeletion(base, proposed string) bool {
+	return strings.TrimSpace(base) != "" && strings.TrimSpace(proposed) == ""
+}
+
+// ProtectedDeletion reports whether the (base, proposed) pair for file is a
+// whole-file deletion of a human-owned file: the case Merge default-blocks. The
+// web layer uses it to surface a distinct, explicit confirmation control.
+func ProtectedDeletion(file, base, proposed string) bool {
+	return humanOwned(file) && isWholeFileDeletion(base, proposed)
 }
 
 // Turn is one chat message in a session's log.
@@ -104,8 +140,15 @@ func ValidateFile(file string) error {
 	return nil
 }
 
-// Open creates a worktree+branch for editing file and registers a session. The
-// branch is cut from the freshest main (remote when configured).
+// Open creates a worktree+branch for editing file and registers a session.
+//
+// Base selection is safety-hardened (editor-safety-guards): a configured remote
+// is trusted as the worktree base ONLY when it is the repo's OWN — its main
+// shares history with local main. A foreign/unrelated origin/main is ignored in
+// favor of local main and is never used as a merge push target. The chosen base
+// is then validated to contain the target file whenever local main does, so a
+// session can never open onto a destructive whole-file-deletion diff produced by
+// a wrong/foreign base. Genuine new-file creation (absent at both) stays allowed.
 func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 	file = filepath.ToSlash(filepath.Clean(file))
 	if err := ValidateFile(file); err != nil {
@@ -115,16 +158,33 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	base := "main"
+	base := "main" // local main: the safe default
+	trusted := ""  // remote to publish to on merge; only a verified repo-own remote
 	if remote != "" {
 		if err := m.primary.Fetch(ctx, remote, "main"); err != nil {
 			return nil, fmt.Errorf("fetch %s main: %w", remote, err)
 		}
-		base = remote + "/main"
+		// Don't blindly trust origin/main: prefer it over local main ONLY when it
+		// is the repo's own remote (shared history). A foreign origin/main is the
+		// exact wrong-base that turned "edit ROI.md" into "delete ROI.md".
+		own, err := m.primary.SharesHistory(ctx, "main", remote+"/main")
+		if err != nil {
+			return nil, err
+		}
+		if own {
+			base = remote + "/main"
+			trusted = remote
+		}
 	}
 	baseMain, err := m.primary.RevParse(ctx, base)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", base, err)
+	}
+	// Validate the edit base: the target MUST exist at base when it exists on local
+	// main, else the worktree (cut from base) renders an existing file as a
+	// destructive deletion. Fail session-open with a clear error instead.
+	if m.primary.Exists(ctx, "main", file) && !m.primary.Exists(ctx, base, file) {
+		return nil, fmt.Errorf("editor: %s exists on main but not at edit base %q; refusing to open a destructive edit (the base may be a wrong or foreign main)", file, base)
 	}
 	branch := "edit-" + slugFile(file) + "-" + fmt.Sprint(time.Now().Unix())
 	wtPath := filepath.Join(m.absRoot, ".worktrees", branch)
@@ -136,7 +196,7 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 		File:     file,
 		Branch:   branch,
 		wtPath:   wtPath,
-		remote:   remote,
+		remote:   trusted,
 		baseMain: baseMain,
 		client:   m.client,
 		wt:       git.New(wtPath),
@@ -241,7 +301,10 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 		s.setErr("commit: " + cerr.Error())
 	}
 	if doMerge {
-		if merr := s.merge(ctx); merr != nil {
+		// An agent-driven merge can NEVER confirm a protected whole-file deletion;
+		// that requires an explicit human action. A phantom deletion (e.g. a wrong
+		// base) surfaces here as a panel error instead of silently publishing.
+		if merr := s.merge(ctx, false); merr != nil {
 			s.setErr("merge: " + merr.Error())
 		}
 	}
@@ -276,13 +339,33 @@ func (s *Session) setErr(msg string) {
 	s.mu.Unlock()
 }
 
-// Merge publishes the session branch to main, making the proposal live. Safe to
-// call when already merged (no-op).
-func (s *Session) Merge(ctx context.Context) error { return s.merge(ctx) }
+// Merge publishes the session branch to main, making the proposal live. It
+// DEFAULT-BLOCKS a whole-file deletion of a human-owned file (returns
+// ErrDeleteNeedsConfirm) so a wrong-base phantom deletion cannot auto-merge; use
+// MergeConfirm for the explicit, separate confirmation. Safe to call when already
+// merged (no-op).
+func (s *Session) Merge(ctx context.Context) error { return s.merge(ctx, false) }
 
-func (s *Session) merge(ctx context.Context) error {
+// MergeConfirm is Merge plus the explicit human confirmation that authorizes a
+// whole-file deletion of a human-owned file — the SEPARATE action the delete
+// guard requires. Every other merge behaves identically to Merge.
+func (s *Session) MergeConfirm(ctx context.Context) error { return s.merge(ctx, true) }
+
+func (s *Session) merge(ctx context.Context, confirmDelete bool) error {
 	if cerr := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); cerr != nil && cerr != git.ErrNothing {
 		return cerr
+	}
+	// Delete guard: never auto-merge a whole-file deletion of a human-owned file.
+	// An empty/absent proposed against a non-empty base is a red flag (the wrong-
+	// base incident), so require an explicit, separate confirmation.
+	if !confirmDelete {
+		base, proposed, derr := s.Diff(ctx)
+		if derr != nil {
+			return derr
+		}
+		if ProtectedDeletion(s.File, base, proposed) {
+			return ErrDeleteNeedsConfirm
+		}
 	}
 	if s.remote != "" {
 		// A configured remote is authoritative: publish to remote main (hard fail if

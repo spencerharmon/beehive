@@ -221,6 +221,40 @@ func (r *Repo) Show(ctx context.Context, ref, path string) (string, error) {
 	return r.Run(ctx, "show", ref+":"+path)
 }
 
+// Exists reports whether path is present at ref. It is the boolean form of Show:
+// a present (even empty) blob -> true; a path absent at ref -> false. Used to
+// validate an edit base before cutting a worktree from it, so an existing file
+// rendered as a whole-file deletion (because the base lacks it) is caught.
+func (r *Repo) Exists(ctx context.Context, ref, path string) bool {
+	_, err := r.Run(ctx, "show", ref+":"+path)
+	return err == nil
+}
+
+// SharesHistory reports whether refs a and b descend from a common ancestor,
+// i.e. they belong to the SAME project history. The editor uses it to tell the
+// repo's OWN remote (whose main shares history with local main) from a foreign /
+// unrelated one before trusting `<remote>/main` as an edit base over local main.
+//
+// Either ref failing to resolve, or the two histories being unrelated (git
+// merge-base exits non-zero with no output), both mean "not provably the same
+// history" and yield (false, nil) — the safe signal to fall back to local main.
+// Only an unexpected failure resolving a ref that does exist surfaces an error.
+func (r *Repo) SharesHistory(ctx context.Context, a, b string) (bool, error) {
+	if _, err := r.RevParse(ctx, a); err != nil {
+		return false, nil
+	}
+	if _, err := r.RevParse(ctx, b); err != nil {
+		return false, nil
+	}
+	// Both refs resolve; merge-base now fails ONLY when the histories are
+	// unrelated (no common ancestor) — the foreign-remote signal, not a fault.
+	out, err := r.Run(ctx, "merge-base", a, b)
+	if err != nil {
+		return false, nil
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
 // DiffPaths reports whether path changed between commits a and b.
 func (r *Repo) DiffPaths(ctx context.Context, a, b, path string) (bool, error) {
 	out, err := r.Run(ctx, "diff", "--name-only", a, b, "--", path)

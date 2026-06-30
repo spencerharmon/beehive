@@ -367,3 +367,63 @@ func TestPublishToMainHealsDirtyLocalTree(t *testing.T) {
 		t.Fatalf("published content missing in main worktree: %q", got)
 	}
 }
+
+// TestSharesHistoryRelatedVsForeign locks the repo-own-remote check the editor
+// base selection relies on: a remote whose main descends from the SAME history
+// shares an ancestor (true), an unrelated/foreign main does not (false), and an
+// absent ref is not provably related (false) — all without surfacing an error.
+func TestSharesHistoryRelatedVsForeign(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	commitFile(t, r, "f", "base\n", "base")
+
+	// A "remote" tracking ref that descends from local main shares history.
+	if _, err := r.Run(ctx, "update-ref", "refs/remotes/origin/main", "main"); err != nil {
+		t.Fatalf("update-ref own: %v", err)
+	}
+	if ok, err := r.SharesHistory(ctx, "main", "origin/main"); err != nil || !ok {
+		t.Fatalf("repo-own remote should share history: ok=%v err=%v", ok, err)
+	}
+
+	// A foreign history: a second root commit with NO common ancestor, parked on
+	// its own ref. merge-base must report unrelated -> false (no error).
+	if _, err := r.Run(ctx, "checkout", "--orphan", "foreign"); err != nil {
+		t.Fatalf("orphan: %v", err)
+	}
+	if _, err := r.Run(ctx, "rm", "-rf", "."); err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	commitFile(t, r, "z", "alien\n", "alien root")
+	if _, err := r.Run(ctx, "update-ref", "refs/remotes/foreign/main", "foreign"); err != nil {
+		t.Fatalf("update-ref foreign: %v", err)
+	}
+	if _, err := r.Run(ctx, "checkout", "main"); err != nil {
+		t.Fatalf("checkout main: %v", err)
+	}
+	if ok, err := r.SharesHistory(ctx, "main", "foreign/main"); err != nil || ok {
+		t.Fatalf("foreign remote must NOT share history: ok=%v err=%v", ok, err)
+	}
+
+	// A non-existent ref is not provably related and never errors.
+	if ok, err := r.SharesHistory(ctx, "main", "origin/does-not-exist"); err != nil || ok {
+		t.Fatalf("absent ref: want (false,nil), got ok=%v err=%v", ok, err)
+	}
+}
+
+// TestExistsAtRef locks the boolean form of Show used to validate an edit base.
+func TestExistsAtRef(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	commitFile(t, r, "present.md", "hi\n", "seed")
+	if !r.Exists(ctx, "main", "present.md") {
+		t.Fatal("present.md should exist at main")
+	}
+	if r.Exists(ctx, "main", "missing.md") {
+		t.Fatal("missing.md must not exist at main")
+	}
+	// An empty (but tracked) blob still counts as present.
+	commitFile(t, r, "empty.md", "", "empty")
+	if !r.Exists(ctx, "main", "empty.md") {
+		t.Fatal("empty tracked file should count as present")
+	}
+}

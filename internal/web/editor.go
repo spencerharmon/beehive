@@ -62,11 +62,23 @@ func (s *Server) editorMerge(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if err := sess.Merge(r.Context()); err != nil {
+	var err error
+	if r.FormValue("confirm") == "delete" {
+		err = sess.MergeConfirm(r.Context())
+	} else {
+		err = sess.Merge(r.Context())
+	}
+	if err != nil && err != editor.ErrDeleteNeedsConfirm {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.render(w, "editor_panel.html", s.panelData(r.Context(), sess))
+	data := s.panelData(r.Context(), sess)
+	if err == editor.ErrDeleteNeedsConfirm {
+		// Default-blocked: surface the block in the panel; DeleteRisk drives the
+		// distinct confirm button so the human can authorize the deletion.
+		data["Error"] = err.Error()
+	}
+	s.render(w, "editor_panel.html", data)
 }
 
 func (s *Server) editorClose(w http.ResponseWriter, r *http.Request) {
@@ -79,15 +91,16 @@ func (s *Server) panelData(ctx context.Context, sess *editor.Session) map[string
 	state := sess.State(ctx)
 	log := sess.Log()
 	return map[string]interface{}{
-		"ID":     sess.ID,
-		"File":   sess.File,
-		"Log":    log,
-		"Rows":   editor.RenderDiff(base, proposed),
-		"State":  state,
-		"Live":   state == "live",
-		"Merged": state == "live" && len(log) > 0,
-		"Busy":   sess.Busy(),
-		"Error":  sess.Err(),
+		"ID":         sess.ID,
+		"File":       sess.File,
+		"Log":        log,
+		"Rows":       editor.RenderDiff(base, proposed),
+		"State":      state,
+		"Live":       state == "live",
+		"Merged":     state == "live" && len(log) > 0,
+		"Busy":       sess.Busy(),
+		"Error":      sess.Err(),
+		"DeleteRisk": editor.ProtectedDeletion(sess.File, base, proposed),
 	}
 }
 
@@ -157,7 +170,23 @@ func (s *Server) apiEditorMerge(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "no such session"})
 		return
 	}
-	if err := sess.Merge(r.Context()); err != nil {
+	// Body is optional; an empty body means confirm=false (default-block a
+	// protected deletion). Only an explicit {"confirm":true} authorizes it.
+	var req struct {
+		Confirm bool `json:"confirm"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	var err error
+	if req.Confirm {
+		err = sess.MergeConfirm(r.Context())
+	} else {
+		err = sess.Merge(r.Context())
+	}
+	if err == editor.ErrDeleteNeedsConfirm {
+		writeJSON(w, 409, map[string]interface{}{"error": err.Error(), "needs_confirm": true})
+		return
+	}
+	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
