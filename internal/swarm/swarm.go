@@ -234,6 +234,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				sel.Submodule.Name, repoDir)
 		}
 		wg = git.New(repoDir)
+		// Sync the submodule checkout to the tracked-branch tip BEFORE branching, so
+		// the worktree starts from the live code rather than the (possibly stale)
+		// recorded pointer. Advancing the beehive pointer to the synced tip is
+		// automatic (no review). A no-remote install (and most tests) keeps the
+		// recorded pointer and branches off HEAD as before.
+		if err := r.syncWorktreeBase(ctx, wg, sel.Submodule, absRoot); err != nil {
+			return res, err
+		}
 		if err := wg.WorktreeAdd(ctx, wtAbs, res.Branch, "HEAD"); err != nil {
 			return res, fmt.Errorf("worktree add: %w", err)
 		}
@@ -699,6 +707,62 @@ func hasTask(sel *selectt.Selection) bool {
 	default:
 		return false
 	}
+}
+
+// syncWorktreeBase brings the submodule checkout to the tracked-branch tip
+// before the code worktree branches off it, so a honeybee always starts from the
+// live code instead of the (possibly stale) recorded pointer. It fetches the
+// tracked branch (from .gitmodules submodule.<path>.branch, default "main") and
+// hard-resets the checkout to origin/<branch>, then advances the beehive pointer
+// to the synced tip by committing the bumped gitlink in the honeybee's beehive
+// worktree (r.Git). That pointer move is reviewless: the tip already lives on the
+// submodule's origin, so the bumped pointer never dangles. A no-remote checkout
+// (single-host install, most tests) is a no-op: the recorded pointer stands and
+// the worktree branches off HEAD as before.
+func (r *Runner) syncWorktreeBase(ctx context.Context, wg *git.Repo, sub repo.Submodule, absRoot string) error {
+	rem, err := wg.Remote(ctx)
+	if err != nil {
+		return fmt.Errorf("submodule %s remote: %w", sub.Name, err)
+	}
+	if rem == "" {
+		return nil // no remote: nothing to sync, keep the recorded pointer
+	}
+	rel, err := filepath.Rel(absRoot, sub.RepoDir())
+	if err != nil {
+		return fmt.Errorf("resolve submodule %s path: %w", sub.Name, err)
+	}
+	branch := r.trackedBranch(ctx, rel)
+	if err := wg.Fetch(ctx, rem, branch); err != nil {
+		return fmt.Errorf("fetch submodule %s %s/%s: %w", sub.Name, rem, branch, err)
+	}
+	if err := wg.HardReset(ctx, rem+"/"+branch); err != nil {
+		return fmt.Errorf("sync submodule %s to %s/%s: %w", sub.Name, rem, branch, err)
+	}
+	// Advance the beehive pointer to the synced tip (no review). Commit only the
+	// gitlink path so unrelated working-tree state is untouched; ErrNothing means
+	// the recorded pointer already matched the tip (no move to commit).
+	tip, err := wg.RevParse(ctx, "HEAD")
+	if err != nil {
+		return fmt.Errorf("resolve synced %s tip: %w", sub.Name, err)
+	}
+	msg := fmt.Sprintf("beehive: sync %s worktree base to tracked tip %s", sub.Name, tip)
+	if err := r.Git.CommitPaths(ctx, msg, rel); err != nil && !errors.Is(err, git.ErrNothing) {
+		return fmt.Errorf("commit synced %s pointer: %w", sub.Name, err)
+	}
+	return nil
+}
+
+// trackedBranch returns the submodule's tracked branch from .gitmodules
+// (submodule.<path>.branch), defaulting to "main" when the key is unset or
+// .gitmodules is absent (e.g. a test's bare nested checkout).
+func (r *Runner) trackedBranch(ctx context.Context, rel string) string {
+	out, err := r.Git.Run(ctx, "config", "-f", ".gitmodules", "--get", "submodule."+rel+".branch")
+	if err == nil {
+		if b := strings.TrimSpace(out); b != "" {
+			return b
+		}
+	}
+	return "main"
 }
 
 // isSourceCheckout reports whether dir is the root of its OWN git work tree (a
