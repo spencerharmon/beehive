@@ -355,7 +355,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// transcript (so it shows in the UI), commits the final transcript to the
 	// session branch, then squashes+merges the durable final to main once and
 	// publishes the agent's branch.
-	finish := func(warning string) {
+	finish := func(warning string) error {
 		recStop()
 		<-recDone
 		rec.snapshot(ctx) // final flush after the last turn settles
@@ -367,7 +367,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		r.streamSession(ctx, sessionRel) // commit final transcript (incl. warning) to the branch
 		r.finalizeSession(ctx, sid, sessionRel, stubCommit)
-		_ = r.publish(ctx)
+		// Publish the work to main and RETURN the result. A failure means the change
+		// never landed on main; callers that treat the task as complete MUST gate on
+		// this so a rejected publish can never read as DONE. Always surfaced to the log.
+		ferr := r.publish(ctx)
+		if ferr != nil && r.Debug != nil {
+			fmt.Fprintf(r.Debug, "\n⚠️  publish to main failed: %v\n", ferr)
+		}
+		return ferr
 	}
 	cleanup := func() {
 		if wg != nil {
@@ -407,18 +414,28 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					finish("")
 					return res, derr
 				}
-				res.Completed = done
-				warn := ""
 				if done {
-					warn = r.pushSourceBranch(ctx, wg, res.Branch)
+					// Publish first; only release + report complete if main advanced.
+					if ferr := finish(""); ferr != nil {
+						res.GCMarked = true
+						res.Warning = fmt.Sprintf(
+							"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
+							sel.Task.ID, ferr)
+						cleanup()
+						return res, nil
+					}
+					res.Completed = true
+					if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
+						res.Warning = w
+					}
 					_ = cl.Release(ctx, sel.Task.ID)
-				} else {
-					warn = fmt.Sprintf(
-						"task %s left %s but the completion check failed — left for review",
-						sel.Task.ID, sel.Task.Status)
+					cleanup()
+					return res, nil
 				}
-				res.Warning = warn
-				finish(warn)
+				res.Warning = fmt.Sprintf(
+					"task %s left %s but the completion check failed — left for review",
+					sel.Task.ID, sel.Task.Status)
+				finish(res.Warning)
 				cleanup()
 				return res, nil
 			case errors.Is(err, claim.ErrLost):
@@ -465,6 +482,18 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			return res, err
 		}
 		if done {
+			// Completion is only real once the work lands on main. Publish first; if it
+			// fails, do NOT release the claim or report Completed — leave the task
+			// claimed (stale -> GC -> retry) so the work is re-driven, never silently
+			// dropped as a phantom DONE.
+			if ferr := finish(res.Warning); ferr != nil {
+				res.GCMarked = true
+				res.Warning = fmt.Sprintf(
+					"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
+					sel.Task.ID, ferr)
+				cleanup()
+				return res, nil
+			}
 			res.Completed = true
 			if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
 				res.Warning = w
@@ -472,7 +501,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			if hasTask(sel) {
 				_ = cl.Release(ctx, sel.Task.ID)
 			}
-			finish(res.Warning)
 			cleanup()
 			return res, nil
 		}

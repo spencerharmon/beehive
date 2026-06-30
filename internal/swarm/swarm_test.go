@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -724,5 +725,60 @@ func TestReconciledPrefixMatch(t *testing.T) {
 				t.Fatalf("stamp %q: got reconciled=%v want %v (head %s)", c.stamp, got, c.want, head)
 			}
 		})
+	}
+}
+
+// TestRunPublishFailureBlocksCompletion guards correctness: a task that reaches
+// its terminal state LOCALLY but whose publish to main fails must NOT be reported
+// Completed (that would be a phantom DONE whose work never landed). Instead the
+// run leaves the claim unreleased and marks itself for GC so the work is re-driven.
+func TestRunPublishFailureBlocksCompletion(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	// Agent drives the task terminal + writes the change doc (completion check passes)…
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	// …but publishing to main fails once the work is terminal. Gate on [DONE] so the
+	// per-turn claim heartbeat (which shares this closure, pre-Prompt while still
+	// IN-PROGRESS) still succeeds; only the completion publish fails.
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Publish: func(ctx context.Context) error {
+			if b, _ := os.ReadFile(planPath); strings.Contains(string(b), "[DONE]") {
+				return errors.New("publish boom")
+			}
+			return nil
+		},
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("publish failed — task must NOT report Completed (phantom DONE): %+v", res)
+	}
+	if !res.GCMarked {
+		t.Fatalf("publish failed — run must mark GC so the work is re-driven: %+v", res)
+	}
+	if res.Warning == "" || !strings.Contains(res.Warning, "publishing to main failed") {
+		t.Fatalf("publish failure should be surfaced in the warning: %+v", res)
 	}
 }
