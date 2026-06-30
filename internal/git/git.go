@@ -108,9 +108,22 @@ func (r *Repo) Remote(ctx context.Context) (string, error) {
 	return "", nil
 }
 
-// Fetch updates remote-tracking refs for branch from remote.
+// Fetch updates the remote-tracking ref for branch from remote, pruning the
+// tracking ref if branch was deleted upstream. The explicit refspec scopes
+// --prune to this branch only, so concurrent fetches of other refs are
+// untouched. Callers read the advanced remote-tracking ref (e.g. origin/main)
+// and fast-forward or re-verify; Fetch never moves the current branch.
 func (r *Repo) Fetch(ctx context.Context, remote, branch string) error {
-	_, err := r.Run(ctx, "fetch", remote, branch)
+	_, err := r.Run(ctx, "fetch", remote, branch, "--prune")
+	return err
+}
+
+// Pull fast-forwards the current branch to remote/branch. --ff-only forbids a
+// merge commit: a divergent history errors instead of merging. The swarm
+// converges by fast-forward + re-verify, so callers (e.g. claim) treat a
+// non-fast-forward pull as a lost race rather than reconciling locally.
+func (r *Repo) Pull(ctx context.Context, remote, branch string) error {
+	_, err := r.Run(ctx, "pull", "--ff-only", remote, branch)
 	return err
 }
 
