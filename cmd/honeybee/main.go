@@ -115,6 +115,10 @@ func run() error {
 	defer func() {
 		_ = primary.WorktreeRemove(context.Background(), wtPath)
 		_, _ = primary.Run(context.Background(), "branch", "-D", wtBranch)
+		// Drop the now-merged session branch locally and on the remote (best-effort).
+		if remote != "" {
+			_, _ = primary.Run(context.Background(), "push", remote, "--delete", sessBranch)
+		}
 		_ = primary.WorktreeRemove(context.Background(), sessPath)
 		_, _ = primary.Run(context.Background(), "branch", "-D", sessBranch)
 	}()
@@ -128,6 +132,13 @@ func run() error {
 	publish := func(ctx context.Context) error { return gitRepo.PublishToMain(ctx, remote) }
 	sessGit := git.New(sessPath)
 	sessPublish := func(ctx context.Context) error { return sessGit.PublishToMain(ctx, remote) }
+	// When the hive has a remote, push the isolated session branch to it on every
+	// stream commit so a beehived on another host can read the live transcript.
+	// Local-only hives (no remote) leave this nil: beehived reads the local branch.
+	var sessPush func(context.Context) error
+	if remote != "" {
+		sessPush = func(ctx context.Context) error { return sessGit.Push(ctx, remote, sessBranch) }
+	}
 
 	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl}
 	// Rebind the primary selection onto the worktree repo so attempt 0 works the
@@ -143,8 +154,10 @@ func run() error {
 	runner := &swarm.Runner{
 		Repo: rp, Git: gitRepo, MaxTurns: c.MaxTurns, WallCap: ttl, TTL: ttl, Publish: publish,
 		Remote: remote, BaseMain: baseMain, Session: session,
-		SessionGit: sessGit, SessionRoot: sessPath, SessionPublish: sessPublish,
+		SessionGit: sessGit, SessionRoot: sessPath, SessionBranch: sessBranch,
+		SessionPublish: sessPublish, SessionPush: sessPush,
 		RestoreConfig: restoreRemotes,
+		TurnTimeout:   time.Duration(c.TurnTimeoutMinutes) * time.Minute,
 	}
 	oc := &swarm.Opencode{Base: c.AgentURL, Model: c.Model, HTTP: &http.Client{Timeout: 0}}
 	if debug {
@@ -193,6 +206,24 @@ func run() error {
 				}
 				return err
 			}
+		} else {
+			// Bootstrap/Reconcile carry no task to claim and would otherwise be run in
+			// parallel by every pass that sees the same ROI drift. A singleton lock
+			// (same commit-race, on a dedicated lock file) makes exactly one pass do it;
+			// the losers reselect a real task instead of duplicating the reconcile.
+			cl := &claim.Claimer{
+				Repo: rp, Sub: sel.Submodule, Git: gitRepo, TTL: ttl,
+				Session: session, Publish: publish, Remote: remote,
+			}
+			if err := cl.ClaimLock(ctx, string(sel.Kind)); err != nil {
+				if errors.Is(err, claim.ErrLost) {
+					tried[key] = true
+					fmt.Fprintf(os.Stderr, "honeybee: %s already held by another pass, reselecting\n", sel.Kind)
+					continue
+				}
+				return err
+			}
+			defer cl.ReleaseLock(context.Background(), string(sel.Kind))
 		}
 
 		if debug {

@@ -308,6 +308,7 @@ func TestRunPublishesSessionToMain(t *testing.T) {
 		Publish:        func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
 		SessionGit:     sessGit,
 		SessionRoot:    sessPath,
+		SessionBranch:  "bee-1-session",
 		SessionPublish: func(ctx context.Context) error { return sessGit.PublishToMain(ctx, "") },
 	}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -317,8 +318,8 @@ func TestRunPublishesSessionToMain(t *testing.T) {
 	if !res.Completed {
 		t.Fatalf("want completed, got %+v", res)
 	}
-	// The session transcript must be written in the SESSION worktree (worktree-
-	// write invariant: the recorder never writes to the primary tree directly).
+	// The final transcript must be committed in the SESSION worktree (the squashed
+	// end-of-session commit; the live copy is streamed to the session branch).
 	if _, err := os.Stat(filepath.Join(sessPath, "submodules", "sm", "sessions", res.SessionID+".md")); err != nil {
 		t.Fatalf("session not written in session worktree: %v", err)
 	}
@@ -367,6 +368,7 @@ func TestSessionAndPlanOnSeparateBranches(t *testing.T) {
 		Publish:        func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
 		SessionGit:     sessGit,
 		SessionRoot:    sessPath,
+		SessionBranch:  "bee-2-session",
 		SessionPublish: func(ctx context.Context) error { return sessGit.PublishToMain(ctx, "") },
 	}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -519,5 +521,57 @@ func TestReviewCompletesOnStatusChange(t *testing.T) {
 	}
 	if !contains(firstPrompt, "bee-R1") {
 		t.Fatalf("review preamble missing implementer branch ref; got:\n%s", firstPrompt)
+	}
+}
+
+// blockingSession's Prompt never returns until its context is canceled, modeling
+// a stalled opencode call.
+type blockingClient struct{}
+
+func (blockingClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	return blockingSession{}, nil
+}
+
+type blockingSession struct{}
+
+func (blockingSession) Prompt(ctx context.Context, text string) (string, error) {
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+func (blockingSession) Messages(ctx context.Context) ([]Message, error) {
+	return []Message{{ID: "m", Role: "assistant", Parts: []Part{{Type: "text", Text: "working"}}}}, nil
+}
+func (blockingSession) Close() error { return nil }
+
+// TestTurnTimeoutAbandonsForGC proves a stalled agent turn is canceled at
+// TurnTimeout and the pass abandons the task for GC with a clear warning —
+// instead of wedging on the dead call until the process backstop. This is the
+// regression for the multi-hour zombie honeybees.
+func TestTurnTimeoutAbandonsForGC(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	r := &Runner{
+		Repo: rp, Git: g, Client: blockingClient{}, MaxTurns: 5,
+		WallCap: time.Hour, TTL: time.Hour, TurnTimeout: 50 * time.Millisecond,
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("a turn timeout must not be a fatal error, got: %v", err)
+	}
+	if !res.GCMarked {
+		t.Fatalf("want GCMarked on a stalled turn, got %+v", res)
+	}
+	if !contains(res.Warning, "per-turn timeout") {
+		t.Fatalf("warning should name the per-turn timeout, got %q", res.Warning)
 	}
 }

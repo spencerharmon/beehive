@@ -63,16 +63,20 @@ type Runner struct {
 	Remote   string
 	BaseMain string
 
-	// Session transcripts are recorded in a SEPARATE beehive worktree/branch so
-	// they never share an index with the agent's PLAN.md/docs edits (an
-	// out-of-band session commit would otherwise be clobbered by the agent's next
-	// index commit, and vice versa). SessionGit/SessionRoot are that worktree;
-	// SessionPublish advances main with it. Distinct file paths (sessions/ vs
-	// plan/docs) merge conflict-free. Nil/"" in tests = no session worktree (the
-	// transcript is still written to disk, just not committed/published).
+	// Session transcripts stream as RAPID commits to an isolated per-session
+	// branch (SessionGit is the worktree on SessionBranch); SessionPush, when set,
+	// pushes that branch to the remote each commit so a beehived on another host
+	// can read it. Nothing touches main mid-session. While running, main holds a
+	// STUB at the session path naming the branch (the branch's first commit, so
+	// the end merge can't conflict on the file); at session end the branch is
+	// squashed and SessionPublish merges the durable final transcript to main
+	// once. Distinct file paths (sessions/ vs plan/docs) merge conflict-free.
+	// Nil/"" in tests = transcript on disk only, not committed/streamed.
 	SessionGit     *git.Repo
 	SessionRoot    string
+	SessionBranch  string
 	SessionPublish func(context.Context) error
+	SessionPush    func(context.Context) error
 
 	// RestoreConfig, when set, reverts any change to the beehive repo's git config
 	// (remotes) that the agent introduced during a turn. git config is shared
@@ -81,17 +85,75 @@ type Runner struct {
 	// edit worktrees from origin/main). The runner calls it at the top of every
 	// turn so drift never persists past the turn that caused it. Nil in tests.
 	RestoreConfig func(context.Context)
+
+	// TurnTimeout bounds a single agent turn (one opencode Prompt). A stalled
+	// session is canceled at this cap and the task is abandoned for GC, instead of
+	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
+	// backstop. 0 = no per-turn cap (tests).
+	TurnTimeout time.Duration
 }
 
-// syncSession commits the live session transcript in the dedicated session
-// worktree and publishes it to main, so the beehived UI shows the session while
-// it runs. The session worktree has exactly one writer (this recorder), so a
-// plain path-scoped commit is safe — no index contention with the agent.
-func (r *Runner) syncSession(ctx context.Context, sid, rel string) {
+// streamSession commits the current transcript to the isolated session branch
+// and, when distributed, pushes that branch to the remote — so a beehived
+// (possibly on another host) reading the branch sees the session in near real
+// time. No merge to main here; that happens once at session end. Best-effort:
+// a failed push never fails the run.
+func (r *Runner) streamSession(ctx context.Context, rel string) {
 	if r.SessionGit == nil {
-		return // tests without a session worktree: file is on disk, not committed
+		return
 	}
-	_ = r.SessionGit.CommitPaths(ctx, "session: "+sid+"\n\nBeehive: session "+sid, rel)
+	if err := r.SessionGit.CommitPaths(ctx, "session: stream", rel); err != nil {
+		return // ErrNothing (no change) or a transient error: skip this tick
+	}
+	if r.SessionPush != nil {
+		_ = r.SessionPush(ctx)
+	}
+}
+
+// startSession plants the stub on main (the session branch's first commit, so
+// the end merge can't conflict on the file) and returns the stub commit to
+// squash onto. No-op (returns "") when there is no session worktree (tests).
+func (r *Runner) startSession(ctx context.Context, file, rel string) string {
+	if r.SessionGit == nil || r.SessionRoot == "" || r.SessionBranch == "" {
+		return ""
+	}
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		return ""
+	}
+	if err := os.WriteFile(file, []byte(repo.SessionStub(r.SessionBranch)), 0o644); err != nil {
+		return ""
+	}
+	if err := r.SessionGit.CommitPaths(ctx, "session: start "+r.SessionBranch, rel); err != nil {
+		return ""
+	}
+	stub, err := r.SessionGit.Head(ctx)
+	if err != nil {
+		return ""
+	}
+	if r.SessionPublish != nil {
+		_ = r.SessionPublish(ctx) // land the stub on main so the session is discoverable
+	}
+	if r.SessionPush != nil {
+		_ = r.SessionPush(ctx)
+	}
+	return stub
+}
+
+// finalizeSession squashes the rapid streaming commits down to a single commit
+// on top of the stub (keeping main history clean) and merges the durable final
+// transcript to main once. stub is the commit startSession returned; "" (tests /
+// no session worktree) makes this a no-op.
+func (r *Runner) finalizeSession(ctx context.Context, sid, rel, stub string) {
+	if r.SessionGit == nil || stub == "" {
+		return
+	}
+	// Collapse stub..HEAD into one commit: --soft keeps the final file staged.
+	if _, err := r.SessionGit.Run(ctx, "reset", "--soft", stub); err != nil {
+		return
+	}
+	if err := r.SessionGit.CommitPaths(ctx, "session: "+sid+"\n\nBeehive: session "+sid, rel); err != nil && err != git.ErrNothing {
+		return
+	}
 	if r.SessionPublish != nil {
 		_ = r.SessionPublish(ctx)
 	}
@@ -254,27 +316,31 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	recCtx, recStop := context.WithCancel(ctx)
 	sid := SessionID(res.Branch, r.now())
 	res.SessionID = sid
-	// The session transcript lives at submodules/<sm>/sessions/<sid>.md. It is
-	// written and committed in the dedicated SESSION worktree (SessionRoot), never
-	// the agent's beehive worktree, so session commits and PLAN.md/docs commits
-	// stay on separate branches. Tests without a session worktree fall back to the
-	// agent worktree path and skip committing.
+	// The transcript streams as rapid commits to the isolated session branch (via
+	// the session worktree), pushed to the remote when distributed; beehived reads
+	// the branch. Fall back to the submodule's sessions dir on disk when there is
+	// no session worktree (tests).
 	sessionRel := filepath.Join("submodules", sel.Submodule.Name, "sessions", sid+".md")
 	sessionFile := filepath.Join(sel.Submodule.SessionsDir(), sid+".md")
 	if r.SessionRoot != "" {
 		sessionFile = filepath.Join(r.SessionRoot, sessionRel)
 	}
 	rec := &recorder{
-		sess:     sess,
-		path:     sessionFile,
-		header:   fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch),
-		debug:    r.Debug,
-		flush:    func(c context.Context) { r.syncSession(c, sid, sessionRel) },
-		flushIvl: 2 * time.Second,
-		toolSt:   map[string]string{},
-		partLen:  map[string]int{},
-		started:  map[string]bool{},
+		sess:    sess,
+		path:    sessionFile,
+		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch),
+		debug:   r.Debug,
+		toolSt:  map[string]string{},
+		partLen: map[string]int{},
+		started: map[string]bool{},
 	}
+	if r.SessionGit != nil {
+		rec.commit = func(c context.Context) { r.streamSession(c, sessionRel) }
+		rec.commitIvl = time.Second
+	}
+	// Plant the stub on main and capture the squash base BEFORE the recorder starts
+	// overwriting the file with the transcript.
+	stubCommit := r.startSession(ctx, sessionFile, sessionRel)
 	recDone := make(chan struct{})
 	go func() { rec.loop(recCtx); close(recDone) }()
 
@@ -285,8 +351,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
 	// finish stops the recorder, optionally records an abort warning to the
-	// session file (so it shows in the UI), then commits+publishes the session
-	// (its own worktree) and publishes the agent's branch.
+	// transcript (so it shows in the UI), commits the final transcript to the
+	// session branch, then squashes+merges the durable final to main once and
+	// publishes the agent's branch.
 	finish := func(warning string) {
 		recStop()
 		<-recDone
@@ -297,7 +364,8 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				fmt.Fprintf(r.Debug, "\n⚠️  %s\n", warning)
 			}
 		}
-		r.syncSession(ctx, sid, sessionRel)
+		r.streamSession(ctx, sessionRel) // commit final transcript (incl. warning) to the branch
+		r.finalizeSession(ctx, sid, sessionRel, stubCommit)
 		_ = r.publish(ctx)
 	}
 	cleanup := func() {
@@ -369,9 +437,26 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		// Drive the turn. Turn 1 sends the seeded `first` prompt; the recorder is
 		// already polling, so even the long bootstrap turn streams to the UI/debug.
-		if _, err := sess.Prompt(ctx, prompt); err != nil {
+		// Bound the turn: a stalled opencode call is canceled at TurnTimeout and the
+		// task abandoned for GC, never a multi-hour zombie blocked on a dead socket.
+		turnCtx := ctx
+		cancelTurn := func() {}
+		if r.TurnTimeout > 0 {
+			turnCtx, cancelTurn = context.WithTimeout(ctx, r.TurnTimeout)
+		}
+		_, perr := sess.Prompt(turnCtx, prompt)
+		timedOut := r.TurnTimeout > 0 && turnCtx.Err() == context.DeadlineExceeded
+		cancelTurn()
+		if perr != nil {
+			if timedOut {
+				res.GCMarked = true
+				res.Warning = fmt.Sprintf("turn %d exceeded the %s per-turn timeout (stalled agent); abandoning for GC", res.Turns, r.TurnTimeout)
+				finish(res.Warning)
+				cleanup()
+				return res, nil
+			}
 			finish("")
-			return res, fmt.Errorf("turn %d prompt: %w", res.Turns, err)
+			return res, fmt.Errorf("turn %d prompt: %w", res.Turns, perr)
 		}
 		done, err := r.complete(sel, res.Branch)
 		if err != nil {

@@ -25,18 +25,24 @@ type Config struct {
 	TTLMinutes   int    `yaml:"ttl_minutes"`   // GC heartbeat TTL
 	MaxTurns     int    `yaml:"max_turns"`     // per-honeybee turn cap
 	RejectLimit  int    `yaml:"reject_limit"`  // rejections before NEEDS-HUMAN
+	// TurnTimeoutMinutes bounds a single agent turn (one opencode call). A stalled
+	// session is canceled at this cap so the honeybee abandons the task for GC
+	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
+	// cap (the whole-run WallCap/TTL still applies between turns).
+	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
 }
 
 // Defaults are applied when the config file omits fields.
 func Defaults(dir string) Config {
 	return Config{
-		Dir:         dir,
-		GPGHome:     filepath.Join(dir, "gnupg"),
-		AgentCmd:    "opencode",
-		AgentURL:    "http://127.0.0.1:4096",
-		TTLMinutes:  60,
-		MaxTurns:    15,
-		RejectLimit: 3,
+		Dir:                dir,
+		GPGHome:            filepath.Join(dir, "gnupg"),
+		AgentCmd:           "opencode",
+		AgentURL:           "http://127.0.0.1:4096",
+		TTLMinutes:         60,
+		MaxTurns:           15,
+		RejectLimit:        3,
+		TurnTimeoutMinutes: 20,
 	}
 }
 
@@ -81,6 +87,9 @@ func Load() (Config, error) {
 	}
 	if c.RejectLimit == 0 {
 		c.RejectLimit = 3
+	}
+	if c.TurnTimeoutMinutes == 0 {
+		c.TurnTimeoutMinutes = 20
 	}
 	return c, nil
 }

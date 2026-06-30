@@ -198,3 +198,64 @@ func TestPublishRaceOneWinner(t *testing.T) {
 		t.Fatalf("want exactly one winner, got %d (a=%v b=%v)", won, errA, errB)
 	}
 }
+
+// TestClaimLockSingleton proves the bootstrap/reconcile singleton lock arbitrates
+// like a task claim: two passes on separate worktrees race for the same lock,
+// exactly one wins, and after the winner releases, a later pass can acquire it.
+func TestClaimLockSingleton(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+	g := git.New(root)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		g.Run(ctx, a...)
+	}
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ndo it\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	mk := func(name string) *Claimer {
+		wt := filepath.Join(root, ".worktrees", name)
+		if err := g.WorktreeAdd(ctx, wt, name, "main"); err != nil {
+			t.Fatal(err)
+		}
+		rp, _ := repo.Open(wt)
+		subs, _ := rp.Submodules()
+		wg := git.New(wt)
+		return &Claimer{
+			Repo: rp, Sub: subs[0], Git: wg, TTL: time.Hour, Session: name,
+			Publish: func(c context.Context) error { return wg.PublishToMain(c, "") },
+		}
+	}
+	a, b := mk("bee-a"), mk("bee-b")
+	errA := a.ClaimLock(ctx, "reconcile")
+	errB := b.ClaimLock(ctx, "reconcile")
+	won, winner := 0, (*Claimer)(nil)
+	for i, e := range []error{errA, errB} {
+		switch {
+		case e == nil:
+			won++
+			winner = []*Claimer{a, b}[i]
+		case errors.Is(e, ErrLost):
+		default:
+			t.Fatalf("unexpected ClaimLock error: %v", e)
+		}
+	}
+	if won != 1 {
+		t.Fatalf("want exactly one lock winner, got %d (a=%v b=%v)", won, errA, errB)
+	}
+	// A fresh pass cannot take the live lock.
+	c := mk("bee-c")
+	if err := c.ClaimLock(ctx, "reconcile"); !errors.Is(err, ErrLost) {
+		t.Fatalf("want ErrLost against a live lock, got %v", err)
+	}
+	// After the winner releases, a later pass can acquire it.
+	if err := winner.ReleaseLock(ctx, "reconcile"); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+	d := mk("bee-d")
+	if err := d.ClaimLock(ctx, "reconcile"); err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+}

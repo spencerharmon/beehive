@@ -13,23 +13,26 @@ import (
 
 // recorder polls one opencode session and renders its full transcript (user
 // prompts, assistant text, model reasoning, tool commands + output) to a file
-// in the beehive repo. When debug is set it also tees live activity to a writer.
-// A single recorder per honeybee means opencode is polled exactly once; the web
-// UI reads the repo file instead of polling opencode itself.
+// on disk. When debug is set it also tees live activity to a writer. A single
+// recorder per honeybee means opencode is polled exactly once; beehived reads
+// the file (a gitignored, real-time live transcript) instead of polling opencode
+// itself. The file is NOT committed per poll — the runner makes one durable
+// commit at session end — so streaming never touches git.
 type recorder struct {
 	sess   Session
-	path   string // submodules/<sm>/sessions/<branch>.md
+	path   string // session worktree file streamed to the session branch
 	header string
 	debug  io.Writer
 
-	// flush, when set, commits the session file and publishes it to main so the
-	// beehived UI (which reads main's working tree) shows the session live. It is
-	// throttled to flushIvl and only runs when the transcript actually changed, to
-	// bound commit churn. lastMD/lastFlush track that.
-	flush     func(context.Context)
-	flushIvl  time.Duration
-	lastMD    string
-	lastFlush time.Time
+	lastMD string // last rendered transcript, to skip rewriting an unchanged file
+
+	// commit, when set, persists the current transcript (commit to the isolated
+	// session branch, push to remote when distributed). Throttled to commitIvl and
+	// only run when the transcript changed, to bound commit churn while staying
+	// near real-time. lastCommit tracks the throttle.
+	commit     func(context.Context)
+	commitIvl  time.Duration
+	lastCommit time.Time
 
 	// debug-stream state (incremental, append-only diffing)
 	toolSt  map[string]string // callID -> last status streamed
@@ -50,15 +53,21 @@ func (rc *recorder) loop(ctx context.Context) {
 	}
 }
 
-// snapshot fetches the session, writes the rendered transcript to the repo, and
-// (when debug) streams new activity. Best-effort: transient poll errors are skipped.
+// snapshot fetches the session, writes the rendered transcript to the worktree
+// file, commits it to the isolated session branch (throttled), and (when debug)
+// streams new activity. Best-effort: transient poll errors are skipped.
 func (rc *recorder) snapshot(ctx context.Context) {
 	msgs, err := rc.sess.Messages(ctx)
 	if err != nil || len(msgs) == 0 {
 		return
 	}
 	md := renderTranscript(rc.header, msgs)
-	changed := md != rc.lastMD
+	if md == rc.lastMD {
+		if rc.debug != nil {
+			rc.streamDebug(msgs)
+		}
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(rc.path), 0o755); err == nil {
 		_ = os.WriteFile(rc.path, []byte(md), 0o644)
 	}
@@ -66,12 +75,12 @@ func (rc *recorder) snapshot(ctx context.Context) {
 	if rc.debug != nil {
 		rc.streamDebug(msgs)
 	}
-	// Publish progress to main so the session shows up live in the UI, throttled.
-	if changed && rc.flush != nil {
+	// Stream to the session branch so beehived sees it near real time, throttled.
+	if rc.commit != nil {
 		now := time.Now()
-		if rc.lastFlush.IsZero() || now.Sub(rc.lastFlush) >= rc.flushIvl {
-			rc.lastFlush = now
-			rc.flush(ctx)
+		if rc.lastCommit.IsZero() || now.Sub(rc.lastCommit) >= rc.commitIvl {
+			rc.lastCommit = now
+			rc.commit(ctx)
 		}
 	}
 }

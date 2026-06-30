@@ -15,6 +15,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/git"
@@ -243,4 +246,108 @@ func (c *Claimer) Reject(ctx context.Context, taskID string, limit int) (plan.St
 		return "", err
 	}
 	return t.Status, nil
+}
+
+// --- Singleton locks (bootstrap / reconcile) -------------------------------
+//
+// Bootstrap and ROI-reconcile operate on PLAN.md as a whole and carry no task
+// to claim, so without a lock every honeybee that sees the same drift runs the
+// SAME reconcile in parallel and they race to merge — wasted sessions and merge
+// thrash. A singleton lock makes exactly one honeybee perform the operation:
+// it's the same commit-race as a task claim, but on a dedicated lock file
+// (submodules/<sm>/.bee-lock-<name>) instead of a PLAN task line. The lock
+// carries a heartbeat ts and is TTL-bounded, so a crashed holder's lock is
+// reclaimable by a later honeybee exactly like a stale task claim.
+
+func (c *Claimer) lockRel(name string) string {
+	return filepath.Join("submodules", c.Sub.Name, ".bee-lock-"+name)
+}
+
+func (c *Claimer) lockPath(name string) string {
+	return filepath.Join(c.Sub.Path, ".bee-lock-"+name)
+}
+
+// readLock parses a lock file's "session\nunix-ts" body. ok is false when the
+// file is absent or malformed (treated as unlocked).
+func readLock(path string) (session string, ts int64, ok bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0, false
+	}
+	lines := strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)
+	if len(lines) < 2 {
+		return "", 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(lines[1]), 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return strings.TrimSpace(lines[0]), n, true
+}
+
+func lockActive(ts int64, now time.Time, ttl time.Duration) bool {
+	return ts != 0 && now.Sub(time.Unix(ts, 0)) < ttl
+}
+
+// ClaimLock acquires the named singleton lock for this session. A live foreign
+// holder (lock fresh within TTL, different session) or a publish/merge conflict
+// is ErrLost — the caller reselects. On success this session owns the operation
+// on main and ReleaseLock must be called when done.
+func (c *Claimer) ClaimLock(ctx context.Context, name string) error {
+	rel, path := c.lockRel(name), c.lockPath(name)
+	if sess, ts, ok := readLock(path); ok && sess != c.Session && lockActive(ts, c.now(), c.TTL) {
+		return ErrLost
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	body := fmt.Sprintf("%s\n%d\n", c.Session, c.now().Unix())
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		return err
+	}
+	if err := c.Git.CommitPaths(ctx, stampMsg(name, "lock"), rel); err != nil && err != git.ErrNothing {
+		return err
+	}
+	if c.Publish != nil {
+		if err := c.Publish(ctx); err != nil {
+			if errors.Is(err, git.ErrConflict) {
+				return ErrLost
+			}
+			return err
+		}
+	}
+	// Verify: pull main and assert our session still holds the lock (a peer that
+	// raced may have landed first; their lock content conflicts with ours).
+	if err := c.syncMain(ctx); err != nil {
+		if errors.Is(err, git.ErrConflict) {
+			return ErrLost
+		}
+		return err
+	}
+	if sess, _, ok := readLock(path); !ok || sess != c.Session {
+		return ErrLost
+	}
+	return nil
+}
+
+// ReleaseLock clears the named lock if this session holds it, then commits and
+// publishes the removal so a peer can take over immediately. A publish conflict
+// is benign (a peer already advanced main) and is swallowed.
+func (c *Claimer) ReleaseLock(ctx context.Context, name string) error {
+	rel, path := c.lockRel(name), c.lockPath(name)
+	if sess, _, ok := readLock(path); !ok || sess != c.Session {
+		return nil // not ours / already gone
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := c.Git.CommitPaths(ctx, stampMsg(name, "unlock"), rel); err != nil && err != git.ErrNothing {
+		return err
+	}
+	if c.Publish != nil {
+		if err := c.Publish(ctx); err != nil && !errors.Is(err, git.ErrConflict) {
+			return err
+		}
+	}
+	return nil
 }

@@ -1,17 +1,21 @@
 package web
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/spencerharmon/beehive/internal/repo"
 )
 
-// sessionLiveWindow: a session file touched more recently than this is treated as
-// a still-running honeybee (its recorder writes every poll, ~700ms).
+// sessionLiveWindow: a session whose branch tip moved more recently than this is
+// treated as a still-running honeybee (the recorder commits ~1s while active).
 const sessionLiveWindow = 15 * time.Second
 
 // sessionInfo describes one recorded session for the list view.
@@ -41,7 +45,7 @@ func (s *Server) sessionsListBody(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, "session_list_body.html", map[string]interface{}{
-		"Name": sm.Name, "Sessions": sessionInfos(sm.SessionsDir(), time.Now()),
+		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), sm.SessionsDir(), time.Now()),
 	})
 }
 
@@ -60,9 +64,13 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "session_view.html", map[string]interface{}{"Name": sm.Name, "Branch": branch})
 }
 
-// sessionBody returns just the transcript text, read live from the working-tree
-// file the honeybee's recorder writes. The frontend polls this; opencode is
-// never contacted here, so viewers add no load to the agent server.
+// sessionBody returns just the transcript text. While a session runs, main holds
+// a STUB at the path naming the isolated branch the transcript streams to; we
+// resolve that branch (fetching from the remote when the honeybee is on another
+// host) and render the branch's copy, so the UI shows the session in near real
+// time without sharing a filesystem with the honeybee. A finished session's
+// path holds the durable final transcript, rendered directly. opencode is never
+// contacted here, so viewers add no load to the agent server.
 func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -74,6 +82,7 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad branch", http.StatusBadRequest)
 		return
 	}
+	sessRel := "submodules/" + sm.Name + "/sessions/" + branch + ".md"
 	b, err := os.ReadFile(filepath.Join(sm.SessionsDir(), branch+".md"))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -83,14 +92,46 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.render(w, "session_body.html", map[string]interface{}{"Body": string(b)})
+	body := string(b)
+	if streamBranch, isStub := repo.ParseSessionStub(body); isStub {
+		if live, ok := s.readSessionBranch(r.Context(), streamBranch, sessRel); ok {
+			body = live
+		} else {
+			body = "(waiting for session output…)"
+		}
+	}
+	s.render(w, "session_body.html", map[string]interface{}{"Body": body})
 }
 
-func sessionInfos(dir string, now time.Time) []sessionInfo {
+// readSessionBranch returns the transcript file as it stands on the isolated
+// session branch. For a distributed honeybee it fetches the branch from the
+// remote first; for a local-only hive it reads the local branch ref directly.
+func (s *Server) readSessionBranch(ctx context.Context, branch, rel string) (string, bool) {
+	if !safeBranch(branch) {
+		return "", false
+	}
+	if rem, _ := s.git.Remote(ctx); rem != "" {
+		_ = s.git.Fetch(ctx, rem, branch) // best-effort: stale ref is better than nothing
+		if out, err := s.git.Show(ctx, rem+"/"+branch, rel); err == nil {
+			return out, true
+		}
+	}
+	if out, err := s.git.Show(ctx, branch, rel); err == nil {
+		return out, true
+	}
+	return "", false
+}
+
+// sessionInfos lists recorded sessions from the committed sessions dir. An entry
+// whose file is a STUB is a running session: its freshness/liveness come from the
+// streaming branch's tip commit time, not the stub's (fixed) mtime. A non-stub
+// entry is a finished session, dated by its file mtime.
+func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []sessionInfo {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
+	rem, _ := s.git.Remote(ctx)
 	var out []sessionInfo
 	for _, e := range ents {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
@@ -100,17 +141,52 @@ func sessionInfos(dir string, now time.Time) []sessionInfo {
 		if err != nil {
 			continue
 		}
+		id := strings.TrimSuffix(e.Name(), ".md")
 		mod := fi.ModTime()
+		live := false
+		if raw, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
+			if branch, isStub := repo.ParseSessionStub(string(raw)); isStub {
+				// Running: date by the streaming branch tip; live while the branch exists.
+				live = true
+				if t, ok := s.branchTipTime(ctx, branch, rem); ok {
+					mod = t
+					live = now.Sub(t) < sessionLiveWindow
+				}
+			}
+		}
 		out = append(out, sessionInfo{
-			ID:       strings.TrimSuffix(e.Name(), ".md"),
+			ID:       id,
 			Modified: mod,
 			Ago:      humanAgo(now.Sub(mod)),
-			Live:     now.Sub(mod) < sessionLiveWindow,
+			Live:     live,
 		})
 	}
 	// Newest activity first so running sessions sit at the top.
 	sort.Slice(out, func(i, j int) bool { return out[i].Modified.After(out[j].Modified) })
 	return out
+}
+
+// branchTipTime returns the last-commit time of a session branch (preferring the
+// remote-tracking ref when distributed). ok is false when the branch is gone
+// (e.g. a finished session whose branch was deleted).
+func (s *Server) branchTipTime(ctx context.Context, branch, rem string) (time.Time, bool) {
+	if !safeBranch(branch) {
+		return time.Time{}, false
+	}
+	refs := []string{branch}
+	if rem != "" {
+		refs = []string{rem + "/" + branch, branch}
+	}
+	for _, ref := range refs {
+		out, err := s.git.Run(ctx, "log", "-1", "--format=%ct", ref)
+		if err != nil {
+			continue
+		}
+		if sec, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64); err == nil {
+			return time.Unix(sec, 0), true
+		}
+	}
+	return time.Time{}, false
 }
 
 func humanAgo(d time.Duration) string {
