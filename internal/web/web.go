@@ -17,6 +17,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/submod"
 )
 
 //go:embed templates/*.html
@@ -24,6 +25,11 @@ var tmplFS embed.FS
 
 //go:embed assets/*
 var assetFS embed.FS
+
+// submoduleAddTimeout bounds a `git submodule add` (a network clone needing
+// creds); it is larger than the 30s plain-commit budget because cloning a real
+// remote can legitimately take longer than a local commit.
+const submoduleAddTimeout = 2 * time.Minute
 
 // Server holds the parsed templates and the repo it serves.
 type Server struct {
@@ -335,42 +341,51 @@ func (s *Server) mergePost(w http.ResponseWriter, r *http.Request) {
 	s.mergeGet(w, r)
 }
 
+// submoduleAdd registers a target repo as a real tracked git submodule through
+// the shared submod.Add (the same `git submodule add` the CLI runs), then commits
+// the new .gitmodules + gitlink. The old handler just os.MkdirAll'd an inert dir
+// with no repo/ and no tracking. The clone needs network/creds and can be slow,
+// so it is bounded by submoduleAddTimeout and errors are surfaced to the user.
 func (s *Server) submoduleAdd(w http.ResponseWriter, r *http.Request) {
-	name := r.FormValue("name")
-	if name == "" || filepath.Base(name) != name {
-		http.Error(w, "invalid name", 400)
+	ctx, cancel := context.WithTimeout(r.Context(), submoduleAddTimeout)
+	defer cancel()
+	added, err := submod.Add(ctx, s.repo.Root, r.FormValue("url"), r.FormValue("name"), r.FormValue("branch"))
+	if err != nil {
+		switch {
+		case errors.Is(err, submod.ErrURLRequired), errors.Is(err, submod.ErrInvalidName):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, submod.ErrExists):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
-	if err := os.MkdirAll(filepath.Join(s.repo.Root, "submodules", name), 0o755); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if err := s.commit(r.Context(), "frontend: add submodule "+name); err != nil && !errors.Is(err, git.ErrNothing) {
+	if err := s.commit(r.Context(), "frontend: add submodule "+added); err != nil && !errors.Is(err, git.ErrNothing) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// submoduleLink records a from->to dependency through the cycle-checked links
+// schema (submod.AddDep) and commits valid, sorted YAML — replacing the old raw
+// `from: [to]` append that was neither schema-valid nor cycle-checked. A cycle,
+// self-dependency, or empty edge is a client error rejected without writing.
 func (s *Server) submoduleLink(w http.ResponseWriter, r *http.Request) {
 	from, to := r.FormValue("from"), r.FormValue("to")
-	if from == "" || to == "" {
-		http.Error(w, "from and to required", 400)
+	if err := submod.AddDep(s.repo.Root, from, to); err != nil {
+		switch {
+		case errors.Is(err, submod.ErrInvalidDep):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, submod.ErrCycle):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
-	p := filepath.Join(s.repo.Root, repo.LinksFile)
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if _, err := f.WriteString(from + ": [" + to + "]\n"); err != nil {
-		f.Close()
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	f.Close()
-	if err := s.commit(r.Context(), "frontend: link "+from+" -> "+to); err != nil {
+	if err := s.commit(r.Context(), "frontend: link "+from+" -> "+to); err != nil && !errors.Is(err, git.ErrNothing) {
 		http.Error(w, err.Error(), 500)
 		return
 	}

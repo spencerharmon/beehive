@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/spencerharmon/beehive/internal/git"
-	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/submod"
 	"github.com/spf13/cobra"
 )
 
@@ -169,20 +168,11 @@ func submoduleAddCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			url := args[0]
-			if name == "" {
-				name = strings.TrimSuffix(filepath.Base(url), ".git")
-			}
-			subdir := filepath.Join(root, "submodules", name)
-			if err := os.MkdirAll(filepath.Join(subdir, "worktrees"), 0o755); err != nil {
+			added, err := submod.Add(cmd.Context(), root, args[0], name, branch)
+			if err != nil {
 				return err
 			}
-			g := git.New(root)
-			rel := filepath.Join("submodules", name, "repo")
-			if _, err := g.Run(cmd.Context(), "submodule", "add", "-b", branch, url, rel); err != nil {
-				return err
-			}
-			fmt.Printf("added submodule %s tracking %s (dormant; author ROI.md to activate)\n", name, branch)
+			fmt.Printf("added submodule %s tracking %s (dormant; author ROI.md to activate)\n", added, branch)
 			return nil
 		},
 	}
@@ -201,19 +191,10 @@ func submoduleLinkCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			a, b := args[0], args[1]
-			for _, sm := range []string{a, b} {
-				p := filepath.Join(root, "submodules", sm, repo.LinksFile)
-				l, err := links.Load(p)
-				if err != nil {
-					return err
-				}
-				l.LinkSubmodules(a, b)
-				if err := l.Save(p); err != nil {
-					return err
-				}
+			if err := submod.LinkSubmodules(root, args[0], args[1]); err != nil {
+				return err
 			}
-			fmt.Printf("linked %s <-> %s\n", a, b)
+			fmt.Printf("linked %s <-> %s\n", args[0], args[1])
 			return nil
 		},
 	}
