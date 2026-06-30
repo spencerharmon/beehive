@@ -16,10 +16,12 @@ import (
 
 // Opencode talks to an opencode server's session API.
 type Opencode struct {
-	Base  string // server base URL
-	Model string // "provider/model"
-	HTTP  *http.Client
-	Debug io.Writer // non-nil: log each HTTP request/response
+	Base        string  // server base URL
+	Model       string  // "provider/model"
+	Temperature float64 // sampling temperature; 0 = backend default (omitted from the request)
+	MaxTokens   int     // max output tokens; 0 = backend default (omitted from the request)
+	HTTP        *http.Client
+	Debug       io.Writer // non-nil: log each HTTP request/response
 }
 
 // Open creates a server session for the working directory dir (an absolute path;
@@ -140,6 +142,15 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 		"system": s.system,
 		"model":  map[string]any{"providerID": prov, "modelID": model},
 		"parts":  []map[string]any{{"type": "text", "text": text}},
+	}
+	// Model knobs from the resolved (layered) config. Only sent when explicitly
+	// configured (non-zero): an unset knob leaves the request byte-identical to
+	// the old default path, so the backend's own default applies.
+	if s.oc.Temperature != 0 {
+		body["temperature"] = s.oc.Temperature
+	}
+	if s.oc.MaxTokens != 0 {
+		body["maxTokens"] = s.oc.MaxTokens
 	}
 	var reply struct {
 		Parts []struct {

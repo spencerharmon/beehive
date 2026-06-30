@@ -98,6 +98,15 @@ func run() error {
 		fmt.Println("honeybee: no workable task")
 		return nil
 	}
+	// Resolve the effective, layered config for the submodule we'll work
+	// (Defaults -> host -> in-repo global -> per-submodule override). The agent
+	// model knobs (URL, model, temperature, max tokens) and turn cap below come
+	// from this per-submodule view, not the flat host-only Load() used for the
+	// pre-selection coordination TTL.
+	eff, err := config.Resolve(primaryRoot, sel0.Submodule.Name)
+	if err != nil {
+		return err
+	}
 	wtBranch := swarm.SessionID(sel0.Submodule.Name, time.Now())
 	wtPath := filepath.Join(primaryRoot, ".worktrees", wtBranch)
 	if err := primary.WorktreeAdd(ctx, wtPath, wtBranch, base); err != nil {
@@ -152,14 +161,14 @@ func run() error {
 	session := wtBranch
 
 	runner := &swarm.Runner{
-		Repo: rp, Git: gitRepo, MaxTurns: c.MaxTurns, WallCap: ttl, TTL: ttl, Publish: publish,
+		Repo: rp, Git: gitRepo, MaxTurns: eff.MaxTurns, WallCap: ttl, TTL: ttl, Publish: publish,
 		Remote: remote, BaseMain: baseMain, Session: session,
 		SessionGit: sessGit, SessionRoot: sessPath, SessionBranch: sessBranch,
 		SessionPublish: sessPublish, SessionPush: sessPush,
 		RestoreConfig: restoreRemotes,
 		TurnTimeout:   time.Duration(c.TurnTimeoutMinutes) * time.Minute,
 	}
-	oc := &swarm.Opencode{Base: c.AgentURL, Model: c.Model, HTTP: &http.Client{Timeout: 0}}
+	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {
 		runner.Debug = os.Stderr
 		oc.Debug = os.Stderr
@@ -228,7 +237,7 @@ func run() error {
 
 		if debug {
 			fmt.Fprintf(os.Stderr, "[honeybee] agent_url=%s model=%q kind=%s worktree=%s remote=%q\n",
-				c.AgentURL, c.Model, sel.Kind, wtPath, remote)
+				eff.AgentURL, eff.Model, sel.Kind, wtPath, remote)
 		}
 		res, err := runner.Run(ctx, sel, prompts.Agents, firstPrompt(sel))
 		if err != nil {
