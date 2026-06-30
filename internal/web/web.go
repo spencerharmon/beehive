@@ -138,7 +138,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 			v.State = "bootstrap"
 		}
 		v.Stamp, _ = sm.ROIStamp()
-		if p, err := parsePlan(sm.PlanPath()); err == nil {
+		if p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl()); err == nil {
 			for _, it := range p.Items {
 				if it.Status != StatusDone {
 					v.Pending++
@@ -204,7 +204,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	p, err := parsePlan(sm.PlanPath())
+	p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl())
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -439,7 +439,7 @@ func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 	}
 	var rows []row
 	for _, sm := range subs {
-		p, _ := parsePlan(sm.PlanPath())
+		p, _ := parsePlan(sm.PlanPath(), time.Now(), s.ttl())
 		for _, it := range p.Items {
 			if it.Status == StatusHuman {
 				rows = append(rows, row{Sub: sm.Name, Item: it})
@@ -453,6 +453,18 @@ func (s *Server) commit(ctx context.Context, msg string) error {
 	c, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	return s.git.Commit(c, msg)
+}
+
+// ttl is the resolved claim heartbeat TTL: a task's session+heartbeat is "active"
+// within it and "stale" (GC-reclaimable) beyond it. It mirrors the runner's TTL
+// (config ttl_minutes) so the frontend's active/stale derivation matches
+// selection. A non-positive config value falls back to the 60m default.
+func (s *Server) ttl() time.Duration {
+	m := s.cfg.TTLMinutes
+	if m <= 0 {
+		m = 60
+	}
+	return time.Duration(m) * time.Minute
 }
 
 func pageParams(r *http.Request) (offset, limit int) {

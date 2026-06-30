@@ -4,14 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/spencerharmon/beehive/internal/artifacts"
 )
-
-// roiStamp matches the PLAN.md reconcile marker: <!-- Beehive-ROI: <sha> -->
-var roiStamp = regexp.MustCompile(`Beehive-ROI:\s*([0-9a-f]+)`)
 
 // Env is the deployment state shown by the env badge/panel. It mirrors
 // artifacts.Deployment (the resolved blue/green state) for the templates, which

@@ -1,8 +1,8 @@
 {{template "header"}}
 <h1>{{.Name}} plan</h1>
 <p>ROI stamp: {{.Plan.ROIStamp}}</p>
-<table><tr><th>id</th><th>status</th><th>desc</th><th>deps</th><th>ttl</th><th>doc</th></tr>
-{{range .Plan.Items}}<tr><td>{{.ID}}</td><td>{{.Status}}</td><td>{{.Desc}}</td><td>{{range .Deps}}{{.}} {{end}}</td><td>{{.Heartbeat}}</td><td>{{.Doc}}</td></tr>{{end}}
+<table><tr><th>id</th><th>status</th><th>desc</th><th>deps</th><th>claim</th><th>doc</th></tr>
+{{range .Plan.Items}}<tr><td>{{.ID}}</td><td>{{.Status}}</td><td>{{.Desc}}</td><td>{{range .Deps}}{{.}} {{end}}</td><td>{{.Claim}}</td><td>{{.Doc}}</td></tr>{{end}}
 </table>
 <form method="post" action="/submodule/{{.Name}}/plan/delete"
       onsubmit="return confirm('Delete PLAN.md for {{.Name}}? The next honeybee will rebootstrap the plan from ROI.md. In-flight task state is discarded.');">
