@@ -542,6 +542,146 @@ func TestROIViewRendersAndRawVerbatim(t *testing.T) {
 	}
 }
 
+// commitRepoAt inits a git repo at dir and lays down one commit per message
+// (each appended to f.txt so every commit changes the tree, even on repeats).
+// A message may carry a stamp body, e.g. "subj\n\nBeehive: <task> <doc>".
+func commitRepoAt(t *testing.T, dir string, msgs ...string) {
+	t.Helper()
+	os.MkdirAll(dir, 0o755)
+	git := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
+	body := ""
+	for _, m := range msgs {
+		body += m + "\n"
+		os.WriteFile(filepath.Join(dir, "f.txt"), []byte(body), 0o644)
+		git("add", "-A")
+		git("commit", "-q", "-m", m)
+	}
+}
+
+// TestSectionByDate is the unit core of the "sectioned" requirement: commits
+// (newest-first, as git log emits them) group into one section per date,
+// preserving order and membership, with no cross-date bleed.
+func TestSectionByDate(t *testing.T) {
+	cs := []Commit{
+		{SHA: "a", Date: "2026-06-30", Subject: "x"},
+		{SHA: "b", Date: "2026-06-30", Subject: "y"},
+		{SHA: "c", Date: "2026-06-29", Subject: "z"},
+	}
+	secs := sectionByDate(cs)
+	if len(secs) != 2 {
+		t.Fatalf("want 2 date sections, got %d: %+v", len(secs), secs)
+	}
+	if secs[0].Date != "2026-06-30" || len(secs[0].Commits) != 2 {
+		t.Fatalf("section 0 = %+v, want 2026-06-30 with 2 commits", secs[0])
+	}
+	if secs[1].Date != "2026-06-29" || len(secs[1].Commits) != 1 || secs[1].Commits[0].SHA != "c" {
+		t.Fatalf("section 1 = %+v, want 2026-06-29 with only c", secs[1])
+	}
+}
+
+// TestCommitGraphPagination drives commitGraph against a real repo: it parses
+// SHA/subject and the Beehive doc stamp, and offset/limit bound the page
+// (newest-first). It reads ONE repoDir, so it can never crawl submodules.
+func TestCommitGraphPagination(t *testing.T) {
+	rd := filepath.Join(t.TempDir(), "repo")
+	commitRepoAt(t, rd, "c1", "c2", "c3 subj\n\nBeehive: task3 docs/bee-c3.md")
+	page1, err := commitGraph(context.Background(), rd, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page1) != 2 || page1[0].Subject != "c3 subj" || page1[1].Subject != "c2" {
+		t.Fatalf("page1 = %+v, want [c3 subj, c2]", page1)
+	}
+	if page1[0].SHA == "" || len(page1[0].SHA) > 12 {
+		t.Fatalf("SHA not parsed/bounded: %q", page1[0].SHA)
+	}
+	if page1[0].DocTask != "task3" || page1[0].DocPath != "docs/bee-c3.md" {
+		t.Fatalf("doc stamp not split: task=%q path=%q", page1[0].DocTask, page1[0].DocPath)
+	}
+	page2, err := commitGraph(context.Background(), rd, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2) != 1 || page2[0].Subject != "c1" {
+		t.Fatalf("page2 = %+v, want [c1]", page2)
+	}
+}
+
+// TestBranchesSectionedScoped proves the rendered branch view is sectioned (a
+// .card section with a date <h2>) AND scoped to ONE submodule: alpha's page
+// shows alpha's commit and never beta's (no cross-submodule crawl).
+func TestBranchesSectionedScoped(t *testing.T) {
+	s, root := setup(t)
+	commitRepoAt(t, filepath.Join(root, "submodules", "alpha", "repo"), "alpha-only-commit")
+	commitRepoAt(t, filepath.Join(root, "submodules", "beta", "repo"), "beta-only-commit")
+
+	w := get(t, s, "/submodule/alpha/branches")
+	if w.Code != 200 {
+		t.Fatalf("branches %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `<section class="card">`) || !strings.Contains(body, "<h2>") {
+		t.Fatalf("branch view is not sectioned:\n%s", body)
+	}
+	if !strings.Contains(body, "alpha-only-commit") {
+		t.Fatalf("alpha commit missing from its own branch view:\n%s", body)
+	}
+	if strings.Contains(body, "beta-only-commit") {
+		t.Fatalf("branch view crawled into another submodule (beta commit leaked):\n%s", body)
+	}
+}
+
+// TestBranchesDocLink proves the commit-stamp linkage: a stamp whose doc exists
+// under the submodule's docs/ renders a link to a doc view that serves the
+// rendered markdown; a stamp whose doc is absent renders no (dead) link.
+func TestBranchesDocLink(t *testing.T) {
+	s, root := setup(t)
+	docsDir := filepath.Join(root, "submodules", "alpha", "docs")
+	os.MkdirAll(docsDir, 0o755)
+	os.WriteFile(filepath.Join(docsDir, "bee-doc.md"), []byte("# Doc Heading\n\nbody text\n"), 0o644)
+	commitRepoAt(t, filepath.Join(root, "submodules", "alpha", "repo"),
+		"has doc\n\nBeehive: dtask docs/bee-doc.md",
+		"no doc\n\nBeehive: mtask docs/missing.md")
+
+	w := get(t, s, "/submodule/alpha/branches")
+	body := w.Body.String()
+	if !strings.Contains(body, `href="/submodule/alpha/doc/bee-doc.md"`) {
+		t.Fatalf("resolved change-doc link missing:\n%s", body)
+	}
+	if strings.Contains(body, "/doc/missing.md") {
+		t.Fatalf("absent change doc must not be linked:\n%s", body)
+	}
+
+	d := get(t, s, "/submodule/alpha/doc/bee-doc.md")
+	if d.Code != 200 {
+		t.Fatalf("doc view %d: %s", d.Code, d.Body)
+	}
+	if db := d.Body.String(); !strings.Contains(db, "<h1>Doc Heading</h1>") || !strings.Contains(db, `class="markdown"`) {
+		t.Fatalf("doc view did not render markdown:\n%s", db)
+	}
+}
+
+// TestDocViewGuards locks the doc handler's safety: a traversal-unsafe filename
+// and a missing doc both 404 (never a read outside submodules/<sm>/docs/).
+func TestDocViewGuards(t *testing.T) {
+	s, _ := setup(t)
+	if w := get(t, s, "/submodule/alpha/doc/a%20b.md"); w.Code != http.StatusNotFound {
+		t.Fatalf("unsafe doc name: got %d, want 404", w.Code)
+	}
+	if w := get(t, s, "/submodule/alpha/doc/nope.md"); w.Code != http.StatusNotFound {
+		t.Fatalf("missing doc: got %d, want 404", w.Code)
+	}
+}
+
 // TestEditorDiffAddDelClasses confirms the chat-diff pane renders unified-diff
 // rows with add/del/eq classes (styled by the design-system --diff-* tokens).
 func TestEditorDiffAddDelClasses(t *testing.T) {

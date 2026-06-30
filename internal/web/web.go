@@ -60,6 +60,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /{$}", s.dashboard)
 	mux.HandleFunc("GET /submodule/{name}", s.explorer)
 	mux.HandleFunc("GET /submodule/{name}/branches", s.branches)
+	mux.HandleFunc("GET /submodule/{name}/doc/{file}", s.doc)
 	mux.HandleFunc("GET /submodule/{name}/plan", s.plan)
 	mux.HandleFunc("POST /submodule/{name}/plan/delete", s.planDelete)
 	mux.HandleFunc("GET /submodule/{name}/sessions", s.sessionsList)
@@ -188,13 +189,53 @@ func (s *Server) branches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	off, lim := pageParams(r)
+	// Scoped to this ONE submodule's checkout: commitGraph reads only
+	// sm.RepoDir(), so the view never crawls across submodules.
 	cs, err := commitGraph(r.Context(), sm.RepoDir(), off, lim)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	for i := range cs {
+		cs[i].DocHref = resolveDocHref(sm, cs[i].DocPath)
+	}
+	prev := off - lim
+	if prev < 0 {
+		prev = 0
+	}
 	s.render(w, "branch_view.html", map[string]interface{}{
-		"Name": sm.Name, "Commits": cs, "Next": off + lim, "Prev": off - lim,
+		"Name":     sm.Name,
+		"Sections": sectionByDate(cs),
+		"Prev":     prev,
+		"HasPrev":  off > 0,
+		"Next":     off + lim,
+		"HasNext":  len(cs) == lim, // a full page may have more
+	})
+}
+
+// doc renders one of a submodule's Beehive change docs
+// (submodules/<name>/docs/<file>) as sanitized markdown, so the branch view's
+// commit-stamp links resolve to a readable page. file is a basename guarded
+// against traversal and the read is scoped to that single submodule's docs/ dir
+// (never another submodule, never outside docs/).
+func (s *Server) doc(w http.ResponseWriter, r *http.Request) {
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	file := r.PathValue("file")
+	if !safeBranch(file) {
+		http.NotFound(w, r)
+		return
+	}
+	b, err := os.ReadFile(filepath.Join(sm.Path, "docs", file))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	s.render(w, "doc_view.html", map[string]interface{}{
+		"Name": sm.Name, "File": file, "Body": renderMarkdown(string(b)),
 	})
 }
 
