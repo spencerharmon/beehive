@@ -1,8 +1,10 @@
 {{define "header"}}<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>beehive</title>
-<script src="https://unpkg.com/htmx.org@1.9.10"></script>
+<script src="/assets/htmx.min.js"></script>
 <link rel="stylesheet" href="/assets/style.css"></head>
 <body>
+<div id="htmx-progress" class="htmx-indicator" role="status" aria-live="polite" aria-label="working"><span class="bar"></span><span class="spin" aria-hidden="true"></span></div>
+<div id="htmx-toast" role="alert" aria-live="assertive" hidden></div>
 <header class="topbar"><nav class="nav"><a class="brand" href="/">beehive</a><span class="nav-links"><a href="/">dashboard</a><a href="/secrets">secrets</a><a href="/merge">merge</a><a href="/env">env</a><a href="/human">human</a></span></nav></header>
 <main class="container">{{end}}
 {{define "footer"}}</main>
@@ -45,6 +47,38 @@
     });
     window.scrollTo(wx, wy);
   });
+})();
+</script>
+<script>
+/* htmx-polish: surface a FAILED htmx request as a dismissible toast and clear it
+   on the next successful swap, so a destructive action never fails silently. A
+   non-2xx (e.g. a 409 merge conflict, a 400 bad input) is not swapped in by htmx
+   by default, so without this the panel would just sit there with no feedback.
+   Separate IIFE from the scroll-preserve script above; no external libraries
+   (single-binary embed, no CDN). */
+(function () {
+  var box = document.getElementById('htmx-toast');
+  if (!box) return;
+  var hideTimer;
+  function show(msg) {
+    box.textContent = msg;
+    box.hidden = false;
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(hide, 6000);
+  }
+  function hide() { box.hidden = true; box.textContent = ''; }
+  document.addEventListener('htmx:responseError', function (e) {
+    var x = e.detail && e.detail.xhr;
+    var msg = (x && (x.responseText || '').trim()) || 'request failed';
+    if (x && x.status) msg += ' (' + x.status + ')';
+    show(msg.length > 200 ? msg.slice(0, 200) + '…' : msg);
+  });
+  document.addEventListener('htmx:sendError', function () { show('network error — request not sent'); });
+  document.addEventListener('htmx:afterOnLoad', function (e) {
+    var x = e.detail && e.detail.xhr;
+    if (x && x.status >= 200 && x.status < 300) hide();
+  });
+  box.addEventListener('click', hide);
 })();
 </script>
 </body></html>{{end}}

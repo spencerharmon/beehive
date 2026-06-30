@@ -1,4 +1,14 @@
 {{template "header"}}
+<div id="merge-panel">
 <h1>Merge to main</h1>
-<form method="post" action="/merge"><select name="name">{{range .Subs}}<option>{{.Name}}</option>{{end}}</select><input name="branch" placeholder="branch"><button>merge</button></form>
+<p class="muted">Runs a real <code>git merge</code> of the chosen branch into the submodule's main. Destructive — you'll be asked to confirm.</p>
+<form method="post" action="/merge"
+      hx-post="/merge" hx-target="#merge-panel" hx-select="#merge-panel" hx-swap="outerHTML"
+      hx-indicator="#htmx-progress"
+      hx-confirm="Merge this branch into main? This runs a real git merge and cannot be undone here.">
+  <select name="name">{{range .Subs}}<option>{{.Name}}</option>{{end}}</select>
+  <input name="branch" placeholder="branch">
+  <button class="merge">merge</button>
+</form>
+</div>
 {{template "footer"}}

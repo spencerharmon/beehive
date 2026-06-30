@@ -1,5 +1,13 @@
 {{template "header"}}
+<div id="env-panel">
 <h1>Environments</h1>
 <p>active: <b>{{.Env.Active}}</b></p>
-<form method="post" action="/env/deploy"><select name="target">{{range .Env.Envs}}<option>{{.}}</option>{{end}}</select><button>deploy</button></form>
+<form method="post" action="/env/deploy"
+      hx-post="/env/deploy" hx-target="#env-panel" hx-select="#env-panel" hx-swap="outerHTML"
+      hx-indicator="#htmx-progress"
+      hx-confirm="Switch the active environment to the selected target?">
+  <select name="target">{{range .Env.Envs}}<option>{{.}}</option>{{end}}</select>
+  <button>deploy</button>
+</form>
+</div>
 {{template "footer"}}
