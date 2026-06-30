@@ -930,6 +930,31 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	if b := w.Body.String(); !strings.Contains(b, "session ended") {
 		t.Errorf("ended-session body should explain the branch is gone, got: %q", b)
 	}
+
+	// Full session page badge must use the same liveness semantics as the list:
+	// running only while the stream branch exists; ended for final transcripts and
+	// orphaned stubs. This catches the old hard-coded "live" badge on every page.
+	livePage := get(t, s, "/submodule/alpha/session/bee-live")
+	if livePage.Code != 200 {
+		t.Fatalf("live page status %d", livePage.Code)
+	}
+	if b := livePage.Body.String(); !strings.Contains(b, `class="badge live">running`) || strings.Contains(b, `>ended</span>`) {
+		t.Errorf("live session page should show running badge, got: %q", b)
+	}
+	deadPage := get(t, s, "/submodule/alpha/session/bee-dead")
+	if deadPage.Code != 200 {
+		t.Fatalf("dead page status %d", deadPage.Code)
+	}
+	if b := deadPage.Body.String(); !strings.Contains(b, `class="badge">ended`) || strings.Contains(b, `>running</span>`) || strings.Contains(b, `>live</span>`) {
+		t.Errorf("ended session page should show ended badge only, got: %q", b)
+	}
+	finalPage := get(t, s, "/submodule/alpha/session/bee-final")
+	if finalPage.Code != 200 {
+		t.Fatalf("final page status %d", finalPage.Code)
+	}
+	if b := finalPage.Body.String(); !strings.Contains(b, `class="badge">ended`) || strings.Contains(b, `>running</span>`) || strings.Contains(b, `>live</span>`) {
+		t.Errorf("final session page should show ended badge only, got: %q", b)
+	}
 }
 
 // TestAssetsHtmxServed locks the single-binary embed contract for htmx itself:

@@ -57,7 +57,28 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad branch", http.StatusBadRequest)
 		return
 	}
-	s.render(w, "session_view.html", map[string]interface{}{"Name": sm.Name, "Branch": branch})
+	s.render(w, "session_view.html", map[string]interface{}{
+		"Name":   sm.Name,
+		"Branch": branch,
+		"Live":   s.sessionLive(r.Context(), sm.SessionsDir(), branch),
+	})
+}
+
+// sessionLive reports whether a session page should show the running badge. Only
+// STUB files whose stream branch still exists are live; final transcripts and
+// orphaned stubs whose branch is gone are ended.
+func (s *Server) sessionLive(ctx context.Context, dir, id string) bool {
+	raw, err := os.ReadFile(filepath.Join(dir, id+".md"))
+	if err != nil {
+		return false
+	}
+	streamBranch, isStub := repo.ParseSessionStub(string(raw))
+	if !isStub {
+		return false
+	}
+	rem, _ := s.git.Remote(ctx)
+	_, ok := s.branchTipTime(ctx, streamBranch, rem)
+	return ok
 }
 
 // sessionBody returns just the transcript text. While a session runs, main holds
