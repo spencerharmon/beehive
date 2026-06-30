@@ -69,7 +69,25 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", base, err)
 	}
-	wtBranch := swarm.SessionID("bee", time.Now())
+
+	// Select once on the primary checkout to learn which submodule we'll work, so
+	// the worktrees can be named <submodule>-<epoch> and are easy for an operator
+	// to find. The real selection/claim happens below in the isolated worktree:
+	// this seeds attempt 0; a lost-claim reselect picks a fresh task there.
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rp0, err := repo.Open(primaryRoot)
+	if err != nil {
+		return err
+	}
+	sel0, err := (&selectt.Selector{Repo: rp0, Git: primary, Rand: rnd, TTL: ttl}).Select(ctx)
+	if err != nil {
+		return err
+	}
+	if sel0 == nil {
+		fmt.Println("honeybee: no workable task")
+		return nil
+	}
+	wtBranch := swarm.SessionID(sel0.Submodule.Name, time.Now())
 	wtPath := filepath.Join(primaryRoot, ".worktrees", wtBranch)
 	if err := primary.WorktreeAdd(ctx, wtPath, wtBranch, base); err != nil {
 		return fmt.Errorf("create beehive worktree: %w", err)
@@ -100,8 +118,12 @@ func run() error {
 	sessGit := git.New(sessPath)
 	sessPublish := func(ctx context.Context) error { return sessGit.PublishToMain(ctx, remote) }
 
-	selector := &selectt.Selector{
-		Repo: rp, Git: gitRepo, Rand: rand.New(rand.NewSource(time.Now().UnixNano())), TTL: ttl,
+	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl}
+	// Rebind the primary selection onto the worktree repo so attempt 0 works the
+	// exact submodule the worktrees are named after.
+	seed, err := rebindSelection(rp, sel0)
+	if err != nil {
+		return err
 	}
 	// This process's unique claim token: the worktree branch is already unique per
 	// honeybee. Stamped on whatever task we work so peers see it as actively held.
@@ -125,9 +147,13 @@ func run() error {
 	const maxReselect = 8
 	tried := map[string]bool{}
 	for attempt := 0; attempt < maxReselect; attempt++ {
-		sel, err := selector.Select(ctx)
-		if err != nil {
-			return err
+		sel := seed
+		if attempt > 0 {
+			s, err := selector.Select(ctx)
+			if err != nil {
+				return err
+			}
+			sel = s
 		}
 		if sel == nil {
 			fmt.Println("honeybee: no workable task")
@@ -181,6 +207,24 @@ func run() error {
 	}
 	fmt.Println("honeybee: reselect cap reached, exiting")
 	return nil
+}
+
+// rebindSelection re-roots a selection made on one repo onto another (the
+// isolated worktree), matching the submodule by name so all paths resolve under
+// the worktree.
+func rebindSelection(rp *repo.Repo, sel *selectt.Selection) (*selectt.Selection, error) {
+	subs, err := rp.Submodules()
+	if err != nil {
+		return nil, err
+	}
+	for _, sm := range subs {
+		if sm.Name == sel.Submodule.Name {
+			s := *sel
+			s.Submodule = sm
+			return &s, nil
+		}
+	}
+	return nil, fmt.Errorf("submodule %s vanished from worktree", sel.Submodule.Name)
 }
 
 // claimable reports whether a selection carries a concrete task to claim
