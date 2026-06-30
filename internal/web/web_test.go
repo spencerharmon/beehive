@@ -558,3 +558,148 @@ func TestEditorDiffAddDelClasses(t *testing.T) {
 		}
 	}
 }
+
+// TestAssetsHtmxServed locks the single-binary embed contract for htmx itself:
+// the library is vendored under assets/ and served at /assets/htmx.min.js (no
+// CDN), so the frontend works offline/air-gapped. It must be the real,
+// version-stamped library, not a stub (htmx-polish embeds htmx, drops the unpkg
+// CDN <script>).
+func TestAssetsHtmxServed(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/assets/htmx.min.js")
+	if w.Code != 200 {
+		t.Fatalf("htmx.min.js status %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Fatalf("content-type = %q, want javascript", ct)
+	}
+	body := w.Body.String()
+	if len(body) < 10000 {
+		t.Fatalf("htmx.min.js is %d bytes — too small to be the real library", len(body))
+	}
+	if !strings.Contains(body, "1.9.10") {
+		t.Fatalf("htmx.min.js missing the expected version marker 1.9.10")
+	}
+}
+
+// TestLayoutEmbedsHtmxNoCDN proves the layout loads the EMBEDDED htmx asset and
+// no longer reaches out to a CDN, and that the global loading indicator + error
+// toast hooks ship on every page (so swaps show a loading state and a failed
+// destructive action is not silent).
+func TestLayoutEmbedsHtmxNoCDN(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String()
+	if !strings.Contains(page, `src="/assets/htmx.min.js"`) {
+		t.Fatalf("layout does not reference the embedded htmx asset:\n%s", page)
+	}
+	if strings.Contains(page, "unpkg.com") || strings.Contains(page, "//cdn.") {
+		t.Fatalf("layout still references a CDN (must be a single-binary embed):\n%s", page)
+	}
+	for _, want := range []string{
+		`id="htmx-progress"`, "htmx-indicator", // global loading indicator
+		`id="htmx-toast"`, "htmx:responseError", // failed-request toast
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("layout missing htmx-polish hook %q:\n%s", want, page)
+		}
+	}
+}
+
+// TestMergePanelConfirmAndIndicator locks the destructive-merge polish: the merge
+// control swaps the #merge-panel fragment with a loading indicator AND asks for
+// confirmation before mergePost runs the real git merge. The handler still
+// returns the merge fragment (Files: templates only; behavior unchanged).
+func TestMergePanelConfirmAndIndicator(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/merge")
+	if w.Code != 200 {
+		t.Fatalf("merge get %d: %s", w.Code, w.Body)
+	}
+	b := w.Body.String()
+	for _, want := range []string{
+		`id="merge-panel"`,              // swappable fragment wrapper
+		`hx-post="/merge"`,              // htmx swap, not a full reload
+		`hx-select="#merge-panel"`,      // extract just the fragment from the page response
+		`hx-indicator="#htmx-progress"`, // visible loading state on the swap
+		"hx-confirm=",                   // confirm prompt on the destructive merge
+	} {
+		if !strings.Contains(b, want) {
+			t.Fatalf("merge panel missing %q:\n%s", want, b)
+		}
+	}
+}
+
+// TestEnvDeployConfirmAndIndicator: switching the active environment is impactful,
+// so the deploy control also confirms and shows a loading indicator.
+func TestEnvDeployConfirmAndIndicator(t *testing.T) {
+	s, _ := setup(t)
+	b := get(t, s, "/env").Body.String()
+	for _, want := range []string{
+		`id="env-panel"`, `hx-post="/env/deploy"`, `hx-indicator="#htmx-progress"`, "hx-confirm=",
+	} {
+		if !strings.Contains(b, want) {
+			t.Fatalf("env panel missing %q:\n%s", want, b)
+		}
+	}
+}
+
+// TestRoiInlineEditAndIndicator: ROI save is an htmx fragment swap (#roi-panel)
+// with a loading indicator, behind an inline-edit affordance (a <details>
+// toggle), while the editable raw source stays present verbatim (round-trip).
+func TestRoiInlineEditAndIndicator(t *testing.T) {
+	s, _ := setup(t)
+	b := get(t, s, "/roi/alpha").Body.String()
+	for _, want := range []string{
+		`id="roi-panel"`,
+		`class="inline-edit"`, // edit-in-place affordance
+		`hx-post="/roi/alpha"`,
+		`hx-select="#roi-panel"`,
+		`hx-indicator="#htmx-progress"`,
+		"<textarea", // raw source still editable verbatim
+	} {
+		if !strings.Contains(b, want) {
+			t.Fatalf("roi editor missing %q:\n%s", want, b)
+		}
+	}
+}
+
+// TestSecretsInlineEditAndIndicator: secrets get inline-edit affordances (an add
+// form plus a per-key set form) that swap the #secrets-panel fragment with a
+// loading indicator.
+func TestSecretsInlineEditAndIndicator(t *testing.T) {
+	s, _ := setup(t)
+	b := get(t, s, "/secrets").Body.String()
+	for _, want := range []string{
+		`id="secrets-panel"`,
+		`class="inline-edit"`,
+		`hx-post="/secrets"`,
+		`hx-select="#secrets-panel"`,
+		`hx-indicator="#htmx-progress"`,
+	} {
+		if !strings.Contains(b, want) {
+			t.Fatalf("secrets panel missing %q:\n%s", want, b)
+		}
+	}
+}
+
+// TestAssetsStyleHtmxPolish locks the htmx-polish CSS contract: the embedded
+// stylesheet defines the indicator visibility rule, the global progress/spinner +
+// toast, and the inline-edit affordance the templates rely on, with motion gated
+// behind prefers-reduced-motion. Kept separate from TestAssetsStyleServed (the
+// design-system contract) so each task owns its own assertions.
+func TestAssetsStyleHtmxPolish(t *testing.T) {
+	s, _ := setup(t)
+	body := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		".htmx-indicator",
+		".htmx-request",
+		"#htmx-progress",
+		"#htmx-toast",
+		"details.inline-edit",
+		"prefers-reduced-motion",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("style.css missing htmx-polish rule %q", want)
+		}
+	}
+}

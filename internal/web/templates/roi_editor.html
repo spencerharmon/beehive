@@ -1,7 +1,17 @@
 {{template "header"}}
+<div id="roi-panel">
 <h1>ROI: {{.Name}}</h1>
 <p><a href="/edit?file=submodules/{{.Name}}/ROI.md">edit with AI chat</a> — propose changes conversationally on a branch, then merge.</p>
-{{if .Saved}}<p class="ok">saved</p>{{end}}
+{{if .Saved}}<p class="ok" role="status">saved</p>{{end}}
 <section class="markdown" aria-label="rendered preview">{{.Rendered}}</section>
-<form method="post" action="/roi/{{.Name}}"><textarea name="body" rows="20" cols="80">{{.Body}}</textarea><br><button>save</button></form>
+<details class="inline-edit"{{if .Saved}} open{{end}}>
+  <summary>edit source</summary>
+  <form method="post" action="/roi/{{.Name}}"
+        hx-post="/roi/{{.Name}}" hx-target="#roi-panel" hx-select="#roi-panel" hx-swap="outerHTML"
+        hx-indicator="#htmx-progress">
+    <textarea name="body" rows="20" cols="80">{{.Body}}</textarea>
+    <button>save</button>
+  </form>
+</details>
+</div>
 {{template "footer"}}
