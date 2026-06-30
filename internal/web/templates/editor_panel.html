@@ -1,5 +1,5 @@
 <div class="editor-grid">
-  <div class="chat">
+  <div class="chat" id="editor-chat" data-scroll-preserve data-scroll-pin>
     {{range .Log}}<div class="msg {{.Role}}"><span class="who">{{.Role}}</span> {{.Text}}</div>{{else}}<p class="muted">Say what you'd like to change in {{.File}}.</p>{{end}}
     {{if .Busy}}<div class="msg agent busy"><span class="who">agent</span> <span class="spinner">editing…</span></div>{{end}}
     {{if .Error}}<div class="msg err">⚠️ {{.Error}}</div>{{end}}
@@ -11,7 +11,7 @@
       {{else if .Live}}<button class="merge merged" disabled>Merge</button>
       {{else}}<button class="merge" hx-post="/editor/{{.ID}}/merge" hx-target="#editor" hx-swap="innerHTML">Merge</button>{{end}}
     </div>
-    <pre class="diff">{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
+    <pre class="diff" id="editor-diff" data-scroll-preserve>{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
 {{else}}<span class="muted">no changes proposed yet</span>{{end}}</pre>
   </div>
 </div>
