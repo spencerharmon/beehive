@@ -17,6 +17,12 @@ Edit code there. Do not run worktree/submodule git plumbing yourself and never w
 - NEVER edit `ROI.md`. It is the record of intent, owned by humans. FORBIDDEN. (Also enforced by hook.)
 - ALL code writes happen in your task worktree `submodules/<sm>/worktrees/<branch>/`; never the shared
   `submodules/<sm>/repo` checkout.
+- NEVER modify the beehive repo's git CONFIG or REMOTES (`git remote add/remove/set-url`,
+  `git config remote.*`, `git config --add`, etc.). git config is SHARED across every worktree, so a
+  remote you add "just to test" leaks into the live repo and corrupts repo-rooted tooling. You publish
+  by committing in your worktree and letting the runner merge to `main` — you never need a remote of
+  your own. If a task requires exercising remote/clone/fetch behavior, do it in a THROWAWAY repo you
+  create in a tmp dir (`git init` / `git clone` under `$TMPDIR`), never against this repo.
 - The runner holds your claim: it stamps your task with `session=<your-id>` + a `heartbeat` and
   re-stamps every turn. You do NOT set this yourself. At the start of each turn confirm the task's
   `session=` is still YOURS. If a different session holds it with a fresh heartbeat, you lost the race:

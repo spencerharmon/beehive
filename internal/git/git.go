@@ -108,6 +108,71 @@ func (r *Repo) Remote(ctx context.Context) (string, error) {
 	return "", nil
 }
 
+// RemoteConfig returns the repo's full `remote.*` config block, one "key value"
+// per line (empty when there are no remotes). It is a snapshot of the repo's
+// remote configuration, used to detect and revert any change to it. git config
+// is shared across all worktrees of a repo, so a stray `git remote add` an agent
+// runs in its worktree leaks into the live repo; comparing against this snapshot
+// lets the runner revert that drift.
+func (r *Repo) RemoteConfig(ctx context.Context) (string, error) {
+	// `--get-regexp` exits 1 when nothing matches (no remotes). That is not an
+	// error for a snapshot, so distinguish it from a real failure by checking the
+	// remote list first.
+	names, err := r.Run(ctx, "remote")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(names) == "" {
+		return "", nil
+	}
+	out, err := r.Run(ctx, "config", "--get-regexp", "^remote\\.")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// RestoreRemotes resets the repo's remotes to a prior snapshot (from
+// RemoteConfig): it removes any remote added since and re-creates any removed,
+// so the repo's remote configuration is exactly the snapshot. Honeybees must
+// never mutate the shared repo config; the runner calls this to revert any
+// config drift an agent introduced. It is a no-op when nothing changed, and is
+// idempotent against the snapshot (safe to call concurrently from peers that
+// share the same baseline).
+func (r *Repo) RestoreRemotes(ctx context.Context, snapshot string) error {
+	cur, err := r.RemoteConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if cur == snapshot {
+		return nil
+	}
+	// Drop every current remote section, then replay the snapshot's keys verbatim.
+	names, err := r.Run(ctx, "remote")
+	if err != nil {
+		return err
+	}
+	for _, name := range strings.Fields(names) {
+		if _, err := r.Run(ctx, "config", "--remove-section", "remote."+name); err != nil {
+			return err
+		}
+	}
+	for _, line := range strings.Split(snapshot, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(line, " ")
+		if !ok {
+			return fmt.Errorf("malformed remote config line %q", line)
+		}
+		if _, err := r.Run(ctx, "config", key, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Fetch updates the remote-tracking ref for branch from remote, pruning the
 // tracking ref if branch was deleted upstream. The explicit refspec scopes
 // --prune to this branch only, so concurrent fetches of other refs are

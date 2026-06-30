@@ -58,6 +58,17 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Snapshot the repo's remote config up front, and revert any drift on exit.
+	// git config is shared across all worktrees, so a `git remote add` the agent
+	// runs in its worktree leaks into the live beehive repo and breaks repo-rooted
+	// readers (the editor cuts edit worktrees from origin/main). Honeybees publish
+	// via worktree merges to main; they must never mutate the shared repo config.
+	remoteSnap, err := primary.RemoteConfig(ctx)
+	if err != nil {
+		return err
+	}
+	restoreRemotes := func(c context.Context) { _ = primary.RestoreRemotes(c, remoteSnap) }
+	defer restoreRemotes(context.Background())
 	base := "main"
 	if remote != "" {
 		if err := primary.Fetch(ctx, remote, "main"); err != nil {
@@ -133,6 +144,7 @@ func run() error {
 		Repo: rp, Git: gitRepo, MaxTurns: c.MaxTurns, WallCap: ttl, TTL: ttl, Publish: publish,
 		Remote: remote, BaseMain: baseMain, Session: session,
 		SessionGit: sessGit, SessionRoot: sessPath, SessionPublish: sessPublish,
+		RestoreConfig: restoreRemotes,
 	}
 	oc := &swarm.Opencode{Base: c.AgentURL, Model: c.Model, HTTP: &http.Client{Timeout: 0}}
 	if debug {

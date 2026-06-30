@@ -254,3 +254,59 @@ func TestIsNonFastForward(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoteConfigSnapshotRestore(t *testing.T) {
+	r := initRepo(t)
+	ctx := context.Background()
+
+	// Baseline: a local-only repo with no remotes.
+	snap, err := r.RemoteConfig(ctx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snap != "" {
+		t.Fatalf("fresh repo has remotes: %q", snap)
+	}
+
+	// Simulate an agent leaking a remote into the shared config.
+	if _, err := r.Run(ctx, "remote", "add", "origin", "git@example.com:x/y.git"); err != nil {
+		t.Fatalf("remote add: %v", err)
+	}
+	if got, _ := r.RemoteConfig(ctx); got == "" {
+		t.Fatal("remote not recorded after add")
+	}
+
+	// Restore reverts to the empty baseline.
+	if err := r.RestoreRemotes(ctx, snap); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if got, _ := r.RemoteConfig(ctx); got != "" {
+		t.Fatalf("remote not reverted: %q", got)
+	}
+
+	// Now a baseline that HAS a remote: restore must re-add a removed one and
+	// drop an extra one, landing exactly on the snapshot.
+	if _, err := r.Run(ctx, "remote", "add", "origin", "git@example.com:keep.git"); err != nil {
+		t.Fatalf("remote add origin: %v", err)
+	}
+	base, err := r.RemoteConfig(ctx)
+	if err != nil {
+		t.Fatalf("snapshot2: %v", err)
+	}
+	if _, err := r.Run(ctx, "remote", "remove", "origin"); err != nil {
+		t.Fatalf("remote remove: %v", err)
+	}
+	if _, err := r.Run(ctx, "remote", "add", "bogus", "git@example.com:bogus.git"); err != nil {
+		t.Fatalf("remote add bogus: %v", err)
+	}
+	if err := r.RestoreRemotes(ctx, base); err != nil {
+		t.Fatalf("restore2: %v", err)
+	}
+	got, _ := r.RemoteConfig(ctx)
+	if got != base {
+		t.Fatalf("restore mismatch:\n got=%q\nwant=%q", got, base)
+	}
+	if u, _ := r.Run(ctx, "remote", "get-url", "origin"); u != "git@example.com:keep.git" {
+		t.Fatalf("origin url not restored: %q", u)
+	}
+}

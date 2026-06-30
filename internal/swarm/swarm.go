@@ -73,6 +73,14 @@ type Runner struct {
 	SessionGit     *git.Repo
 	SessionRoot    string
 	SessionPublish func(context.Context) error
+
+	// RestoreConfig, when set, reverts any change to the beehive repo's git config
+	// (remotes) that the agent introduced during a turn. git config is shared
+	// across all worktrees, so a `git remote add` an agent runs in its worktree
+	// leaks into the live repo and corrupts repo-rooted readers (the editor cuts
+	// edit worktrees from origin/main). The runner calls it at the top of every
+	// turn so drift never persists past the turn that caused it. Nil in tests.
+	RestoreConfig func(context.Context)
 }
 
 // syncSession commits the live session transcript in the dedicated session
@@ -298,6 +306,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
+		// Revert any change the agent made to the repo's git config (remotes) during
+		// the previous turn before doing more work. Honeybees publish via worktree
+		// merges to main but must never touch the shared repo config; this keeps that
+		// invariant turn-by-turn so a stray remote never outlives the turn.
+		if r.RestoreConfig != nil {
+			r.RestoreConfig(ctx)
+		}
 		// Guard: an operator may have deleted the plan or removed this task on main
 		// after we started. Detect it and exit rather than work a task nobody wants.
 		if removed, warning, err := r.taskRemoved(ctx, sel); err == nil && removed {
