@@ -86,7 +86,7 @@ func NewManager(root string, cfg config.Config) (*Manager, error) {
 		absRoot: abs,
 		cfg:     cfg,
 		primary: git.New(root),
-		client:  &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, HTTP: &http.Client{Timeout: 0}},
+		client:  &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}},
 		byID:    map[string]*Session{},
 	}, nil
 }

@@ -17,7 +17,10 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
 
-	cfg, err := config.Load()
+	// Global-effective config: Defaults -> host file -> in-repo global. The
+	// daemon serves all submodules and the editor acts on root-level human files,
+	// so there is no single submodule scope here (submodule="").
+	cfg, err := config.Resolve(*root, "")
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
