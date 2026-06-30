@@ -51,6 +51,77 @@ func get(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
 	return w
 }
 
+// renderTmpl executes a named template to a string. The polled fragments
+// (session_body / session_list / editor_panel) need live session/editor data to
+// reach through a handler, so their scroll-preserve wiring is asserted directly
+// off the parsed template set (white-box) instead of standing up a fake session.
+func renderTmpl(t *testing.T, s *Server, name string, data interface{}) string {
+	t.Helper()
+	var b strings.Builder
+	if err := s.tmpl.ExecuteTemplate(&b, name, data); err != nil {
+		t.Fatalf("render %s: %v", name, err)
+	}
+	return b.String()
+}
+
+// TestScrollPreserveScriptEmbedded locks that the save/restore script ships on a
+// real full-page response (the layout footer), with no external lib reference.
+// It is what keeps every polled pane from yanking the reader to the top.
+func TestScrollPreserveScriptEmbedded(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String() // dashboard renders the layout header+footer
+	for _, want := range []string{
+		"htmx:beforeSwap", "htmx:afterSwap", // save before, restore after a swap
+		"data-scroll-preserve", // the pane contract the script keys off
+		"data-scroll-pin",      // bottom-pin (follow live output only when pinned)
+		"scrollTop",            // per-pane restore
+		"window.scrollTo",      // window-scroll restore (covers page-scrolled lists)
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("embedded scroll-restore script missing %q", want)
+		}
+	}
+}
+
+// TestScrollPreserveWiring locks the per-fragment contract: every polled scroll
+// region carries a STABLE pane id + data-scroll-preserve, and the live-growing
+// panes (session transcript, editor chat) additionally pin to bottom. DOM
+// scrollTop itself is not unit-testable in Go; the manual scroll check is in the
+// change doc. A rename here must break this test on purpose.
+func TestScrollPreserveWiring(t *testing.T) {
+	s, _ := setup(t)
+
+	// Session transcript: stable id, preserve, and pin (it grows at the bottom).
+	body := renderTmpl(t, s, "session_body.html", map[string]interface{}{"Body": "turn\n"})
+	for _, want := range []string{`id="session-transcript"`, "data-scroll-preserve", "data-scroll-pin"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("session_body.html missing %q:\n%s", want, body)
+		}
+	}
+
+	// Auto-refreshing session list: preserve wiring on the polled node.
+	list := renderTmpl(t, s, "session_list.html", map[string]interface{}{"Name": "alpha"})
+	for _, want := range []string{`id="session-list"`, "data-scroll-preserve"} {
+		if !strings.Contains(list, want) {
+			t.Fatalf("session_list.html missing %q:\n%s", want, list)
+		}
+	}
+
+	// Editor chat+diff: chat pins to bottom, diff just holds position.
+	panel := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"})
+	for _, want := range []string{`id="editor-chat"`, `id="editor-diff"`, "data-scroll-preserve", "data-scroll-pin"} {
+		if !strings.Contains(panel, want) {
+			t.Fatalf("editor_panel.html missing %q:\n%s", want, panel)
+		}
+	}
+
+	// The transcript poll target shell is present (the script restores into it).
+	view := renderTmpl(t, s, "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x"})
+	if !strings.Contains(view, `id="session-body"`) {
+		t.Fatalf("session_view.html missing #session-body poll target:\n%s", view)
+	}
+}
+
 func TestDashboard(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/")

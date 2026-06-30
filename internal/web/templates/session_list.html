@@ -1,6 +1,7 @@
 {{template "header"}}
 <h1>{{.Name}} · sessions</h1>
 <div id="session-list"
+     data-scroll-preserve
      hx-get="/submodule/{{.Name}}/sessions/body"
      hx-trigger="load, every 2s"
      hx-swap="innerHTML">

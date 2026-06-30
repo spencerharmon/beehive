@@ -5,4 +5,46 @@
 <body>
 <header class="topbar"><nav class="nav"><a class="brand" href="/">beehive</a><span class="nav-links"><a href="/">dashboard</a><a href="/secrets">secrets</a><a href="/merge">merge</a><a href="/env">env</a><a href="/human">human</a></span></nav></header>
 <main class="container">{{end}}
-{{define "footer"}}</main></body></html>{{end}}
+{{define "footer"}}</main>
+<script>
+/* poll-scroll-preserve: an htmx poll-refresh swaps a pane's innerHTML, which
+   destroys its inner scroll container and yanks the reader back to the top
+   mid-read. We save every [data-scroll-preserve] pane's scrollTop before a swap
+   and restore it after (keyed by a STABLE id that re-renders identically), and
+   also restore the window scroll, so a refresh never jumps the viewport. A
+   [data-scroll-pin] pane that was scrolled to its bottom keeps following new
+   output; otherwise the reader's absolute position is held. Anchors on content,
+   not the container. No external libraries (single-binary embed, no CDN). */
+(function () {
+  var SLACK = 4, saved = {}, wx = 0, wy = 0;
+  function target(e) { return (e.detail && e.detail.target) || e.target; }
+  function panes(t) {
+    var out = [];
+    if (!t || t.nodeType !== 1) return out;
+    if (t.matches && t.matches('[data-scroll-preserve][id]')) out.push(t);
+    if (t.querySelectorAll) {
+      var n = t.querySelectorAll('[data-scroll-preserve][id]');
+      for (var i = 0; i < n.length; i++) out.push(n[i]);
+    }
+    return out;
+  }
+  document.addEventListener('htmx:beforeSwap', function (e) {
+    wx = window.scrollX; wy = window.scrollY;
+    panes(target(e)).forEach(function (el) {
+      saved[el.id] = {
+        top: el.scrollTop,
+        pinned: el.scrollHeight - el.scrollTop - el.clientHeight <= SLACK
+      };
+    });
+  });
+  document.addEventListener('htmx:afterSwap', function (e) {
+    panes(target(e)).forEach(function (el) {
+      var s = saved[el.id];
+      if (!s) return;
+      el.scrollTop = (el.hasAttribute('data-scroll-pin') && s.pinned) ? el.scrollHeight : s.top;
+    });
+    window.scrollTo(wx, wy);
+  });
+})();
+</script>
+</body></html>{{end}}
