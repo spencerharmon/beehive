@@ -2,3 +2,4 @@
 *.test
 /.cave/
 /.worktrees/
+/AGENTS.md
