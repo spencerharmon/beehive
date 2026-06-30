@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/artifacts"
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/git"
@@ -160,13 +161,22 @@ func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 	// HTML (renderMarkdown drops raw HTML / unsafe links). The raw source stays
 	// reachable through the per-file editor (ROI editor / chat editor links).
 	docs := map[string]template.HTML{}
-	for label, f := range map[string]string{
-		"PLAN": repo.PlanFile, "ROI": repo.ROIFile,
-		"INFRA": repo.InfraFile, "ARTIFACTS": repo.Artifacts,
-	} {
+	// PLAN and ROI render their raw markdown (PLAN's structure lives in
+	// internal/plan; ROI is human-owned and edited verbatim).
+	for label, f := range map[string]string{"PLAN": repo.PlanFile, "ROI": repo.ROIFile} {
 		if b, err := os.ReadFile(filepath.Join(sm.Path, f)); err == nil {
 			docs[label] = renderMarkdown(string(b))
 		}
+	}
+	// INFRASTRUCTURE.md and ARTIFACTS.md are read through internal/artifacts (the
+	// typed model) instead of raw text: the rendered HTML is the model's
+	// round-tripped serialization, and the same parse feeds the dashboard env
+	// badge. An absent doc is skipped (Present()==false).
+	if in, err := artifacts.LoadInfra(filepath.Join(sm.Path, repo.InfraFile)); err == nil && in.Present() {
+		docs["INFRA"] = renderMarkdown(in.String())
+	}
+	if a, err := artifacts.LoadArtifacts(filepath.Join(sm.Path, repo.Artifacts)); err == nil && a.Present() {
+		docs["ARTIFACTS"] = renderMarkdown(a.String())
 	}
 	s.render(w, "explorer.html", map[string]interface{}{"Name": sm.Name, "Docs": docs})
 }
