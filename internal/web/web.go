@@ -115,19 +115,32 @@ func (s *Server) submodule(name string) (repo.Submodule, error) {
 	return repo.Submodule{}, os.ErrNotExist
 }
 
-// subView is dashboard per-submodule status.
+// subView is one dashboard card: a submodule's live swarm status, blue/green env
+// badge, and task counts. State is the file-derived swarm phase
+// (active|dormant|bootstrap); Active is the ADDITIVE live overlay — a task
+// currently carries a fresh session+heartbeat claim (a honeybee is working it
+// right now), which is NOT a status (there is no IN-PROGRESS). Pending/Human are
+// the unified-parser counts (pending = not DONE; human = NEEDS-HUMAN only).
 type subView struct {
 	Name    string
-	State   string
-	Stamp   string
-	Pending int
+	State   string // swarm phase: active | dormant | bootstrap
+	Stamp   string // last-reconciled ROI commit
+	Env     string // active deployment env (blue/green) from the submodule's infra
+	Pending int    // tasks not DONE
+	Human   int    // tasks NEEDS-HUMAN
+	Active  bool   // a task has a fresh claim within the TTL (live overlay)
 }
 
-func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+// subViews builds the dashboard cards, one per submodule. now/ttl are passed in
+// (the handler supplies time.Now()/s.ttl()) so claim freshness — and thus the
+// live "active" overlay — is derived deterministically and is unit-testable,
+// mirroring parsePlan. Counts come from the unified PLAN.md parser (internal/plan
+// via parsePlan); the env badge from the submodule's own INFRASTRUCTURE.md
+// through the typed artifacts model (absent markers => the blue default).
+func (s *Server) subViews(now time.Time, ttl time.Duration) ([]subView, error) {
 	subs, err := s.repo.Submodules()
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return nil, err
 	}
 	var views []subView
 	for _, sm := range subs {
@@ -139,15 +152,34 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 			v.State = "bootstrap"
 		}
 		v.Stamp, _ = sm.ROIStamp()
-		if p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl()); err == nil {
+		if p, err := parsePlan(sm.PlanPath(), now, ttl); err == nil {
 			for _, it := range p.Items {
 				if it.Status != StatusDone {
 					v.Pending++
 				}
+				if it.Status == StatusHuman {
+					v.Human++
+				}
+				if it.Active {
+					v.Active = true
+				}
 			}
 		}
+		env, _ := parseEnv(filepath.Join(sm.Path, repo.InfraFile))
+		v.Env = env.Active
 		views = append(views, v)
 	}
+	return views, nil
+}
+
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	views, err := s.subViews(time.Now(), s.ttl())
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	// The hive-level deploy state (the root INFRASTRUCTURE.md the /env panel
+	// writes) is shown once at the top; each card's badge is its own submodule env.
 	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
 	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env})
 }

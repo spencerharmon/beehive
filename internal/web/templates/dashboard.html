@@ -1,10 +1,17 @@
 {{template "header"}}
 <h1>Submodules</h1>
-<p>Active env: <b>{{.Env.Active}}</b> · <a href="/edit?file=INFRASTRUCTURE.md">edit infrastructure with AI</a></p>
+<p class="muted small">Hive env: <span class="badge env-{{.Env.Active}}">{{.Env.Active}}</span> · <a href="/edit?file=INFRASTRUCTURE.md">edit infrastructure with AI</a></p>
 <div class="cards">
-{{range .Subs}}<div class="card"><h3><a href="/submodule/{{.Name}}">{{.Name}}</a></h3>
-<span class="badge">{{.State}}</span> pending: {{.Pending}} stamp: {{.Stamp}}
-<div><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">branches</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <a href="/roi/{{.Name}}">roi</a> · <a href="/edit?file=submodules/{{.Name}}/ROI.md">edit roi (AI)</a></div></div>{{else}}<p>no submodules</p>{{end}}
+{{range .Subs}}<div class="card{{if .Active}} active{{end}}">
+  <h3><a href="/submodule/{{.Name}}">{{.Name}}</a></h3>
+  <p>
+    <span class="badge">{{.State}}</span>
+    <span class="badge env-{{.Env}}">{{.Env}}</span>
+    {{if .Active}}<span class="badge live">live</span>{{end}}
+  </p>
+  <p class="small muted">pending: {{.Pending}} · <a href="/human">needs-human: {{.Human}}</a>{{if .Stamp}} · roi: {{.Stamp}}{{end}}</p>
+  <div class="small"><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">branches</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <a href="/roi/{{.Name}}">roi</a> · <a href="/edit?file=submodules/{{.Name}}/ROI.md">edit roi (AI)</a></div>
+</div>{{else}}<p>no submodules</p>{{end}}
 </div>
 <form method="post" action="/submodule/add">
   <input name="url" placeholder="repo url (git@host:org/repo.git)" required>

@@ -230,6 +230,19 @@ small, .small { font-size: var(--text-sm); }
   border-color: transparent;
   color: #fff;
 }
+/* Env (blue/green) deploy badges: the active deployment colour per dashboard
+ * card. The emitted class is `env-<active>`; an env with no rule (e.g. a custom
+ * name) keeps the neutral .badge look. Token-driven so it tracks light/dark. */
+.badge.env-blue {
+  background: hsl(214 78% 48%);
+  border-color: transparent;
+  color: #fff;
+}
+.badge.env-green {
+  background: hsl(var(--hue-done) 58% 40%);
+  border-color: transparent;
+  color: #fff;
+}
 .ago { color: var(--text-muted); font-size: var(--text-xs); }
 .ok { color: var(--success); font-weight: 600; }
 .muted { color: var(--text-muted); }

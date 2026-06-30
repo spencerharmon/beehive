@@ -141,6 +141,127 @@ func TestDashboard(t *testing.T) {
 	}
 }
 
+// TestDashboardCards proves the dashboard renders one design-system card per
+// submodule with a swarm-state badge, a blue/green env badge, and the unified
+// (internal/plan) pending + NEEDS-HUMAN counts — the latter linking to /human.
+// alpha (setup fixture) has t1 TODO, t2 NEEDS-HUMAN, t3 DONE and no
+// INFRASTRUCTURE.md, so: state active, env blue (default), pending 2 (DONE
+// excluded, not double-counted), human 1.
+func TestDashboardCards(t *testing.T) {
+	s, _ := setup(t)
+	body := get(t, s, "/").Body.String()
+	for _, want := range []string{
+		`<div class="cards">`,                      // card grid
+		`<span class="badge">active</span>`,        // live swarm-state badge
+		`<span class="badge env-blue">blue</span>`, // blue/green env badge (default)
+		"pending: 2",     // unified pending (t1,t2; DONE excluded)
+		"needs-human: 1", // NEEDS-HUMAN only (t2)
+		`href="/human"`,  // human count links to the human view
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard card missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestSubViewsStates is the core of dashboard-cards: subViews derives one card per
+// submodule with the correct live swarm state (active/dormant/bootstrap), the
+// blue/green env badge from the submodule's own INFRASTRUCTURE.md, the unified
+// pending/human counts, and the live "active" overlay from a fresh
+// session+heartbeat claim. now/ttl are injected so the claim freshness — and the
+// overlay — is deterministic (the handler derives them from time.Now()).
+func TestSubViewsStates(t *testing.T) {
+	s, root := setup(t) // alpha: ROI+PLAN (t1 TODO claimed @11:00Z, t2 NEEDS-HUMAN, t3 DONE)
+	// alpha deploys green via its own infra doc (the per-card env badge source).
+	if err := os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.InfraFile),
+		[]byte("Active: green\nEnvironments: blue, green\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// beta: dormant — a submodule dir with no ROI.md is never selected.
+	if err := os.MkdirAll(filepath.Join(root, "submodules", "beta"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// gamma: bootstrap — ROI present but PLAN absent (awaiting a bootstrap pass).
+	if err := os.MkdirAll(filepath.Join(root, "submodules", "gamma"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(root, "submodules", "gamma", repo.ROIFile), []byte("# gamma\n"), 0o644)
+
+	now := mustTime(t, "2026-06-30T11:30:00Z") // 30m after t1's heartbeat => fresh
+	views, err := s.subViews(now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 3 {
+		t.Fatalf("want 3 cards (alpha,beta,gamma), got %d: %+v", len(views), views)
+	}
+	by := map[string]subView{}
+	for _, v := range views {
+		by[v.Name] = v
+	}
+
+	a := by["alpha"]
+	if a.State != "active" {
+		t.Fatalf("alpha state = %q, want active", a.State)
+	}
+	if a.Env != "green" {
+		t.Fatalf("alpha env = %q, want green (its own INFRASTRUCTURE.md)", a.Env)
+	}
+	if a.Pending != 2 || a.Human != 1 {
+		t.Fatalf("alpha counts pending=%d human=%d, want 2/1", a.Pending, a.Human)
+	}
+	if !a.Active {
+		t.Fatalf("alpha should be live (t1 claim fresh at now): %+v", a)
+	}
+
+	if b := by["beta"]; b.State != "dormant" || b.Active || b.Pending != 0 || b.Human != 0 || b.Env != "blue" {
+		t.Fatalf("beta = %+v, want dormant/env=blue/0/0 and not live", b)
+	}
+	if g := by["gamma"]; g.State != "bootstrap" || g.Active || g.Env != "blue" {
+		t.Fatalf("gamma = %+v, want bootstrap/env=blue and not live", g)
+	}
+
+	// The overlay is live: 2h past the claim's heartbeat (TTL 1h), alpha is stale,
+	// so no card is marked active.
+	stale, _ := s.subViews(mustTime(t, "2026-06-30T13:00:00Z"), time.Hour)
+	for _, v := range stale {
+		if v.Active {
+			t.Fatalf("no card should be live with an expired claim: %+v", v)
+		}
+	}
+}
+
+// TestDashboardCardTemplate locks the card template's design-system markup: a
+// live-claim card carries the additive `.active` overlay (class="card active")
+// plus a "live" badge while an idle card does not, and the env badge class is
+// `env-<active>`. Rendering the template directly keeps the overlay assertion
+// deterministic.
+func TestDashboardCardTemplate(t *testing.T) {
+	s, _ := setup(t)
+	data := map[string]interface{}{
+		"Env": Env{Active: "blue"},
+		"Subs": []subView{
+			{Name: "live1", State: "active", Env: "green", Pending: 3, Human: 1, Active: true},
+			{Name: "idle1", State: "dormant", Env: "blue", Pending: 0, Human: 0, Active: false},
+		},
+	}
+	out := renderTmpl(t, s, "dashboard.html", data)
+	for _, want := range []string{
+		`<div class="card active">`,                  // live overlay on the active-claim card
+		`<span class="badge live">live</span>`,       // live badge
+		`<span class="badge env-green">green</span>`, // env badge class is env-<active>
+		`<div class="card">`,                         // the idle card is a plain card
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dashboard card template missing %q:\n%s", want, out)
+		}
+	}
+	// Exactly one of the two cards is the live one (the idle card is not overlaid).
+	if n := strings.Count(out, `class="card active"`); n != 1 {
+		t.Fatalf("want exactly 1 live card, got %d:\n%s", n, out)
+	}
+}
+
 func TestPlanAndHuman(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/submodule/alpha/plan")
@@ -473,7 +594,9 @@ func TestAssetsStyleServed(t *testing.T) {
 		".status-needs-arbitration",
 		".status-done",
 		".status-needs-human",
-		".active", // session+heartbeat overlay (no IN-PROGRESS status)
+		".active",   // session+heartbeat overlay (no IN-PROGRESS status)
+		".env-blue", // dashboard-cards blue/green env badge
+		".env-green",
 	}
 	for _, m := range must {
 		if !strings.Contains(body, m) {
