@@ -78,17 +78,23 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /env", s.envGet)
 	mux.HandleFunc("POST /env/deploy", s.envDeploy)
 	mux.HandleFunc("GET /human", s.human)
-	// AI editor chat (browser): one worktree branch per session.
+	// AI chat-diff editor (browser): one ROOT worktree branch per session over an
+	// arbitrary repo file. A turn proposes a diff; approve commits it on the
+	// branch, reject discards it, merge publishes to main.
 	mux.HandleFunc("GET /edit", s.editNew)
 	mux.HandleFunc("GET /editor/{id}", s.editorPage)
 	mux.HandleFunc("GET /editor/{id}/panel", s.editorPanel)
 	mux.HandleFunc("POST /editor/{id}/chat", s.editorChat)
+	mux.HandleFunc("POST /editor/{id}/approve", s.editorApprove)
+	mux.HandleFunc("POST /editor/{id}/reject", s.editorReject)
 	mux.HandleFunc("POST /editor/{id}/merge", s.editorMerge)
 	mux.HandleFunc("POST /editor/{id}/close", s.editorClose)
-	// AI editor chat (JSON API): browser-free clients.
+	// AI chat-diff editor (JSON API): browser-free clients.
 	mux.HandleFunc("POST /api/editor", s.apiEditorOpen)
 	mux.HandleFunc("GET /api/editor/{id}", s.apiEditorGet)
 	mux.HandleFunc("POST /api/editor/{id}/chat", s.apiEditorChat)
+	mux.HandleFunc("POST /api/editor/{id}/approve", s.apiEditorApprove)
+	mux.HandleFunc("POST /api/editor/{id}/reject", s.apiEditorReject)
 	mux.HandleFunc("POST /api/editor/{id}/merge", s.apiEditorMerge)
 	mux.HandleFunc("GET /api/editor/{id}/diff", s.apiEditorDiff)
 	mux.Handle("GET /assets/", http.FileServer(http.FS(assetFS)))

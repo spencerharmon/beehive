@@ -218,3 +218,175 @@ func TestSessionMergeAutoPushesRemote(t *testing.T) {
 		t.Fatalf("remote main missing the change:\n%s", out)
 	}
 }
+
+// A turn now leaves its change UNCOMMITTED (pending). Approve commits it onto the
+// edit branch but does NOT publish to main; the human gate is real.
+func TestSessionApproveCommitsProposalWithoutPublishing(t *testing.T) {
+	root, _ := setupRepo(t)
+	file := "submodules/sm/ROI.md"
+	fc := &fakeClient{reply: "appended."}
+	fc.editFn = func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(file))
+		b, _ := os.ReadFile(p)
+		_ = os.WriteFile(p, append(b, []byte("approved goal\n")...), 0o644)
+	}
+	m := newTestManager(t, root, fc)
+	ctx := context.Background()
+	sess, err := m.Open(ctx, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.Chat(ctx, "add a goal"); err != nil {
+		t.Fatal(err)
+	}
+	// Proposed but uncommitted: pending, and the branch HEAD does not have it yet.
+	if !sess.Pending(ctx) {
+		t.Fatal("want pending right after a turn")
+	}
+	if head, _ := sess.wt.Show(ctx, "HEAD", file); strings.Contains(head, "approved goal") {
+		t.Fatalf("proposal must not be committed before approval; HEAD=%q", head)
+	}
+
+	if err := sess.Approve(ctx); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	// Approve records it on the branch (HEAD now has it) and clears pending...
+	if sess.Pending(ctx) {
+		t.Fatal("approve should clear pending")
+	}
+	head, err := sess.wt.Show(ctx, "HEAD", file)
+	if err != nil || !strings.Contains(head, "approved goal") {
+		t.Fatalf("approve did not commit onto branch HEAD: %q err=%v", head, err)
+	}
+	// ...but does NOT publish to main: still dirty, primary working tree untouched.
+	if st := sess.State(ctx); st != "dirty" {
+		t.Fatalf("approve must not publish; want dirty, got %s", st)
+	}
+	onMain, _ := os.ReadFile(filepath.Join(root, filepath.FromSlash(file)))
+	if strings.Contains(string(onMain), "approved goal") {
+		t.Fatalf("approve leaked to main working tree: %q", string(onMain))
+	}
+}
+
+// Reject restores an existing file to its committed state: the session becomes a
+// no-op (live) and the proposed content is gone.
+func TestSessionRejectRestoresExistingFile(t *testing.T) {
+	root, _ := setupRepo(t)
+	file := "submodules/sm/ROI.md"
+	fc := &fakeClient{reply: "rewrote."}
+	fc.editFn = func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(file))
+		_ = os.WriteFile(p, []byte("# ROI\n\ntotally different\n"), 0o644)
+	}
+	m := newTestManager(t, root, fc)
+	ctx := context.Background()
+	sess, err := m.Open(ctx, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.Chat(ctx, "rewrite it"); err != nil {
+		t.Fatal(err)
+	}
+	if !sess.Pending(ctx) {
+		t.Fatal("want pending")
+	}
+	if err := sess.Reject(ctx); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	if sess.Pending(ctx) {
+		t.Fatal("reject should clear pending")
+	}
+	if st := sess.State(ctx); st != "live" {
+		t.Fatalf("reject should restore live, got %s", st)
+	}
+	_, proposed, _ := sess.Diff(ctx)
+	if strings.Contains(proposed, "totally different") || !strings.Contains(proposed, "original goal") {
+		t.Fatalf("reject did not restore original content: %q", proposed)
+	}
+}
+
+// Reject of a file the agent newly created (absent at HEAD) removes it entirely.
+func TestSessionRejectRemovesNewFile(t *testing.T) {
+	root, _ := setupRepo(t)
+	file := "submodules/sm/NEWNOTES.md" // absent on main/HEAD
+	fc := &fakeClient{reply: "created."}
+	fc.editFn = func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(file))
+		_ = os.WriteFile(p, []byte("brand new\n"), 0o644)
+	}
+	m := newTestManager(t, root, fc)
+	ctx := context.Background()
+	sess, err := m.Open(ctx, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.Chat(ctx, "create it"); err != nil {
+		t.Fatal(err)
+	}
+	if !sess.Pending(ctx) {
+		t.Fatal("want pending for a new file")
+	}
+	if err := sess.Reject(ctx); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	if sess.Pending(ctx) {
+		t.Fatal("reject should clear pending")
+	}
+	if _, err := os.Stat(filepath.Join(sess.wtPath, filepath.FromSlash(file))); !os.IsNotExist(err) {
+		t.Fatalf("reject should remove the new file; stat err=%v", err)
+	}
+}
+
+// The surface is generic over ANY repo path, not just coordination files: a turn
+// over a plain source file yields a proposed diff that approve+merge makes live.
+func TestSessionArbitraryFileProposesAndMerges(t *testing.T) {
+	root, _ := setupRepo(t)
+	file := "internal/app/main.go"
+	fc := &fakeClient{reply: "scaffolded."}
+	fc.editFn = func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(file))
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		_ = os.WriteFile(p, []byte("package app\n\nfunc main() {}\n"), 0o644)
+	}
+	m := newTestManager(t, root, fc)
+	ctx := context.Background()
+	sess, err := m.Open(ctx, file)
+	if err != nil {
+		t.Fatalf("open arbitrary file: %v", err)
+	}
+	if _, err := sess.Chat(ctx, "scaffold main"); err != nil {
+		t.Fatal(err)
+	}
+	base, proposed, _ := sess.Diff(ctx)
+	if base != "" {
+		t.Fatalf("new file base should be empty, got %q", base)
+	}
+	if !strings.Contains(proposed, "func main()") {
+		t.Fatalf("arbitrary-file turn did not yield a proposal: %q", proposed)
+	}
+	if !sess.Pending(ctx) {
+		t.Fatal("arbitrary-file proposal should be pending")
+	}
+	if err := sess.Approve(ctx); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if err := sess.Merge(ctx); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	onMain, _ := os.ReadFile(filepath.Join(root, filepath.FromSlash(file)))
+	if !strings.Contains(string(onMain), "func main()") {
+		t.Fatalf("arbitrary file did not reach main: %q", string(onMain))
+	}
+}
+
+// Path traversal (and other escapes) are rejected at Open, before any worktree.
+func TestOpenRejectsTraversal(t *testing.T) {
+	root, _ := setupRepo(t)
+	m := newTestManager(t, root, &fakeClient{})
+	ctx := context.Background()
+	for _, bad := range []string{"../etc/passwd", "/etc/passwd", "submodules/../../escape", ".git/config", "", "."} {
+		if _, err := m.Open(ctx, bad); err == nil {
+			t.Errorf("Open(%q) should be rejected", bad)
+		}
+	}
+}

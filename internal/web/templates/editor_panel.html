@@ -7,7 +7,9 @@
   <div class="diffpane">
     <div class="statusbar">
       {{if .Live}}<span class="state live">State: live</span>{{else}}<span class="state dirty">State: dirty</span>{{end}}
-      {{if .Merged}}<button class="merge merged" disabled>Merged</button>
+      {{if .Pending}}<button class="merge" hx-post="/editor/{{.ID}}/approve" hx-target="#editor" hx-swap="innerHTML">Approve</button>
+      <button class="danger" hx-post="/editor/{{.ID}}/reject" hx-target="#editor" hx-swap="innerHTML">Reject</button>
+      {{else if .Merged}}<button class="merge merged" disabled>Merged</button>
       {{else if .Live}}<button class="merge merged" disabled>Merge</button>
       {{else}}<button class="merge" hx-post="/editor/{{.ID}}/merge" hx-target="#editor" hx-swap="innerHTML">Merge</button>{{end}}
     </div>

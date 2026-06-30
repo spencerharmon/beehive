@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"html/template"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/swarm"
 )
 
 func setup(t *testing.T) (*Server, string) {
@@ -1098,6 +1100,220 @@ func TestAssetsStyleHtmxPolish(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("style.css missing htmx-polish rule %q", want)
+		}
+	}
+}
+
+// ---- chat-diff editor: end-to-end through the HTTP surface ----
+
+// fakeEditorAgent stands in for the opencode client: each turn runs editFn
+// against the session worktree and returns a canned reply.
+type fakeEditorAgent struct {
+	editFn func(dir string)
+	reply  string
+}
+
+func (f *fakeEditorAgent) NewSession(ctx context.Context, dir, system, first string) (swarm.Session, string, error) {
+	if f.editFn != nil {
+		f.editFn(dir)
+	}
+	return &fakeEditorSession{f: f, dir: dir}, f.reply, nil
+}
+
+type fakeEditorSession struct {
+	f   *fakeEditorAgent
+	dir string
+}
+
+func (s *fakeEditorSession) Prompt(ctx context.Context, text string) (string, error) {
+	if s.f.editFn != nil {
+		s.f.editFn(s.dir)
+	}
+	return s.f.reply, nil
+}
+func (s *fakeEditorSession) Messages(ctx context.Context) ([]swarm.Message, error) { return nil, nil }
+func (s *fakeEditorSession) Close() error                                          { return nil }
+
+// setupEditorServer builds a Server over a repo with a real commit on `main` (the
+// editor cuts edit branches from main, so an empty repo will not do) and injects
+// a fake agent that performs edit.
+func setupEditorServer(t *testing.T, edit func(dir string), reply string) (*Server, string) {
+	t.Helper()
+	root := t.TempDir()
+	if err := repo.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "t@t"},
+		{"config", "user.name", "t"},
+		{"config", "receive.denyCurrentBranch", "updateInstead"},
+	} {
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	sm := filepath.Join(root, "submodules", "alpha")
+	if err := os.MkdirAll(sm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sm, repo.ROIFile), []byte("# alpha\n\noriginal goal\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-q", "-m", "seed"}} {
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	r, err := repo.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(r, config.Defaults(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.editors.SetAgent(&fakeEditorAgent{editFn: edit, reply: reply})
+	return s, root
+}
+
+// postJSON drives a JSON API route through the full mux and decodes the response.
+func postJSON(t *testing.T, s *Server, path, body string) (int, map[string]interface{}) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.Routes().ServeHTTP(w, req)
+	var out map[string]interface{}
+	if w.Body.Len() > 0 {
+		_ = json.Unmarshal(w.Body.Bytes(), &out)
+	}
+	return w.Code, out
+}
+
+// showInWorktree reads path at HEAD of the per-session edit worktree (the branch
+// id names both the worktree dir and the branch), proving what Approve committed.
+func showInWorktree(t *testing.T, root, id, path string) (string, error) {
+	t.Helper()
+	c := exec.Command("git", "show", "HEAD:"+path)
+	c.Dir = filepath.Join(root, ".worktrees", id)
+	out, err := c.CombinedOutput()
+	return string(out), err
+}
+
+// TestEditorArbitraryPathProposeApprove is the foundation acceptance: a chat turn
+// over an ARBITRARY path yields a proposed diff, and Approve writes+commits it in
+// the edit worktree (without publishing to main).
+func TestEditorArbitraryPathProposeApprove(t *testing.T) {
+	// An arbitrary, non-coordination source path — proves the surface is generic.
+	file := "internal/widget/widget.go"
+	s, root := setupEditorServer(t, func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(file))
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		_ = os.WriteFile(p, []byte("package widget\n\nfunc New() {}\n"), 0o644)
+	}, "scaffolded the widget.")
+
+	code, open := postJSON(t, s, "/api/editor", `{"path":"`+file+`"}`)
+	if code != 200 {
+		t.Fatalf("open arbitrary path: code %d (%v)", code, open)
+	}
+	id, _ := open["id"].(string)
+	if id == "" {
+		t.Fatalf("no session id in %v", open)
+	}
+
+	// A chat turn proposes a diff.
+	if code, _ := postJSON(t, s, "/api/editor/"+id+"/chat", `{"message":"scaffold it"}`); code != 200 {
+		t.Fatalf("chat: code %d", code)
+	}
+	dw := get(t, s, "/api/editor/"+id+"/diff")
+	if dw.Code != 200 {
+		t.Fatalf("diff: code %d", dw.Code)
+	}
+	var diff map[string]interface{}
+	_ = json.Unmarshal(dw.Body.Bytes(), &diff)
+	if base, _ := diff["base"].(string); base != "" {
+		t.Fatalf("new-file base should be empty, got %q", base)
+	}
+	if proposed, _ := diff["proposed"].(string); !strings.Contains(proposed, "func New()") {
+		t.Fatalf("turn did not yield a proposal: %q", proposed)
+	}
+	// Before approval the proposal is NOT committed on the branch.
+	if out, err := showInWorktree(t, root, id, file); err == nil && strings.Contains(out, "func New()") {
+		t.Fatalf("proposal committed before approval: %q", out)
+	}
+
+	// Approve writes+commits in the edit worktree.
+	code, appr := postJSON(t, s, "/api/editor/"+id+"/approve", ``)
+	if code != 200 {
+		t.Fatalf("approve: code %d (%v)", code, appr)
+	}
+	if pending, _ := appr["pending"].(bool); pending {
+		t.Fatal("approve should clear pending")
+	}
+	out, err := showInWorktree(t, root, id, file)
+	if err != nil || !strings.Contains(out, "func New()") {
+		t.Fatalf("approve did not commit in the edit worktree: %q err=%v", out, err)
+	}
+	// Approve must NOT publish to main: the primary working tree is untouched.
+	if _, statErr := os.Stat(filepath.Join(root, filepath.FromSlash(file))); !os.IsNotExist(statErr) {
+		t.Fatalf("approve leaked to main working tree (stat err=%v)", statErr)
+	}
+}
+
+// TestEditorRejectIsNoOp covers the other gate branch: Reject discards the
+// proposal so the session leaves no trace.
+func TestEditorRejectIsNoOp(t *testing.T) {
+	file := "submodules/alpha/" + repo.ROIFile
+	s, root := setupEditorServer(t, func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(file))
+		_ = os.WriteFile(p, []byte("# alpha\n\nrewritten by agent\n"), 0o644)
+	}, "rewrote it.")
+
+	_, open := postJSON(t, s, "/api/editor", `{"path":"`+file+`"}`)
+	id, _ := open["id"].(string)
+	if id == "" {
+		t.Fatalf("no id: %v", open)
+	}
+	if code, _ := postJSON(t, s, "/api/editor/"+id+"/chat", `{"message":"rewrite"}`); code != 200 {
+		t.Fatalf("chat code %d", code)
+	}
+	// Reject restores the file; the session becomes live (a no-op vs main).
+	code, rej := postJSON(t, s, "/api/editor/"+id+"/reject", ``)
+	if code != 200 {
+		t.Fatalf("reject: code %d (%v)", code, rej)
+	}
+	if pending, _ := rej["pending"].(bool); pending {
+		t.Fatal("reject should clear pending")
+	}
+	if state, _ := rej["state"].(string); state != "live" {
+		t.Fatalf("reject should restore live, got %q", state)
+	}
+	out, err := showInWorktree(t, root, id, file)
+	if err != nil {
+		t.Fatalf("show after reject: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "rewritten by agent") || !strings.Contains(out, "original goal") {
+		t.Fatalf("reject did not restore original content: %q", out)
+	}
+}
+
+// TestEditorRejectsTraversal locks the path-traversal guard on both the browser
+// and JSON surfaces.
+func TestEditorRejectsTraversal(t *testing.T) {
+	s, _ := setupEditorServer(t, nil, "")
+	// Browser surface.
+	if w := get(t, s, "/edit?path=../etc/passwd"); w.Code != http.StatusBadRequest {
+		t.Fatalf("GET /edit traversal: want 400, got %d", w.Code)
+	}
+	// JSON surface (both the canonical "path" and the legacy "file" alias).
+	for _, bad := range []string{`{"path":"../etc/passwd"}`, `{"path":"/etc/passwd"}`, `{"file":".git/config"}`, `{"path":""}`} {
+		if code, _ := postJSON(t, s, "/api/editor", bad); code != http.StatusBadRequest {
+			t.Fatalf("POST /api/editor %s: want 400, got %d", bad, code)
 		}
 	}
 }

@@ -47,13 +47,35 @@ func TestRenderDiffEscapesHTML(t *testing.T) {
 }
 
 func TestValidateFile(t *testing.T) {
-	ok := []string{"submodules/x/ROI.md", "INFRASTRUCTURE.md", "submodules/y/SUBMODULE-LINKS.yaml"}
+	// The chat-diff editor is generic over ANY repo-relative file: coordination
+	// files, submodule files, source, and not-yet-existing new files are all valid
+	// targets. Ownership policy (e.g. ROI.md / PLAN.md) is enforced by git hooks at
+	// commit time, NOT by path validation. Only paths that escape the repo (or dive
+	// into its .git plumbing) are rejected here.
+	ok := []string{
+		"PLAN.md", "AGENTS.md", "ROI.md",
+		"submodules/x/ROI.md", "INFRASTRUCTURE.md",
+		"submodules/y/SUBMODULE-LINKS.yaml",
+		"internal/web/web.go",         // source
+		"submodules/x/secret.txt",     // arbitrary file
+		"a/b/c/d/new-file-not-yet.md", // new file, deep path
+		"./PLAN.md",                   // cleans to PLAN.md
+	}
 	for _, f := range ok {
 		if err := ValidateFile(f); err != nil {
 			t.Errorf("want ok for %q: %v", f, err)
 		}
 	}
-	bad := []string{"PLAN.md", "AGENTS.md", "../etc/passwd", "submodules/x/../../escape/ROI.md.x", "submodules/x/secret.txt"}
+	bad := []string{
+		"",                                    // empty
+		".",                                   // repo root, not a file
+		"..",                                  // parent
+		"../etc/passwd",                       // traversal
+		"/etc/passwd",                         // absolute
+		"submodules/x/../../../escape/ROI.md", // cleans to ../escape/ROI.md (escapes)
+		".git",                                // git dir itself
+		".git/config",                         // inside git plumbing
+	}
 	for _, f := range bad {
 		if err := ValidateFile(f); err == nil {
 			t.Errorf("want error for %q", f)

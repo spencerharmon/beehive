@@ -12,14 +12,14 @@ import (
 
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/git"
-	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spencerharmon/beehive/internal/swarm"
 )
 
-// agentClient is the slice of the opencode client the editor needs: a session
-// seeded with a system prompt and a first message, returning the reply. Narrowed
-// to an interface so tests can inject a fake. (*swarm.Opencode) satisfies it.
-type agentClient interface {
+// Agent is the slice of the opencode client the editor needs: a session seeded
+// with a system prompt and a first message, returning the reply. Narrowed to an
+// interface so tests and wiring can inject a fake. (*swarm.Opencode) satisfies
+// it.
+type Agent interface {
 	NewSession(ctx context.Context, cwd, system, first string) (swarm.Session, string, error)
 }
 
@@ -27,14 +27,6 @@ type agentClient interface {
 // has explicitly approved merging. beehived performs the merge on its behalf, so
 // "ask the agent to merge" and clicking Merge converge to the same git state.
 const mergeMarker = "<<<MERGE>>>"
-
-// editableBasenames are the human-owned coordination files an editor session may
-// touch. Everything else (PLAN.md, AGENTS.md, secrets, code) is off limits.
-var editableBasenames = map[string]bool{
-	repo.ROIFile:   true,
-	repo.InfraFile: true,
-	repo.LinksFile: true,
-}
 
 // Turn is one chat message in a session's log.
 type Turn struct {
@@ -53,7 +45,7 @@ type Session struct {
 	remote   string
 	baseMain string
 
-	client agentClient
+	client Agent
 	wt     *git.Repo // worktree git
 
 	mu   sync.Mutex
@@ -69,7 +61,7 @@ type Manager struct {
 	absRoot string
 	cfg     config.Config
 	primary *git.Repo
-	client  agentClient
+	client  Agent
 
 	mu   sync.Mutex
 	byID map[string]*Session
@@ -91,15 +83,27 @@ func NewManager(root string, cfg config.Config) (*Manager, error) {
 	}, nil
 }
 
-// ValidateFile reports whether file (repo-relative) is an editable coordination
-// file and is safe (no traversal). It does not require the file to exist yet.
+// SetAgent swaps the opencode client the manager seeds sessions with. Used by
+// beehived wiring and by tests that inject a fake agent in place of the real
+// network-backed opencode server.
+func (m *Manager) SetAgent(a Agent) { m.client = a }
+
+// ValidateFile reports whether file is a safe repo-relative target for a
+// chat-diff edit session. The editor is generalized over ANY file in the beehive
+// repo (ROI/PLAN/INFRASTRUCTURE/code/docs/...), so the only constraint is that
+// the path stays INSIDE the repo: absolute paths, "." and any ".." traversal are
+// rejected, as is anything under .git/ (the repo's own plumbing is never an edit
+// target). The file need not exist yet — a new-file proposal is valid. Ownership
+// rules for protected files (ROI.md is writable only under the frontend git
+// identity; the pre-commit/pre-receive hooks still apply) are enforced at commit
+// time by the hooks, not here.
 func ValidateFile(file string) error {
 	clean := filepath.ToSlash(filepath.Clean(file))
-	if clean == "." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "..") || strings.Contains(clean, "../") {
+	if clean == "." || clean == "" || strings.HasPrefix(clean, "/") || clean == ".." || strings.HasPrefix(clean, "../") {
 		return fmt.Errorf("invalid file path %q", file)
 	}
-	if !editableBasenames[filepath.Base(clean)] {
-		return fmt.Errorf("%q is not an editable file", file)
+	if clean == ".git" || strings.HasPrefix(clean, ".git/") {
+		return fmt.Errorf("%q is inside the git directory", file)
 	}
 	return nil
 }
@@ -235,11 +239,12 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 	s.log = append(s.log, Turn{Role: "agent", Text: display, At: time.Now()})
 	s.mu.Unlock()
 
-	// Commit whatever the agent wrote so the branch carries the proposal (and a
-	// merge can fast-forward). Nothing-to-commit is fine (agent only answered).
-	if cerr := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); cerr != nil && cerr != git.ErrNothing {
-		s.setErr("commit: " + cerr.Error())
-	}
+	// The agent edits the target file directly in this isolated worktree, but the
+	// proposal is deliberately left UNCOMMITTED so a human can Approve (commit it)
+	// or Reject (discard it): nothing reaches the branch without approval. The one
+	// exception is an in-chat approval — when the user explicitly approved and the
+	// agent emitted the merge marker, publish straight to main (merge commits the
+	// proposal first), so "ask the agent to merge" still converges to live.
 	if doMerge {
 		if merr := s.merge(ctx); merr != nil {
 			s.setErr("merge: " + merr.Error())
@@ -299,6 +304,52 @@ func (s *Session) merge(ctx context.Context) error {
 	}
 	// No remote: local main is the only target and is what makes the proposal live.
 	return s.wt.UpdateLocalMain(ctx)
+}
+
+// Approve commits the pending proposal — whatever the agent wrote to the target
+// file this session — onto the edit branch in the isolated worktree. This is the
+// human gate: a turn leaves its change UNCOMMITTED, and only Approve records it
+// on the branch. It does not publish to main (Merge does that); the commit keeps
+// the proposal isolated and publishable. A no-op (returns nil) when nothing is
+// pending. The commit is scoped to the target path, so any stray file the agent
+// touched is never recorded.
+func (s *Session) Approve(ctx context.Context) error {
+	if err := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); err != nil && err != git.ErrNothing {
+		return err
+	}
+	return nil
+}
+
+// Reject discards the pending proposal, restoring the target file to its
+// committed state on the edit branch so the session is a no-op until the next
+// turn. A file the agent newly created (absent at HEAD) is removed; an existing
+// file is reverted to HEAD. Only the target path is restored — Approve/Merge
+// never committed anything else, so nothing else can have leaked onto the branch.
+func (s *Session) Reject(ctx context.Context) error {
+	if _, err := s.wt.Show(ctx, "HEAD", s.File); err == nil {
+		// Tracked at HEAD: revert index + worktree to the committed version.
+		_, rerr := s.wt.Run(ctx, "checkout", "HEAD", "--", s.File)
+		return rerr
+	}
+	// New on this branch (not at HEAD): drop the proposal file entirely.
+	if err := os.Remove(filepath.Join(s.wtPath, filepath.FromSlash(s.File))); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// Pending reports whether an un-approved proposal exists: the target file in the
+// worktree differs from its committed state on the edit branch (HEAD). It is true
+// right after a turn that changed the file and false once Approve commits it (or
+// Reject discards it). Distinct from State, which compares the worktree against
+// main to decide live vs dirty.
+func (s *Session) Pending(ctx context.Context) bool {
+	head, _ := s.wt.Show(ctx, "HEAD", s.File) // "" when the file is new on the branch
+	b, err := os.ReadFile(filepath.Join(s.wtPath, filepath.FromSlash(s.File)))
+	if err != nil && !os.IsNotExist(err) {
+		return false
+	}
+	return strings.TrimRight(head, "\n") != strings.TrimRight(string(b), "\n")
 }
 
 // Diff returns the file content on main (base) and in the worktree (proposed).
