@@ -2,7 +2,9 @@ package repo
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -13,6 +15,42 @@ func TestInitOpen(t *testing.T) {
 	}
 	if _, err := Open(root); err != nil {
 		t.Fatalf("open: %v", err)
+	}
+}
+
+func TestInitCreatesGitRepoOnMain(t *testing.T) {
+	root := t.TempDir()
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	if out := gitOut(t, root, "rev-parse", "--show-toplevel"); out != root {
+		t.Fatalf("git toplevel = %q, want %q", out, root)
+	}
+	if out := gitOut(t, root, "branch", "--show-current"); out != "main" {
+		t.Fatalf("branch = %q, want main", out)
+	}
+}
+
+func TestInitExistingGitCreatesAndChecksOutMain(t *testing.T) {
+	root := t.TempDir()
+	gitOut(t, root, "init")
+	gitOut(t, root, "config", "user.name", "Beehive Test")
+	gitOut(t, root, "config", "user.email", "beehive-test@example.invalid")
+	gitOut(t, root, "checkout", "-b", "dev")
+	if err := os.WriteFile(filepath.Join(root, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, root, "add", "seed.txt")
+	gitOut(t, root, "commit", "-m", "seed")
+
+	if err := Init(root); err != nil {
+		t.Fatal(err)
+	}
+	if out := gitOut(t, root, "show-ref", "--verify", "refs/heads/main"); out == "" {
+		t.Fatal("main ref not created")
+	}
+	if out := gitOut(t, root, "branch", "--show-current"); out != "main" {
+		t.Fatalf("branch = %q, want main", out)
 	}
 }
 
@@ -65,4 +103,15 @@ func TestInitScaffolds(t *testing.T) {
 			t.Fatalf("%s not created by Init: %v", name, err)
 		}
 	}
+}
+
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
 }

@@ -27,15 +27,17 @@ func initCmd() *cobra.Command {
 			if err := repo.Init(path); err != nil {
 				return err
 			}
-			// Hook install is best-effort: only if path is already a git repo
-			// (a fresh clone always is). Lays down ALL hooks idempotently, so a
-			// re-run upgrades stale hooks; .git/hooks is never tracked by git.
-			_ = config.InstallHooks(path)
+			// Init always leaves path as a git repo on main. Lay down ALL hooks
+			// idempotently, so a re-run upgrades stale hooks; .git/hooks is never
+			// tracked by git.
+			if err := config.InstallHooks(path); err != nil {
+				return err
+			}
 			// Allow honeybee worktrees to publish to the checked-out main branch
 			// via `git push . HEAD:main` (local, no-remote convergence).
 			g := git.New(path)
-			if _, err := g.Run(cmd.Context(), "rev-parse", "--git-dir"); err == nil {
-				_, _ = g.Run(cmd.Context(), "config", "receive.denyCurrentBranch", "updateInstead")
+			if _, err := g.Run(cmd.Context(), "config", "receive.denyCurrentBranch", "updateInstead"); err != nil {
+				return err
 			}
 			fmt.Println("beehive repo at", path)
 			return nil

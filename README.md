@@ -113,7 +113,7 @@ Core files:
 ## Common CLI commands
 
 ```sh
-beehive init <path>
+beehive init <path>                       # creates git repo on main if needed
 beehive submodule add <repo>
 beehive submodule link <a> <b>
 beehive submodule plan rollback <plan-id>

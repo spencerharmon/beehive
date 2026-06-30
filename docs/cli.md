@@ -3,7 +3,7 @@
 Deterministic. No LLM. Edits files, commits, pushes.
 
 ```
-beehive init <path>                       scaffold a beehive repo
+beehive init <path>                       scaffold a beehive repo; git init + main when needed
 beehive version                           print version
 
 beehive submodule add <repo>              add submodule (dormant until ROI authored)
