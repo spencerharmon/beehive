@@ -104,31 +104,51 @@ type Plan struct {
 	Items    []PlanItem
 }
 
-// parsePlan reads PLAN.md and projects it for the views via internal/plan.Parse
-// (the single PLAN.md parser — the H2 header format `## <id> [STATUS] <!--
-// attempts=N deps=a,b weight=W session=<id> heartbeat=<RFC3339> -->`). A missing
-// file is an empty plan. Each task's active/stale claim state is derived against
-// now and ttl. now/ttl are passed in so the projection is deterministically
-// testable; handlers supply time.Now() and the resolved TTL.
-func parsePlan(path string, now time.Time, ttl time.Duration) (Plan, error) {
-	var p Plan
+// loadPlan reads PLAN.md and structurally parses it via internal/plan.Parse (the
+// single PLAN.md parser — the H2 header format `## <id> [STATUS] <!-- attempts=N
+// deps=a,b weight=W session=<id> heartbeat=<RFC3339> -->`). A missing file is an
+// empty plan (not an error). This is the expensive, wall-clock-INDEPENDENT half
+// of parsePlan: the unit planCache memoizes per beehive HEAD (see cache.go),
+// kept separate from the cheap claim projection so active/stale stays fresh on
+// every read even when the structure is served from cache. The returned
+// *plan.Plan is read-only to callers (projectPlan only reads it), so a cached
+// instance is safe to share across concurrent requests.
+func loadPlan(path string) (*plan.Plan, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return p, nil
+			return &plan.Plan{}, nil
 		}
-		return p, err
+		return nil, err
 	}
-	parsed, err := plan.Parse(string(b))
-	if err != nil {
-		return p, err
-	}
-	p.ROIStamp = parsed.ROI
+	return plan.Parse(string(b))
+}
+
+// projectPlan maps a structurally-parsed plan into the view Plan, deriving each
+// task's active/stale claim state against now/ttl. It is cheap and recomputed on
+// every read (never cached), so a claim's freshness is always current even when
+// the structural parse came from the HEAD-keyed cache.
+func projectPlan(parsed *plan.Plan, now time.Time, ttl time.Duration) Plan {
+	p := Plan{ROIStamp: parsed.ROI}
 	for _, t := range parsed.Tasks {
 		p.Items = append(p.Items, projectTask(t, now, ttl))
 	}
 	resolveDeps(p.Items)
-	return p, nil
+	return p
+}
+
+// parsePlan reads PLAN.md and projects it for the views: loadPlan (structural
+// parse) then projectPlan (active/stale vs now/ttl). It is the uncached path;
+// handlers serve reads through the HEAD-keyed planCache, which reuses these same
+// two halves so cached and uncached results are identical. now/ttl are passed in
+// so the projection is deterministically testable; handlers supply time.Now()
+// and the resolved TTL.
+func parsePlan(path string, now time.Time, ttl time.Duration) (Plan, error) {
+	parsed, err := loadPlan(path)
+	if err != nil {
+		return Plan{}, err
+	}
+	return projectPlan(parsed, now, ttl), nil
 }
 
 // resolveDeps fills each item's DepStates, marking which of its deps are DONE in

@@ -49,7 +49,8 @@ Single `SECRETS.yaml.gpg`, one encrypted yaml doc, referenced by INFRASTRUCTURE.
 - `docs/opencode.md` — agent backend setup
 - `docs/cli.md` — CLI reference
 - `docs/repo-layout.md` — beehive repo layout
-- `docs/frontend-components.md` — frontend routes/components
+- `docs/frontend-components.md` — frontend routes/components; PLAN.md parse cache (HEAD-keyed,
+  invalidate-on-commit) and its supported-submodule ceiling (low hundreds per `beehived`)
 - `CONTRIBUTING.md`, `docs/RELEASE-NOTES-TEMPLATE.md`
 
 See `IMPLEMENTATION.org` for the full plan.

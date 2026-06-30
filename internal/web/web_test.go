@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/links"
+	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
@@ -269,6 +271,181 @@ func TestParsePlanMissingFile(t *testing.T) {
 	}
 	if len(p.Items) != 0 || p.ROIStamp != "" {
 		t.Fatalf("missing file should yield empty plan, got %+v", p)
+	}
+}
+
+// TestPlanCacheParseOncePerHead is the unit core of frontend-perf-cache: the
+// HEAD-keyed cache performs the file-read+structural parse of each PLAN.md ONCE
+// per HEAD generation (a warm read at the same HEAD+path is served without
+// re-parsing), drops the entire previous generation when HEAD advances
+// (invalidate-on-commit), and treats an empty HEAD (a repo with no commits) as
+// uncacheable so pre-first-commit views still render. A counting loader stands in
+// for loadPlan so each cache-miss parse is observable.
+func TestPlanCacheParseOncePerHead(t *testing.T) {
+	parsed, err := plan.Parse("<!-- Beehive-ROI: gen1 -->\n# Plan\n\n## t1 [TODO] <!-- attempts=0 deps= -->\nbody\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loads := 0
+	c := &planCache{
+		entries: map[string]*plan.Plan{},
+		load: func(path string) (*plan.Plan, error) {
+			loads++
+			return parsed, nil
+		},
+	}
+	now, ttl := mustTime(t, "2026-06-30T12:00:00Z"), time.Hour
+	mustView := func(head, path string) {
+		t.Helper()
+		if _, err := c.view(head, path, now, ttl); err != nil {
+			t.Fatalf("view(%q,%q): %v", head, path, err)
+		}
+	}
+
+	// Two reads at the same HEAD+path: the structural parse happens exactly once.
+	mustView("h1", "alpha")
+	mustView("h1", "alpha")
+	if loads != 1 {
+		t.Fatalf("same HEAD+path parsed %d times, want 1 (warm cache)", loads)
+	}
+	// A different path at the same HEAD is its own entry (one more parse).
+	mustView("h1", "beta")
+	if loads != 2 {
+		t.Fatalf("distinct path at same HEAD: loads=%d, want 2", loads)
+	}
+	// HEAD advancing (a commit) drops the whole generation -> re-parse alpha...
+	mustView("h2", "alpha")
+	if loads != 3 {
+		t.Fatalf("HEAD change did not invalidate: loads=%d, want 3", loads)
+	}
+	// ...and the old generation is gone, so beta re-parses at the new HEAD too.
+	mustView("h2", "beta")
+	if loads != 4 {
+		t.Fatalf("stale generation not dropped: loads=%d, want 4", loads)
+	}
+	// c.loads (the cache's own miss counter) tracks the same real-load count.
+	if c.loads != loads {
+		t.Fatalf("c.loads=%d disagrees with observed loads=%d", c.loads, loads)
+	}
+	// Empty HEAD (no commits yet): uncacheable, so every call re-parses.
+	mustView("", "alpha")
+	mustView("", "alpha")
+	if loads != 6 {
+		t.Fatalf("empty HEAD must not cache: loads=%d, want 6", loads)
+	}
+}
+
+// TestPlanCacheViewMatchesUncached proves the cache is a transparent optimization:
+// a cached view equals the uncached parsePlan for the same inputs, AND the claim
+// projection (active/stale) is recomputed on every read rather than cached — so
+// the SAME cached structural parse, read at two different wall-clock times with NO
+// HEAD change, reports a claim active before the TTL and stale after it.
+// Correctness over hit-rate, exactly as the task's caveat requires.
+func TestPlanCacheViewMatchesUncached(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "PLAN.md")
+	// t1 carries a session+heartbeat claim so the projection is time-sensitive.
+	src := "<!-- Beehive-ROI: cafe -->\n# Plan\n\n" +
+		"## t1 [TODO] <!-- attempts=0 deps=t0 weight=4 session=bee-A heartbeat=2026-06-30T11:30:00Z -->\n" +
+		"build it\nDoc: docs/tasks/t1.md\n\n" +
+		"## t2 [DONE] <!-- attempts=0 deps= -->\ndone\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ttl := time.Hour
+	c := newPlanCache()
+
+	// Within the TTL (30m after the heartbeat): cached view == uncached parse.
+	fresh := mustTime(t, "2026-06-30T12:00:00Z")
+	cached, err := c.view("h1", path, fresh, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := parsePlan(path, fresh, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cached, want) {
+		t.Fatalf("cached view != uncached parse:\n cached=%+v\n   want=%+v", cached, want)
+	}
+	if !cached.Items[0].Active || cached.Items[0].Stale {
+		t.Fatalf("t1 should be ACTIVE within TTL: %+v", cached.Items[0])
+	}
+
+	// Past the TTL (2h after the heartbeat) at the SAME HEAD: the structural parse
+	// is still cached, but the projection must now report the claim STALE. Were
+	// active/stale cached, this would wrongly still say active.
+	expired := mustTime(t, "2026-06-30T13:30:00Z")
+	later, err := c.view("h1", path, expired, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if later.Items[0].Active || !later.Items[0].Stale {
+		t.Fatalf("t1 should be STALE past TTL even from a cached parse: %+v", later.Items[0])
+	}
+	if again, _ := parsePlan(path, expired, ttl); !reflect.DeepEqual(later, again) {
+		t.Fatalf("cached stale view != uncached:\n cached=%+v\n   want=%+v", later, again)
+	}
+}
+
+// TestPlanViewCacheInvalidatesOnCommit drives the HEAD-keyed cache end-to-end
+// through the plan handler against a REAL beehive repo: repeated requests at the
+// same HEAD read+parse PLAN.md only once (the dominant per-request cost the task
+// targets), the dashboard shares that warm parse, and a commit that advances HEAD
+// invalidates the cache so the next request reflects the new PLAN.md. The cache's
+// own miss counter (s.plans.loads) is the signal.
+func TestPlanViewCacheInvalidatesOnCommit(t *testing.T) {
+	s, root := setup(t)
+	gitIn := func(args ...string) {
+		t.Helper()
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	// The cache keys on HEAD and treats an unborn HEAD as uncacheable; commit so
+	// HEAD is a real SHA and caching engages (the steady state on a live repo).
+	gitIn("add", "-A")
+	gitIn("commit", "-q", "-m", "seed")
+
+	// Two reads at the same HEAD: PLAN.md is parsed exactly once.
+	for i := 0; i < 2; i++ {
+		if w := get(t, s, "/submodule/alpha/plan"); w.Code != 200 {
+			t.Fatalf("plan %d: %s", w.Code, w.Body)
+		}
+	}
+	if s.plans.loads != 1 {
+		t.Fatalf("two same-HEAD reads parsed %d times, want 1 (warm cache)", s.plans.loads)
+	}
+	// The dashboard reads the same submodule's plan at the same HEAD: still warm.
+	if w := get(t, s, "/"); w.Code != 200 {
+		t.Fatalf("dashboard %d: %s", w.Code, w.Body)
+	}
+	if s.plans.loads != 1 {
+		t.Fatalf("dashboard re-parsed a warm plan: loads=%d, want 1", s.plans.loads)
+	}
+
+	// Change PLAN.md and commit: HEAD advances, so the cache must invalidate and
+	// the next request must reflect the new content (a fresh parse).
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## t1 [DONE] <!-- attempts=0 deps= -->\nshipped now\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn("add", "-A")
+	gitIn("commit", "-q", "-m", "advance plan")
+
+	w := get(t, s, "/submodule/alpha/plan")
+	if w.Code != 200 {
+		t.Fatalf("plan after commit %d: %s", w.Code, w.Body)
+	}
+	if s.plans.loads != 2 {
+		t.Fatalf("commit did not invalidate the cache: loads=%d, want 2", s.plans.loads)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "shipped now") {
+		t.Fatalf("post-commit plan did not reflect the new PLAN.md:\n%s", body)
 	}
 }
 

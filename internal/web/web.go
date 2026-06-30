@@ -39,6 +39,7 @@ type Server struct {
 	git     *git.Repo
 	tmpl    *template.Template
 	editors *editor.Manager
+	plans   *planCache // HEAD-keyed parse-once cache for PLAN.md views
 }
 
 // New builds a Server over the beehive repo at root.
@@ -51,7 +52,7 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em}, nil
+	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em, plans: newPlanCache()}, nil
 }
 
 // Routes returns the mux wired to all handlers.
@@ -129,6 +130,13 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	// Resolve HEAD once and share it across every submodule's cached plan read:
+	// the dashboard aggregate (per-submodule ROI stamp + pending count) comes from
+	// the same HEAD-keyed parse the plan view uses, so a warm cache serves it
+	// without re-reading PLAN.md. The ROI stamp is parsed.ROI (the same value
+	// repo.Submodule.ROIStamp scans for), so no separate raw read is needed.
+	head := s.head(r.Context())
+	now, ttl := time.Now(), s.ttl()
 	var views []subView
 	for _, sm := range subs {
 		v := subView{Name: sm.Name, State: "active"}
@@ -138,8 +146,8 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		case sm.NeedsBootstrap():
 			v.State = "bootstrap"
 		}
-		v.Stamp, _ = sm.ROIStamp()
-		if p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl()); err == nil {
+		if p, err := s.plans.view(head, sm.PlanPath(), now, ttl); err == nil {
+			v.Stamp = p.ROIStamp
 			for _, it := range p.Items {
 				if it.Status != StatusDone {
 					v.Pending++
@@ -245,7 +253,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl())
+	p, err := s.plans.view(s.head(r.Context()), sm.PlanPath(), time.Now(), s.ttl())
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -254,6 +262,8 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 	// (Beehive: <taskid> <docpath>): scan this submodule's history once for the
 	// stamps, then resolve each to a viewable doc under the submodule's docs/
 	// (resolveDocHref guards traversal + existence, so a link is never dead).
+	// p.Items is a fresh per-request projection, so setting DocHref never mutates
+	// the cached structural parse.
 	docs := changeDocsByTask(r.Context(), sm.RepoDir())
 	for i := range p.Items {
 		p.Items[i].DocHref = resolveDocHref(sm, docs[p.Items[i].ID])
@@ -482,13 +492,15 @@ func (s *Server) envDeploy(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 	subs, _ := s.repo.Submodules()
+	head := s.head(r.Context())
+	now, ttl := time.Now(), s.ttl()
 	type row struct {
 		Sub  string
 		Item PlanItem
 	}
 	var rows []row
 	for _, sm := range subs {
-		p, _ := parsePlan(sm.PlanPath(), time.Now(), s.ttl())
+		p, _ := s.plans.view(head, sm.PlanPath(), now, ttl)
 		for _, it := range p.Items {
 			if it.Status == StatusHuman {
 				rows = append(rows, row{Sub: sm.Name, Item: it})
@@ -514,6 +526,20 @@ func (s *Server) ttl() time.Duration {
 		m = 60
 	}
 	return time.Duration(m) * time.Minute
+}
+
+// head resolves the beehive repo's current HEAD short SHA — the planCache
+// invalidation key — or "" when it cannot be read (e.g. a repo with no commits
+// yet), which the cache treats as uncacheable so views still render fresh. It is
+// resolved once per request and shared across every submodule's cached plan read,
+// so a multi-submodule dashboard pays a single `rev-parse` rather than one per
+// submodule.
+func (s *Server) head(ctx context.Context) string {
+	h, err := s.git.Head(ctx)
+	if err != nil {
+		return ""
+	}
+	return h
 }
 
 func pageParams(r *http.Request) (offset, limit int) {
