@@ -4,6 +4,7 @@
 # Creates:
 #   ~/.config/beehive/config.yaml
 #   ~/.config/beehive/gnupg/       (with a real gpg key if no secret key exists)
+#   ~/.config/systemd/user/opencode.service
 #   ~/.config/systemd/user/beehived.service
 #   ~/.config/systemd/user/beehive-honeybee.service
 #   ~/.config/systemd/user/beehive-honeybee.timer
@@ -28,9 +29,13 @@ Options:
   --on-active DURATION     honeybee timer OnActiveSec value (default: 2min)
   --runtime-max SEC        transient honeybee RuntimeMaxSec (default: 21600)
   --path PATH              PATH used by units (default: $HOME/.local/bin:/usr/local/bin:/usr/bin:/bin)
+  --opencode-cmd CMD       opencode binary for the server unit (default: opencode)
+  --opencode-hostname HOST opencode server bind host (default: 127.0.0.1)
+  --opencode-port PORT     opencode server port (default: 4096)
+  --no-opencode            do not install/enable the opencode server unit
   --no-debug               omit --debug from honeybee command
   --no-enable              write units and daemon-reload, but do not enable them
-  --now                    start beehived.service and beehive-honeybee.timer after enabling
+  --now                    start the opencode, beehived, and honeybee units after enabling
   --linger                 run loginctl enable-linger for this user
   -h, --help               show this help
 
@@ -47,6 +52,10 @@ calendar="*:0/7"
 on_active="2min"
 runtime_max="21600"
 unit_path="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+opencode_enable=1
+opencode_cmd="opencode"
+opencode_hostname="127.0.0.1"
+opencode_port="4096"
 debug=1
 enable_units=1
 start_now=0
@@ -75,6 +84,17 @@ while [ "$#" -gt 0 ]; do
     --path)
       [ "$#" -ge 2 ] || { echo "--path requires PATH" >&2; exit 2; }
       unit_path="$2"; shift 2 ;;
+    --opencode-cmd)
+      [ "$#" -ge 2 ] || { echo "--opencode-cmd requires CMD" >&2; exit 2; }
+      opencode_cmd="$2"; shift 2 ;;
+    --opencode-hostname)
+      [ "$#" -ge 2 ] || { echo "--opencode-hostname requires HOST" >&2; exit 2; }
+      opencode_hostname="$2"; shift 2 ;;
+    --opencode-port)
+      [ "$#" -ge 2 ] || { echo "--opencode-port requires PORT" >&2; exit 2; }
+      opencode_port="$2"; shift 2 ;;
+    --no-opencode)
+      opencode_enable=0; shift ;;
     --no-debug)
       debug=0; shift ;;
     --no-enable)
@@ -102,6 +122,11 @@ esac
 case "$runtime_max" in
   *[!0-9]*|'') echo "--runtime-max must be integer seconds: $runtime_max" >&2; exit 2 ;;
 esac
+case "$opencode_port" in
+  *[!0-9]*|'') echo "--opencode-port must be an integer: $opencode_port" >&2; exit 2 ;;
+esac
+[ -n "$opencode_hostname" ] || { echo "--opencode-hostname must not be empty" >&2; exit 2; }
+[ -n "$opencode_cmd" ] || { echo "--opencode-cmd must not be empty" >&2; exit 2; }
 
 if [ ! -d "$repo" ]; then
   echo "repo path does not exist: $repo" >&2
@@ -124,6 +149,26 @@ unit_addr=$(escape_unit "$addr")
 unit_path_escaped=$(escape_unit "$unit_path")
 unit_calendar=$(escape_unit "$calendar")
 unit_on_active=$(escape_unit "$on_active")
+unit_opencode_cmd=$(escape_unit "$opencode_cmd")
+unit_opencode_hostname=$(escape_unit "$opencode_hostname")
+
+# add_opencode_dep inserts `Wants=/After=opencode.service` into a unit's [Unit]
+# section (right after its `After=network-online.target` line) so the frontend and
+# each honeybee pass order after a reachable opencode server. No-op when the
+# opencode unit is not installed.
+add_opencode_dep() {
+  [ "$opencode_enable" -eq 1 ] || return 0
+  file="$1"
+  tmp="$file.tmp"
+  awk '
+    { print }
+    $0 == "After=network-online.target" && !inserted {
+      print "Wants=opencode.service"
+      print "After=opencode.service"
+      inserted = 1
+    }
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
 
 mkdir -p "$config_dir" "$gpg_home" "$unit_dir"
 chmod 0700 "$gpg_home"
@@ -164,6 +209,33 @@ else
   echo "gpg key already present in $gpg_home; leaving untouched"
 fi
 
+if [ "$opencode_enable" -eq 1 ]; then
+  cat > "$unit_dir/opencode.service" <<EOF
+[Unit]
+Description=opencode server for beehive honeybees
+Documentation=https://opencode.ai
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment="PATH=$unit_path_escaped"
+# Provider credentials: prefer 'opencode auth login' (writes to ~/.config), or
+# drop keys into this optional EnvironmentFile (leading '-' = missing is OK).
+EnvironmentFile=-$unit_config_dir/opencode.env
+ExecStart=/usr/bin/env $unit_opencode_cmd serve --hostname "$unit_opencode_hostname" --port "$opencode_port"
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+else
+  rm -f "$unit_dir/opencode.service"
+fi
+
 cat > "$unit_dir/beehived.service" <<EOF
 [Unit]
 Description=Beehive frontend daemon
@@ -181,6 +253,7 @@ RestartSec=5s
 [Install]
 WantedBy=default.target
 EOF
+add_opencode_dep "$unit_dir/beehived.service"
 
 honeybee_debug_arg=""
 if [ "$debug" -eq 1 ]; then
@@ -203,6 +276,7 @@ ExecStart=/usr/bin/systemd-run --user --collect --quiet \\
   /usr/bin/env "PATH=$unit_path_escaped" "BEEHIVE_CONFIG_DIR=$unit_config_dir" \\
   beehive honeybee start "$unit_repo"$honeybee_debug_arg
 EOF
+add_opencode_dep "$unit_dir/beehive-honeybee.service"
 
 cat > "$unit_dir/beehive-honeybee.timer" <<EOF
 [Unit]
@@ -224,12 +298,19 @@ fi
 
 systemctl --user daemon-reload
 
+enable_list="beehived.service beehive-honeybee.timer"
+start_list="beehived.service beehive-honeybee.timer"
+if [ "$opencode_enable" -eq 1 ]; then
+  enable_list="opencode.service $enable_list"
+  start_list="opencode.service $start_list"
+fi
+
 if [ "$enable_units" -eq 1 ]; then
-  systemctl --user enable beehived.service beehive-honeybee.timer
+  systemctl --user enable $enable_list
 fi
 
 if [ "$start_now" -eq 1 ]; then
-  systemctl --user start beehived.service beehive-honeybee.timer
+  systemctl --user start $start_list
 fi
 
 if [ "$enable_linger" -eq 1 ]; then
@@ -244,10 +325,15 @@ echo "installed systemd user units in $unit_dir"
 echo "config: $config_dir"
 echo "gpg_home: $gpg_home"
 echo "repo: $repo"
+if [ "$opencode_enable" -eq 1 ]; then
+  echo "opencode server: $opencode_cmd serve --hostname $opencode_hostname --port $opencode_port"
+else
+  echo "opencode server unit: skipped (--no-opencode)"
+fi
 if [ "$start_now" -eq 0 ]; then
   if [ "$enable_units" -eq 1 ]; then
-    echo "units enabled but not started; use --now or run: systemctl --user start beehived.service beehive-honeybee.timer"
+    echo "units enabled but not started; use --now or run: systemctl --user start $start_list"
   else
-    echo "units written but not enabled; run: systemctl --user enable beehived.service beehive-honeybee.timer"
+    echo "units written but not enabled; run: systemctl --user enable $enable_list"
   fi
 fi

@@ -97,7 +97,7 @@ Install user units and a user-local gpg keyring/config:
 ./scripts/install-systemd-user.sh --repo ~/beehive-infra --now
 ```
 
-The script writes `~/.config/systemd/user/beehived.service`, `beehive-honeybee.service`, and `beehive-honeybee.timer`; creates `~/.config/beehive/config.yaml`; and generates a real gpg key under `~/.config/beehive/gnupg` when no secret key exists.
+The script writes `~/.config/systemd/user/opencode.service`, `beehived.service`, `beehive-honeybee.service`, and `beehive-honeybee.timer`; creates `~/.config/beehive/config.yaml`; and generates a real gpg key under `~/.config/beehive/gnupg` when no secret key exists. The opencode server unit (`opencode serve`, default `127.0.0.1:4096`) is installed by default; pass `--no-opencode` to skip it.
 
 Example unit contents and manual install steps live in `docs/orchestration.md`. They run the frontend on port `8955` and launch honeybee passes as transient `run-*.service` units so long passes do not block the timer.
 

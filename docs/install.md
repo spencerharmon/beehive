@@ -80,7 +80,7 @@ For user-local config and services:
 ./scripts/install-systemd-user.sh --repo /path/to/beehive-repo --now
 ```
 
-This creates `~/.config/beehive/config.yaml`, creates/generates a real gpg key under `~/.config/beehive/gnupg`, installs `beehived.service`, `beehive-honeybee.service`, and `beehive-honeybee.timer` under `~/.config/systemd/user`, reloads systemd user units, enables them, and starts them when `--now` is present.
+This creates `~/.config/beehive/config.yaml`, creates/generates a real gpg key under `~/.config/beehive/gnupg`, installs `opencode.service`, `beehived.service`, `beehive-honeybee.service`, and `beehive-honeybee.timer` under `~/.config/systemd/user`, reloads systemd user units, enables them, and starts them when `--now` is present. The opencode server unit runs `opencode serve` (default `127.0.0.1:4096`); pass `--no-opencode` to skip it.
 
 
 Expose on all interfaces:

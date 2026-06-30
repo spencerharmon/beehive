@@ -31,11 +31,14 @@ What it does:
 - Creates `~/.config/beehive/config.yaml` if missing.
 - Creates `~/.config/beehive/gnupg` with mode `0700`.
 - Generates a real gpg key in that keyring when no secret key exists.
+- Writes `~/.config/systemd/user/opencode.service` (unless `--no-opencode`).
 - Writes `~/.config/systemd/user/beehived.service`.
 - Writes `~/.config/systemd/user/beehive-honeybee.service`.
 - Writes `~/.config/systemd/user/beehive-honeybee.timer`.
 - Runs `systemctl --user daemon-reload`.
-- Enables units by default; `--now` starts frontend and timer.
+- Enables units by default; `--now` starts opencode, frontend, and timer.
+
+The opencode server unit runs `opencode serve` (default `127.0.0.1:4096`, matching `agent_url`), and `beehived.service` + `beehive-honeybee.service` are ordered `After=opencode.service`. Tune it with `--opencode-cmd`, `--opencode-hostname`, `--opencode-port`, or omit it with `--no-opencode`.
 
 Common variants:
 
@@ -49,15 +52,47 @@ Common variants:
 # Headless host: keep user manager alive after logout.
 ./scripts/install-systemd-user.sh --repo ~/beehive-infra --linger --now
 
-# Custom schedule and bind address.
+# Skip the opencode unit (managing the server elsewhere).
+./scripts/install-systemd-user.sh --repo ~/beehive-infra --no-opencode --now
+
+# Custom schedule, bind address, and opencode port.
 ./scripts/install-systemd-user.sh \
   --repo ~/beehive-infra \
   --addr 127.0.0.1:8955 \
   --calendar '*:0/15' \
+  --opencode-port 4096 \
   --now
 ```
 
 The default config dir is `~/.config/beehive`; override with `--config-dir` or `BEEHIVE_CONFIG_DIR`.
+
+## opencode server unit
+
+Each honeybee drives a long-running `opencode serve` over HTTP at `agent_url` (default `http://127.0.0.1:4096`). `~/.config/systemd/user/opencode.service`:
+
+```ini
+[Unit]
+Description=opencode server for beehive honeybees
+Documentation=https://opencode.ai
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Provider credentials: prefer `opencode auth login`, or set them here / in the file below.
+EnvironmentFile=-%h/.config/beehive/opencode.env
+ExecStart=/usr/bin/env opencode serve --hostname 127.0.0.1 --port 4096
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Give opencode provider credentials with `opencode auth login` (writes `~/.config`) or an `~/.config/beehive/opencode.env` (e.g. `ANTHROPIC_API_KEY=...`). The frontend and honeybee units below add `Wants=opencode.service` + `After=opencode.service` so the server is up first.
 
 ## Frontend daemon unit
 
@@ -68,6 +103,8 @@ The default config dir is `~/.config/beehive`; override with `--config-dir` or `
 Description=Beehive frontend daemon
 Wants=network-online.target
 After=network-online.target
+Wants=opencode.service
+After=opencode.service
 
 [Service]
 Type=simple
@@ -113,6 +150,8 @@ Each timer activation spawns one honeybee pass as its own transient unit via `sy
 Description=Launch a beehive honeybee pass
 Wants=network-online.target
 After=network-online.target
+Wants=opencode.service
+After=opencode.service
 
 [Service]
 Type=oneshot
@@ -180,6 +219,9 @@ Spawning each pass with `systemd-run` instead of running it inside the scheduled
 ## Operate
 
 ```sh
+systemctl --user status opencode.service               # opencode server status
+journalctl --user -u opencode.service -f               # opencode server logs
+
 systemctl --user status beehived.service               # frontend status
 journalctl --user -u beehived.service -f               # frontend logs
 
