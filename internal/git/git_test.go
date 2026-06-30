@@ -62,6 +62,175 @@ func TestMergeConflict(t *testing.T) {
 	}
 }
 
+// bareOrigin inits an empty bare repo (default branch main) to act as a shared
+// origin two clones push to and fetch from.
+func bareOrigin(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if _, err := New(dir).Run(context.Background(), "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("bare init: %v", err)
+	}
+	return dir
+}
+
+// cloneOf clones origin into a fresh temp dir named name, with a committer
+// identity configured so commits succeed.
+func cloneOf(t *testing.T, origin, name string) *Repo {
+	t.Helper()
+	ctx := context.Background()
+	parent := t.TempDir()
+	dir := filepath.Join(parent, name)
+	if _, err := New(parent).Run(ctx, "clone", "-q", origin, dir); err != nil {
+		t.Fatalf("clone %s: %v", name, err)
+	}
+	r := New(dir)
+	for _, a := range [][]string{
+		{"config", "user.email", "t@t"},
+		{"config", "user.name", "t"},
+	} {
+		if _, err := r.Run(ctx, a...); err != nil {
+			t.Fatalf("config %v: %v", a, err)
+		}
+	}
+	return r
+}
+
+func writeFile(t *testing.T, r *Repo, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(r.Dir, name), []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func readFile(t *testing.T, r *Repo, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(r.Dir, name))
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(b)
+}
+
+func commitFile(t *testing.T, r *Repo, name, body, msg string) string {
+	t.Helper()
+	writeFile(t, r, name, body)
+	if err := r.Commit(context.Background(), msg); err != nil {
+		t.Fatalf("commit %s: %v", msg, err)
+	}
+	sha, err := r.RevParse(context.Background(), "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	return sha
+}
+
+// TestRemoteRoundTrip exercises Push -> Fetch -> Pull through a bare origin:
+// clone a seeds origin, clone b advances it via Push, a's Fetch advances the
+// remote-tracking ref (without moving HEAD), and a's Pull fast-forwards HEAD to
+// b's tip with the new content on disk.
+func TestRemoteRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+
+	// a seeds origin's main.
+	v1 := commitFile(t, a, "f", "v1\n", "v1")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push v1: %v", err)
+	}
+	if got, _ := New(origin).RevParse(ctx, "main"); got != v1 {
+		t.Fatalf("Push did not update origin: origin main %s != %s", got, v1)
+	}
+
+	// b clones the seeded origin and advances main.
+	b := cloneOf(t, origin, "b")
+	v2 := commitFile(t, b, "f", "v2\n", "v2")
+	if err := b.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("b push v2: %v", err)
+	}
+	if got, _ := New(origin).RevParse(ctx, "main"); got != v2 {
+		t.Fatalf("Push did not advance origin to v2: %s != %s", got, v2)
+	}
+
+	// a fetches: origin/main advances to v2 but HEAD stays at v1.
+	if err := a.Fetch(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a fetch: %v", err)
+	}
+	if got, _ := a.RevParse(ctx, "origin/main"); got != v2 {
+		t.Fatalf("Fetch did not advance origin/main: %s != %s", got, v2)
+	}
+	if got, _ := a.RevParse(ctx, "HEAD"); got != v1 {
+		t.Fatalf("Fetch moved HEAD: %s != %s", got, v1)
+	}
+
+	// a pulls --ff-only: HEAD fast-forwards to v2 with v2 content on disk.
+	if err := a.Pull(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a pull: %v", err)
+	}
+	if got, _ := a.RevParse(ctx, "HEAD"); got != v2 {
+		t.Fatalf("Pull did not fast-forward HEAD: %s != %s", got, v2)
+	}
+	if got := readFile(t, a, "f"); got != "v2\n" {
+		t.Fatalf("Pull content not updated: %q", got)
+	}
+}
+
+// TestHardResetDiscards proves HardReset moves HEAD to ref and discards both
+// committed and uncommitted local changes.
+func TestHardResetDiscards(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	base := commitFile(t, r, "f", "base\n", "base")
+	commitFile(t, r, "f", "second\n", "second") // HEAD now ahead of base
+	writeFile(t, r, "f", "dirty\n")             // plus an uncommitted edit
+
+	if err := r.HardReset(ctx, base); err != nil {
+		t.Fatalf("HardReset: %v", err)
+	}
+	if got, _ := r.RevParse(ctx, "HEAD"); got != base {
+		t.Fatalf("HardReset did not move HEAD to base: %s != %s", got, base)
+	}
+	if got := readFile(t, r, "f"); got != "base\n" {
+		t.Fatalf("HardReset did not discard edits: %q", got)
+	}
+	if c, _ := r.Clean(ctx); !c {
+		t.Fatal("tree dirty after HardReset")
+	}
+}
+
+// TestPullFFOnlyDivergence is the caveat: on divergent histories Pull must error
+// (no merge commit) and leave the current branch untouched, so callers can treat
+// it as a lost race.
+func TestPullFFOnlyDivergence(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "f", "v1\n", "v1")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push v1: %v", err)
+	}
+
+	b := cloneOf(t, origin, "b")
+
+	// a advances origin down one line of history...
+	commitFile(t, a, "g", "a-side\n", "a-side")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push a-side: %v", err)
+	}
+	// ...while b commits a divergent line locally.
+	bTip := commitFile(t, b, "h", "b-side\n", "b-side")
+
+	if err := b.Pull(ctx, "origin", "main"); err == nil {
+		t.Fatal("Pull --ff-only must error on divergence, got nil")
+	}
+	if got, _ := b.RevParse(ctx, "HEAD"); got != bTip {
+		t.Fatalf("Pull moved HEAD on a divergent ff-only pull: %s != %s", got, bTip)
+	}
+	if c, _ := b.HasConflict(ctx); c {
+		t.Fatal("Pull left the tree in a conflicted/merging state")
+	}
+}
+
 func TestIsNonFastForward(t *testing.T) {
 	retry := []string{
 		"! [rejected] main -> main (non-fast-forward)",
