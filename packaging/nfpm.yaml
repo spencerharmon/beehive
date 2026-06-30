@@ -1,6 +1,6 @@
 # nfpm config: build deb/rpm placing the three binaries and /etc/beehive.
 # Build: nfpm pkg --packager deb --target dist/  (after release cross-compile)
-# Keygen runs at install time via the postinstall scriptlet (scripts/install.sh).
+# Keygen runs at install time via packaging/postinstall.sh.
 name: beehive
 arch: amd64
 platform: linux

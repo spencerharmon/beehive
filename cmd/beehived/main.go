@@ -15,7 +15,7 @@ import (
 
 func main() {
 	root := flag.String("repo", ".", "beehive repo root")
-	addr := flag.String("addr", ":8080", "listen address")
+	addr := flag.String("addr", ":8955", "listen address")
 	flag.Parse()
 
 	// Resolve the registry the daemon serves: a present host repos.yaml (a

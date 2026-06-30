@@ -22,4 +22,4 @@ beehive worktree rm  <submodule> <branch> remove worktree
 A new submodule is dormant (never selected) until a human authors its `ROI.md`.
 The first honeybee then bootstraps `PLAN.md`. ROI.md is human-owned; honeybees
 may never edit it (enforced by pre-receive hook). Frontend runs `beehived`
-(:8080).
+(default `:8955`).

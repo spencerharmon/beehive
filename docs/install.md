@@ -1,60 +1,111 @@
 # Install Guide
 
-Beehive ships three static binaries from one repo:
+Beehive ships three static Go binaries from one repo:
 
-- `beehive` — deterministic CLI (no LLM)
-- `beehived` — frontend daemon (only long-running process)
+- `beehive` — deterministic CLI (no LLM calls)
+- `beehived` — frontend daemon (only long-running process, defaults to `:8955`)
 - `honeybee` — single-task agent runner
 
-All three read shared config + gpg keyring from `/etc/beehive`. Works the same
-single-host, config-managed, or container bind-mount.
+All three read shared config and gpg keyring from `/etc/beehive` by default. Override with `BEEHIVE_CONFIG_DIR`.
 
-## Package manager
+## Requirements
 
-```
-sudo apt install beehive        # or: rpm/dnf
+- Go 1.22+ when building from source.
+- Git.
+- `gpg` for secrets/key generation.
+- Agent backend on PATH for honeybee runs. Default: `opencode`.
+
+## Direct install from repo
+
+System install to `/usr/local/bin` and `/etc/beehive`:
+
+```sh
+git clone https://github.com/spencerharmon/beehive.git
+cd beehive
+sudo ./scripts/install.sh
 beehive version
 ```
 
-The package places binaries in `/usr/local/bin` and scaffolds `/etc/beehive`
-with a `config.yaml` and a `gnupg/` keyring. The postinstall scriptlet
-(`packaging/postinstall.sh`) generates a gpg key at install time **only if none
-exists** — bring your own key by dropping it in `/etc/beehive/gnupg` before
-install. Set `BEEHIVE_SKIP_KEYGEN=1` to opt out.
+User-local install without sudo:
 
-Packages are built with [nfpm](https://nfpm.goreleaser.com) from
-`packaging/nfpm.yaml` after the release cross-compile produces `dist/`.
-
-## Manual / staged install
-
-```
-git clone https://github.com/spencerharmon/beehive && cd beehive
-sudo scripts/install.sh                 # live install to /usr/local + /etc/beehive
-scripts/install.sh "$PWD/stage"         # staged (DESTDIR) for packaging
+```sh
+git clone https://github.com/spencerharmon/beehive.git
+cd beehive
+PREFIX="$HOME/.local" \
+BEEHIVE_CONFIG_DIR="$HOME/.config/beehive" \
+./scripts/install.sh
+export PATH="$HOME/.local/bin:$PATH"
+beehive version
 ```
 
-`install.sh` prefers prebuilt `dist/` binaries, else builds from source. It is
-idempotent: existing keyring and `config.yaml` are never clobbered.
+Staged install for packaging:
+
+```sh
+DESTDIR="$PWD/stage" PREFIX=/usr/local ./scripts/install.sh
+```
+
+`install.sh` behavior:
+
+- Installs `beehive`, `beehived`, and `honeybee`.
+- Prefers release artifacts named `dist/<binary>-<os>-<arch>` or `dist/<binary>`.
+- Builds from source when matching artifacts are absent.
+- Creates config directory and `config.yaml` only if missing.
+- Creates gpg keyring and generates a key only when `gpg` exists and no secret key exists.
+- Honors `PREFIX`, `BEEHIVE_CONFIG_DIR`, `DESTDIR`, `TMPDIR`, `CGO_ENABLED`, and `BEEHIVE_SKIP_KEYGEN=1`.
+
+## Build without installing
+
+```sh
+git clone https://github.com/spencerharmon/beehive.git
+cd beehive
+mkdir -p bin
+for bin in beehive beehived honeybee; do
+  CGO_ENABLED=0 go build -trimpath -o "bin/$bin" "./cmd/$bin"
+done
+./bin/beehive version
+```
+
+## Run beehived
+
+```sh
+beehived -repo /path/to/beehive-repo
+# http://localhost:8955
+```
+
+Expose on all interfaces:
+
+```sh
+beehived -addr 0.0.0.0:8955 -repo /path/to/beehive-repo
+```
+
+## Package manager
+
+```sh
+sudo apt install beehive        # or rpm/dnf package
+beehive version
+```
+
+The package places binaries in `/usr/local/bin` and scaffolds `/etc/beehive` with a `config.yaml` and `gnupg/` keyring. The postinstall scriptlet (`packaging/postinstall.sh`) generates a gpg key at install time only if none exists. Bring your own key by dropping it in `/etc/beehive/gnupg` before install. Set `BEEHIVE_SKIP_KEYGEN=1` to opt out when using `scripts/install.sh` directly.
+
+Packages are built with [nfpm](https://nfpm.goreleaser.com) from `packaging/nfpm.yaml` after release cross-compile produces `dist/`.
 
 ## Release artifacts
 
-CI cross-compiles `linux`/`darwin` × `amd64`/`arm64` on `v*` tags, emits
-`SHA256SUMS-<os>-<arch>` and a cosign keyless signature. Verify:
+CI cross-compiles `linux`/`darwin` × `amd64`/`arm64` on `v*` tags, emits `SHA256SUMS-<os>-<arch>` and a cosign keyless signature. Verify:
 
-```
+```sh
 cosign verify-blob --signature SHA256SUMS-linux-amd64.sig SHA256SUMS-linux-amd64
 sha256sum -c SHA256SUMS-linux-amd64
 ```
 
 ## Config (`/etc/beehive/config.yaml`)
 
-| key           | default              | meaning                       |
-|---------------|----------------------|-------------------------------|
-| `gpg_home`    | `/etc/beehive/gnupg` | secrets keyring dir           |
-| `agent_cmd`   | `opencode`           | agent backend binary          |
-| `ttl_minutes` | `60`                 | heartbeat TTL before GC       |
-| `max_turns`   | `15`                 | per-honeybee turn cap         |
-| `reject_limit`| `3`                  | rejections before NEEDS-HUMAN |
+| key            | default              | meaning                         |
+|----------------|----------------------|---------------------------------|
+| `gpg_home`     | `/etc/beehive/gnupg` | secrets keyring dir             |
+| `agent_cmd`    | `opencode`           | agent backend binary            |
+| `ttl_minutes`  | `60`                 | heartbeat TTL before GC         |
+| `max_turns`    | `15`                 | per-honeybee turn cap           |
+| `reject_limit` | `3`                  | rejections before NEEDS-HUMAN   |
 
-Missing file/fields fall back to defaults. Override dir with
-`BEEHIVE_CONFIG_DIR`.
+Missing file/fields fall back to defaults. Override config dir with `BEEHIVE_CONFIG_DIR`.

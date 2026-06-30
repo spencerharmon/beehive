@@ -1,34 +1,67 @@
-# Beehive
+# Beehive documentation
 
-AI coding-agent platform: developer command/control frontend + autonomous honeybee swarm that
-continuously reconciles code with team intent. State is a git repo; coordination is git merges.
+Beehive is git-native orchestration for autonomous coding agents. Team intent, plans, sessions, and source checkouts live in one repo; independent honeybees work isolated tasks and converge through git.
 
-## Install
+Binaries:
+
+- `beehive` — deterministic CLI. No LLM calls.
+- `beehived` — web frontend daemon. Default listen address: `:8955`.
+- `honeybee` — one-task agent runner.
+
+## Install directly from repo
+
+```sh
+git clone https://github.com/spencerharmon/beehive.git
+cd beehive
+sudo ./scripts/install.sh
+beehive version
 ```
-# package manager generates gpg key at install, or bring your own
-sudo apt install beehive            # places binaries + /etc/beehive
-beehive --version
+
+User-local install:
+
+```sh
+git clone https://github.com/spencerharmon/beehive.git
+cd beehive
+PREFIX="$HOME/.local" \
+BEEHIVE_CONFIG_DIR="$HOME/.config/beehive" \
+./scripts/install.sh
+export PATH="$HOME/.local/bin:$PATH"
+beehive version
 ```
-Keys/config in `/etc/beehive` shared by cli, frontend, honeybee. Works single-host, config-managed, or
-container bind-mount.
+
+Build without installing:
+
+```sh
+mkdir -p bin
+for bin in beehive beehived honeybee; do
+  CGO_ENABLED=0 go build -trimpath -o "bin/$bin" "./cmd/$bin"
+done
+```
+
+`./scripts/install.sh` installs all three binaries, prefers matching `dist/` artifacts, builds from source when needed, creates config only if missing, and generates a gpg key only when no secret key exists. It honors `PREFIX`, `BEEHIVE_CONFIG_DIR`, `DESTDIR`, `TMPDIR`, `CGO_ENABLED`, and `BEEHIVE_SKIP_KEYGEN=1`.
 
 ## Quick start
-```
-beehive submodule add git@github.com:org/web-frontend.git   # dormant until ROI authored
-# author submodules/web-frontend/ROI.md in the frontend, then:
-beehive honeybee start submodules/web-frontend              # bootstraps PLAN.md, works tasks
-beehived                                                     # frontend on :8080
+
+```sh
+beehive init ~/beehive-infra
+cd ~/beehive-infra
+beehive submodule add git@github.com:org/project.git
+# Author submodules/project/ROI.md in editor or frontend.
+beehive honeybee start submodules/project
+beehived -repo .                         # http://localhost:8955
 ```
 
-## Concepts
-- **ROI.md** record of intent. Human-owned. Honeybees may never edit it.
-- **PLAN.md** tasks, bootstrapped from ROI by first honeybee; rightsized for one context window.
-- **honeybee** one agent, one task; coordinates via commit-race to main. Runs one opencode session per task;
-  model set in opencode config under /etc/beehive (provider-agnostic).
-- **task types** GC > arbitration > review > main. Stuck (>1h) tasks GC'd.
+## Core concepts
 
-## CLI
-```
+- `ROI.md` — human-owned record of intent. Honeybees must not edit it.
+- `PLAN.md` — honeybee-owned task plan bootstrapped/reconciled from ROI.
+- `honeybee` — one agent, one task, isolated worktree, git commit/merge convergence.
+- Task classes — GC, arbitration, review, main work.
+- `/etc/beehive` — default shared config and gpg keyring; override with `BEEHIVE_CONFIG_DIR`.
+
+## CLI sketch
+
+```sh
 beehive init <path>
 beehive submodule add <repo>
 beehive submodule link <a> <b>
@@ -36,20 +69,21 @@ beehive submodule plan rollback <plan-id>
 beehive secret add|update|edit -f file.yaml
 beehive honeybee start <path>
 beehive worktree add|rm <submodule> <branch>
+beehive audit [submodule]
+beehive instruction list|update
 ```
 
-## Secrets
-Single `SECRETS.yaml.gpg`, one encrypted yaml doc, referenced by INFRASTRUCTURE.md. gpg-managed.
+## Docs index
 
-## Docs
-- `docs/install.md` — install, packaging, /etc/beehive, release verification
-- `docs/secrets.md` — gpg secrets workflow
-- `docs/honeybee.md` — honeybee operation + turn loop
-- `docs/orchestration.md` — scheduling passes (systemd timer example)
-- `docs/opencode.md` — agent backend setup
-- `docs/cli.md` — CLI reference
-- `docs/repo-layout.md` — beehive repo layout
-- `docs/frontend-components.md` — frontend routes/components
-- `CONTRIBUTING.md`, `docs/RELEASE-NOTES-TEMPLATE.md`
+- `../README.md` — top-level overview and source install instructions.
+- `docs/install.md` — install, packaging, `/etc/beehive`, release verification.
+- `docs/secrets.md` — gpg secrets workflow.
+- `docs/honeybee.md` — honeybee operation and turn loop.
+- `docs/orchestration.md` — scheduling passes with systemd.
+- `docs/opencode.md` — agent backend setup.
+- `docs/cli.md` — CLI reference.
+- `docs/repo-layout.md` — beehive repo layout.
+- `docs/frontend-components.md` — frontend routes/components.
+- `CONTRIBUTING.md`, `docs/RELEASE-NOTES-TEMPLATE.md`.
 
-See `IMPLEMENTATION.org` for the full plan.
+See `IMPLEMENTATION.org` and `plan.org` for implementation plan/history.
