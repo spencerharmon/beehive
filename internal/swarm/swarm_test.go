@@ -989,3 +989,175 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// worktreeGitlinks returns the tracked gitlinks under submodules/*/worktrees/* in
+// g's index — the orphan-leak signature the producer fix and GC sweep must keep at
+// zero. Any entry here would fatal `git submodule update` on every host.
+func worktreeGitlinks(t *testing.T, g *git.Repo) []string {
+	t.Helper()
+	links, err := g.TrackedGitlinks(context.Background())
+	if err != nil {
+		t.Fatalf("tracked gitlinks: %v", err)
+	}
+	var out []string
+	for _, l := range links {
+		if strings.Contains(l, "/worktrees/") && strings.HasPrefix(l, "submodules/") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// TestGCWorktreeGitlinksRemovesOrphan seeds an orphan gitlink under
+// submodules/sm/worktrees/* (a honeybee code worktree mistakenly staged as a
+// submodule pointer) and proves the GC sweep removes it — so a subsequent
+// `git submodule update` succeeds instead of fataling — while NEVER touching the
+// registered submodule submodules/sm/repo (declared in .gitmodules).
+func TestGCWorktreeGitlinksRemovesOrphan(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	ctx := context.Background()
+
+	// A real, declared submodule at submodules/sm/repo.
+	sm := filepath.Join(root, "submodules", "sm")
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	if err := git.New(repoDir).Commit(ctx, "base"); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(root, ".gitmodules"),
+		[]byte("[submodule \"sm\"]\n\tpath = submodules/sm/repo\n\turl = "+repoDir+"\n"), 0o644)
+
+	// An ORPHAN code-worktree gitlink (no .gitmodules entry) — the leak.
+	orphan := filepath.Join(sm, "worktrees", "bee-T1")
+	os.MkdirAll(orphan, 0o755)
+	gitInit(t, orphan)
+	os.WriteFile(filepath.Join(orphan, "code.go"), []byte("package x\n"), 0o644)
+	if err := git.New(orphan).Commit(ctx, "leak"); err != nil {
+		t.Fatal(err)
+	}
+	// Seed both gitlinks (+ .gitmodules) into beehive history exactly how the leak
+	// entered: a sweeping `git add -A` commit.
+	if err := g.Commit(ctx, "seed with orphan"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Precondition: the orphan wedges submodule update (proves it is harmful).
+	if _, err := g.Run(ctx, "submodule", "update", "--init"); err == nil {
+		t.Fatal("expected submodule update to fatal on the seeded orphan gitlink, but it succeeded")
+	}
+	if got := worktreeGitlinks(t, g); len(got) != 1 {
+		t.Fatalf("precondition: want exactly the seeded orphan, got %v", got)
+	}
+
+	r := &Runner{Git: g}
+	if err := r.gcWorktreeGitlinks(ctx); err != nil {
+		t.Fatalf("gc sweep: %v", err)
+	}
+
+	if got := worktreeGitlinks(t, g); len(got) != 0 {
+		t.Fatalf("sweep left orphan worktree gitlink(s): %v", got)
+	}
+	// The registered submodule must be untouched.
+	links, _ := g.TrackedGitlinks(ctx)
+	var sawRepo bool
+	for _, l := range links {
+		if l == "submodules/sm/repo" {
+			sawRepo = true
+		}
+	}
+	if !sawRepo {
+		t.Fatal("sweep removed the REGISTERED submodule gitlink; it must be untouched")
+	}
+	// Self-heal: submodule update now succeeds.
+	if _, err := g.Run(ctx, "submodule", "update", "--init"); err != nil {
+		t.Fatalf("submodule update still fails after sweep: %v", err)
+	}
+	// The removal was committed (so it rides to main via publish), not left staged.
+	staged, err := g.Run(ctx, "diff", "--cached", "--name-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staged != "" {
+		t.Fatalf("sweep left changes staged but uncommitted: %q", staged)
+	}
+}
+
+// TestGCWorktreeGitlinksNoop: with no orphan present the sweep makes no commit
+// (idempotent steady state), so it never churns history on a healthy hive.
+func TestGCWorktreeGitlinksNoop(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	ctx := context.Background()
+	os.MkdirAll(filepath.Join(root, "submodules", "sm"), 0o755)
+	os.WriteFile(filepath.Join(root, "submodules", "sm", "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	if err := g.Commit(ctx, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := g.Run(ctx, "rev-parse", "HEAD")
+	r := &Runner{Git: g}
+	if err := r.gcWorktreeGitlinks(ctx); err != nil {
+		t.Fatalf("gc sweep: %v", err)
+	}
+	after, _ := g.Run(ctx, "rev-parse", "HEAD")
+	if before != after {
+		t.Fatalf("sweep committed with no orphan present (%s -> %s)", before, after)
+	}
+}
+
+// TestWorkRunLeavesNoWorktreeGitlink simulates a full Work setup + honeybee
+// commit and asserts the beehive index NEVER records a gitlink under
+// submodules/*/worktrees/*. The runner creates a code worktree at
+// submodules/sm/worktrees/bee-T1 and the per-turn claim heartbeat commits; with
+// the old sweeping `git add -A` that nested checkout was staged as an orphan
+// gitlink — the scoped CommitPaths producer fix must leave a clean index.
+func TestWorkRunLeavesNoWorktreeGitlink(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	ctx := context.Background()
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(ctx, "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	var existed bool
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		// The code worktree must physically exist mid-run, or a clean index proves
+		// nothing (it was simply never there to leak).
+		if fi, err := os.Stat(wtDir); err == nil && fi.IsDir() {
+			existed = true
+		}
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Session: "bee-T1"}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("expected completion, got %+v", res)
+	}
+	if !existed {
+		t.Fatal("code worktree never existed mid-run; the test cannot prove a non-leak")
+	}
+	if got := worktreeGitlinks(t, g); len(got) != 0 {
+		t.Fatalf("Work run leaked orphan gitlink(s) into the beehive index: %v", got)
+	}
+}

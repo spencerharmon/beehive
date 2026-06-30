@@ -72,6 +72,15 @@ func stampMsg(taskID, action string) string {
 	return fmt.Sprintf("plan: %s %s\n\nBeehive: %s plan", action, taskID, taskID)
 }
 
+// planRel is this submodule's PLAN.md path relative to the beehive repo root —
+// the ONLY file the claim protocol mutates. Scoping claim commits to it (via
+// CommitPaths) instead of `git add -A` keeps a stray nested checkout, e.g. a
+// honeybee code worktree under submodules/<sm>/worktrees/, from being staged as
+// an orphan gitlink that later fatals `git submodule update`.
+func (c *Claimer) planRel() string {
+	return filepath.Join("submodules", c.Sub.Name, repo.PlanFile)
+}
+
 // syncMain pulls beehive main into the worktree so we observe competing claims
 // and resolutions. A merge conflict means a competing edit to our task line:
 // surfaced as ErrLost by callers.
@@ -106,7 +115,7 @@ func (c *Claimer) Claim(ctx context.Context, taskID string, ts time.Time) error 
 	if err := c.save(p); err != nil {
 		return err
 	}
-	if err := c.Git.Commit(ctx, stampMsg(taskID, "claim")); err != nil && err != git.ErrNothing {
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "claim"), c.planRel()); err != nil && err != git.ErrNothing {
 		return err
 	}
 	if c.Publish != nil {
@@ -169,7 +178,7 @@ func (c *Claimer) Heartbeat(ctx context.Context, taskID string, from plan.Status
 	if err := c.save(p); err != nil {
 		return err
 	}
-	if err := c.Git.Commit(ctx, stampMsg(taskID, "heartbeat")); err != nil && err != git.ErrNothing {
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "heartbeat"), c.planRel()); err != nil && err != git.ErrNothing {
 		return err
 	}
 	if c.Publish != nil {
@@ -201,7 +210,7 @@ func (c *Claimer) Release(ctx context.Context, taskID string) error {
 	if err := c.save(p); err != nil {
 		return err
 	}
-	if err := c.Git.Commit(ctx, stampMsg(taskID, "release")); err != nil && err != git.ErrNothing {
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "release"), c.planRel()); err != nil && err != git.ErrNothing {
 		return err
 	}
 	if c.Publish != nil {
@@ -242,7 +251,7 @@ func (c *Claimer) Reject(ctx context.Context, taskID string, limit int) (plan.St
 	if err := c.save(p); err != nil {
 		return "", err
 	}
-	if err := c.Git.Commit(ctx, stampMsg(taskID, "reject")); err != nil && err != git.ErrNothing {
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "reject"), c.planRel()); err != nil && err != git.ErrNothing {
 		return "", err
 	}
 	return t.Status, nil

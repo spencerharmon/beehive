@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -257,5 +258,47 @@ func TestClaimLockSingleton(t *testing.T) {
 	d := mk("bee-d")
 	if err := d.ClaimLock(ctx, "reconcile"); err != nil {
 		t.Fatalf("acquire after release: %v", err)
+	}
+}
+
+// TestClaimScopesCommitToPlan proves the claim protocol stages ONLY PLAN.md, so a
+// honeybee code worktree present at submodules/<sm>/worktrees/<branch> during a
+// Claim/Heartbeat is never recorded as an orphan gitlink (the leak this fixes).
+// With the prior `git add -A` claim commit the nested checkout below would be
+// staged as a mode-160000 gitlink; CommitPaths(planRel) must leave it untracked.
+func TestClaimScopesCommitToPlan(t *testing.T) {
+	c, ctx := setup(t)
+	// A real nested checkout where a Work code worktree would live.
+	wt := filepath.Join(c.Sub.Path, "worktrees", "bee-T1")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wg := git.New(wt)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		if _, err := wg.Run(ctx, a...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	os.WriteFile(filepath.Join(wt, "code.go"), []byte("package x\n"), 0o644)
+	if err := wg.Commit(ctx, "code"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.Claim(ctx, "T1", time.Now().UTC()); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// Heartbeat re-stamps every turn and is the most frequent committer.
+	if err := c.Heartbeat(ctx, "T1", plan.TODO, time.Now().UTC().Add(time.Minute)); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+
+	links, err := c.Git.TrackedGitlinks(ctx)
+	if err != nil {
+		t.Fatalf("tracked gitlinks: %v", err)
+	}
+	for _, l := range links {
+		if strings.HasPrefix(l, "submodules/sm/worktrees/") {
+			t.Fatalf("claim leaked an orphan gitlink into the beehive index: %s", l)
+		}
 	}
 }

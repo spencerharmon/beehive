@@ -238,6 +238,17 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		return res, err
 	}
 
+	// Self-heal any orphan worktree gitlink an earlier leak committed under
+	// submodules/*/worktrees/* (a honeybee code worktree mistakenly staged as a
+	// submodule pointer). Such an orphan has no .gitmodules entry and FATALS
+	// `git submodule update`, wedging every host. Run it first, before this run
+	// stages anything, so the removal commits cleanly on its own; the normal
+	// publish flow carries it to main. Best-effort: a sweep failure must never
+	// block the actual task.
+	if err := r.gcWorktreeGitlinks(ctx); err != nil && r.Debug != nil {
+		fmt.Fprintf(r.Debug, "[honeybee] worktree-gitlink sweep: %v\n", err)
+	}
+
 	// Only a main Work task edits the submodule repo and needs a worktree.
 	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
 	var wg *git.Repo
@@ -606,6 +617,55 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	cleanup()
 	return res, nil
+}
+
+// isWorktreeGitlinkPath reports whether a tracked path sits where a honeybee code
+// worktree lives: submodules/<sm>/worktrees/<branch>. A gitlink recorded there is
+// always an orphan — the real, declared submodule is submodules/<sm>/repo — so it
+// is safe to remove. The pattern alone already excludes submodules/<sm>/repo;
+// gcWorktreeGitlinks additionally excludes every .gitmodules-declared path.
+func isWorktreeGitlinkPath(p string) bool {
+	parts := strings.Split(p, "/")
+	return len(parts) >= 4 && parts[0] == "submodules" && parts[2] == "worktrees"
+}
+
+// gcWorktreeGitlinks removes any orphan gitlink an earlier leak committed under
+// submodules/*/worktrees/* (a honeybee code worktree mistakenly staged as a
+// submodule pointer via `git add -A`). Such an orphan has no .gitmodules entry
+// and fatals `git submodule update`, wedging every host. It stages the removal
+// (git rm --cached, leaving the on-disk worktree dir untouched) and commits it on
+// this honeybee's branch; the normal publish flow carries the fix to main.
+// Registered submodules (declared in .gitmodules, e.g. submodules/<sm>/repo) are
+// never touched. Idempotent — a no-op once no orphan remains.
+func (r *Runner) gcWorktreeGitlinks(ctx context.Context) error {
+	links, err := r.Git.TrackedGitlinks(ctx)
+	if err != nil {
+		return err
+	}
+	declared, err := r.Git.DeclaredSubmodulePaths(ctx)
+	if err != nil {
+		return err
+	}
+	declaredSet := make(map[string]bool, len(declared))
+	for _, d := range declared {
+		declaredSet[d] = true
+	}
+	var orphans []string
+	for _, l := range links {
+		if isWorktreeGitlinkPath(l) && !declaredSet[l] {
+			orphans = append(orphans, l)
+		}
+	}
+	if len(orphans) == 0 {
+		return nil
+	}
+	if err := r.Git.RemoveCached(ctx, orphans...); err != nil {
+		return err
+	}
+	if err := r.Git.CommitStaged(ctx, "swarm: remove orphan worktree gitlink(s)\n\nBeehive: gc plan"); err != nil && !errors.Is(err, git.ErrNothing) {
+		return err
+	}
+	return nil
 }
 
 // taskRemoved checks whether the operator deleted the plan or removed this

@@ -91,6 +91,62 @@ func (r *Repo) CommitPaths(ctx context.Context, msg string, paths ...string) err
 	return err
 }
 
+// CommitStaged commits whatever is already staged in the index with msg, staging
+// nothing further. Unlike Commit it never runs `git add`, so it records EXACTLY
+// the caller's prepared index (e.g. a targeted `git rm --cached`) without
+// sweeping in unrelated working-tree changes. ErrNothing when the index matches
+// HEAD (nothing staged).
+func (r *Repo) CommitStaged(ctx context.Context, msg string) error {
+	staged, err := r.Run(ctx, "diff", "--cached", "--name-only")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(staged) == "" {
+		return ErrNothing
+	}
+	_, err = r.Run(ctx, "commit", "-m", msg)
+	return err
+}
+
+// TrackedGitlinks returns the paths of every gitlink (mode 160000 index entry) —
+// submodule pointers, declared in .gitmodules or not. A stray `git add -A` over a
+// nested checkout (e.g. a honeybee code worktree under submodules/<sm>/worktrees/)
+// records such an orphan gitlink with no .gitmodules entry, which then fatals
+// `git submodule update`; this lists them so a sweep can remove them.
+func (r *Repo) TrackedGitlinks(ctx context.Context) ([]string, error) {
+	out, err := r.Run(ctx, "ls-files", "--stage")
+	if err != nil {
+		return nil, err
+	}
+	var links []string
+	for _, line := range strings.Split(out, "\n") {
+		// "<mode> <sha> <stage>\t<path>"; gitlinks carry mode 160000.
+		if !strings.HasPrefix(line, "160000 ") {
+			continue
+		}
+		tab := strings.IndexByte(line, '\t')
+		if tab < 0 {
+			continue
+		}
+		if p := strings.TrimSpace(line[tab+1:]); p != "" {
+			links = append(links, p)
+		}
+	}
+	return links, nil
+}
+
+// RemoveCached unstages paths from the index without touching the working tree
+// (git rm --cached). Used to drop an orphan gitlink the index recorded while
+// leaving the on-disk worktree dir in place. A no-op for an empty path list.
+func (r *Repo) RemoveCached(ctx context.Context, paths ...string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	args := append([]string{"rm", "--cached", "-q", "--"}, paths...)
+	_, err := r.Run(ctx, args...)
+	return err
+}
+
 // Remote returns the name of the repo's default push remote ("origin" if
 // present, else the first configured remote), or "" when the repo has none.
 func (r *Repo) Remote(ctx context.Context) (string, error) {
@@ -354,7 +410,7 @@ func (r *Repo) healLocalMain(ctx context.Context) error {
 		return err
 	}
 	_, _ = m.Run(ctx, "submodule", "sync", "--quiet")
-	paths, err := m.declaredSubmodulePaths(ctx)
+	paths, err := m.DeclaredSubmodulePaths(ctx)
 	if err != nil {
 		return err
 	}
@@ -398,10 +454,10 @@ func (r *Repo) mainWorktreeDir(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("git: no worktrees listed")
 }
 
-// declaredSubmodulePaths returns the submodule paths declared in .gitmodules
+// DeclaredSubmodulePaths returns the submodule paths declared in .gitmodules
 // (none when there is no .gitmodules), so callers can sync real submodules
 // without tripping over orphan gitlinks that have no declaration.
-func (r *Repo) declaredSubmodulePaths(ctx context.Context) ([]string, error) {
+func (r *Repo) DeclaredSubmodulePaths(ctx context.Context) ([]string, error) {
 	if _, statErr := os.Stat(filepath.Join(r.Dir, ".gitmodules")); statErr != nil {
 		return nil, nil
 	}
