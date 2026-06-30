@@ -115,6 +115,81 @@ func TestRunGCCap(t *testing.T) {
 	}
 }
 
+// TestRunGCCapReclaimsWorktree proves the turn/wall cap path RECLAIMS the agent's
+// orphaned code worktree (mirroring the DONE path) so stale trees don't pile up,
+// while DELIBERATELY leaving the task status and its now-going-stale
+// session+heartbeat claim intact — there is no IN-PROGRESS status under the
+// unified claim model, so that lingering claim is the only signal stale-claim GC
+// uses to reclaim/re-TODO the task. The stub Client never completes the task.
+func TestRunGCCapReclaimsWorktree(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	// Seed an actively-claimed task (session + heartbeat) so we can prove the cap
+	// path leaves the claim behind rather than releasing it.
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= session=bee-z heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	// Record that the code worktree physically existed mid-run, so a later absence
+	// is a real reclaim and not merely "never created".
+	var existedMidRun bool
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		if fi, err := os.Stat(wtDir); err == nil && fi.IsDir() {
+			existedMidRun = true
+		}
+	}}}
+	fixed := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 2, WallCap: time.Hour, TTL: time.Hour,
+		Session: "bee-z", Now: func() time.Time { return fixed },
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed || !res.GCMarked {
+		t.Fatalf("want gc cap (incomplete), got %+v", res)
+	}
+	if !existedMidRun {
+		t.Fatal("worktree was never created during the run; the test cannot prove a reclaim")
+	}
+	// 1) The orphaned code worktree must be reclaimed at the cap.
+	if _, err := os.Stat(wtDir); !os.IsNotExist(err) {
+		t.Fatalf("cap path did not reclaim the worktree %s (stat err=%v)", wtDir, err)
+	}
+	// 2) status unchanged and 3) the claim (session+heartbeat) still present, so
+	// stale-claim GC can later reclaim it — the runner must NOT Release or flip
+	// status at the cap.
+	b, _ := os.ReadFile(planPath)
+	p, perr := plan.Parse(string(b))
+	if perr != nil {
+		t.Fatalf("plan parse: %v", perr)
+	}
+	tk := p.Find("T1")
+	if tk == nil {
+		t.Fatal("task T1 vanished from PLAN.md")
+	}
+	if tk.Status != plan.TODO {
+		t.Fatalf("cap path changed task status to %s; it must stay TODO", tk.Status)
+	}
+	if tk.Session != "bee-z" || tk.Heartbeat.IsZero() {
+		t.Fatalf("cap path cleared the claim (session=%q heartbeat=%v); a stale claim must remain for GC", tk.Session, tk.Heartbeat)
+	}
+}
+
 // TestTaskRemovedGuard: an operator removes the honeybee's task from PLAN.md on
 // main after it started; the next turn's guard detects it and aborts with a
 // warning recorded in the session file.
