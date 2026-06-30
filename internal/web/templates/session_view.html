@@ -2,9 +2,49 @@
 <h1>{{.Name}} · {{.Branch}}</h1>
 <p><a href="/submodule/{{.Name}}/sessions">all sessions</a> · {{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">ended</span>{{end}}</p>
 <div id="session-body"
+     data-stream="/submodule/{{.Name}}/session/{{.Branch}}/stream"
      hx-get="/submodule/{{.Name}}/session/{{.Branch}}/body"
      hx-trigger="load, every 2s"
      hx-swap="innerHTML">
   <p>loading…</p>
 </div>
+<script>
+/* session-stream: push the transcript live over Server-Sent Events, superseding
+   the 2s htmx poll while connected and falling back to it on any error (a server
+   or proxy without SSE, or a dropped stream). No SPA, no external libraries
+   (single-binary embed). Keeps the bottom-pin contract: follow new output only
+   when the reader is already at the bottom, otherwise hold their position. */
+(function () {
+  var body = document.getElementById('session-body');
+  if (!body || typeof EventSource === 'undefined') return; // no SSE: htmx poll stays
+  var url = body.getAttribute('data-stream');
+  if (!url) return;
+  var SLACK = 4, streaming = false;
+  // While the SSE stream is live, suppress this pane's htmx poll so the two never
+  // fight over #session-transcript; htmx:beforeRequest is cancelable.
+  body.addEventListener('htmx:beforeRequest', function (e) {
+    if (streaming) e.preventDefault();
+  });
+  function render(text) {
+    var pre = document.getElementById('session-transcript');
+    if (!pre) {
+      // Own the pane: create the same node the poll fragment would, so the SSE
+      // path is self-sufficient before the first (now-suppressed) poll lands.
+      body.innerHTML = '<pre class="session" id="session-transcript" data-scroll-preserve data-scroll-pin></pre>';
+      pre = document.getElementById('session-transcript');
+    }
+    var atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight <= SLACK;
+    pre.textContent = text;
+    if (atBottom) pre.scrollTop = pre.scrollHeight; // bottom-pin: keep following live output
+  }
+  var es = new EventSource(url);
+  es.onopen = function () { streaming = true; };
+  es.onmessage = function (e) { render(e.data); };
+  es.onerror = function () {
+    // Stream unsupported or dropped: stop retrying and let the htmx poll resume.
+    streaming = false;
+    es.close();
+  };
+})();
+</script>
 {{template "footer"}}

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"html/template"
 	"net/http"
@@ -1098,6 +1099,140 @@ func TestAssetsStyleHtmxPolish(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("style.css missing htmx-polish rule %q", want)
+		}
+	}
+}
+
+// readSSEEvent reads one Server-Sent Events event off br: it collects consecutive
+// "data:" field lines (each with the single optional leading space trimmed) until
+// the blank line that terminates the event, and returns them rejoined with "\n"
+// — the inverse of writeSSE, so a multi-line transcript round-trips.
+func readSSEEvent(t *testing.T, br *bufio.Reader) string {
+	t.Helper()
+	var data []string
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			if len(data) > 0 {
+				return strings.Join(data, "\n")
+			}
+			t.Fatalf("read SSE event: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			return strings.Join(data, "\n") // event terminator
+		}
+		if strings.HasPrefix(line, "data:") {
+			data = append(data, strings.TrimPrefix(line[len("data:"):], " "))
+		}
+	}
+}
+
+// TestSessionStreamSSE drives the live session pane end-to-end over a real HTTP
+// connection: the endpoint is text/event-stream, the first frame carries the
+// transcript verbatim (multi-line round-trip), a change to the file is pushed on
+// the next tick (the pane updates live, file/git-derived — opencode is never
+// contacted), and a client disconnect tears the handler down (no hang/leak).
+func TestSessionStreamSSE(t *testing.T) {
+	s, root := setup(t)
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := "# transcript\nhello world\n"
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-x.md"), []byte(transcript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	// 8s ceiling bounds any read so a regression can never hang the suite; the
+	// explicit cancel below exercises clean mid-stream teardown.
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL+"/submodule/alpha/session/bee-x/stream", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("stream status %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q, want text/event-stream", ct)
+	}
+	br := bufio.NewReader(resp.Body)
+
+	// First frame: the transcript, verbatim (proves the per-line data round-trip).
+	if got := readSSEEvent(t, br); got != transcript {
+		t.Fatalf("initial frame = %q, want the transcript verbatim %q", got, transcript)
+	}
+
+	// Live update: the handler pushes only on change, so the NEXT event the client
+	// sees is exactly the updated transcript.
+	updated := transcript + "more output\n"
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-x.md"), []byte(updated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSSEEvent(t, br); got != updated {
+		t.Fatalf("post-change frame = %q, want the updated transcript %q", got, updated)
+	}
+
+	// Disconnect: cancelling the request must close the stream (the handler's loop
+	// returns on ctx.Done — no spawned goroutine, nothing to leak).
+	cancel()
+	closed := make(chan struct{})
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			if _, err := resp.Body.Read(buf); err != nil {
+				close(closed)
+				return
+			}
+		}
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not close after client disconnect — handler failed to tear down")
+	}
+}
+
+// TestSessionStreamGuards locks the stream endpoint's input guards: an unknown
+// submodule is 404 and a traversal-unsafe branch is 400 (never a path-escaping
+// read), mirroring the body handler.
+func TestSessionStreamGuards(t *testing.T) {
+	s, _ := setup(t)
+	if w := get(t, s, "/submodule/none/session/bee-x/stream"); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown submodule: got %d, want 404", w.Code)
+	}
+	if w := get(t, s, "/submodule/alpha/session/..%2f..%2fevil/stream"); w.Code == 200 {
+		t.Fatalf("unsafe branch must be rejected, got %d", w.Code)
+	}
+}
+
+// TestSessionViewStreamWiring locks the live-pane template contract: the view
+// names the SSE endpoint, opens an EventSource that renders into the SAME
+// bottom-pinned #session-transcript node, suppresses the htmx poll while
+// streaming, and closes the stream on error so the htmx 2s poll remains the
+// graceful fallback (which must still be present).
+func TestSessionViewStreamWiring(t *testing.T) {
+	s, _ := setup(t)
+	view := renderTmpl(t, s, "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x"})
+	for _, want := range []string{
+		`data-stream="/submodule/alpha/session/bee-x/stream"`, // SSE endpoint
+		"new EventSource",    // live stream client (no SPA, no external lib)
+		"session-transcript", // renders into the same pinned transcript node
+		"data-scroll-pin",    // bottom-pin contract preserved
+		"htmx:beforeRequest", // suppress the poll while the stream is live
+		"es.close()",         // stop the stream on error -> poll resumes
+		`hx-get="/submodule/alpha/session/bee-x/body"`, // htmx poll still present as fallback
+		`hx-trigger="load, every 2s"`,
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("session_view.html missing live-stream wiring %q:\n%s", want, view)
 		}
 	}
 }

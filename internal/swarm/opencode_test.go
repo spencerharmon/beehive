@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -166,5 +168,177 @@ func TestPromptIdlePollHonorsCancel(t *testing.T) {
 	defer cancel()
 	if _, err := s.Prompt(ctx, "hi"); err == nil {
 		t.Fatal("Prompt must surface the ctx cancellation of a never-idle turn, got nil error")
+	}
+}
+
+// sseFrame formats one opencode /event SSE frame: a single data line carrying the
+// compact JSON event, terminated by the blank line that ends an SSE event.
+func sseFrame(json string) string { return "data: " + json + "\n\n" }
+
+// TestStreamPromptAssemblesDeltas is the core of the streaming read path: with
+// Stream set, Prompt subscribes to /event, and opencode's CUMULATIVE part-text
+// updates are surfaced as incremental suffix deltas via OnDelta while the full
+// reply assembles to the final text. session.idle ends the turn (stream-end ==
+// turn-idle), exactly like the poll path's completed marker.
+func TestStreamPromptAssemblesDeltas(t *testing.T) {
+	frames := []string{
+		`{"type":"message.part.updated","properties":{"part":{"id":"p1","sessionID":"sess1","messageID":"a1","type":"text","text":"Hello"}}}`,
+		`{"type":"message.part.updated","properties":{"part":{"id":"p1","sessionID":"sess1","messageID":"a1","type":"text","text":"Hello, "}}}`,
+		`{"type":"message.part.updated","properties":{"part":{"id":"p1","sessionID":"sess1","messageID":"a1","type":"text","text":"Hello, world"}}}`,
+		// A part from ANOTHER session must be ignored (the bus is global).
+		`{"type":"message.part.updated","properties":{"part":{"id":"x9","sessionID":"other","messageID":"z","type":"text","text":"leak"}}}`,
+		`{"type":"session.idle","properties":{"sessionID":"sess1"}}`,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/event" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fl, _ := w.(http.Flusher)
+			for _, f := range frames {
+				_, _ = io.WriteString(w, sseFrame(f))
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+			return
+		}
+		// Accept the turn fire-and-forget (no completed): the stream drives idle.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"info":{"id":"a1","time":{}},"parts":[]}`))
+	}))
+	defer srv.Close()
+
+	var deltas []string
+	oc := &Opencode{Base: srv.URL, Model: "anthropic/claude-3", HTTP: srv.Client(), Stream: true,
+		OnDelta: func(sess, d string) {
+			if sess != "sess1" {
+				t.Errorf("OnDelta session = %q, want sess1", sess)
+			}
+			deltas = append(deltas, d)
+		}}
+	s := &ocSession{oc: oc, id: "sess1", dir: "/wt", system: "sys"}
+
+	reply, err := s.Prompt(context.Background(), "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply != "Hello, world" {
+		t.Fatalf("reply = %q, want the assembled %q", reply, "Hello, world")
+	}
+	// Deltas are the incremental suffixes, not one lump, and concatenate to the full text.
+	want := []string{"Hello", ", ", "world"}
+	if len(deltas) != len(want) {
+		t.Fatalf("deltas = %v, want %v (the cross-session frame must be ignored)", deltas, want)
+	}
+	for i := range want {
+		if deltas[i] != want[i] {
+			t.Fatalf("delta[%d] = %q, want %q (deltas=%v)", i, deltas[i], want[i], deltas)
+		}
+	}
+	if got := strings.Join(deltas, ""); got != reply {
+		t.Fatalf("deltas concatenated = %q, want to equal the reply %q", got, reply)
+	}
+}
+
+// TestStreamPromptFallsBackToPoll proves graceful degradation: a server with no
+// /event stream (404) makes Stream-enabled Prompt fall back to the proven
+// post+poll turn-idle path and still return the settled text — and it posts the
+// turn EXACTLY ONCE (openEvents runs before the post, so the abandoned stream
+// attempt never double-drives the turn).
+func TestStreamPromptFallsBackToPoll(t *testing.T) {
+	var mu sync.Mutex
+	var posts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/event" {
+			http.Error(w, "no event stream on this server", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			mu.Lock()
+			posts++
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"info":{"id":"a1","time":{}},"parts":[]}`))
+			return
+		}
+		// Poll: the turn is already idle with its final text.
+		_, _ = w.Write([]byte(`[{"info":{"id":"a1","role":"assistant","time":{"completed":1700000000000}},` +
+			`"parts":[{"type":"text","text":"final answer"}]}]`))
+	}))
+	defer srv.Close()
+
+	oc := &Opencode{Base: srv.URL, Model: "anthropic/claude-3", HTTP: srv.Client(), Stream: true}
+	oc.pollMin, oc.pollMax = time.Millisecond, 2*time.Millisecond
+	s := &ocSession{oc: oc, id: "sess1", dir: "/wt", system: "sys"}
+
+	reply, err := s.Prompt(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("a non-streaming server must fall back without error, got %v", err)
+	}
+	if reply != "final answer" {
+		t.Fatalf("reply = %q, want %q from the poll fallback", reply, "final answer")
+	}
+	mu.Lock()
+	gotPosts := posts
+	mu.Unlock()
+	if gotPosts != 1 {
+		t.Fatalf("posts = %d, want exactly one — the stream fallback must not double-post the turn", gotPosts)
+	}
+}
+
+// TestStreamPromptHonorsCancel proves a stream that never goes idle is bounded by
+// ctx and leaks no goroutines: the reader runs in Prompt's own goroutine, so a
+// cancel unblocks the underlying read, surfaces the error, and the goroutine
+// count settles back to baseline (no background reader was spawned).
+func TestStreamPromptHonorsCancel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/event" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush() // send headers so the subscribe returns, then hold open (never idle)
+			}
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"info":{"id":"a1","time":{}},"parts":[]}`))
+	}))
+	defer srv.Close()
+
+	// DisableKeepAlives so no idle-connection goroutine lingers to confound the
+	// leak check; each request's connection is released when it ends.
+	oc := &Opencode{Base: srv.URL, Model: "anthropic/claude-3", Stream: true,
+		HTTP: &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}}
+	s := &ocSession{oc: oc, id: "sess1", dir: "/wt", system: "sys"}
+
+	base := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Prompt(ctx, "hi")
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let it subscribe, post, and block on the stream
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancel mid-stream must surface an error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Prompt hung on the stream after cancel — it did not honor ctx")
+	}
+	// The streaming path spawns no goroutine of its own, so after teardown the
+	// count returns to baseline (give the transport a moment to release the conn).
+	settled := false
+	for i := 0; i < 100; i++ {
+		if runtime.NumGoroutine() <= base+1 {
+			settled = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !settled {
+		t.Fatalf("goroutines did not settle after cancel (base=%d now=%d): the stream leaked a goroutine",
+			base, runtime.NumGoroutine())
 	}
 }

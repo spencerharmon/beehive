@@ -4,9 +4,11 @@
 package swarm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +26,17 @@ const (
 	defaultPollMax = 2 * time.Second
 )
 
+// maxStreamLine bounds one SSE line from opencode's /event stream so a malformed
+// or hostile server cannot make the reader allocate without limit (the buffers
+// requirement). opencode emits one compact JSON event per data line, well under
+// this; a line past the cap fails the scan and is surfaced, never silently grown.
+const maxStreamLine = 8 << 20 // 8 MiB
+
+// errNoStream marks an opencode server that exposes no usable /event stream
+// (endpoint missing, non-2xx, or unreachable). Prompt treats it as a signal to
+// fall back to the proven post+poll turn-idle path, NOT as a turn failure.
+var errNoStream = errors.New("opencode: event stream unavailable")
+
 // Opencode talks to an opencode server's session API.
 type Opencode struct {
 	Base        string  // server base URL
@@ -32,6 +45,20 @@ type Opencode struct {
 	MaxTokens   int     // max output tokens; 0 = backend default (omitted from the request)
 	HTTP        *http.Client
 	Debug       io.Writer // non-nil: log each HTTP request/response
+
+	// Stream, when true, makes Prompt consume opencode's /event SSE stream to
+	// observe assistant text as it is produced, emitting deltas via OnDelta and
+	// returning the assembled reply when the turn goes idle (stream end ==
+	// turn-idle, consistent with the poll path). A server with no usable /event
+	// stream transparently falls back to the post+poll path, so enabling Stream is
+	// always safe. Off by default: the recorder already renders a near-real-time
+	// transcript by polling, so streaming is opt-in per deployment.
+	Stream bool
+	// OnDelta, when non-nil and Stream is true, receives each incremental
+	// assistant text delta (the session id and the newly-appended text) as it
+	// arrives on the event stream. The full reply is still returned by Prompt
+	// regardless, so a nil OnDelta simply means "stream but don't tee deltas".
+	OnDelta func(session, delta string)
 
 	// pollMin/pollMax bound the turn-idle backoff (see Prompt/awaitTurn). Zero =
 	// the package defaults; tests set tiny values to keep the wait loop fast. Kept
@@ -162,7 +189,50 @@ func (s *ocSession) Messages(ctx context.Context) ([]Message, error) {
 // message list until that assistant message reports completed. ctx (the runner's
 // per-turn timeout / WallCap) bounds the wait and poll errors are surfaced, never
 // swallowed.
+//
+// When Stream is set, Prompt first tries the /event SSE path (live token deltas,
+// stream-end == turn-idle); a server without a usable event stream falls back to
+// the exact post+poll path below, so streaming never changes the contract.
 func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
+	if s.oc.Stream {
+		reply, err := s.streamPrompt(ctx, text)
+		if err == nil {
+			return reply, nil
+		}
+		if !errors.Is(err, errNoStream) {
+			return "", err // a real failure mid-stream — surface it, do not re-drive
+		}
+		// No usable event stream: degrade gracefully to the proven poll path. The
+		// stream was abandoned BEFORE any message was posted (openEvents runs first),
+		// so falling through posts exactly once.
+	}
+	acc, err := s.postPrompt(ctx, text)
+	if err != nil {
+		return "", err
+	}
+	// Synchronous server: the accept reply already carries time.completed, so the
+	// turn is done and its parts are authoritative — no need to poll.
+	if acc.completed {
+		return acc.text, nil
+	}
+	// Fire-and-forget accept: wait for the assistant message to settle.
+	return s.awaitTurn(ctx, acc.assistantID)
+}
+
+// acceptResult is what opencode echoes when it ACCEPTS a turn: the assistant
+// message id to track, whether the turn was already completed synchronously, and
+// (only then) its settled text.
+type acceptResult struct {
+	assistantID string
+	text        string
+	completed   bool
+}
+
+// postPrompt POSTs the turn to opencode and returns the accept echo. The request
+// body is built identically to the original Prompt (same agent/system/model
+// split and the same only-when-set model knobs), so the poll path stays
+// byte-identical to before this feature.
+func (s *ocSession) postPrompt(ctx context.Context, text string) (acceptResult, error) {
 	prov, model, _ := strings.Cut(s.oc.Model, "/")
 	body := map[string]any{
 		"agent":  "build",
@@ -192,21 +262,202 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 		} `json:"parts"`
 	}
 	if err := s.oc.post(ctx, "/session/"+s.id+"/message", s.dir, body, &reply); err != nil {
-		return "", err
+		return acceptResult{}, err
 	}
-	// Synchronous server: the accept reply already carries time.completed, so the
-	// turn is done and its parts are authoritative — no need to poll.
-	if reply.Info.Time.Completed != 0 {
+	acc := acceptResult{assistantID: reply.Info.ID, completed: reply.Info.Time.Completed != 0}
+	if acc.completed {
 		var sb strings.Builder
 		for _, p := range reply.Parts {
 			if p.Type == "text" {
 				sb.WriteString(p.Text)
 			}
 		}
-		return sb.String(), nil
+		acc.text = sb.String()
 	}
-	// Fire-and-forget accept: wait for the assistant message to settle.
-	return s.awaitTurn(ctx, reply.Info.ID)
+	return acc, nil
+}
+
+// streamEvent is one frame from opencode's /event SSE bus. The bus is global, so
+// every frame carries the session id of the thing it concerns: a text part
+// update (cumulative text), an assistant message reaching completed, or the
+// session going idle. Only the fields this reader needs are decoded.
+type streamEvent struct {
+	Type       string `json:"type"`
+	Properties struct {
+		Part struct {
+			ID        string `json:"id"`
+			SessionID string `json:"sessionID"`
+			MessageID string `json:"messageID"`
+			Type      string `json:"type"`
+			Text      string `json:"text"`
+		} `json:"part"`
+		Info struct {
+			ID        string `json:"id"`
+			Role      string `json:"role"`
+			SessionID string `json:"sessionID"`
+			Time      struct {
+				Completed float64 `json:"completed"`
+			} `json:"time"`
+		} `json:"info"`
+		SessionID string `json:"sessionID"`
+	} `json:"properties"`
+}
+
+// streamPrompt drives one turn over the event stream: it subscribes to /event
+// BEFORE posting (so no early token is missed in the subscribe-after-post gap),
+// posts the turn, and reads the stream until the turn goes idle. A server with no
+// usable event stream returns errNoStream from openEvents, before any post, so
+// the caller can fall back to the poll path with exactly one POST total.
+func (s *ocSession) streamPrompt(ctx context.Context, text string) (string, error) {
+	resp, err := s.openEvents(ctx)
+	if err != nil {
+		return "", err // errNoStream (fall back) or a surfaced ctx error
+	}
+	defer resp.Body.Close()
+	acc, err := s.postPrompt(ctx, text)
+	if err != nil {
+		return "", err
+	}
+	// Synchronous server: it finished the turn in the accept reply, so there is
+	// nothing to stream — return the settled text directly.
+	if acc.completed {
+		return acc.text, nil
+	}
+	return s.readStream(ctx, resp.Body, acc.assistantID)
+}
+
+// openEvents subscribes to opencode's /event SSE bus. A construction or ctx error
+// is surfaced as-is; an unreachable endpoint or a non-2xx response is reported as
+// errNoStream so Prompt falls back to the poll path rather than failing the turn.
+// On success the caller owns resp.Body and must close it.
+func (s *ocSession) openEvents(ctx context.Context) (*http.Response, error) {
+	url := s.oc.Base + "/event"
+	if s.dir != "" {
+		url += "?directory=" + neturl.QueryEscape(s.dir)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	cl := s.oc.HTTP
+	if cl == nil {
+		cl = http.DefaultClient
+	}
+	if s.oc.Debug != nil {
+		fmt.Fprintf(s.oc.Debug, "[opencode] GET %s (event stream)\n", url)
+	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err() // cancelled/timed out: a real ctx error, not a missing stream
+		}
+		return nil, fmt.Errorf("%w: %v", errNoStream, err) // endpoint unreachable: fall back
+	}
+	if resp.StatusCode/100 != 2 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("%w: status %d", errNoStream, resp.StatusCode)
+	}
+	return resp, nil
+}
+
+// readStream consumes the SSE bus until the tracked turn goes idle, emitting each
+// assistant text delta via OnDelta and returning the assembled reply. opencode
+// sends CUMULATIVE part text, so the latest update for a part is its full text;
+// deltas are the newly-appended suffix. The turn is idle on the session's
+// session.idle, on its assistant message reaching completed, or on a clean EOF
+// (stream end == turn-idle, consistent with the poll path). ctx cancellation
+// unblocks the underlying read (the request carries ctx) and is surfaced, never
+// swallowed; the reader runs in the caller's goroutine, so cancel leaks nothing.
+func (s *ocSession) readStream(ctx context.Context, body io.Reader, assistantID string) (string, error) {
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 0, 64<<10), maxStreamLine)
+	order := []string{} // text part ids in first-seen order, for deterministic assembly
+	latest := map[string]string{}
+	assemble := func() string {
+		var sb strings.Builder
+		for _, id := range order {
+			sb.WriteString(latest[id])
+		}
+		return sb.String()
+	}
+	for sc.Scan() {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		data, ok := sseData(sc.Bytes())
+		if !ok {
+			continue // comment, blank line, or a non-data field
+		}
+		var ev streamEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			continue // keep-alive / non-JSON frame: tolerate, don't fail the turn
+		}
+		switch ev.Type {
+		case "message.part.updated":
+			p := ev.Properties.Part
+			if p.SessionID != s.id || p.Type != "text" {
+				continue // another session, or non-text (reasoning/tool) part
+			}
+			prev, seen := latest[p.ID]
+			if !seen {
+				order = append(order, p.ID)
+			}
+			latest[p.ID] = p.Text
+			if s.oc.OnDelta != nil {
+				if d := suffixDelta(prev, p.Text); d != "" {
+					s.oc.OnDelta(s.id, d)
+				}
+			}
+		case "message.updated":
+			in := ev.Properties.Info
+			if in.SessionID == s.id && in.Role == "assistant" && in.Time.Completed != 0 &&
+				(assistantID == "" || in.ID == assistantID) {
+				return assemble(), nil
+			}
+		case "session.idle":
+			if ev.Properties.SessionID == s.id {
+				return assemble(), nil
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("opencode stream: %w", err)
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	// Clean EOF with no explicit idle marker: the server closed the stream, which
+	// signals the turn is done. Return whatever assembled.
+	return assemble(), nil
+}
+
+// sseData extracts the payload of an SSE "data:" field line, trimming the single
+// optional leading space per the spec. Non-data lines (comments, event:, id:,
+// blanks) report ok=false.
+func sseData(line []byte) ([]byte, bool) {
+	const field = "data:"
+	if !bytes.HasPrefix(line, []byte(field)) {
+		return nil, false
+	}
+	d := line[len(field):]
+	if len(d) > 0 && d[0] == ' ' {
+		d = d[1:]
+	}
+	return d, true
+}
+
+// suffixDelta returns the text newly appended to a cumulative part: the suffix of
+// cur after prev when cur extends prev (the normal monotonic case), else the
+// whole of cur (a non-monotonic rewrite, so the consumer still sees the content).
+func suffixDelta(prev, cur string) string {
+	if strings.HasPrefix(cur, prev) {
+		return cur[len(prev):]
+	}
+	return cur
 }
 
 // awaitTurn polls the session message list until the assistant message for the

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -99,23 +100,38 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad branch", http.StatusBadRequest)
 		return
 	}
+	body, err := s.resolveSessionBody(r.Context(), sm, branch)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.render(w, "session_body.html", map[string]interface{}{"Body": body})
+}
+
+// resolveSessionBody computes the transcript display text for a session branch:
+// the live stream-branch copy of a running session's stub (fetched from the
+// remote when distributed), the durable final transcript of a finished session,
+// or a plain status line when output isn't available yet / the stream branch is
+// gone. It never contacts opencode — purely file/git derived — so both the
+// polled body fragment and the SSE stream share one source of truth. The error
+// return is reserved for an unexpected read failure (not "absent", which is a
+// normal "waiting" state).
+func (s *Server) resolveSessionBody(ctx context.Context, sm repo.Submodule, branch string) (string, error) {
 	sessRel := "submodules/" + sm.Name + "/sessions/" + branch + ".md"
 	b, err := os.ReadFile(filepath.Join(sm.SessionsDir(), branch+".md"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.render(w, "session_body.html", map[string]interface{}{"Body": "(waiting for session output…)"})
-			return
+			return "(waiting for session output…)", nil
 		}
-		http.Error(w, err.Error(), 500)
-		return
+		return "", err
 	}
 	body := string(b)
 	if streamBranch, isStub := repo.ParseSessionStub(body); isStub {
-		if live, ok := s.readSessionBranch(r.Context(), streamBranch, sessRel); ok {
+		if live, ok := s.readSessionBranch(ctx, streamBranch, sessRel); ok {
 			body = live
 		} else {
-			rem, _ := s.git.Remote(r.Context())
-			if _, exists := s.branchTipTime(r.Context(), streamBranch, rem); exists {
+			rem, _ := s.git.Remote(ctx)
+			if _, exists := s.branchTipTime(ctx, streamBranch, rem); exists {
 				// Branch exists but the transcript file isn't on it yet: a session that
 				// just started and hasn't written its first commit. Genuinely waiting.
 				body = "(waiting for session output…)"
@@ -127,7 +143,78 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.render(w, "session_body.html", map[string]interface{}{"Body": body})
+	return body, nil
+}
+
+// sessionStreamInterval is how often the SSE handler re-derives the transcript
+// from disk/git and pushes it if it changed. 1s keeps the pane near real time
+// while staying lighter than (and independent of) the 2s htmx poll it supersedes.
+const sessionStreamInterval = 1 * time.Second
+
+// sessionStream pushes the session transcript to the browser over Server-Sent
+// Events, so the session pane updates live without a SPA. It reuses
+// resolveSessionBody (file/git derived — opencode is never contacted), sends an
+// immediate first frame, then re-checks every sessionStreamInterval and pushes
+// only on change. The loop is bounded by the request context: a client
+// disconnect cancels r.Context(), the select returns, and the handler exits —
+// no goroutine is spawned, so nothing leaks. A server/proxy without streaming
+// (no Flusher) returns 501 and the client keeps its htmx poll.
+func (s *Server) sessionStream(w http.ResponseWriter, r *http.Request) {
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	branch := r.PathValue("branch")
+	if !safeBranch(branch) {
+		http.Error(w, "bad branch", http.StatusBadRequest)
+		return
+	}
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusNotImplemented)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering so frames flush live
+
+	ctx := r.Context()
+	last, sent := "", false
+	push := func() {
+		body, err := s.resolveSessionBody(ctx, sm, branch)
+		if err != nil {
+			return // transient read error: skip this tick, keep the stream open
+		}
+		if sent && body == last {
+			return // unchanged: don't re-send (the client already shows it)
+		}
+		last, sent = body, true
+		writeSSE(w, body)
+		fl.Flush()
+	}
+	push() // immediate first frame so the pane fills without waiting a tick
+	t := time.NewTicker(sessionStreamInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			push()
+		}
+	}
+}
+
+// writeSSE writes payload as one SSE event, emitting each line as its own "data:"
+// field so a multi-line transcript round-trips (the browser rejoins the data
+// fields with "\n"). The event is terminated by the blank line SSE requires.
+func writeSSE(w io.Writer, payload string) {
+	for _, line := range strings.Split(payload, "\n") {
+		fmt.Fprintf(w, "data: %s\n", line)
+	}
+	fmt.Fprint(w, "\n")
 }
 
 // readSessionBranch returns the transcript file as it stands on the isolated
