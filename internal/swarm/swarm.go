@@ -380,8 +380,18 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		prompt = "continue"
 	}
-	res.GCMarked = true // turn/wall cap hit; leave the active claim to go stale for GC
+	// Turn/wall cap hit: the agent never reached completion. Mirror the DONE path
+	// and reclaim the orphaned code worktree (cleanup -> wg.WorktreeRemove) so
+	// stale trees don't accumulate and a future `git worktree add` for this
+	// branch/dir doesn't collide. DELIBERATELY leave the task's status and its
+	// (now going-stale) session+heartbeat claim untouched: there is no IN-PROGRESS
+	// status under the unified claim model, so that lingering claim is exactly the
+	// signal stale-claim GC uses to reclaim/re-TODO the task. We must NOT Release
+	// here (that clears the claim and would hide the abandonment) and must NOT flip
+	// status. cleanup() only removes the worktree dir; it never writes PLAN.md.
+	res.GCMarked = true
 	finish("")
+	cleanup()
 	return res, nil
 }
 
