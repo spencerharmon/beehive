@@ -8,6 +8,16 @@ You are given the diff of ROI.md from the last-reconciled commit to HEAD (ROI.md
 - Read the diff. Update PLAN.md: add/modify/remove/retire tasks so the plan matches new intent.
 - Preserve in-flight task status; retiring a task in flight -> NEEDS-REVIEW with a doc, not silent delete.
 - Add design docs for new tasks. Tag dependencies. Rightsize for one context window.
+- **(Re)weight every task on the logarithmic (base-2) priority scale below** whenever the ROI diff
+  changes the priority order or adds/retiers tasks. Selection is a weighted-random lottery, so weight
+  must make high priority dominate while still letting lower tiers run:
+  - Keyed to ROI's stated priority order, each step DOWN the order **halves** the weight. Enumerate the
+    priority tiers top-to-bottom; top tier = `2^(T-1)` (T = tier count), each lower tier halves, floor 1.
+    Tasks in one tier share its weight. A dependency gating a high task inherits the gated task's tier
+    (never starve a P1 behind a low-weight prerequisite).
+  - Current 8-tier order (P1 > P2 > correctness > completeness > configuration > aesthetics > chat-diff
+    editor > deferred) -> `128, 64, 32, 16, 8, 4, 2, 1`. Emit `weight=N` in the header; omit only for the
+    bottom (weight=1) tier. Re-emit weights for existing tasks when their tier moved.
 - Update the PLAN.md ROI stamp to the current ROI.md commit: `<!-- Beehive-ROI: <sha> -->`.
 - NEVER edit ROI.md. Commit PLAN.md to main; conflict -> reselect.
 - Do NOT implement tasks; reconciliation ends at a committed, restamped PLAN.md.
