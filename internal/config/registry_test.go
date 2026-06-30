@@ -219,3 +219,134 @@ func TestLoadRegistryFromExplicitDir(t *testing.T) {
 		t.Fatalf("Names = %v, want [a]", got)
 	}
 }
+
+// TestSingleEntryRegistryRoundTrip confirms SingleEntryRegistry is the inverse of
+// RepoEntry.Config: the synthesized entry carries the resolved config's own
+// keyring + agent settings, and projecting it back over that same config
+// reproduces it exactly (the byte-identical legacy guarantee).
+func TestSingleEntryRegistryRoundTrip(t *testing.T) {
+	cfg := Config{
+		Dir:          "/etc/beehive",
+		GPGHome:      "/etc/beehive/gnupg",
+		GPGRecipient: "host@example.com",
+		AgentCmd:     "opencode",
+		AgentURL:     "http://127.0.0.1:4096",
+		Model:        "host/model",
+		Temperature:  0.4,
+		MaxTokens:    1234,
+		TTLMinutes:   60,
+		MaxTurns:     15,
+		RejectLimit:  3,
+	}
+	reg := SingleEntryRegistry(cfg, "/srv/myhive")
+	if len(reg.Repos) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(reg.Repos))
+	}
+	e := reg.Repos[0]
+	if e.Name != "myhive" {
+		t.Errorf("Name = %q, want myhive (root base name)", e.Name)
+	}
+	if e.Root != "/srv/myhive" {
+		t.Errorf("Root = %q, want /srv/myhive", e.Root)
+	}
+	// Legacy keyring preserved on the entry.
+	if e.GPGHome != cfg.GPGHome || e.GPGRecipient != cfg.GPGRecipient {
+		t.Errorf("entry keyring = %q/%q, want %q/%q", e.GPGHome, e.GPGRecipient, cfg.GPGHome, cfg.GPGRecipient)
+	}
+	// Inverse of RepoEntry.Config: projecting the entry back over the same base
+	// config reproduces it field-for-field.
+	if got := e.Config(cfg); got != cfg {
+		t.Fatalf("Config round-trip not byte-identical:\n got %+v\nwant %+v", got, cfg)
+	}
+}
+
+// TestSingleEntryRegistryNameFallback confirms a root with no usable base name
+// falls back to "default" (a blank handle would break the frontend switcher).
+func TestSingleEntryRegistryNameFallback(t *testing.T) {
+	for _, root := range []string{".", "", "/", ".."} {
+		if got := SingleEntryRegistry(Config{}, root).Repos[0].Name; got != "default" {
+			t.Errorf("root %q: Name = %q, want default", root, got)
+		}
+	}
+}
+
+// TestResolveRegistryBareSynthesizes confirms a host with no repos.yaml resolves
+// to a one-entry registry equal to today's single resolved config: legacy keyring
+// preserved and the entry projects back to that config byte-identically.
+func TestResolveRegistryBareSynthesizes(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+	write(t, filepath.Join(hostDir, "config.yaml"), "gpg_recipient: host@example.com\nmodel: host/model\n")
+
+	reg, err := ResolveRegistry(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reg.Empty() || len(reg.Repos) != 1 {
+		t.Fatalf("want synthesized one-entry registry, got %+v", reg)
+	}
+	cfg, err := Resolve(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := reg.Repos[0]
+	if e.Root != root {
+		t.Errorf("entry Root = %q, want %q", e.Root, root)
+	}
+	if e.GPGHome != cfg.GPGHome || e.GPGRecipient != cfg.GPGRecipient {
+		t.Errorf("legacy keyring not preserved: entry %q/%q, cfg %q/%q", e.GPGHome, e.GPGRecipient, cfg.GPGHome, cfg.GPGRecipient)
+	}
+	if got := e.Config(cfg); got != cfg {
+		t.Fatalf("synthesized entry not byte-identical:\n got %+v\nwant %+v", got, cfg)
+	}
+}
+
+// TestResolveRegistryPresentFileUsed confirms a present repos.yaml is loaded and
+// used as-is (not synthesized): the daemon serves the declared multi-repo set.
+func TestResolveRegistryPresentFileUsed(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+	write(t, filepath.Join(hostDir, RegistryFile), `
+repos:
+  - name: zeta
+    root: /srv/zeta
+    gpg_home: /srv/zeta/gnupg
+    gpg_recipient: zeta@example.com
+  - name: alpha
+    root: /srv/alpha
+    gpg_home: /srv/alpha/gnupg
+    gpg_recipient: alpha@example.com
+`)
+	reg, err := ResolveRegistry(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := reg.Names(), []string{"alpha", "zeta"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Names = %v, want %v (declared registry, not synthesized)", got, want)
+	}
+}
+
+// TestResolveRegistryInvalidFails confirms a present-but-invalid registry (shared
+// keyring) fails resolution, so the daemon refuses to start instead of loading a
+// secret-isolation violation.
+func TestResolveRegistryInvalidFails(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+	write(t, filepath.Join(hostDir, RegistryFile), `
+repos:
+  - name: a
+    root: /srv/a
+    gpg_home: /shared/gnupg
+    gpg_recipient: a@example.com
+  - name: b
+    root: /srv/b
+    gpg_home: /shared/gnupg
+    gpg_recipient: b@example.com
+`)
+	if _, err := ResolveRegistry(root); err == nil {
+		t.Fatal("ResolveRegistry should reject a shared gpg_home, got nil")
+	}
+}
