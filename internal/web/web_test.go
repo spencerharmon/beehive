@@ -177,7 +177,7 @@ func TestParsePlanRealFormat(t *testing.T) {
 		"implement t1\nFiles: a.go\nDoc: docs/tasks/t1.md\n\n" +
 		"## t2 [NEEDS-REVIEW] <!-- attempts=1 deps= session=bee-B heartbeat=2026-06-30T09:00:00Z -->\n" +
 		"review me\nDoc: docs/tasks/t2.md\n\n" +
-		"## t3 [NEEDS-HUMAN] <!-- attempts=4 deps= -->\nstuck\n\n" +
+		"## t3 [NEEDS-HUMAN] <!-- attempts=4 deps= -->\nstuck\nHuman-needed: Need operator decision\n\n" +
 		"## t4 [DONE] <!-- attempts=0 deps= -->\ndone\n"
 	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
@@ -240,6 +240,9 @@ func TestParsePlanRealFormat(t *testing.T) {
 		if it := byID[id]; it.Active || it.Stale || it.Claim() != "" {
 			t.Fatalf("%s unclaimed but active=%v stale=%v claim=%q", id, it.Active, it.Stale, it.Claim())
 		}
+	}
+	if got := byID["t3"].HumanReason; got != "Need operator decision" {
+		t.Fatalf("t3 human reason = %q", got)
 	}
 
 	// Count semantics the views use: pending = not DONE; human = NEEDS-HUMAN.

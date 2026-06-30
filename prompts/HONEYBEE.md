@@ -39,7 +39,8 @@ Edit code there. Do not run worktree/submodule git plumbing yourself and never w
 
 ## Claim model (no IN-PROGRESS status)
 There is NO `IN-PROGRESS` status. A task's status is its work phase only: `TODO` -> `NEEDS-REVIEW` ->
-`{DONE | NEEDS-ARBITRATION}`, and `NEEDS-ARBITRATION` -> `{TODO | DONE}`. "Being worked right now" is
+`{DONE | NEEDS-ARBITRATION}`, `NEEDS-ARBITRATION` -> `{TODO | DONE}`, and explicit escalation ->
+`NEEDS-HUMAN`. "Being worked right now" is
 derived from the claim metadata (`session=<id>` + a fresh `heartbeat`), which any status can carry. A
 task whose heartbeat is older than the TTL is stale and may be reclaimed by overwrite regardless of
 status. You change only the STATUS (the work phase); the runner manages session+heartbeat.
@@ -74,14 +75,23 @@ real. Only a TODO task is yours to implement.
       every other host/bee). Bump the submodule pointer.
    d. Flip the PLAN.md task to NEEDS-REVIEW on main and commit. (The runner then releases your claim so a
       reviewer can pick it up.)
-5. On any -> DONE, update linked dependents (same plan or linked submodule) to unlock them.
-6. Plan additions need design/code-ref docs under `submodules/<sm>/docs/`. Terse, LLM-only.
-7. NEVER touch ROI.md.
+5. **Human escalation.** If a task has a concrete blocker that cannot be honestly resolved without
+   operator input (missing credentials/config/calibration, unavailable upstream API, contradictory spec,
+   or user-visible contract decision), run:
+   `beehive task human <submodule> <task-id> --reason "<specific blocker and exact input needed>"`.
+   This sets the PLAN.md task to `NEEDS-HUMAN`, records `Human-needed: <reason>` in the task body,
+   clears your claim, and commits the plan change. Do not write `HUMAN-NEEDED`; exact status is
+   `NEEDS-HUMAN`. Do not use this for normal uncertainty or tedious work — choose a workable internal
+   path and continue.
+6. On any -> DONE, update linked dependents (same plan or linked submodule) to unlock them.
+7. Plan additions need design/code-ref docs under `submodules/<sm>/docs/`. Terse, LLM-only.
+8. NEVER touch ROI.md.
 
 ## Tooling
 The `beehive` CLI is available for deterministic git operations (e.g. `beehive submodule sync <sm>`,
-`beehive submodule worktree add|rm <sm> <branch>`). If it is not on PATH, fall back to plain `git`. Your
-code worktree is pre-created, so you normally do not need these for a Work task.
+`beehive submodule worktree add|rm <sm> <branch>`, `beehive task human <sm> <task-id> --reason <why>`).
+If it is not on PATH, fall back to plain `git`. Your code worktree is pre-created, so you normally do
+not need worktree plumbing for a Work task.
 
 ## Turn loop
 Each turn the runner checks completion deterministically. If met, you exit. If not, you get "continue":

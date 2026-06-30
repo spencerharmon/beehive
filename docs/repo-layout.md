@@ -27,8 +27,8 @@ submodules/
 ## Files
 
 - **ROI.md** intent; sole human-owned doc; pre-receive hook rejects honeybee diffs.
-- **PLAN.md** tasks, state machine: TODO→IN-PROGRESS→NEEDS-REVIEW→{DONE|NEEDS-ARBITRATION};
-  arb→{TODO|DONE}; >3 rejects→NEEDS-HUMAN. Carries the ROI reconcile stamp.
+- **PLAN.md** tasks, state machine: TODO→NEEDS-REVIEW→{DONE|NEEDS-ARBITRATION};
+  arbitration→{TODO|DONE}; reject overflow or explicit `beehive task human ... --reason` → NEEDS-HUMAN with a `Human-needed:` reason. Active work is session+heartbeat metadata, not an IN-PROGRESS status. Carries the ROI reconcile stamp.
 - **docs/** terse, LLM-targeted change docs, one per branch+task.
 - **ARTIFACTS.md / INFRASTRUCTURE.md** outputs + deploy/infra config.
 - **SUBMODULE-LINKS.yaml** dependency edges; cycle-checked on every tag write.

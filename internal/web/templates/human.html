@@ -1,6 +1,6 @@
 {{template "header"}}
 <h1>NEEDS-HUMAN</h1>
-<table><tr><th>submodule</th><th>id</th><th>desc</th></tr>
-{{range .Rows}}<tr><td>{{.Sub}}</td><td>{{.Item.ID}}</td><td>{{.Item.Desc}}</td></tr>{{else}}<tr><td colspan=3>none</td></tr>{{end}}
+<table><tr><th>submodule</th><th>id</th><th>reason</th><th>desc</th></tr>
+{{range .Rows}}<tr><td>{{.Sub}}</td><td>{{.Item.ID}}</td><td>{{.Item.HumanReason}}</td><td>{{.Item.Desc}}</td></tr>{{else}}<tr><td colspan=4>none</td></tr>{{end}}
 </table>
 {{template "footer"}}

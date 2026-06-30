@@ -9,6 +9,7 @@
 //
 //	## <id> [<STATUS>] <!-- attempts=N deps=a,b session=<id> heartbeat=<RFC3339> -->
 //	free-form body lines...
+//	Human-needed: concrete blocker/reason (only when status is NEEDS-HUMAN)
 //
 // The ROI stamp is the first comment; tasks are H2 headers carrying a metadata
 // comment. Body lines between headers belong to the preceding task. A task is
@@ -27,11 +28,14 @@ import (
 	"time"
 )
 
+const humanReasonPrefix = "Human-needed:"
+
 // Status is a task state. The machine is:
 //
 //	TODO -> NEEDS-REVIEW -> {DONE | NEEDS-ARBITRATION}
 //	NEEDS-ARBITRATION -> {TODO | DONE}
-//	rejections > limit -> NEEDS-HUMAN (terminal, frontend-only)
+//	rejections > limit -> NEEDS-HUMAN (terminal)
+//	explicit human request -> NEEDS-HUMAN (terminal, with Human-needed reason)
 //
 // "In progress" is NOT a status: a task being worked keeps its phase status
 // (TODO while implementing, NEEDS-REVIEW while under review, ...) and is marked
@@ -204,6 +208,34 @@ func (t *Task) header() string {
 	}
 	return fmt.Sprintf("## %s [%s] <!-- %s -->", t.ID, t.Status, meta)
 }
+
+// HumanReason returns the current reason a task is blocked for operator input,
+// recorded as a body field so humans can read/edit it directly in PLAN.md.
+func (t *Task) HumanReason() string {
+	for _, line := range t.Body {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), humanReasonPrefix); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
+}
+
+func (t *Task) setHumanReason(reason string) {
+	reason = oneLine(reason)
+	field := humanReasonPrefix + " " + reason
+	for i, line := range t.Body {
+		if _, ok := strings.CutPrefix(strings.TrimSpace(line), humanReasonPrefix); ok {
+			t.Body[i] = field
+			return
+		}
+	}
+	if len(t.Body) > 0 && strings.TrimSpace(t.Body[len(t.Body)-1]) != "" {
+		t.Body = append(t.Body, "")
+	}
+	t.Body = append(t.Body, field)
+}
+
+func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 // Stamp sets the Beehive-ROI sha, inserting the comment if absent.
 func (p *Plan) Stamp(sha string) {

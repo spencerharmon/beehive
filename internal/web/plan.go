@@ -38,18 +38,19 @@ type Dep struct {
 // satisfied/pending against this plan, and DocHref links the change doc the
 // implementing commit stamped (set by the handler, which has the repo + docs/).
 type PlanItem struct {
-	ID        string
-	Status    string
-	Desc      string // first non-empty body line (plan.Task has no Desc field)
-	Deps      []string
-	DepStates []Dep // deps resolved to satisfied/pending against this plan's DONE set
-	Weight    int
-	Session   string    // claim owner; "" when unclaimed
-	Heartbeat time.Time // last claim stamp; zero when unclaimed
-	Active    bool      // claim fresh within the TTL (the unified "in progress")
-	Stale     bool      // claim past the TTL (GC-reclaimable; owner presumed dead)
-	Doc       string    // linked change-doc path from a body "Doc:" line, "" if none
-	DocHref   string    // link to view the change doc (from the commit stamp), "" if unresolved
+	ID          string
+	Status      string
+	Desc        string // first non-empty body line (plan.Task has no Desc field)
+	Deps        []string
+	DepStates   []Dep // deps resolved to satisfied/pending against this plan's DONE set
+	Weight      int
+	Session     string    // claim owner; "" when unclaimed
+	Heartbeat   time.Time // last claim stamp; zero when unclaimed
+	Active      bool      // claim fresh within the TTL (the unified "in progress")
+	Stale       bool      // claim past the TTL (GC-reclaimable; owner presumed dead)
+	Doc         string    // linked change-doc path from a body "Doc:" line, "" if none
+	DocHref     string    // link to view the change doc (from the commit stamp), "" if unresolved
+	HumanReason string    // explicit NEEDS-HUMAN reason from a body "Human-needed:" line
 }
 
 // StatusClass is the design-system pill class for the task's status: the base
@@ -155,14 +156,15 @@ func resolveDeps(items []PlanItem) {
 // active/stale claim flags against now/ttl.
 func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
 	it := PlanItem{
-		ID:        t.ID,
-		Status:    string(t.Status),
-		Deps:      t.Deps,
-		Weight:    t.Weight,
-		Session:   t.Session,
-		Heartbeat: t.Heartbeat,
-		Active:    t.Active(now, ttl),
-		Stale:     t.Stale(now, ttl),
+		ID:          t.ID,
+		Status:      string(t.Status),
+		Deps:        t.Deps,
+		Weight:      t.Weight,
+		Session:     t.Session,
+		Heartbeat:   t.Heartbeat,
+		Active:      t.Active(now, ttl),
+		Stale:       t.Stale(now, ttl),
+		HumanReason: t.HumanReason(),
 	}
 	for _, line := range t.Body {
 		s := strings.TrimSpace(line)

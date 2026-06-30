@@ -8,8 +8,8 @@ import (
 
 // transitions enumerates the legal status edges. There is no IN-PROGRESS state:
 // a task is implemented in place at TODO (marked active by a session+heartbeat),
-// then moves straight to NEEDS-REVIEW. NEEDS-HUMAN is terminal and only reachable
-// via Reject overflow.
+// then moves straight to NEEDS-REVIEW. NEEDS-HUMAN is terminal and reachable via
+// Reject overflow or explicit human-request escalation with a concrete reason.
 var transitions = map[Status]map[Status]bool{
 	StatusTODO:   {StatusReview: true},
 	StatusReview: {StatusDone: true, StatusArb: true},
@@ -79,9 +79,31 @@ func (t *Task) Reject(limit int, now time.Time) error {
 	t.Heartbeat = time.Time{}
 	if t.Attempts > limit {
 		t.Status = StatusHuman
+		if t.HumanReason() == "" {
+			t.setHumanReason(fmt.Sprintf("rejected %d times; exceeded reject_limit=%d", t.Attempts, limit))
+		}
 	} else {
 		t.Status = StatusTODO
 	}
+	return nil
+}
+
+// RequestHuman moves a non-DONE task to NEEDS-HUMAN with an explicit reason and
+// releases its active claim. This is the first-class escalation path when a bee
+// hits a concrete blocker requiring operator input (credentials, calibration,
+// public-contract decision, contradictory spec, missing upstream API, etc.).
+func (t *Task) RequestHuman(reason string, now time.Time) error {
+	reason = oneLine(reason)
+	if reason == "" {
+		return fmt.Errorf("plan: human request for %s requires a reason", t.ID)
+	}
+	if t.Status == StatusDone {
+		return fmt.Errorf("plan: cannot request human for DONE task %s", t.ID)
+	}
+	t.Status = StatusHuman
+	t.Session = ""
+	t.Heartbeat = time.Time{}
+	t.setHumanReason(reason)
 	return nil
 }
 

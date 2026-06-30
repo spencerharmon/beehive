@@ -20,7 +20,7 @@ All views derive from beehive repo files; the daemon is the only long-running pr
 | POST /submodule/link               | create SUBMODULE-LINKS entry                     |
 | GET  /env                          | dev/prod + blue/green deployment mgmt           |
 | POST /env/deploy                   | trigger blue/green switch                       |
-| GET  /human                        | NEEDS-HUMAN items awaiting resolution           |
+| GET  /human                        | NEEDS-HUMAN items awaiting resolution with reason |
 
 ## Component inventory (templates/)
 - `layout.html` — shell, nav, htmx headers

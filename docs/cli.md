@@ -15,6 +15,7 @@ beehive secret update -f <file.yaml>      replace secrets
 beehive secret edit                       decrypt to $EDITOR, re-encrypt
 
 beehive honeybee start <path>             select + run one honeybee on a submodule
+beehive task human <submodule> <task-id>  set NEEDS-HUMAN with --reason/--reason-file
 beehive worktree add <submodule> <branch> create per-branch worktree
 beehive worktree rm  <submodule> <branch> remove worktree
 ```

@@ -307,7 +307,8 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"Implementer branch bee-%[2]s in submodules/%[1]s/repo; change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
 				"reviewer rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
 				"SIDE WITH IMPLEMENTER -> merge pointer bump + PLAN.md DONE + unlock dependents. "+
-				"SIDE WITH REVIEWER -> PLAN.md TODO (or NEEDS-HUMAN past the limit) with the binding rationale.\n"+
+				"SIDE WITH REVIEWER -> PLAN.md TODO with the binding rationale; if a concrete operator blocker is exposed, "+
+				"run beehive task human %[1]s %[2]s --reason \"<specific blocker>\".\n"+
 				"The run completes when the task leaves NEEDS-ARBITRATION. Act autonomously.\n\n",
 			smName, sel.Task.ID)
 	case selectt.Work:
@@ -336,7 +337,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			"Claim: the runner stamped this task session=%[1]s and re-stamps it each turn. Before doing work "+
 				"each turn, confirm submodules/%[2]s/PLAN.md still shows session=%[1]s on task %[3]s with a fresh "+
 				"heartbeat. If a DIFFERENT session holds it, STOP immediately — you lost the race and the runner "+
-				"will reselect. Do not edit the session/heartbeat yourself.\n\n",
+				"will reselect. Do not edit the session/heartbeat yourself. If you hit a concrete blocker requiring "+
+				"operator input, run: beehive task human %[2]s %[3]s --reason \"<specific blocker and exact input needed>\". "+
+				"Use exact status NEEDS-HUMAN; never write HUMAN-NEEDED.\n\n",
 			r.Session, smName, sel.Task.ID)
 	}
 	first = preamble + first
@@ -693,6 +696,9 @@ func (r *Runner) statusLeft(sel *selectt.Selection, from plan.Status) (bool, err
 	if t == nil {
 		return false, nil
 	}
+	if t.Status == plan.NeedsHuman && t.HumanReason() == "" {
+		return false, nil
+	}
 	return t.Status != from, nil
 }
 
@@ -729,6 +735,9 @@ func (r *Runner) workDone(sel *selectt.Selection, branch string) (bool, error) {
 	t := p.Find(sel.Task.ID)
 	if t == nil {
 		return false, nil
+	}
+	if t.Status == plan.NeedsHuman {
+		return t.HumanReason() != "", nil
 	}
 	terminal := t.Status == plan.Done || t.Status == plan.NeedsReview ||
 		t.Status == plan.NeedsArb

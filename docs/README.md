@@ -68,6 +68,7 @@ beehive submodule link <a> <b>
 beehive submodule plan rollback <plan-id>
 beehive secret add|update|edit -f file.yaml
 beehive honeybee start <path>
+beehive task human <submodule> <task-id> --reason "specific blocker"
 beehive worktree add|rm <submodule> <branch>
 beehive audit [submodule]
 beehive instruction list|update

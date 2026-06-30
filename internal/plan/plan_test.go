@@ -3,6 +3,7 @@ package plan
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,6 +132,38 @@ func TestRejectAttempts(t *testing.T) {
 	tk.Reject(3, now) // 4th > 3
 	if tk.Status != StatusHuman {
 		t.Fatalf("want NEEDS-HUMAN, got %s", tk.Status)
+	}
+	if got := tk.HumanReason(); got == "" {
+		t.Fatal("reject overflow should record a human reason")
+	}
+}
+
+func TestRequestHuman(t *testing.T) {
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	tk := &Task{ID: "a", Status: StatusTODO, Session: "bee-1", Heartbeat: now, Body: []string{"do thing"}}
+	if err := tk.RequestHuman("Need operator to choose public wire format.\nChanging later is breaking.", now); err != nil {
+		t.Fatal(err)
+	}
+	if tk.Status != StatusHuman {
+		t.Fatalf("status = %s, want NEEDS-HUMAN", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("human request must release claim")
+	}
+	if got := tk.HumanReason(); got != "Need operator to choose public wire format. Changing later is breaking." {
+		t.Fatalf("reason = %q", got)
+	}
+	if got := (&Plan{Tasks: []*Task{tk}}).String(); !strings.Contains(got, "Human-needed: Need operator") {
+		t.Fatalf("serialized plan missing human reason:\n%s", got)
+	}
+}
+
+func TestRequestHumanRejectsEmptyAndDone(t *testing.T) {
+	if err := (&Task{ID: "a", Status: StatusTODO}).RequestHuman(" \n\t ", time.Now()); err == nil {
+		t.Fatal("empty reason allowed")
+	}
+	if err := (&Task{ID: "a", Status: StatusDone}).RequestHuman("need operator", time.Now()); err == nil {
+		t.Fatal("DONE human request allowed")
 	}
 }
 
