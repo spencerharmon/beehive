@@ -67,6 +67,7 @@ them all up front. Resolve a skill's path against `skills/` at the repo root.
 | Bootstrap | standing up a new target or whole install | `skills/bootstrap.md` |
 | Rebootstrap | rebuilding a target's plan from scratch | `skills/rebootstrap.md` |
 | Cleanup | clearing stale worktrees/branches/claims/drift | `skills/cleanup.md` |
+| Edit on a shared checkout | changing a submodule/layer file while honeybees or beehived share the filesystem | `skills/shared-checkout-edits.md` |
 | Update instructions | refreshing managed files to new binary defaults | `skills/update-instructions.md` |
 
 The binary ships a default for every skill above; a site may add its own skill files
