@@ -367,3 +367,83 @@ func TestPublishToMainHealsDirtyLocalTree(t *testing.T) {
 		t.Fatalf("published content missing in main worktree: %q", got)
 	}
 }
+
+// TestSourceBranchReclaimVerbs exercises the remote-branch reclamation primitives
+// end to end through a bare origin: LsRemoteBranch sees a pushed branch (and the
+// absence of one), IsAncestor distinguishes a merged branch from a divergent one,
+// DeleteRemoteBranch removes a present branch and is a no-op (no error) on an
+// already-absent one, and DeleteBranch drops a local ref.
+func TestSourceBranchReclaimVerbs(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+
+	// Seed origin/main, then push a "merged" bee branch (== main) and a divergent
+	// "unmerged" bee branch (main + 1 commit not on main).
+	main := commitFile(t, a, "f", "v1\n", "v1")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push main: %v", err)
+	}
+	if _, err := a.Run(ctx, "push", "origin", "main:refs/heads/bee-merged"); err != nil {
+		t.Fatalf("push bee-merged: %v", err)
+	}
+	unmerged := commitFile(t, a, "g", "side\n", "side") // advances a's HEAD past origin/main
+	if _, err := a.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-unmerged"); err != nil {
+		t.Fatalf("push bee-unmerged: %v", err)
+	}
+
+	// A second clone is the "reclaimer" that inspects/deletes via the verbs.
+	b := cloneOf(t, origin, "b")
+
+	// LsRemoteBranch: present branches resolve to their tips; an absent one is "".
+	if got, err := b.LsRemoteBranch(ctx, "origin", "bee-merged"); err != nil || got != main {
+		t.Fatalf("LsRemoteBranch bee-merged = %q,%v want %s", got, err, main)
+	}
+	if got, err := b.LsRemoteBranch(ctx, "origin", "bee-unmerged"); err != nil || got != unmerged {
+		t.Fatalf("LsRemoteBranch bee-unmerged = %q,%v want %s", got, err, unmerged)
+	}
+	if got, err := b.LsRemoteBranch(ctx, "origin", "bee-absent"); err != nil || got != "" {
+		t.Fatalf("LsRemoteBranch bee-absent = %q,%v want empty", got, err)
+	}
+
+	// Bring the branch tips local so IsAncestor can read their objects.
+	if err := b.Fetch(ctx, "origin", "main"); err != nil {
+		t.Fatalf("fetch main: %v", err)
+	}
+	if err := b.Fetch(ctx, "origin", "bee-unmerged"); err != nil {
+		t.Fatalf("fetch bee-unmerged: %v", err)
+	}
+	// IsAncestor: the merged tip is contained in origin/main; the divergent one is not.
+	if ok, err := b.IsAncestor(ctx, main, "origin/main"); err != nil || !ok {
+		t.Fatalf("IsAncestor(merged, origin/main) = %v,%v want true", ok, err)
+	}
+	if ok, err := b.IsAncestor(ctx, unmerged, "origin/main"); err != nil || ok {
+		t.Fatalf("IsAncestor(unmerged, origin/main) = %v,%v want false", ok, err)
+	}
+
+	// DeleteRemoteBranch removes a present branch...
+	if err := b.DeleteRemoteBranch(ctx, "origin", "bee-merged"); err != nil {
+		t.Fatalf("DeleteRemoteBranch bee-merged: %v", err)
+	}
+	if got, _ := b.LsRemoteBranch(ctx, "origin", "bee-merged"); got != "" {
+		t.Fatalf("bee-merged still on origin after delete: %s", got)
+	}
+	// ...and is an idempotent no-op (no error) on an already-absent branch.
+	if err := b.DeleteRemoteBranch(ctx, "origin", "bee-merged"); err != nil {
+		t.Fatalf("DeleteRemoteBranch of an absent branch must be a no-op, got %v", err)
+	}
+	if err := b.DeleteRemoteBranch(ctx, "origin", "bee-never-existed"); err != nil {
+		t.Fatalf("DeleteRemoteBranch of a never-existing branch must be a no-op, got %v", err)
+	}
+
+	// DeleteBranch drops a local ref (create one, then delete it).
+	if _, err := b.Run(ctx, "branch", "bee-local", "main"); err != nil {
+		t.Fatalf("create local branch: %v", err)
+	}
+	if err := b.DeleteBranch(ctx, "bee-local"); err != nil {
+		t.Fatalf("DeleteBranch: %v", err)
+	}
+	if _, err := b.Run(ctx, "rev-parse", "--verify", "refs/heads/bee-local"); err == nil {
+		t.Fatal("local branch bee-local still present after DeleteBranch")
+	}
+}

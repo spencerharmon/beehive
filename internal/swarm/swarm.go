@@ -433,6 +433,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			_ = wg.WorktreeRemove(ctx, wtAbs)
 		}
 	}
+	// reclaimBranch deletes this task's merged source branch from the submodule
+	// origin and drops its local ref. Call it AFTER cleanup() removes the worktree
+	// (a checked-out branch cannot be deleted locally). The hard merged-guard inside
+	// means an unmerged/in-flight branch is left intact, so it is safe on DONE and
+	// cap alike. A reclaim warning is recorded only when no warning is already set.
+	reclaimBranch := func() {
+		if w := r.reclaimSourceBranch(ctx, sel.Submodule, res.Branch, absRoot); w != "" && res.Warning == "" {
+			res.Warning = w
+		}
+	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
 		// Revert any change the agent made to the repo's git config (remotes) during
 		// the previous turn before doing more work. Honeybees publish via worktree
@@ -490,6 +500,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					}
 					_ = cl.Release(ctx, sel.Task.ID)
 					cleanup()
+					reclaimBranch()
 					return res, nil
 				}
 				res.Warning = fmt.Sprintf(
@@ -580,6 +591,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				_ = cl.Release(ctx, sel.Task.ID)
 			}
 			cleanup()
+			reclaimBranch()
 			return res, nil
 		}
 		if r.now().After(deadline) {
@@ -602,6 +614,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		return res, ferr
 	}
 	cleanup()
+	reclaimBranch()
 	return res, nil
 }
 
@@ -872,5 +885,68 @@ func (r *Runner) pushSourceBranch(ctx context.Context, wg *git.Repo, branch stri
 	if err := wg.Push(ctx, rem, branch); err != nil {
 		return fmt.Sprintf("source branch %s was NOT pushed to %s (%v); the submodule pointer will dangle until pushed", branch, rem, err)
 	}
+	return ""
+}
+
+// reclaimSourceBranch deletes a finished task's pushed bee-<taskid> source branch
+// from the submodule origin and drops its local ref — but ONLY once that branch's
+// tip is already contained in the submodule's tracked main. That guard is
+// load-bearing: an in-flight branch (e.g. just handed to NEEDS-REVIEW, or a
+// capped/abandoned attempt) is never deleted, so a delete can never lose a commit
+// nor dangle the bumped pointer for peers — once the commit lives on main it stays
+// resolvable there after the branch is gone. It rides the GC/DONE path and is
+// best-effort: it returns a warning string, never a hard error. A Review/Arbitrate
+// pass or single-host install without the submodule checked out, a missing remote,
+// or an already-deleted branch is a silent no-op; only a failed delete or a check
+// that could not run is surfaced as a warning, leaving the branch intact.
+func (r *Runner) reclaimSourceBranch(ctx context.Context, sub repo.Submodule, branch, absRoot string) string {
+	repoDir := sub.RepoDir()
+	// Without a real submodule checkout (Review/Arbitrate, or a host that never
+	// initialized it) we cannot talk to its origin; leave reclamation to a host
+	// that has the checkout.
+	if !isSourceCheckout(ctx, repoDir) {
+		return ""
+	}
+	sg := git.New(repoDir)
+	rem, err := sg.Remote(ctx)
+	if err != nil || rem == "" {
+		return "" // no remote: nothing was ever pushed, nothing to reclaim
+	}
+	tip, err := sg.LsRemoteBranch(ctx, rem, branch)
+	if err != nil {
+		return fmt.Sprintf("could not query source branch %s on %s (%v); left intact", branch, rem, err)
+	}
+	if tip == "" {
+		// The remote branch is already gone (a peer reclaimed it, or it was never
+		// pushed). Drop any lingering local ref so it does not accumulate; no-op.
+		_ = sg.DeleteBranch(ctx, branch)
+		return ""
+	}
+	rel, err := filepath.Rel(absRoot, repoDir)
+	if err != nil {
+		return fmt.Sprintf("could not resolve %s submodule path (%v); source branch %s left intact", sub.Name, err, branch)
+	}
+	tracked := r.trackedBranch(ctx, rel)
+	// Fetch the tracked main (so the ancestry check sees the latest, incl. a just-
+	// merged approval) and the source branch (so its tip object is present locally).
+	if err := sg.Fetch(ctx, rem, tracked); err != nil {
+		return fmt.Sprintf("could not fetch %s/%s to verify source branch %s is merged (%v); left intact", rem, tracked, branch, err)
+	}
+	if err := sg.Fetch(ctx, rem, branch); err != nil {
+		return fmt.Sprintf("could not fetch source branch %s from %s (%v); left intact", branch, rem, err)
+	}
+	merged, err := sg.IsAncestor(ctx, tip, rem+"/"+tracked)
+	if err != nil {
+		return fmt.Sprintf("could not determine whether source branch %s is merged into %s/%s (%v); left intact", branch, rem, tracked, err)
+	}
+	if !merged {
+		// In-flight: deleting it would lose the commit and dangle the pointer. Keep.
+		return ""
+	}
+	if err := sg.DeleteRemoteBranch(ctx, rem, branch); err != nil {
+		return fmt.Sprintf("merged source branch %s was NOT deleted on %s (%v); it will accumulate until reclaimed", branch, rem, err)
+	}
+	// The remote branch is gone and the commit survives on main; drop the local ref.
+	_ = sg.DeleteBranch(ctx, branch)
 	return ""
 }

@@ -989,3 +989,215 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// gitConfig sets a committer identity on an already-existing repo/clone (which,
+// unlike gitInit, must not be re-`git init`ed).
+func gitConfig(t *testing.T, dir string) *git.Repo {
+	t.Helper()
+	g := git.New(dir)
+	ctx := context.Background()
+	for _, a := range [][]string{{"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		if _, err := g.Run(ctx, a...); err != nil {
+			t.Fatalf("config %v: %v", a, err)
+		}
+	}
+	return g
+}
+
+// bareOriginSeeded creates a bare origin with a single base commit on main
+// (seeded via a scratch clone driven by g) and returns the origin path.
+func bareOriginSeeded(t *testing.T, g *git.Repo) string {
+	t.Helper()
+	ctx := context.Background()
+	origin := t.TempDir()
+	if _, err := git.New(origin).Run(ctx, "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("bare init: %v", err)
+	}
+	seed := filepath.Join(t.TempDir(), "seed")
+	if _, err := g.Run(ctx, "clone", "-q", origin, seed); err != nil {
+		t.Fatalf("seed clone: %v", err)
+	}
+	sg := gitConfig(t, seed)
+	os.WriteFile(filepath.Join(seed, "f"), []byte("base\n"), 0o644)
+	if err := sg.Commit(ctx, "base"); err != nil {
+		t.Fatalf("seed base: %v", err)
+	}
+	if err := sg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("seed push: %v", err)
+	}
+	return origin
+}
+
+// originHasBranch reports whether the bare origin still advertises a local branch.
+func originHasBranch(t *testing.T, origin, branch string) bool {
+	t.Helper()
+	out, err := git.New(origin).Run(context.Background(), "for-each-ref", "--format=%(refname:short)", "refs/heads/"+branch)
+	if err != nil {
+		t.Fatalf("for-each-ref %s: %v", branch, err)
+	}
+	return strings.TrimSpace(out) == branch
+}
+
+// TestReclaimSourceBranchGuard drives reclaimSourceBranch directly across its four
+// outcomes: a merged branch (tip already on the tracked main) is deleted on origin;
+// an unmerged in-flight branch is left intact (deleting it would lose the commit
+// and dangle the bumped pointer); a missing branch is a silent no-op; and a
+// checkout with no remote is a silent no-op. None may surface a warning.
+func TestReclaimSourceBranchGuard(t *testing.T) {
+	ctx := context.Background()
+
+	// build makes a beehive Runner whose submodule "sm" is a fresh clone of a bare
+	// origin seeded with main, returning the pieces the assertions need. Each case
+	// gets its own isolated origin + checkout.
+	build := func(t *testing.T) (*Runner, repo.Submodule, string, string) {
+		t.Helper()
+		root := t.TempDir()
+		g := gitInit(t, root)
+		repo.Init(root)
+		sm := filepath.Join(root, "submodules", "sm")
+		os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+		origin := bareOriginSeeded(t, g)
+		repoDir := filepath.Join(sm, "repo")
+		if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+			t.Fatalf("clone submodule: %v", err)
+		}
+		gitConfig(t, repoDir)
+		g.Commit(ctx, "seed")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		absRoot, _ := filepath.Abs(root)
+		return &Runner{Repo: rp, Git: g}, subs[0], origin, absRoot
+	}
+
+	// pushBee creates branch on origin via a scratch clone: extra==true adds a
+	// commit (so the branch diverges from main = unmerged); extra==false points it
+	// at main (already merged).
+	pushBee := func(t *testing.T, g *git.Repo, origin, branch string, extra bool) {
+		t.Helper()
+		sc := filepath.Join(t.TempDir(), "push-"+branch)
+		if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+			t.Fatalf("scratch clone: %v", err)
+		}
+		scg := gitConfig(t, sc)
+		if extra {
+			os.WriteFile(filepath.Join(sc, branch+".txt"), []byte("work\n"), 0o644)
+			if err := scg.Commit(ctx, "work on "+branch); err != nil {
+				t.Fatalf("commit on %s: %v", branch, err)
+			}
+		}
+		if _, err := scg.Run(ctx, "push", "origin", "HEAD:refs/heads/"+branch); err != nil {
+			t.Fatalf("push %s: %v", branch, err)
+		}
+	}
+
+	t.Run("merged-deletes", func(t *testing.T) {
+		r, sub, origin, absRoot := build(t)
+		pushBee(t, r.Git, origin, "bee-T1", false) // == main: merged
+		if !originHasBranch(t, origin, "bee-T1") {
+			t.Fatal("precondition: bee-T1 should be on origin")
+		}
+		if w := r.reclaimSourceBranch(ctx, sub, "bee-T1", absRoot); w != "" {
+			t.Fatalf("merged branch reclaim warned: %q", w)
+		}
+		if originHasBranch(t, origin, "bee-T1") {
+			t.Fatal("a merged source branch must be deleted on origin")
+		}
+	})
+
+	t.Run("unmerged-kept", func(t *testing.T) {
+		r, sub, origin, absRoot := build(t)
+		pushBee(t, r.Git, origin, "bee-T1", true) // main + 1: unmerged
+		if w := r.reclaimSourceBranch(ctx, sub, "bee-T1", absRoot); w != "" {
+			t.Fatalf("unmerged branch reclaim warned: %q", w)
+		}
+		if !originHasBranch(t, origin, "bee-T1") {
+			t.Fatal("an unmerged in-flight source branch must be left intact on origin")
+		}
+	})
+
+	t.Run("missing-noop", func(t *testing.T) {
+		r, sub, origin, absRoot := build(t)
+		if w := r.reclaimSourceBranch(ctx, sub, "bee-T1", absRoot); w != "" {
+			t.Fatalf("missing branch reclaim must be a silent no-op, warned: %q", w)
+		}
+		if originHasBranch(t, origin, "bee-T1") {
+			t.Fatal("missing case must not create bee-T1")
+		}
+	})
+
+	t.Run("no-remote-noop", func(t *testing.T) {
+		root := t.TempDir()
+		g := gitInit(t, root)
+		repo.Init(root)
+		sm := filepath.Join(root, "submodules", "sm")
+		os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+		repoDir := filepath.Join(sm, "repo")
+		os.MkdirAll(repoDir, 0o755)
+		gitInit(t, repoDir) // a real checkout but NO remote
+		os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+		git.New(repoDir).Commit(ctx, "base")
+		g.Commit(ctx, "seed")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		absRoot, _ := filepath.Abs(root)
+		r := &Runner{Repo: rp, Git: g}
+		if w := r.reclaimSourceBranch(ctx, subs[0], "bee-T1", absRoot); w != "" {
+			t.Fatalf("no-remote reclaim must be a silent no-op, warned: %q", w)
+		}
+	})
+}
+
+// TestWorkCompletionKeepsUnmergedSourceBranch is the end-to-end guard: a Work task
+// that completes to NEEDS-REVIEW pushes its bee-<taskid> source branch to the
+// submodule origin, but because that branch carries a commit not yet on the tracked
+// main, the DONE/cap reclaim must LEAVE IT INTACT — deleting it would lose the
+// in-flight commit and dangle the just-bumped pointer for reviewers/peers.
+func TestWorkCompletionKeepsUnmergedSourceBranch(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+
+	// The submodule checkout is a clone of a bare origin seeded with main.
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		// Author a real commit on the source branch so bee-T1 diverges from the
+		// tracked main (a genuine in-flight, not-yet-merged change)...
+		os.WriteFile(filepath.Join(wtDir, "feature.txt"), []byte("work\n"), 0o644)
+		_ = git.New(wtDir).Commit(ctx, "feat: in-flight work")
+		// ...then complete the Work handoff: change doc + NEEDS-REVIEW.
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("want completed handoff, got %+v", res)
+	}
+	// The source branch was pushed (so the pointer resolves) AND kept (unmerged).
+	if !originHasBranch(t, origin, "bee-T1") {
+		t.Fatal("completed Work pushed an unmerged bee-T1 that reclaim wrongly deleted")
+	}
+	if res.Warning != "" {
+		t.Fatalf("keeping an unmerged branch must not warn, got %q", res.Warning)
+	}
+}
