@@ -78,6 +78,33 @@ Override listen address when needed:
 beehived -addr 0.0.0.0:8955 -repo /path/to/beehive-repo
 ```
 
+### Frontend performance & the supported-submodule ceiling
+
+Every dashboard/plan/human request derives its view from files on disk (chiefly
+each submodule's `PLAN.md`). To avoid re-reading and re-parsing every plan on
+every request, `beehived` memoizes the parse **per repo `HEAD` commit**: the
+first request at a given `HEAD` parses each `PLAN.md` once, and subsequent
+requests reuse that parse until `HEAD` advances. Because honeybees publish only
+by committing/pushing — every claim, heartbeat, status flip, and merge is a
+commit — any change to a tracked file advances `HEAD` and drops the whole cache,
+so the frontend never serves data from a stale commit. Invalidation is
+deliberately coarse (whole-cache on any commit): correctness over hit-rate.
+
+Only the time-*independent* work (the read + parse) is cached. Time-*dependent*
+state — whether a task's claim is still fresh or has gone stale — is recomputed
+against the wall clock on every request, so a crashed owner's claim still expires
+on schedule even though no new commit advanced `HEAD`.
+
+**Ceiling.** The cache holds one parsed plan per submodule for the current
+`HEAD`, so live memory is `O(submodules)` parsed plans and each commit re-parses
+the plans touched since. This is sized for human-scale hives — up to a few
+hundred submodules with tens-of-KB `PLAN.md` files — where the parsed set fits
+comfortably in memory and a full re-parse per commit is cheap next to the request
+rate. Far beyond that (thousands of submodules, or a commit cadence so high that
+nearly every request spans a fresh `HEAD`) the coarse invalidation degrades
+toward the uncached cost. That is a hit-rate ceiling, not a correctness cliff:
+views stay correct at any scale.
+
 ## Quick start
 
 ```sh

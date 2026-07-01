@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -172,7 +173,7 @@ func TestDashboardCards(t *testing.T) {
 	// t1's heartbeat is 2026-06-30T11:00:00Z; 30m before now with a 60m TTL => a
 	// fresh claim, so alpha is Working.
 	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
-	views, err := s.subViews(now, time.Hour)
+	views, err := s.subViews(context.Background(), now, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,6 +204,11 @@ func TestDashboardCards(t *testing.T) {
 	if !a.Working {
 		t.Errorf("alpha Working = false, want true (t1 claim fresh at now)")
 	}
+	// Stamp rides the same cached PLAN.md parse (p.ROIStamp), not a second
+	// ROIStamp() disk read: alpha's PLAN.md carries `Beehive-ROI: abc123`.
+	if a.Stamp != "abc123" {
+		t.Errorf("alpha Stamp = %q, want abc123 (from the cached plan parse)", a.Stamp)
+	}
 
 	if got := by["bravo"].State; got != "bootstrap" {
 		t.Errorf("bravo State = %q, want bootstrap", got)
@@ -219,7 +225,7 @@ func TestDashboardCards(t *testing.T) {
 
 	// A claim well past the TTL must NOT read as Working (the card's live overlay
 	// is derived from claim freshness, not a status).
-	stale, err := s.subViews(now.Add(48*time.Hour), time.Hour)
+	stale, err := s.subViews(context.Background(), now.Add(48*time.Hour), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +382,163 @@ func TestParsePlanMissingFile(t *testing.T) {
 	}
 }
 
-// TestPlanItemViewHelpers locks the pure view projections plan-view-pills adds:
+// TestPlanViewMissingFile confirms the cached path matches the uncached baseline
+// for the empty-plan case: a not-yet-bootstrapped submodule (no PLAN.md) is an
+// empty plan, not an error, and — since a missing read is not cached as an error
+// — it still resolves cleanly.
+func TestPlanViewMissingFile(t *testing.T) {
+	s, root := setup(t)
+	commitAll(t, root, "init")
+	head := s.headSHA(context.Background())
+	p, err := s.planView(head, filepath.Join(root, "submodules", "alpha", "nope.md"), time.Now(), time.Hour)
+	if err != nil {
+		t.Fatalf("missing file should be empty plan, got err %v", err)
+	}
+	if len(p.Items) != 0 || p.ROIStamp != "" {
+		t.Fatalf("missing file should yield empty plan, got %+v", p)
+	}
+}
+
+// TestPlanViewCacheHitAndCommitInvalidation is the core of the parse-once cache:
+// repeated reads at one repo HEAD parse PLAN.md exactly once (a cache hit adds no
+// miss), and a commit — which advances HEAD — drops the generation so the next
+// read re-parses. Keying invalidation on HEAD is exactly the design's trigger:
+// every claim, heartbeat, status flip, and merge is a commit, so any of them
+// advances HEAD and conservatively wipes the cache.
+func TestPlanViewCacheHitAndCommitInvalidation(t *testing.T) {
+	s, root := setup(t)
+	commitAll(t, root, "init") // give the repo a HEAD so the cache engages
+	path := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+	ttl := time.Hour
+	head1 := s.headSHA(context.Background())
+	if head1 == "" {
+		t.Fatal("no HEAD after seed commit")
+	}
+
+	p1, err := s.planView(head1, path, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cache.Misses(); got != 1 {
+		t.Fatalf("first read misses = %d, want 1", got)
+	}
+	// Second read at the same HEAD is served from cache: no additional parse.
+	p2, err := s.planView(head1, path, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cache.Misses(); got != 1 {
+		t.Fatalf("cached read misses = %d, want 1 (parse-once per HEAD)", got)
+	}
+	if !reflect.DeepEqual(p1, p2) {
+		t.Fatalf("cached view differs from first read:\n %+v\nvs %+v", p1, p2)
+	}
+	// A commit advances HEAD -> the next read must re-parse.
+	commitAll(t, root, "advance")
+	head2 := s.headSHA(context.Background())
+	if head2 == head1 {
+		t.Fatalf("HEAD did not advance after commit (%q)", head2)
+	}
+	if _, err := s.planView(head2, path, now, ttl); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cache.Misses(); got != 2 {
+		t.Fatalf("post-commit misses = %d, want 2 (HEAD change invalidates)", got)
+	}
+}
+
+// TestPlanViewMatchesParsePlan proves the cache changes only WHEN the read+parse
+// runs, never WHAT the view contains: planView equals the uncached parsePlan
+// baseline for the same HEAD/now/ttl.
+func TestPlanViewMatchesParsePlan(t *testing.T) {
+	s, root := setup(t)
+	commitAll(t, root, "init")
+	path := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+	ttl := time.Hour
+
+	want, err := parsePlan(path, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.planView(s.headSHA(context.Background()), path, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("planView != parsePlan:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// TestPlanViewReprojectsClaimWithoutCommit guards WHAT is cached: only the
+// time-independent read+parse. A claim's active->stale flip turns purely on the
+// wall clock crossing the TTL with NO new commit (a crashed owner stops
+// committing, so HEAD never advances). The view must still flip while the parse
+// stays served from cache — i.e. the projection is recomputed every call, never
+// memoized.
+func TestPlanViewReprojectsClaimWithoutCommit(t *testing.T) {
+	s, root := setup(t)
+	commitAll(t, root, "init")
+	path := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	ttl := time.Hour
+	head := s.headSHA(context.Background())
+
+	// t1's heartbeat is 2026-06-30T11:00:00Z; 30m later within a 60m ttl => active.
+	fresh := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+	p, err := s.planView(head, path, fresh, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t1 := itemByID(p, "t1"); !t1.Active || t1.Stale {
+		t.Fatalf("t1 want active & !stale at fresh time, got %+v", t1)
+	}
+	if got := s.cache.Misses(); got != 1 {
+		t.Fatalf("misses = %d, want 1", got)
+	}
+	// Same HEAD (no commit), now well past the ttl: the parse is served from cache
+	// yet the claim must read stale / not-active.
+	expired := fresh.Add(48 * time.Hour)
+	p2, err := s.planView(head, path, expired, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t1 := itemByID(p2, "t1"); t1.Active || !t1.Stale {
+		t.Fatalf("t1 want !active & stale past ttl, got %+v", t1)
+	}
+	if got := s.cache.Misses(); got != 1 {
+		t.Fatalf("misses = %d, want 1 (parse cached; projection recomputed live)", got)
+	}
+}
+
+// itemByID returns the plan item with id (or a zero item), a small test helper
+// for asserting on one task's projected claim state.
+func itemByID(p Plan, id string) PlanItem {
+	for _, it := range p.Items {
+		if it.ID == id {
+			return it
+		}
+	}
+	return PlanItem{}
+}
+
+// commitAll writes a uniquely-named marker file under dir then stages and commits
+// everything, guaranteeing a real commit that advances the repo HEAD — the
+// viewCache generation key. Used by the cache tests to drive invalidation.
+func commitAll(t *testing.T, dir, marker string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "cachemarker-"+marker), []byte(marker), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range [][]string{{"add", "-A"}, {"commit", "-q", "-m", marker}} {
+		c := exec.Command("git", a...)
+		c.Dir = dir
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", a, err, out)
+		}
+	}
+}
+
 // the design-system status pill class (base shape + lower-cased slug hue), the
 // claim state derived from session+heartbeat freshness (NOT a status), and the
 // compact heartbeat label (empty when unclaimed).
