@@ -63,6 +63,21 @@ func (o *Opencode) Open(ctx context.Context, dir, system string) (Session, error
 	return &ocSession{oc: o, id: created.ID, dir: dir, system: system}, nil
 }
 
+// WithModel returns a shallow copy of the client pinned to model, so the runner
+// can dispatch a single session on a tiered (e.g. cheaper) model without mutating
+// the shared client every other session keeps using. model == "" or a model equal
+// to the current one is a no-op that returns the receiver unchanged, so a host
+// with no per-kind tiering keeps using exactly one client value (byte-identical to
+// the untiered path). Implements the ModelClient interface the runner probes for.
+func (o *Opencode) WithModel(model string) Client {
+	if model == "" || model == o.Model {
+		return o
+	}
+	cp := *o
+	cp.Model = model
+	return &cp
+}
+
 // NewSession creates a session and sends the first prompt, returning its reply.
 // Convenience for callers that don't record the first turn (e.g. the editor,
 // which reads the changed file from disk rather than the opencode transcript).

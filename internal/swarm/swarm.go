@@ -39,6 +39,15 @@ type Client interface {
 	Open(ctx context.Context, cwd, system string) (Session, error)
 }
 
+// ModelClient is an optional Client capability the runner probes for to tier the
+// agent model per task kind: WithModel returns a client pinned to model without
+// mutating the receiver, so the strong-model default every other kind uses is
+// left intact. A Client that does not implement it (or a "" route) always runs
+// the single default model, so per-kind tiering is inert unless configured.
+type ModelClient interface {
+	WithModel(model string) Client
+}
+
 // Runner drives a single honeybee turn loop.
 type Runner struct {
 	Repo     *repo.Repo
@@ -92,6 +101,22 @@ type Runner struct {
 	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
 	// backstop. 0 = no per-turn cap (tests).
 	TurnTimeout time.Duration
+
+	// ModelByKind tiers the agent model per selection kind (reconcile/bootstrap/
+	// work/review/arbitrate). When a kind maps to a non-empty model AND Client
+	// implements ModelClient, that session dispatches on the cheaper/tiered model;
+	// every unmapped kind keeps Client's default (strong) model. Empty/nil leaves a
+	// single-model host byte-identical to the untiered path. See routeModel.
+	ModelByKind map[string]string
+
+	// IdleTurns kills a pass that makes no forward progress for this many
+	// consecutive turns (idle-churn / loop detection). Progress is fingerprinted
+	// from task status + produced artifacts (see progressKey), NOT raw PLAN bytes,
+	// so the runner's own per-turn heartbeat re-stamp is not mistaken for progress.
+	// The stuck task is abandoned for GC (like the turn/wall cap) with a warning,
+	// rather than burning the whole MaxTurns budget. 0 = disabled (tests, and any
+	// host that has not opted in; MaxTurns/WallCap/TTL still apply).
+	IdleTurns int
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -344,10 +369,23 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	first = preamble + first
 
+	// Tier the model for this kind: if a per-kind route is configured and the
+	// client supports it, dispatch this whole session on the tiered (cheaper)
+	// model; otherwise use the client's strong default unchanged.
+	client := r.Client
+	if m := r.routeModel(sel); m != "" {
+		if mc, ok := client.(ModelClient); ok {
+			client = mc.WithModel(m)
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] kind=%s routed to model %s\n", sel.Kind, m)
+			}
+		}
+	}
+
 	if r.Debug != nil {
 		fmt.Fprintf(r.Debug, "[honeybee] dir=%s submodule=%s kind=%s opening session...\n", absRoot, sel.Submodule.Name, sel.Kind)
 	}
-	sess, err := r.Client.Open(ctx, absRoot, system)
+	sess, err := client.Open(ctx, absRoot, system)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
 	}
@@ -436,6 +474,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			_ = wg.WorktreeRemove(ctx, wtAbs)
 		}
 	}
+	// Idle-churn detection state: prevKey is the previous turn's progress
+	// fingerprint (see progressKey), idle counts consecutive turns whose
+	// fingerprint did not advance. Both are inert unless IdleTurns > 0.
+	var prevKey string
+	var haveKey bool
+	var idle int
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
 		// Revert any change the agent made to the repo's git config (remotes) during
 		// the previous turn before doing more work. Honeybees publish via worktree
@@ -585,6 +629,39 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			cleanup()
 			return res, nil
 		}
+		// Idle-churn / loop detection: the turn produced no completion, so fingerprint
+		// forward progress (task status + artifacts, never raw PLAN bytes). If the
+		// fingerprint has not advanced for IdleTurns consecutive turns, the agent is
+		// wedged — abandon the task for GC now (mirroring the turn/wall cap) instead
+		// of burning the full MaxTurns budget on a stuck pass. Inert when IdleTurns==0.
+		// A fingerprint read error is non-fatal: skip accounting this turn rather than
+		// kill a healthy pass on a transient FS/git blip.
+		if r.IdleTurns > 0 {
+			key, kerr := r.progressKey(ctx, sel, wtAbs)
+			switch {
+			case kerr != nil:
+				if r.Debug != nil {
+					fmt.Fprintf(r.Debug, "[honeybee] progress fingerprint (turn %d) failed: %v\n", res.Turns, kerr)
+				}
+			case !haveKey:
+				prevKey, haveKey, idle = key, true, 0
+			case key == prevKey:
+				idle++
+				if idle >= r.IdleTurns {
+					res.GCMarked = true
+					res.Warning = fmt.Sprintf(
+						"no forward progress for %d consecutive turns (idle churn); abandoning for GC", idle)
+					if ferr := finish(res.Warning); ferr != nil {
+						cleanup()
+						return res, ferr
+					}
+					cleanup()
+					return res, nil
+				}
+			default:
+				prevKey, idle = key, 0
+			}
+		}
 		if r.now().After(deadline) {
 			break
 		}
@@ -656,6 +733,77 @@ func (r *Runner) taskRemoved(ctx context.Context, sel *selectt.Selection) (bool,
 			sel.Task.ID, sel.Submodule.Name, ref), nil
 	}
 	return false, "", nil
+}
+
+// routeModel returns the tiered agent model configured for this selection's kind,
+// or "" when no per-kind tiering applies (empty map or the kind unmapped). "" is
+// the signal to keep the client's default (strong) model, so an unconfigured host
+// runs exactly one model.
+func (r *Runner) routeModel(sel *selectt.Selection) string {
+	if len(r.ModelByKind) == 0 {
+		return ""
+	}
+	return r.ModelByKind[string(sel.Kind)]
+}
+
+// progressKey fingerprints the honeybee's forward progress for idle-churn
+// detection (see the IdleTurns loop). It deliberately keys on TASK STATUS and
+// produced ARTIFACTS, never raw PLAN.md bytes: the runner re-stamps the task's
+// session/heartbeat every turn, so hashing the file would always look like
+// progress and defeat the check. Two turns with an identical key made no forward
+// progress. Bootstrap/Reconcile key on their completion signal; the task kinds
+// key on the task's status, and Work additionally on the change-doc presence and
+// the code worktree's HEAD + dirty state, so an agent actively editing/committing
+// code still counts as progress. wtAbs is the Work code worktree ("" otherwise).
+func (r *Runner) progressKey(ctx context.Context, sel *selectt.Selection, wtAbs string) (string, error) {
+	switch sel.Kind {
+	case selectt.Bootstrap:
+		_, err := os.Stat(sel.Submodule.PlanPath())
+		if err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+		return fmt.Sprintf("plan=%t", err == nil), nil
+	case selectt.Reconcile:
+		done, err := r.reconciled(sel)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("reconciled=%t", done), nil
+	default:
+		b, err := os.ReadFile(sel.Submodule.PlanPath())
+		if err != nil {
+			return "", err
+		}
+		p, err := plan.Parse(string(b))
+		if err != nil {
+			return "", err
+		}
+		status := "absent"
+		if t := p.Find(sel.Task.ID); t != nil {
+			status = string(t.Status)
+			if t.Status == plan.NeedsHuman {
+				status += fmt.Sprintf("/reason=%t", t.HumanReason() != "")
+			}
+		}
+		key := "status=" + status
+		if sel.Kind == selectt.Work && wtAbs != "" {
+			doc, derr := r.docPresent(sel, branchFor(sel))
+			if derr != nil {
+				return "", derr
+			}
+			wgt := git.New(wtAbs)
+			head, herr := wgt.RevParse(ctx, "HEAD")
+			if herr != nil {
+				return "", herr
+			}
+			dirty, derr := wgt.Run(ctx, "status", "--porcelain")
+			if derr != nil {
+				return "", derr
+			}
+			key += fmt.Sprintf(" doc=%t head=%s dirty=%q", doc, head, dirty)
+		}
+		return key, nil
+	}
 }
 
 // complete is the deterministic per-turn completion check.

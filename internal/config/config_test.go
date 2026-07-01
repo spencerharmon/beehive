@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -140,7 +141,10 @@ func TestResolveBareInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Defaults(hostDir)
-	if c != want {
+	// DeepEqual (not ==): Config now carries a map field (ModelByKind), which is
+	// not comparable with ==. Both sides have a nil map here, so this still asserts
+	// exact equality with the built-in Defaults.
+	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("bare Resolve = %+v, want Defaults %+v", c, want)
 	}
 }
@@ -155,5 +159,90 @@ func TestResolveMalformedErrors(t *testing.T) {
 
 	if _, err := Resolve(root, ""); err == nil {
 		t.Fatal("expected error for malformed config layer, got nil")
+	}
+}
+
+// TestResolveModelByKindLayering proves the per-kind model map merges KEY-BY-KEY
+// across layers (a more specific layer retiers one kind without dropping kinds a
+// lower layer set), unlike the scalar "whole value wins" fields, and that a
+// per-kind route survives alongside the untiered strong Model.
+func TestResolveModelByKindLayering(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+
+	// Host sets the strong default model and tiers two trivial kinds cheaply.
+	write(t, filepath.Join(hostDir, "config.yaml"), `
+model: strong/model
+model_by_kind:
+  reconcile: cheap/host
+  bootstrap: cheap/host
+`)
+	// Global retiers reconcile only; bootstrap must survive from the host layer.
+	write(t, filepath.Join(root, "config.yaml"), `
+model_by_kind:
+  reconcile: cheap/global
+`)
+	// Submodule adds a new kind (review) without disturbing the inherited ones.
+	write(t, filepath.Join(root, "submodules", "x", "config.yaml"), `
+model_by_kind:
+  review: cheap/sub
+`)
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Model != "strong/model" {
+		t.Errorf("Model = %q, want strong/model (untiered default kept)", c.Model)
+	}
+	want := map[string]string{
+		"reconcile": "cheap/global", // global retiered over host
+		"bootstrap": "cheap/host",   // survives from host (key-by-key merge)
+		"review":    "cheap/sub",    // added by the submodule layer
+	}
+	if !reflect.DeepEqual(c.ModelByKind, want) {
+		t.Fatalf("ModelByKind = %v, want %v (must merge per-key, not replace)", c.ModelByKind, want)
+	}
+}
+
+// TestResolveModelByKindNoAlias proves merge allocates a fresh map so a resolved
+// config never aliases (and thus can never mutate) a lower layer's map.
+func TestResolveModelByKindNoAlias(t *testing.T) {
+	base := Config{ModelByKind: map[string]string{"work": "strong"}}
+	over := Config{ModelByKind: map[string]string{"reconcile": "cheap"}}
+	out := merge(base, over)
+	out.ModelByKind["reconcile"] = "mutated"
+	if over.ModelByKind["reconcile"] != "cheap" {
+		t.Fatalf("merge aliased the over map: %v", over.ModelByKind)
+	}
+	if _, ok := base.ModelByKind["reconcile"]; ok {
+		t.Fatalf("merge mutated the base map: %v", base.ModelByKind)
+	}
+}
+
+// TestResolveMaxIdleTurns confirms max_idle_turns layers like the other scalar
+// caps (most-specific non-zero wins) and defaults to 0 (idle detection disabled)
+// on an unconfigured host.
+func TestResolveMaxIdleTurns(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+
+	// Default: no file sets it -> 0 (disabled), leaving a bare host unchanged.
+	if c, err := Resolve(root, "x"); err != nil {
+		t.Fatal(err)
+	} else if c.MaxIdleTurns != 0 {
+		t.Fatalf("MaxIdleTurns default = %d, want 0 (idle detection off unless configured)", c.MaxIdleTurns)
+	}
+
+	write(t, filepath.Join(hostDir, "config.yaml"), "max_idle_turns: 3\n")
+	write(t, filepath.Join(root, "submodules", "x", "config.yaml"), "max_idle_turns: 5\n")
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxIdleTurns != 5 {
+		t.Fatalf("MaxIdleTurns = %d, want 5 (submodule overrides host)", c.MaxIdleTurns)
 	}
 }

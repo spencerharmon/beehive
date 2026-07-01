@@ -168,3 +168,53 @@ func TestPromptIdlePollHonorsCancel(t *testing.T) {
 		t.Fatal("Prompt must surface the ctx cancellation of a never-idle turn, got nil error")
 	}
 }
+
+// TestWithModelNoop proves the tiering no-op contract: WithModel("") and
+// WithModel(current) return the SAME client (no allocation, no mutation), so a
+// host with no per-kind route keeps using exactly one client value.
+func TestWithModelNoop(t *testing.T) {
+	oc := &Opencode{Base: "http://x", Model: "strong/model", Temperature: 0.4, MaxTokens: 99}
+	for _, m := range []string{"", "strong/model"} {
+		got, ok := oc.WithModel(m).(*Opencode)
+		if !ok || got != oc {
+			t.Fatalf("WithModel(%q) = %v (ok=%v); want the same *Opencode receiver", m, got, ok)
+		}
+	}
+}
+
+// TestWithModelTiers proves WithModel returns an independent copy pinned to the
+// tiered model while leaving the receiver's Model (and every other knob) intact,
+// and that a Prompt on the tiered client sends the tiered model to the backend.
+func TestWithModelTiers(t *testing.T) {
+	var body map[string]any
+	srv := captureBody(t, &body)
+	defer srv.Close()
+
+	oc := &Opencode{Base: srv.URL, Model: "strong/model", Temperature: 0.4, MaxTokens: 99, HTTP: srv.Client()}
+	cheap, ok := oc.WithModel("cheap/mini").(*Opencode)
+	if !ok {
+		t.Fatal("WithModel did not return *Opencode")
+	}
+	if cheap == oc {
+		t.Fatal("WithModel returned the receiver; a real retier must be a copy")
+	}
+	if oc.Model != "strong/model" {
+		t.Fatalf("receiver Model mutated to %q; WithModel must not touch the receiver", oc.Model)
+	}
+	if cheap.Model != "cheap/mini" {
+		t.Fatalf("tiered client Model = %q, want cheap/mini", cheap.Model)
+	}
+	// Other knobs carry over unchanged into the copy.
+	if cheap.Temperature != 0.4 || cheap.MaxTokens != 99 || cheap.Base != oc.Base {
+		t.Fatalf("tiered copy dropped knobs: %+v", cheap)
+	}
+	// The tiered model actually reaches the request body.
+	s := &ocSession{oc: cheap, id: "s1", dir: "/wt", system: "sys"}
+	if _, err := s.Prompt(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	model, _ := body["model"].(map[string]any)
+	if model["providerID"] != "cheap" || model["modelID"] != "mini" {
+		t.Fatalf("request model = %v, want cheap/mini split", body["model"])
+	}
+}

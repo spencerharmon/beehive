@@ -52,17 +52,30 @@ type Config struct {
 	GPGRecipient string  `yaml:"gpg_recipient"` // recipient for SECRETS.yaml.gpg
 	AgentCmd     string  `yaml:"agent_cmd"`     // opencode binary
 	AgentURL     string  `yaml:"agent_url"`     // opencode server base URL
-	Model        string  `yaml:"model"`         // provider/model for opencode
+	Model        string  `yaml:"model"`         // provider/model for opencode (strong default)
 	Temperature  float64 `yaml:"temperature"`   // sampling temperature for the agent model
-	MaxTokens    int     `yaml:"max_tokens"`    // max output tokens per turn (0 = backend default)
-	TTLMinutes   int     `yaml:"ttl_minutes"`   // GC heartbeat TTL
-	MaxTurns     int     `yaml:"max_turns"`     // per-honeybee turn cap
-	RejectLimit  int     `yaml:"reject_limit"`  // rejections before NEEDS-HUMAN
+	// ModelByKind tiers the agent model per task kind (reconcile/bootstrap/work/
+	// review/arbitrate), so trivial kinds can dispatch a cheaper model while real
+	// code work keeps the strong Model. A kind absent from the map falls through
+	// to Model, so an unset map leaves a single-model host byte-identical. Merged
+	// key-by-key across layers (see merge), not replaced wholesale.
+	ModelByKind map[string]string `yaml:"model_by_kind"`
+	MaxTokens   int               `yaml:"max_tokens"`   // max output tokens per turn (0 = backend default)
+	TTLMinutes  int               `yaml:"ttl_minutes"`  // GC heartbeat TTL
+	MaxTurns    int               `yaml:"max_turns"`    // per-honeybee turn cap
+	RejectLimit int               `yaml:"reject_limit"` // rejections before NEEDS-HUMAN
 	// TurnTimeoutMinutes bounds a single agent turn (one opencode call). A stalled
 	// session is canceled at this cap so the honeybee abandons the task for GC
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+	// MaxIdleTurns kills a pass that makes no forward progress for this many
+	// consecutive turns (idle-churn / loop detection), so a wedged honeybee is
+	// abandoned for GC early instead of burning the full MaxTurns budget. Progress
+	// is measured from task status + produced artifacts, not raw PLAN bytes, so
+	// runner heartbeat churn does not count as progress. 0 = disabled (no idle cap;
+	// MaxTurns/WallCap/TTL still apply), keeping an unconfigured host unchanged.
+	MaxIdleTurns int `yaml:"max_idle_turns"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -128,6 +141,21 @@ func merge(base, over Config) Config {
 	if over.Temperature != 0 {
 		out.Temperature = over.Temperature
 	}
+	// ModelByKind merges key-by-key (per-kind override), unlike scalar fields:
+	// a higher layer can retier one kind without dropping kinds set by a lower
+	// layer. A fresh map is allocated so neither input is aliased/mutated.
+	if len(over.ModelByKind) > 0 {
+		merged := make(map[string]string, len(base.ModelByKind)+len(over.ModelByKind))
+		for k, v := range base.ModelByKind {
+			merged[k] = v
+		}
+		for k, v := range over.ModelByKind {
+			if v != "" {
+				merged[k] = v
+			}
+		}
+		out.ModelByKind = merged
+	}
 	if over.MaxTokens != 0 {
 		out.MaxTokens = over.MaxTokens
 	}
@@ -142,6 +170,9 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	if over.MaxIdleTurns != 0 {
+		out.MaxIdleTurns = over.MaxIdleTurns
 	}
 	return out
 }

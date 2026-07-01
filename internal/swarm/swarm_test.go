@@ -3,6 +3,7 @@ package swarm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -987,5 +988,203 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// TestRouteModel unit-tests the per-kind model routing: an empty map yields "" (no
+// tiering), a mapped kind yields its model, and an unmapped kind falls through to
+// "" (the strong default).
+func TestRouteModel(t *testing.T) {
+	r := &Runner{}
+	boot := &selectt.Selection{Kind: selectt.Bootstrap}
+	if got := r.routeModel(boot); got != "" {
+		t.Fatalf("nil map: routeModel = %q, want '' (no tiering)", got)
+	}
+	r.ModelByKind = map[string]string{"bootstrap": "cheap/mini"}
+	if got := r.routeModel(boot); got != "cheap/mini" {
+		t.Fatalf("mapped kind: routeModel = %q, want cheap/mini", got)
+	}
+	if got := r.routeModel(&selectt.Selection{Kind: selectt.Work}); got != "" {
+		t.Fatalf("unmapped kind: routeModel = %q, want '' (falls through to strong)", got)
+	}
+}
+
+// modelSpyClient implements ModelClient and records the model each opened session
+// ran on, so a test can assert the runner tiers cheap vs strong per kind. WithModel
+// mirrors the production no-op contract (self on "" or same model).
+type modelSpyClient struct {
+	model  string
+	opened *[]string
+	onTurn func(turn int)
+}
+
+func (c *modelSpyClient) WithModel(model string) Client {
+	if model == "" || model == c.model {
+		return c
+	}
+	return &modelSpyClient{model: model, opened: c.opened, onTurn: c.onTurn}
+}
+
+func (c *modelSpyClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	*c.opened = append(*c.opened, c.model)
+	return &mockSession{onTurn: c.onTurn}, nil
+}
+
+// TestDispatchRoutesModelByKind proves the runner dispatches a session on the
+// tiered (cheap) model when the selection's kind is mapped, and keeps the client's
+// strong default when the kind is unmapped or no tiering is configured — the core
+// "cheap for trivial kinds, strong for real work" routing.
+func TestDispatchRoutesModelByKind(t *testing.T) {
+	cases := []struct {
+		name   string
+		byKind map[string]string
+		want   string
+	}{
+		{"kind mapped -> cheap", map[string]string{"bootstrap": "cheap/mini"}, "cheap/mini"},
+		{"kind unmapped -> strong", map[string]string{"work": "cheap/mini"}, "strong/model"},
+		{"no map -> strong", nil, "strong/model"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			g := gitInit(t, root)
+			repo.Init(root)
+			sm := filepath.Join(root, "submodules", "sm")
+			os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+			os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+			g.Commit(context.Background(), "seed")
+			rp, _ := repo.Open(root)
+			subs, _ := rp.Submodules()
+			sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+			var opened []string
+			cl := &modelSpyClient{model: "strong/model", opened: &opened, onTurn: func(turn int) {
+				// Bootstrap completes as soon as PLAN.md exists.
+				os.WriteFile(subs[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+			}}
+			r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour, ModelByKind: tc.byKind}
+			res, err := r.Run(context.Background(), sel, "sys", "first")
+			if err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if !res.Completed {
+				t.Fatalf("want completed, got %+v", res)
+			}
+			if len(opened) != 1 || opened[0] != tc.want {
+				t.Fatalf("opened models = %v, want [%s]", opened, tc.want)
+			}
+		})
+	}
+}
+
+// TestDispatchNonModelClientUnaffected proves a plain Client (no WithModel) runs
+// unchanged even when a route is configured: tiering is a best-effort capability,
+// never a hard requirement, so a single-model backend is never broken.
+func TestDispatchNonModelClientUnaffected(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	// mockClient does NOT implement ModelClient; a configured route must be a no-op.
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		ModelByKind: map[string]string{"bootstrap": "cheap/mini"},
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a non-ModelClient must still complete with a route configured, got %+v", res)
+	}
+}
+
+// TestIdleChurnAbandonsForGC proves the no-forward-progress cap: an agent that
+// never advances the task is abandoned for GC after IdleTurns consecutive idle
+// turns — with a clear warning — long before the (much larger) MaxTurns budget is
+// spent. This is the loop/idle-churn kill that stops burning tokens on a wedged pass.
+func TestIdleChurnAbandonsForGC(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	// The stub client never writes PLAN.md -> Bootstrap never completes -> the
+	// progress fingerprint ("plan=false") never advances. IdleTurns=2 must kill it
+	// at turn 3 (baseline turn 1, then 2 idle turns), not at MaxTurns=10.
+	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 10, WallCap: time.Hour, TTL: time.Hour, IdleTurns: 2}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed || !res.GCMarked {
+		t.Fatalf("idle churn should abandon (incomplete, GC-marked), got %+v", res)
+	}
+	if !contains(res.Warning, "no forward progress") {
+		t.Fatalf("warning should name the idle churn, got %q", res.Warning)
+	}
+	if res.Turns != 3 {
+		t.Fatalf("idle kill should fire at turn 3 (baseline + IdleTurns=2), got %d", res.Turns)
+	}
+}
+
+// TestIdleResetsOnForwardProgress proves real progress each turn keeps resetting
+// the idle counter: an agent that commits new code in its worktree every turn
+// (HEAD advances) is NEVER idle-killed even with a small IdleTurns, and instead
+// runs to the ordinary MaxTurns GC cap. Guards against a false-positive idle kill
+// mistaking heartbeat churn — or a coarse fingerprint — for a stall.
+func TestIdleResetsOnForwardProgress(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	ctx := context.Background()
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(ctx, "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	// Each turn commits a NEW file in the code worktree (HEAD advances) but never
+	// drives the task terminal: genuine forward progress every turn.
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(wtDir, fmt.Sprintf("p-%d", turn)), []byte("x"), 0o644)
+		_ = git.New(wtDir).Commit(ctx, fmt.Sprintf("progress %d", turn))
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 4, WallCap: time.Hour, TTL: time.Hour, IdleTurns: 2}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if contains(res.Warning, "no forward progress") {
+		t.Fatalf("progress every turn must NOT trigger an idle kill, got %q", res.Warning)
+	}
+	if !res.GCMarked || res.Turns != 5 {
+		t.Fatalf("want full MaxTurns burn (GC cap, Turns=5) since idle keeps resetting, got %+v", res)
 	}
 }
