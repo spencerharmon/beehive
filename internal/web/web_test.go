@@ -141,6 +141,107 @@ func TestDashboard(t *testing.T) {
 	}
 }
 
+// TestDashboardCards is the core of dashboard-cards: subViews derives one card
+// per submodule with the correct swarm State (active/dormant/bootstrap), the
+// active blue/green Env from the submodule's own INFRASTRUCTURE.md (via the typed
+// artifacts model), the Pending/Human counts from the unified parser (a
+// NEEDS-HUMAN task counts in BOTH, a DONE task in neither), and Working from a
+// fresh session+heartbeat claim. now is fixed so Working is deterministic. It
+// also renders the card grid and asserts the badges/links are wired.
+func TestDashboardCards(t *testing.T) {
+	s, root := setup(t)
+	// alpha (from setup: t1 TODO+claim, t2 NEEDS-HUMAN, t3 DONE) gets its own
+	// INFRASTRUCTURE.md declaring green active -> an env badge on its card.
+	if err := os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.InfraFile),
+		[]byte("# infra\nActive: green\nEnvironments: blue, green\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// bravo: ROI present, PLAN absent -> bootstrap. No INFRASTRUCTURE.md -> no env.
+	bravo := filepath.Join(root, "submodules", "bravo")
+	if err := os.MkdirAll(bravo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bravo, repo.ROIFile), []byte("# bravo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// charlie: no ROI -> dormant.
+	if err := os.MkdirAll(filepath.Join(root, "submodules", "charlie"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// t1's heartbeat is 2026-06-30T11:00:00Z; 30m before now with a 60m TTL => a
+	// fresh claim, so alpha is Working.
+	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+	views, err := s.subViews(now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]subView{}
+	for _, v := range views {
+		by[v.Name] = v
+	}
+
+	a, ok := by["alpha"]
+	if !ok {
+		t.Fatalf("no alpha card in %+v", views)
+	}
+	if a.State != "active" {
+		t.Errorf("alpha State = %q, want active", a.State)
+	}
+	if a.Env != "green" {
+		t.Errorf("alpha Env = %q, want green (from INFRASTRUCTURE.md)", a.Env)
+	}
+	if a.EnvClass() != "env-green" {
+		t.Errorf("alpha EnvClass = %q, want env-green", a.EnvClass())
+	}
+	if a.Pending != 2 {
+		t.Errorf("alpha Pending = %d, want 2 (t1 TODO + t2 NEEDS-HUMAN; DONE t3 excluded)", a.Pending)
+	}
+	if a.Human != 1 {
+		t.Errorf("alpha Human = %d, want 1 (t2 NEEDS-HUMAN only)", a.Human)
+	}
+	if !a.Working {
+		t.Errorf("alpha Working = false, want true (t1 claim fresh at now)")
+	}
+
+	if got := by["bravo"].State; got != "bootstrap" {
+		t.Errorf("bravo State = %q, want bootstrap", got)
+	}
+	if got := by["bravo"].Env; got != "" {
+		t.Errorf("bravo Env = %q, want empty (no INFRASTRUCTURE.md)", got)
+	}
+	if got := by["bravo"].Pending; got != 0 {
+		t.Errorf("bravo Pending = %d, want 0 (no PLAN)", got)
+	}
+	if got := by["charlie"].State; got != "dormant" {
+		t.Errorf("charlie State = %q, want dormant", got)
+	}
+
+	// A claim well past the TTL must NOT read as Working (the card's live overlay
+	// is derived from claim freshness, not a status).
+	stale, err := s.subViews(now.Add(48*time.Hour), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range stale {
+		if v.Name == "alpha" && v.Working {
+			t.Errorf("alpha Working = true at now+48h, want false (claim stale past TTL)")
+		}
+	}
+
+	// Rendered card grid: the env badge, the NEEDS-HUMAN count linking /human, the
+	// swarm-state badges, and the pending count are all present in the HTML.
+	body := get(t, s, "/").Body.String()
+	for _, want := range []string{
+		"card-meta", "green", "needs-human 1", `href="/human"`,
+		"bootstrap", "dormant", "pending 2",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dashboard HTML missing %q:\n%s", want, body)
+		}
+	}
+}
+
 func TestPlanAndHuman(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/submodule/alpha/plan")
