@@ -555,6 +555,144 @@ func TestWorkPreambleHasDocPath(t *testing.T) {
 	}
 }
 
+// TestWorkBriefScopesToTaskFiles: a Work dispatch's first prompt carries the
+// precomputed task brief — the resolved worktree/branch/base-pointer, the exact
+// change-doc path and commit stamp, the task's own PLAN card, and excerpts of
+// ONLY the files the task's `Files:` line names. A committed submodule file the
+// task does NOT name is not dumped in, proving the working set is scoped to the
+// task rather than the whole tree.
+func TestWorkBriefScopesToTaskFiles(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	// Three committed source files; the task names only the first two.
+	os.WriteFile(filepath.Join(repoDir, "alpha.go"), []byte("package p\n// MARKER_ALPHA\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "beta.go"), []byte("package p\n// MARKER_BETA\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "gamma.go"), []byte("package p\n// MARKER_GAMMA\n"), 0o644)
+	if err := git.New(repoDir).Commit(context.Background(), "base"); err != nil {
+		t.Fatalf("submodule base commit: %v", err)
+	}
+	basePointer, err := git.New(repoDir).RevParse(context.Background(), "HEAD")
+	if err != nil {
+		t.Fatalf("base rev: %v", err)
+	}
+
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	body := []string{
+		"Do: touch the two files.",
+		"Files: alpha.go, beta.go (the two we edit)",
+		"Doc: submodules/sm/docs/bee-T1-T1.md",
+	}
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO, Body: body}}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	cl.sess.capture = &firstPrompt
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Resolved handoff fields: worktree, branch, the base pointer the pass got,
+	// the exact doc path, the commit stamp, and the task's own card.
+	for _, want := range []string{
+		"# Task brief",
+		"submodules/sm/worktrees/bee-T1",
+		"Branch: bee-T1",
+		"Submodule pointer / worktree base commit: " + basePointer,
+		"submodules/sm/docs/bee-T1-T1.md",
+		"Beehive: T1 submodules/sm/docs/bee-T1-T1.md",
+		"## T1 [TODO]",
+	} {
+		if !contains(firstPrompt, want) {
+			t.Fatalf("brief missing %q; got:\n%s", want, firstPrompt)
+		}
+	}
+	// No-remote install: the brief says so rather than inventing a tip.
+	if !contains(firstPrompt, "no submodule remote") {
+		t.Fatalf("brief should note the absent remote; got:\n%s", firstPrompt)
+	}
+	// The named files are excerpted, header + content...
+	for _, want := range []string{"### alpha.go", "MARKER_ALPHA", "### beta.go", "MARKER_BETA"} {
+		if !contains(firstPrompt, want) {
+			t.Fatalf("brief missing named-file excerpt %q; got:\n%s", want, firstPrompt)
+		}
+	}
+	// ...but an unnamed committed file is NOT pulled into the working set.
+	if contains(firstPrompt, "MARKER_GAMMA") {
+		t.Fatalf("brief leaked an unnamed file (gamma.go) into the working set; got:\n%s", firstPrompt)
+	}
+}
+
+// TestWorkBriefShowsTrackedTip: with a submodule remote, the brief reports the
+// submodule's tracked tip (the origin ref the setup synced to) rather than a
+// guess, and its base-pointer line equals that synced tip — proving the brief
+// reuses the runner's already-resolved pointer/tip, never a divergent one.
+func TestWorkBriefShowsTrackedTip(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	ctx := context.Background()
+
+	origin := t.TempDir()
+	og := gitInit(t, origin)
+	os.WriteFile(filepath.Join(origin, "alpha.go"), []byte("package p\n// MARKER_ALPHA\n"), 0o644)
+	if err := og.Commit(ctx, "base"); err != nil {
+		t.Fatalf("origin base: %v", err)
+	}
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	os.WriteFile(filepath.Join(origin, "alpha.go"), []byte("package p\n// MARKER_ALPHA tip\n"), 0o644)
+	if err := og.Commit(ctx, "tip"); err != nil {
+		t.Fatalf("origin tip: %v", err)
+	}
+	originTip, err := og.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("origin tip rev: %v", err)
+	}
+
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO, Body: []string{"Files: alpha.go"}}}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !contains(firstPrompt, "Submodule tracked tip (origin): "+originTip) {
+		t.Fatalf("brief missing tracked tip %s; got:\n%s", originTip, firstPrompt)
+	}
+	if !contains(firstPrompt, "Submodule pointer / worktree base commit: "+originTip) {
+		t.Fatalf("brief base pointer should be the synced tip %s; got:\n%s", originTip, firstPrompt)
+	}
+}
+
 // TestReviewCompletesOnStatusChange: a Review session is NOT claimed/clobbered
 // and completes the moment the agent moves the task out of NEEDS-REVIEW (here
 // -> DONE on approve). No code worktree, no heartbeat, no change-doc requirement

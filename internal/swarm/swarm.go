@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -331,6 +332,17 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"Beehive layer: submodules/%[1]s/ROI.md (read-only), submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/.\n"+
 				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
 			smName)
+	}
+	// A Work pass gets a precomputed task brief appended to its context: the
+	// runner already resolved the worktree, branch, and submodule pointer/tip when
+	// it set the pass up, and it knows the protocol's deterministic choices (the
+	// change-doc path, the commit stamp). Handing those to the agent — plus
+	// excerpts of just the files the task's `Files:` line names — means the agent
+	// never runs discovery git plumbing or reads the whole submodule tree to get
+	// its bearings. It reuses the SAME wtAbs/branch/pointer the setup produced, so
+	// the brief can never drift from what the pass actually got.
+	if sel.Kind == selectt.Work {
+		preamble += r.workBrief(ctx, sel, wg, wtAbs, res.Branch, absRoot)
 	}
 	if hasTask(sel) {
 		preamble += fmt.Sprintf(
@@ -845,6 +857,281 @@ func (r *Runner) trackedBranch(ctx context.Context, rel string) string {
 		}
 	}
 	return "main"
+}
+
+// Per-file excerpt bounds. The brief scopes the agent's working set to the
+// files the task names; it must not turn into a full-tree dump, so each excerpt
+// is capped by both lines and bytes.
+const (
+	briefMaxLines = 200
+	briefMaxBytes = 8192
+)
+
+// pathTokenRe matches a plausible file/dir path token (letters, digits, and the
+// path punctuation `_ . / * ? [ ] -`). It is the shape filter for tokens pulled
+// out of a task's free-form `Files:` line; a token must ALSO contain a "/" or a
+// "." to be treated as a path (so prose words like "guard" are not mistaken for
+// files).
+var pathTokenRe = regexp.MustCompile(`^[A-Za-z0-9_./*?\[\]-]+$`)
+
+// workBrief assembles the precomputed task brief for a Work dispatch. It reuses
+// the EXACT values the Work setup already resolved (the worktree path wtAbs, the
+// branch, and the submodule checkout wg the setup synced) so the brief reflects
+// what the pass actually got — never a second, divergent derivation. It provides
+// the protocol's deterministic choices as ANSWERS (the change-doc path, the
+// commit stamp) rather than formulas, renders the task's own PLAN card, and
+// includes bounded excerpts of just the files the task's `Files:` line names.
+// Best-effort and never fatal: an unresolved git value or unreadable file
+// degrades to a note, so the brief can only ADD context, never break the run.
+func (r *Runner) workBrief(ctx context.Context, sel *selectt.Selection, wg *git.Repo, wtAbs, branch, absRoot string) string {
+	sm := sel.Submodule.Name
+	tid := sel.Task.ID
+
+	wtRel := wtAbs
+	if rel, err := filepath.Rel(absRoot, wtAbs); err == nil {
+		wtRel = rel
+	}
+	docPath := fmt.Sprintf("submodules/%s/docs/%s-%s.md", sm, branch, tid)
+	stamp := fmt.Sprintf("Beehive: %s %s", tid, docPath)
+
+	// The submodule pointer / worktree base is wg's HEAD — the exact commit
+	// WorktreeAdd branched the code worktree off. The tracked tip is the submodule
+	// origin's tracked-branch ref the setup fetched (empty on a no-remote install).
+	pointer := "(unresolved)"
+	tip := ""
+	if wg != nil {
+		if h, err := wg.RevParse(ctx, "HEAD"); err == nil && h != "" {
+			pointer = h
+		}
+		if rem, err := wg.Remote(ctx); err == nil && rem != "" {
+			tb := "main"
+			if rel, rerr := filepath.Rel(absRoot, sel.Submodule.RepoDir()); rerr == nil {
+				tb = r.trackedBranch(ctx, rel)
+			}
+			if t, err := wg.RevParse(ctx, rem+"/"+tb); err == nil && t != "" {
+				tip = t
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("# Task brief (precomputed by the runner — these are resolved for you; do not re-derive them)\n")
+	b.WriteString("Code worktree (edit the submodule's code here): " + wtRel + "\n")
+	b.WriteString("Branch: " + branch + "\n")
+	b.WriteString("Submodule pointer / worktree base commit: " + pointer + "\n")
+	if tip != "" {
+		b.WriteString("Submodule tracked tip (origin): " + tip + "\n")
+	} else {
+		b.WriteString("Submodule tracked tip: (no submodule remote; the recorded pointer is the base)\n")
+	}
+	b.WriteString("Change doc — write it at EXACTLY this path: " + docPath + "\n")
+	b.WriteString("Commit stamp — include this line in the submodule commit message: " + stamp + "\n\n")
+
+	// The task's own PLAN card (id, status, body verbatim), so the agent orients
+	// from the card rather than re-reading PLAN.md.
+	b.WriteString("## Task card\n")
+	b.WriteString(fmt.Sprintf("## %s [%s]\n", tid, sel.Task.Status))
+	if len(sel.Task.Body) > 0 {
+		b.WriteString(strings.Join(sel.Task.Body, "\n"))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+
+	// Excerpts of just the files the task touches (its `Files:` line), so the
+	// agent's working set is those files, not the whole submodule tree.
+	toks := taskFiles(sel.Task.Body)
+	if len(toks) > 0 {
+		b.WriteString("## Task files (your working set — excerpts of the files this task's Files: line names)\n")
+		dirs := briefBaseDirs(wtAbs, toks)
+		for _, tok := range toks {
+			b.WriteString(fileExcerpt(wtAbs, tok, dirs))
+		}
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// taskFiles extracts candidate file/dir path tokens from a task's `Files:` field.
+// The field is free-form (comma-separated paths interleaved with parenthetical
+// notes, sometimes wrapped across lines), so this: gathers the text from the
+// `Files:` line through any continuation up to the next known field label
+// (`Doc:`/`Accept:`) or a blank line; drops parenthetical groups; splits on
+// commas; and keeps the first path-shaped token of each chunk, de-duplicated in
+// order. Prose-only chunks yield nothing.
+func taskFiles(body []string) []string {
+	var field strings.Builder
+	collecting := false
+	for _, ln := range body {
+		t := strings.TrimSpace(ln)
+		if collecting {
+			if t == "" || briefStopsField(t) {
+				break
+			}
+			field.WriteString(" ")
+			field.WriteString(t)
+			continue
+		}
+		if rest, ok := strings.CutPrefix(t, "Files:"); ok {
+			field.WriteString(rest)
+			collecting = true
+		}
+	}
+	text := stripParens(field.String())
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, chunk := range strings.Split(text, ",") {
+		tok := firstPathToken(chunk)
+		if tok == "" || seen[tok] {
+			continue
+		}
+		seen[tok] = true
+		out = append(out, tok)
+	}
+	return out
+}
+
+// briefStopsField reports whether a body line begins the field that follows
+// `Files:` in the plan grammar, so continuation-gathering stops there.
+func briefStopsField(t string) bool {
+	for _, label := range []string{"Doc:", "Accept:", "Impl", "Review", "Reconciled", "Arbitration", "Human-needed:"} {
+		if strings.HasPrefix(t, label) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripParens removes balanced parenthetical groups (the annotations that pad a
+// `Files:` line) so comma-splitting sees only the path list.
+func stripParens(s string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+// firstPathToken returns the first whitespace-delimited, path-shaped token in a
+// chunk (trimming surrounding quotes/parens and trailing punctuation), or "".
+func firstPathToken(chunk string) string {
+	for _, f := range strings.Fields(chunk) {
+		f = strings.Trim(f, "`()")
+		f = strings.TrimRight(f, ".,;:")
+		if f == "" || !pathTokenRe.MatchString(f) {
+			continue
+		}
+		if !strings.Contains(f, "/") && !strings.Contains(f, ".") {
+			continue // a bare prose word, not a path
+		}
+		return f
+	}
+	return ""
+}
+
+// briefBaseDirs collects the directories named (directly or as a file's parent)
+// by the path-qualified tokens, so a bare sibling filename like `swarm_test.go`
+// can be resolved next to `internal/swarm/swarm.go`.
+func briefBaseDirs(wtAbs string, toks []string) []string {
+	var dirs []string
+	seen := map[string]bool{}
+	add := func(d string) {
+		if d == "" || d == "." || seen[d] {
+			return
+		}
+		seen[d] = true
+		dirs = append(dirs, d)
+	}
+	for _, tok := range toks {
+		if !strings.Contains(tok, "/") {
+			continue
+		}
+		full := filepath.Join(wtAbs, filepath.FromSlash(tok))
+		if fi, err := os.Stat(full); err == nil && fi.IsDir() {
+			add(tok)
+			continue
+		}
+		if i := strings.LastIndex(tok, "/"); i >= 0 {
+			add(tok[:i])
+		}
+	}
+	return dirs
+}
+
+// fileExcerpt renders a bounded excerpt of tok within the worktree, resolving a
+// bare filename against the collected base dirs. It never reads outside wtAbs and
+// never fails: a glob, a directory, a missing (to-be-created) file, or a read
+// error each degrade to a one-line note.
+func fileExcerpt(wtAbs, tok string, dirs []string) string {
+	if strings.ContainsAny(tok, "*?[") {
+		return fmt.Sprintf("### %s (pattern — no single-file excerpt)\n", tok)
+	}
+	full := resolveInWorktree(wtAbs, tok, dirs)
+	if rel, err := filepath.Rel(wtAbs, full); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Sprintf("### %s (outside the worktree — skipped)\n", tok)
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return fmt.Sprintf("### %s (not present in the worktree — new file to create)\n", tok)
+	}
+	if info.IsDir() {
+		return fmt.Sprintf("### %s/ (directory — read within it as needed)\n", tok)
+	}
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return fmt.Sprintf("### %s (unreadable: %v)\n", tok, err)
+	}
+	lines := strings.Split(string(data), "\n")
+	total := len(lines)
+	truncated := false
+	if len(lines) > briefMaxLines {
+		lines = lines[:briefMaxLines]
+		truncated = true
+	}
+	excerpt := strings.Join(lines, "\n")
+	if len(excerpt) > briefMaxBytes {
+		excerpt = excerpt[:briefMaxBytes]
+		truncated = true
+	}
+	hdr := fmt.Sprintf("### %s (%d lines", tok, total)
+	if truncated {
+		hdr += ", truncated"
+	}
+	hdr += ")\n"
+	return hdr + "```\n" + excerpt + "\n```\n"
+}
+
+// resolveInWorktree resolves tok to an absolute path inside wtAbs, trying the
+// token as given first and then, for a bare filename, under each base dir. It
+// returns the primary candidate (for the "not present" note) when nothing exists.
+func resolveInWorktree(wtAbs, tok string, dirs []string) string {
+	cand := filepath.Join(wtAbs, filepath.FromSlash(tok))
+	if _, err := os.Stat(cand); err == nil {
+		return cand
+	}
+	if !strings.Contains(tok, "/") {
+		for _, d := range dirs {
+			c := filepath.Join(wtAbs, filepath.FromSlash(d), tok)
+			if _, err := os.Stat(c); err == nil {
+				return c
+			}
+		}
+	}
+	return cand
 }
 
 // isSourceCheckout reports whether dir is the root of its OWN git work tree (a
