@@ -3,6 +3,7 @@ package swarm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,10 +39,46 @@ type recorder struct {
 	toolSt  map[string]string // callID -> last status streamed
 	partLen map[string]int    // "<kind>:<partID>" -> chars streamed
 	started map[string]bool   // markers already emitted (user msg / reasoning lead)
+
+	// pollIvl is the fallback poll cadence (recorder.pollLoop). Zero = the 700ms
+	// default; tests set a small value so the fallback path advances quickly.
+	pollIvl time.Duration
 }
 
+// loop drives the recorder for the life of the session. It prefers streaming:
+// when the session can consume opencode's event channel, the transcript is
+// rendered as tokens arrive (near real time) instead of at the poll cadence. It
+// falls back to polling when streaming is unsupported (ErrNoStream, e.g. a test
+// mock or an older server) or if a live stream drops mid-session, so recording
+// always continues. ctx cancellation (session end) returns from either path.
 func (rc *recorder) loop(ctx context.Context) {
-	t := time.NewTicker(700 * time.Millisecond)
+	if st, ok := rc.sess.(streamer); ok {
+		onUpdate := func(msgs []Message) { _ = rc.render(ctx, msgs) }
+		onIdle := func() { rc.flush(ctx) }
+		err := st.stream(ctx, onUpdate, onIdle)
+		if ctx.Err() != nil {
+			return // session ended: stop, no fallback
+		}
+		if rc.debug != nil {
+			if errors.Is(err, ErrNoStream) {
+				fmt.Fprint(rc.debug, "\n[recorder] opencode event stream unavailable; polling transcript\n")
+			} else if err != nil {
+				fmt.Fprintf(rc.debug, "\n[recorder] event stream ended (%v); falling back to polling\n", err)
+			}
+		}
+		// Fall through to polling for the rest of the session.
+	}
+	rc.pollLoop(ctx)
+}
+
+// pollLoop renders the transcript by polling the message list on a fixed cadence.
+// Used when streaming is unavailable; also the historical default path.
+func (rc *recorder) pollLoop(ctx context.Context) {
+	iv := rc.pollIvl
+	if iv <= 0 {
+		iv = 700 * time.Millisecond
+	}
+	t := time.NewTicker(iv)
 	defer t.Stop()
 	for {
 		select {
@@ -53,15 +90,34 @@ func (rc *recorder) loop(ctx context.Context) {
 	}
 }
 
-// snapshot fetches the session, writes the rendered transcript to the worktree
-// file, commits it to the isolated session branch (throttled), and (when debug)
-// streams new activity. The recorder loop treats errors as transient; final
-// session publication checks them so it never publishes a stale or missing file.
+// flush forces an immediate commit of the current transcript, bypassing the
+// throttle. Called when a streamed turn goes idle so a completed turn lands on
+// the session branch promptly instead of waiting out the commit interval.
+func (rc *recorder) flush(ctx context.Context) {
+	if rc.commit != nil {
+		rc.lastCommit = time.Now()
+		rc.commit(ctx)
+	}
+}
+
+// snapshot fetches the session by polling and renders it. The final authoritative
+// flush in the runner's finish() calls this after the recorder goroutine stops,
+// so the poll message list is the source of truth at session end even when the
+// live transcript was streamed.
 func (rc *recorder) snapshot(ctx context.Context) error {
 	msgs, err := rc.sess.Messages(ctx)
 	if err != nil {
 		return err
 	}
+	return rc.render(ctx, msgs)
+}
+
+// render writes the rendered transcript for msgs to the worktree file, commits it
+// to the isolated session branch (throttled), and (when debug) streams new
+// activity. Shared by the poll path (snapshot) and the streaming path (loop's
+// onUpdate). The recorder loop treats errors as transient; final session
+// publication checks them so it never publishes a stale or missing file.
+func (rc *recorder) render(ctx context.Context, msgs []Message) error {
 	md := renderTranscript(rc.header, msgs)
 	if md == rc.lastMD {
 		if rc.debug != nil {

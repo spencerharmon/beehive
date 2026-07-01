@@ -39,6 +39,9 @@ type Server struct {
 	git     *git.Repo
 	tmpl    *template.Template
 	editors *editor.Manager
+	// streamInterval is the SSE re-read cadence for live session transcripts. 0
+	// means the default (streamIvl); tests set it small to keep them fast.
+	streamInterval time.Duration
 }
 
 // New builds a Server over the beehive repo at root.
@@ -67,6 +70,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /submodule/{name}/sessions/body", s.sessionsListBody)
 	mux.HandleFunc("GET /submodule/{name}/session/{branch}", s.sessionView)
 	mux.HandleFunc("GET /submodule/{name}/session/{branch}/body", s.sessionBody)
+	mux.HandleFunc("GET /submodule/{name}/session/{branch}/stream", s.sessionStream)
 	mux.HandleFunc("GET /roi/{name}", s.roiGet)
 	mux.HandleFunc("POST /roi/{name}", s.roiPost)
 	mux.HandleFunc("GET /secrets", s.secretsGet)
@@ -597,6 +601,18 @@ func (s *Server) ttl() time.Duration {
 		m = 60
 	}
 	return time.Duration(m) * time.Minute
+}
+
+// streamIvl is the SSE re-read cadence for a live session transcript: how often
+// sessionStream re-derives the file-backed transcript and pushes it if changed.
+// It is short enough to feel token-live but bounded so a viewer never hammers
+// git; tests override it via streamInterval to run fast. The default (1s) beats
+// the 2s htmx poll it supersedes while the stream is connected.
+func (s *Server) streamIvl() time.Duration {
+	if s.streamInterval > 0 {
+		return s.streamInterval
+	}
+	return time.Second
 }
 
 func pageParams(r *http.Request) (offset, limit int) {

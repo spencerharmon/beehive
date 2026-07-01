@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -99,35 +100,136 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad branch", http.StatusBadRequest)
 		return
 	}
+	body, _, err := s.sessionTranscript(r.Context(), sm, branch)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.render(w, "session_body.html", map[string]interface{}{"Body": body})
+}
+
+// sessionStream pushes the session transcript to the browser over server-sent
+// events, re-reading it on a short cadence and sending it whenever it changes,
+// until the session ends or the client disconnects. It surfaces agent output
+// token-by-token instead of in the 2s poll jumps, and carries the SAME
+// file-derived transcript sessionBody renders (git/disk, never opencode) — so the
+// htmx poll is an interchangeable fallback: the page cancels the poll while this
+// stream is live and resumes it on the "end" event (which also fetches the
+// authoritative final transcript). A ResponseWriter that cannot flush (no
+// streaming) is reported so the client keeps polling.
+func (s *Server) sessionStream(w http.ResponseWriter, r *http.Request) {
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	branch := r.PathValue("branch")
+	if !safeBranch(branch) {
+		http.Error(w, "bad branch", http.StatusBadRequest)
+		return
+	}
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	fl.Flush()
+
+	ctx := r.Context()
+	t := time.NewTicker(s.streamIvl())
+	defer t.Stop()
+	last := ""
+	first := true
+	for {
+		body, live, err := s.sessionTranscript(ctx, sm, branch)
+		if err != nil {
+			// Headers are already committed (200), so we cannot change status: end
+			// the stream and let the htmx poll fallback surface the real error.
+			writeSSEEvent(w, "end", "")
+			fl.Flush()
+			return
+		}
+		if first || body != last {
+			writeSSEData(w, body)
+			fl.Flush()
+			last = body
+			first = false
+		}
+		if !live {
+			// Session ended: tell the client to stop and do one authoritative poll.
+			writeSSEEvent(w, "end", "")
+			fl.Flush()
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// sessionTranscript resolves the current transcript text for a session branch and
+// whether the session is still live (streaming to an isolated branch that exists).
+// It is the shared read used by both the poll (sessionBody) and the SSE stream
+// (sessionStream): a STUB path resolves to its live branch copy; a non-stub path
+// is the durable final transcript; a stub whose branch is gone is an ended session
+// with no published final. A read error (other than a not-yet-created file) is
+// returned so the poll path can surface it as a 500.
+func (s *Server) sessionTranscript(ctx context.Context, sm repo.Submodule, branch string) (body string, live bool, err error) {
 	sessRel := "submodules/" + sm.Name + "/sessions/" + branch + ".md"
 	b, err := os.ReadFile(filepath.Join(sm.SessionsDir(), branch+".md"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.render(w, "session_body.html", map[string]interface{}{"Body": "(waiting for session output…)"})
-			return
+			// Not created yet: a session just starting. Keep waiting (still live).
+			return "(waiting for session output…)", true, nil
 		}
-		http.Error(w, err.Error(), 500)
+		return "", false, err
+	}
+	body = string(b)
+	streamBranch, isStub := repo.ParseSessionStub(body)
+	if !isStub {
+		return body, false, nil // durable final transcript: ended
+	}
+	if live, ok := s.readSessionBranch(ctx, streamBranch, sessRel); ok {
+		return live, true, nil
+	}
+	rem, _ := s.git.Remote(ctx)
+	if _, exists := s.branchTipTime(ctx, streamBranch, rem); exists {
+		// Branch exists but the transcript file isn't on it yet: a session that
+		// just started and hasn't written its first commit. Genuinely waiting.
+		return "(waiting for session output…)", true, nil
+	}
+	// Stub on main but the stream branch is gone: the session ended without its
+	// finalize replacing the stub (crash, or an orphaned publish). Say so rather
+	// than implying it is still spinning up.
+	return "(session ended — live stream branch is gone; no final transcript was published)", false, nil
+}
+
+// writeSSEData emits a (possibly multi-line) payload as one SSE message event:
+// each line becomes its own data: field, which the browser rejoins with "\n".
+func writeSSEData(w io.Writer, payload string) {
+	for _, line := range strings.Split(payload, "\n") {
+		fmt.Fprintf(w, "data: %s\n", line)
+	}
+	fmt.Fprint(w, "\n")
+}
+
+// writeSSEEvent emits a named SSE event (e.g. "end") with an optional payload.
+func writeSSEEvent(w io.Writer, event, payload string) {
+	fmt.Fprintf(w, "event: %s\n", event)
+	if payload == "" {
+		fmt.Fprint(w, "data: \n\n")
 		return
 	}
-	body := string(b)
-	if streamBranch, isStub := repo.ParseSessionStub(body); isStub {
-		if live, ok := s.readSessionBranch(r.Context(), streamBranch, sessRel); ok {
-			body = live
-		} else {
-			rem, _ := s.git.Remote(r.Context())
-			if _, exists := s.branchTipTime(r.Context(), streamBranch, rem); exists {
-				// Branch exists but the transcript file isn't on it yet: a session that
-				// just started and hasn't written its first commit. Genuinely waiting.
-				body = "(waiting for session output…)"
-			} else {
-				// Stub on main but the stream branch is gone: the session ended without
-				// its finalize replacing the stub (crash, or an orphaned publish). Say so
-				// rather than implying it is still spinning up.
-				body = "(session ended — live stream branch is gone; no final transcript was published)"
-			}
-		}
+	for _, line := range strings.Split(payload, "\n") {
+		fmt.Fprintf(w, "data: %s\n", line)
 	}
-	s.render(w, "session_body.html", map[string]interface{}{"Body": body})
+	fmt.Fprint(w, "\n")
 }
 
 // readSessionBranch returns the transcript file as it stands on the isolated
