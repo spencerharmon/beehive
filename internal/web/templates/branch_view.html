@@ -1,5 +1,14 @@
 {{template "header"}}
 <h1>{{.Name}} commits</h1>
+<form class="card" hx-post="/merge" hx-target="#merge-result" hx-swap="innerHTML"
+      hx-indicator="#htmx-progress"
+      hx-confirm="Publish this branch? It merges into the tracked branch, pushes origin, and advances the pointer — this cannot be undone here.">
+  <input type="hidden" name="name" value="{{.Name}}">
+  <input type="hidden" name="from" value="branch">
+  <input name="branch" placeholder="bee-branch to publish">
+  <button class="merge">publish / merge</button>
+</form>
+<div id="merge-result"></div>
 {{range .Sections}}
 <section class="card">
 <h2>{{.Date}}</h2>

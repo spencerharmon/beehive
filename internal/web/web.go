@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/artifacts"
@@ -399,8 +400,7 @@ func (s *Server) mergePost(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	g := git.New(sm.RepoDir())
-	if err := g.Merge(r.Context(), branch); err != nil {
+	if err := s.mergeAndPublish(r.Context(), sm, branch); err != nil {
 		if errors.Is(err, git.ErrConflict) {
 			http.Error(w, "merge conflict", http.StatusConflict)
 			return
@@ -408,11 +408,87 @@ func (s *Server) mergePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := s.commit(r.Context(), "frontend: merge "+branch+" in "+name); err != nil && !errors.Is(err, git.ErrNothing) {
-		http.Error(w, err.Error(), 500)
+	// The branch view posts from=branch and swaps only a small #merge-result
+	// node, so answer it with an inline success fragment instead of the whole
+	// merge panel (which is what the /merge panel form re-selects via
+	// hx-select="#merge-panel"). Failures on either surface are surfaced by the
+	// layout's global htmx error toast, so only the success shape differs.
+	if r.FormValue("from") == "branch" {
+		tracked := s.trackedBranch(r.Context(), sm)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<p class="ok">Published ` + template.HTMLEscapeString(branch) +
+			` into ` + template.HTMLEscapeString(tracked) + ` in ` + template.HTMLEscapeString(name) + `.</p>`))
 		return
 	}
 	s.mergeGet(w, r)
+}
+
+// mergeAndPublish is the end-to-end "merge button" write path: it merges branch
+// into the submodule's tracked branch, PUBLISHES that branch to the submodule
+// origin, advances the beehive pointer, and publishes the beehive repo's main.
+// A merge that only lands locally is not published, so this routes through the
+// same push + pointer-bump the honeybees use (see the merge-button-wire task).
+//
+// Ordering guarantees the ROI invariant "no partial publish": the merge happens
+// FIRST and nothing is pushed before it succeeds, so a conflict leaves the
+// submodule origin untouched. On conflict the in-progress merge is aborted so
+// the shared submodule checkout is left clean, and git.ErrConflict is returned
+// (the caller maps it to 409). It is idempotent: an already-merged branch is a
+// clean no-op — the merge is "Already up to date" (HEAD unmoved), the push has
+// nothing to send, and the pointer commit is git.ErrNothing (tolerated).
+func (s *Server) mergeAndPublish(ctx context.Context, sm repo.Submodule, branch string) error {
+	g := git.New(sm.RepoDir())
+	// 1) Merge into the submodule checkout's tracked branch. On conflict abort so
+	//    the shared checkout is not left mid-merge; nothing has been pushed yet, so
+	//    the origin stays untouched.
+	if err := g.Merge(ctx, branch); err != nil {
+		if errors.Is(err, git.ErrConflict) {
+			_, _ = g.Run(ctx, "merge", "--abort")
+		}
+		return err
+	}
+	// 2) Publish the merged tracked branch to the submodule origin so peers (which
+	//    branch off origin/<tracked>) see it. HEAD:refs/heads/<tracked> is robust
+	//    to a detached submodule checkout. No remote (single-host / tests) skips
+	//    the push: local main is already advanced and honeybees branch off it.
+	rem, err := g.Remote(ctx)
+	if err != nil {
+		return err
+	}
+	tracked := s.trackedBranch(ctx, sm)
+	if rem != "" {
+		if err := g.Push(ctx, rem, "HEAD:refs/heads/"+tracked); err != nil {
+			return err
+		}
+	}
+	// 3) Advance the beehive pointer to the merged submodule tip and commit it.
+	//    ErrNothing (already merged: the gitlink did not move) is a clean no-op,
+	//    which is what keeps the whole action idempotent.
+	if err := s.commit(ctx, "frontend: merge "+branch+" into "+tracked+" in "+sm.Name); err != nil && !errors.Is(err, git.ErrNothing) {
+		return err
+	}
+	// 4) Publish the beehive repo's own main so other hosts see the advanced
+	//    pointer (no-op when the beehive repo has no remote).
+	return s.publishMain(ctx)
+}
+
+// trackedBranch resolves the submodule's tracked branch from .gitmodules
+// (submodule.<relpath>.branch), defaulting to "main" when the key is unset or
+// .gitmodules is absent. It mirrors the runner's resolution (swarm.trackedBranch)
+// so the frontend publishes the same branch the honeybees track instead of
+// hardcoding "main".
+func (s *Server) trackedBranch(ctx context.Context, sm repo.Submodule) string {
+	rel, err := filepath.Rel(s.repo.Root, sm.RepoDir())
+	if err != nil {
+		rel = filepath.Join("submodules", sm.Name, "repo")
+	}
+	out, err := s.git.Run(ctx, "config", "-f", ".gitmodules", "--get", "submodule."+rel+".branch")
+	if err == nil {
+		if b := strings.TrimSpace(out); b != "" {
+			return b
+		}
+	}
+	return "main"
 }
 
 // submoduleAdd registers a target repo as a real tracked git submodule through

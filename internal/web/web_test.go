@@ -1347,3 +1347,260 @@ func TestHygieneCleanAndWidget(t *testing.T) {
 		t.Fatalf("dashboard does not embed the hygiene widget:\n%s", dash.Body)
 	}
 }
+
+// mergeRepo builds a beehive root whose `alpha` submodule is a real clone of a
+// bare origin (tracked branch main) with the submodule pointer committed. It is
+// the fixture for the merge-button end-to-end tests: a merge must publish to the
+// submodule origin AND advance the beehive pointer, so the fixture needs a real
+// remote and a committed gitlink. Returns the server, the beehive root, the bare
+// submodule origin, and the submodule checkout; each test adds its own branch.
+func mergeRepo(t *testing.T) (s *Server, root, origin, repoDir string) {
+	t.Helper()
+	root = t.TempDir()
+	if err := repo.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	hygGit(t, root, "config", "user.email", "t@t")
+	hygGit(t, root, "config", "user.name", "t")
+
+	// Bare origin for the submodule with a base commit on main, seeded through a
+	// throwaway clone (a bare repo has no worktree to commit in).
+	originParent := t.TempDir()
+	origin = filepath.Join(originParent, "origin.git")
+	hygGit(t, originParent, "init", "-q", "--bare", "-b", "main", "origin.git")
+	seedParent := t.TempDir()
+	seed := filepath.Join(seedParent, "seed")
+	hygGit(t, seedParent, "clone", "-q", origin, "seed")
+	hygGit(t, seed, "config", "user.email", "t@t")
+	hygGit(t, seed, "config", "user.name", "t")
+	os.WriteFile(filepath.Join(seed, "f"), []byte("base\n"), 0o644)
+	hygGit(t, seed, "add", "-A")
+	hygGit(t, seed, "commit", "-q", "-m", "base")
+	hygGit(t, seed, "push", "-q", "origin", "main")
+
+	// The submodule checkout: a clone of origin at submodules/alpha/repo, on main.
+	repoDir = filepath.Join(root, "submodules", "alpha", "repo")
+	os.MkdirAll(filepath.Dir(repoDir), 0o755)
+	hygGit(t, root, "clone", "-q", origin, "submodules/alpha/repo")
+	hygGit(t, repoDir, "config", "user.email", "t@t")
+	hygGit(t, repoDir, "config", "user.name", "t")
+
+	// Declare the submodule (tracked branch main) and commit the gitlink so the
+	// beehive pointer resolves via rev-parse HEAD:submodules/alpha/repo. The
+	// .gitmodules section name is the PATH, exactly as `git submodule add` writes
+	// it (so submodule.<path>.branch resolves).
+	os.WriteFile(filepath.Join(root, ".gitmodules"), []byte(
+		"[submodule \"submodules/alpha/repo\"]\n\tpath = submodules/alpha/repo\n\tbranch = main\n\turl = "+origin+"\n"), 0o644)
+	hygGit(t, root, "add", ".gitmodules", "submodules/alpha/repo")
+	hygGit(t, root, "commit", "-q", "-m", "seed submodule")
+
+	r, err := repo.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err = New(r, config.Defaults(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, root, origin, repoDir
+}
+
+// TestMergePublishesAndAdvancesPointer is the core acceptance: POST /merge
+// fast-forwards the tracked branch, PUSHES it to the submodule origin, and
+// advances (and commits) the beehive pointer. The old handler merged + committed
+// the pointer locally only — origin never moved, so the "merge" was not
+// published. This proves the full write path now runs.
+func TestMergePublishesAndAdvancesPointer(t *testing.T) {
+	s, root, origin, repoDir := mergeRepo(t)
+
+	// A feature branch one commit ahead of main (a clean fast-forward merge).
+	hygGit(t, repoDir, "checkout", "-q", "-b", "feat")
+	os.WriteFile(filepath.Join(repoDir, "g"), []byte("feature\n"), 0o644)
+	hygGit(t, repoDir, "add", "-A")
+	hygGit(t, repoDir, "commit", "-q", "-m", "feat work")
+	featTip := hygGit(t, repoDir, "rev-parse", "HEAD")
+	hygGit(t, repoDir, "checkout", "-q", "main")
+
+	originBefore := hygGit(t, origin, "rev-parse", "main")
+	headBefore := hygGit(t, root, "rev-parse", "HEAD")
+
+	w := postForm(t, s, "/merge", url.Values{"name": {"alpha"}, "branch": {"feat"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("merge = %d, want 200: %s", w.Code, w.Body)
+	}
+	// origin/main advanced to the merged tip: the push actually happened.
+	if got := hygGit(t, origin, "rev-parse", "main"); got != featTip {
+		t.Fatalf("origin main = %s, want merged tip %s (before %s): merge did not push origin", got, featTip, originBefore)
+	}
+	// The beehive pointer advanced AND was committed (a new root commit).
+	if got := hygGit(t, root, "rev-parse", "HEAD:submodules/alpha/repo"); got != featTip {
+		t.Fatalf("submodule pointer = %s, want %s: pointer not advanced/committed", got, featTip)
+	}
+	if hygGit(t, root, "rev-parse", "HEAD") == headBefore {
+		t.Fatal("beehive root HEAD did not advance: the pointer bump was not committed")
+	}
+}
+
+// TestMergeIdempotentOnAlreadyMerged proves a second merge of an already-merged
+// branch is a clean no-op (success, not error): the merge is "already up to
+// date", the push has nothing to send, and the pointer commit is git.ErrNothing
+// (tolerated) — so nothing moves the second time.
+func TestMergeIdempotentOnAlreadyMerged(t *testing.T) {
+	s, root, origin, repoDir := mergeRepo(t)
+	hygGit(t, repoDir, "checkout", "-q", "-b", "feat")
+	os.WriteFile(filepath.Join(repoDir, "g"), []byte("feature\n"), 0o644)
+	hygGit(t, repoDir, "add", "-A")
+	hygGit(t, repoDir, "commit", "-q", "-m", "feat work")
+	hygGit(t, repoDir, "checkout", "-q", "main")
+
+	if w := postForm(t, s, "/merge", url.Values{"name": {"alpha"}, "branch": {"feat"}}); w.Code != http.StatusOK {
+		t.Fatalf("first merge = %d, want 200: %s", w.Code, w.Body)
+	}
+	originAfter := hygGit(t, origin, "rev-parse", "main")
+	pointerAfter := hygGit(t, root, "rev-parse", "HEAD:submodules/alpha/repo")
+	headAfter := hygGit(t, root, "rev-parse", "HEAD")
+
+	// Second merge of the now already-merged branch must succeed and change nothing.
+	if w := postForm(t, s, "/merge", url.Values{"name": {"alpha"}, "branch": {"feat"}}); w.Code != http.StatusOK {
+		t.Fatalf("second (idempotent) merge = %d, want 200: %s", w.Code, w.Body)
+	}
+	if got := hygGit(t, origin, "rev-parse", "main"); got != originAfter {
+		t.Fatalf("idempotent merge moved origin main: %s != %s", got, originAfter)
+	}
+	if got := hygGit(t, root, "rev-parse", "HEAD:submodules/alpha/repo"); got != pointerAfter {
+		t.Fatalf("idempotent merge moved the pointer: %s != %s", got, pointerAfter)
+	}
+	if got := hygGit(t, root, "rev-parse", "HEAD"); got != headAfter {
+		t.Fatalf("idempotent merge made a spurious beehive commit: HEAD %s != %s", got, headAfter)
+	}
+}
+
+// TestMergeConflictReturns409OriginUntouched proves the "no partial publish"
+// invariant: a conflicting branch returns 409, nothing is pushed to origin, the
+// beehive pointer is unchanged, and the in-progress merge is ABORTED so the
+// shared submodule checkout is left clean (not wedged mid-merge).
+func TestMergeConflictReturns409OriginUntouched(t *testing.T) {
+	s, root, origin, repoDir := mergeRepo(t)
+
+	// feat and main edit the SAME line of f from the shared base => merge conflict.
+	hygGit(t, repoDir, "checkout", "-q", "-b", "feat")
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("feat\n"), 0o644)
+	hygGit(t, repoDir, "add", "-A")
+	hygGit(t, repoDir, "commit", "-q", "-m", "feat edit")
+	hygGit(t, repoDir, "checkout", "-q", "main")
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("main\n"), 0o644)
+	hygGit(t, repoDir, "add", "-A")
+	hygGit(t, repoDir, "commit", "-q", "-m", "main edit")
+
+	originBefore := hygGit(t, origin, "rev-parse", "main")
+	pointerBefore := hygGit(t, root, "rev-parse", "HEAD:submodules/alpha/repo")
+	headBefore := hygGit(t, root, "rev-parse", "HEAD")
+
+	w := postForm(t, s, "/merge", url.Values{"name": {"alpha"}, "branch": {"feat"}})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("conflict merge = %d, want 409: %s", w.Code, w.Body)
+	}
+	if got := hygGit(t, origin, "rev-parse", "main"); got != originBefore {
+		t.Fatalf("conflict pushed to origin: main %s != %s (partial publish)", got, originBefore)
+	}
+	if got := hygGit(t, root, "rev-parse", "HEAD:submodules/alpha/repo"); got != pointerBefore {
+		t.Fatalf("conflict moved the pointer: %s != %s", got, pointerBefore)
+	}
+	if got := hygGit(t, root, "rev-parse", "HEAD"); got != headBefore {
+		t.Fatalf("conflict made a beehive commit: %s != %s", got, headBefore)
+	}
+	// The merge was aborted: the shared submodule checkout is clean (committed
+	// state, no unmerged paths), so subsequent operations are not wedged.
+	if st := hygGit(t, repoDir, "status", "--porcelain"); st != "" {
+		t.Fatalf("submodule checkout left dirty after conflict (not aborted):\n%s", st)
+	}
+}
+
+// TestServerTrackedBranch proves the merge path resolves the tracked branch from
+// .gitmodules instead of hardcoding "main": an explicit branch key is honored,
+// and an absent key falls back to main.
+func TestServerTrackedBranch(t *testing.T) {
+	root := t.TempDir()
+	if err := repo.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	hygGit(t, root, "config", "user.email", "t@t")
+	hygGit(t, root, "config", "user.name", "t")
+	os.MkdirAll(filepath.Join(root, "submodules", "alpha", "repo"), 0o755)
+	r, _ := repo.Open(root)
+	s, err := New(r, config.Defaults(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := repo.Submodule{Name: "alpha", Path: filepath.Join(root, "submodules", "alpha")}
+	ctx := context.Background()
+
+	// No .gitmodules => default main.
+	if b := s.trackedBranch(ctx, sm); b != "main" {
+		t.Fatalf("default tracked branch = %q, want main", b)
+	}
+	// A non-main tracked branch must be honored (proves it is not hardcoded). The
+	// section name is the PATH, as `git submodule add` writes it.
+	os.WriteFile(filepath.Join(root, ".gitmodules"), []byte(
+		"[submodule \"submodules/alpha/repo\"]\n\tpath = submodules/alpha/repo\n\tbranch = trunk\n\turl = ./x\n"), 0o644)
+	if b := s.trackedBranch(ctx, sm); b != "trunk" {
+		t.Fatalf("tracked branch = %q, want trunk (from .gitmodules)", b)
+	}
+}
+
+// TestBranchViewPublishControlWired proves the branch/commit view now exposes a
+// publish control wired to POST /merge (htmx, with a destructive-action confirm),
+// closing the "branch_view lists commits with no action" gap the task calls out.
+// The submodule is prefilled and from=branch marks this entry point so the
+// handler answers with an inline fragment rather than the full merge panel.
+func TestBranchViewPublishControlWired(t *testing.T) {
+	s, _, _, _ := mergeRepo(t)
+	w := get(t, s, "/submodule/alpha/branches")
+	if w.Code != 200 {
+		t.Fatalf("branches view = %d: %s", w.Code, w.Body)
+	}
+	b := w.Body.String()
+	for _, want := range []string{
+		`hx-post="/merge"`,           // wired to the real publish handler
+		`hx-target="#merge-result"`,  // inline result, not a full reload
+		"hx-confirm=",                // destructive-action confirm
+		`name="name" value="alpha"`,  // the submodule is prefilled
+		`name="from" value="branch"`, // marks the branch-view entry point
+		`id="merge-result"`,          // inline result sink
+	} {
+		if !strings.Contains(b, want) {
+			t.Fatalf("branch view missing publish-control %q:\n%s", want, b)
+		}
+	}
+}
+
+// TestMergeFromBranchViewReturnsInlineResult proves the branch-view entry point
+// (from=branch) publishes for real AND answers with a small inline success
+// fragment (not the whole merge panel, which is what the /merge panel form
+// swaps), so the htmx #merge-result swap shows a confirmation in place.
+func TestMergeFromBranchViewReturnsInlineResult(t *testing.T) {
+	s, _, origin, repoDir := mergeRepo(t)
+	hygGit(t, repoDir, "checkout", "-q", "-b", "feat")
+	os.WriteFile(filepath.Join(repoDir, "g"), []byte("feature\n"), 0o644)
+	hygGit(t, repoDir, "add", "-A")
+	hygGit(t, repoDir, "commit", "-q", "-m", "feat work")
+	featTip := hygGit(t, repoDir, "rev-parse", "HEAD")
+	hygGit(t, repoDir, "checkout", "-q", "main")
+
+	w := postForm(t, s, "/merge", url.Values{"name": {"alpha"}, "branch": {"feat"}, "from": {"branch"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("branch-view merge = %d, want 200: %s", w.Code, w.Body)
+	}
+	b := w.Body.String()
+	if !strings.Contains(b, `class="ok"`) || !strings.Contains(b, "feat") {
+		t.Fatalf("branch-view merge did not return an inline ok fragment:\n%s", b)
+	}
+	// It is the small fragment, NOT the full merge panel page.
+	if strings.Contains(b, `id="merge-panel"`) || strings.Contains(b, "Merge to main") {
+		t.Fatalf("branch-view merge returned the whole panel instead of a fragment:\n%s", b)
+	}
+	// And it actually published via the same real path (origin advanced).
+	if got := hygGit(t, origin, "rev-parse", "main"); got != featTip {
+		t.Fatalf("branch-view merge did not push origin: %s != %s", got, featTip)
+	}
+}
