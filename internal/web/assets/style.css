@@ -583,3 +583,49 @@ ul.secrets > li > code {
   font-size: var(--text-sm);
 }
 ul.secrets details.inline-edit { margin: 0; }
+
+/* dashboard-cards --------------------------------------------------------- *
+ * Per-submodule cards on the dashboard. Purely ADDITIVE: builds on the shared
+ * tokens and the existing .cards/.card/.badge/.active classes without editing
+ * them. The two coloured-badge families reuse the SAME light/dark pill tokens
+ * as the status pills, so light and dark differ only in token values:
+ *   swarm state  .badge.state-active | .state-bootstrap  (dormant stays neutral)
+ *   deployment   .badge.env + .env-blue | .env-green      (a leading colour dot)
+ * A fresh session+heartbeat claim adds `.active` to the state badge (the
+ * design-system live overlay: teal ring + pulsing dot), so a card whose bee is
+ * working right now reads at a glance. */
+.card-badges { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin: 0 0 var(--space-3); }
+.card-stats { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-4); margin: 0 0 var(--space-2); font-size: var(--text-sm); }
+.card-stats b { font-weight: 700; }
+.card-links { font-size: var(--text-sm); color: var(--text-muted); }
+
+/* Swarm-state badges: hue via --bh, rendered with the shared pill tokens.
+ * state-dormant is intentionally left as the neutral .badge (an inert target). */
+.badge.state-active { --bh: var(--hue-done); }
+.badge.state-bootstrap { --bh: var(--hue-review); }
+.badge.state-active,
+.badge.state-bootstrap {
+  background: hsl(var(--bh) var(--pill-s) var(--pill-bg-l));
+  color: hsl(var(--bh) var(--pill-fg-s) var(--pill-fg-l));
+  border-color: hsl(var(--bh) var(--pill-s) var(--pill-border-l));
+}
+
+/* Deployment env badge: neutral pill with a leading dot coloured by the active
+ * environment (blue / green; any other name falls back to the accent-blue hue,
+ * so a custom env still renders). */
+.badge.env::before {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 0.55em;
+  margin-right: 0.4em;
+  border-radius: 50%;
+  background: hsl(var(--eh, 214) 60% 50%);
+  vertical-align: baseline;
+}
+.badge.env-blue { --eh: 214; }
+.badge.env-green { --eh: var(--hue-done); }
+
+/* NEEDS-HUMAN count link: violet, matching the needs-human status hue, so a
+ * card that needs a human draws the eye (links through to the /human queue). */
+.needs-human { color: hsl(var(--hue-human) 58% 52%); font-weight: 600; }

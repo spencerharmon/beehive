@@ -1141,3 +1141,89 @@ func TestAssetsStyleHtmxPolish(t *testing.T) {
 		}
 	}
 }
+
+// TestDashboardCards is the dashboard-cards contract: subViews derives one card
+// per submodule from files on disk (the live swarm status), carrying the swarm
+// state, that submodule's own blue/green env, and — through the unified plan
+// parser — a pending count that EXCLUDES DONE, a human count that is NEEDS-HUMAN
+// ONLY (no double-count), and a live flag true only for a fresh session+heartbeat
+// claim within the TTL. now is fixed 30m after alpha's t1 heartbeat (ttl 60m) so
+// the live derivation is deterministic regardless of the wall clock. Fixtures
+// cover every swarm state, both envs, and live vs not-live.
+func TestDashboardCards(t *testing.T) {
+	s, root := setup(t) // alpha: active, blue, t1 TODO (claimed) + t2 NEEDS-HUMAN + t3 DONE
+	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+
+	mk := func(name string, files map[string]string) {
+		dir := filepath.Join(root, "submodules", name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for f, body := range files {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// bravo: no ROI.md -> dormant, no plan -> zero counts.
+	mk("bravo", nil)
+	// charlie: ROI present but no PLAN.md -> bootstrap.
+	mk("charlie", map[string]string{repo.ROIFile: "# charlie\n"})
+	// delta: has a plan -> active; its own INFRASTRUCTURE.md pins green; one DONE +
+	// one unclaimed TODO -> pending 1, human 0, not live.
+	mk("delta", map[string]string{
+		repo.ROIFile:   "# delta\n",
+		repo.InfraFile: "# infra\n\nActive: green\n",
+		repo.PlanFile: "<!-- Beehive-ROI: d00d -->\n# Plan\n\n" +
+			"## d1 [DONE] <!-- attempts=0 deps= -->\nshipped\n\n" +
+			"## d2 [TODO] <!-- attempts=0 deps= -->\nqueued\n",
+	})
+
+	views, err := s.subViews(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]subView{}
+	for _, v := range views {
+		by[v.Name] = v
+	}
+	if len(by) != 4 {
+		t.Fatalf("want 4 cards, got %d: %+v", len(by), views)
+	}
+	// alpha: active, default blue env, pending = TODO+NEEDS-HUMAN (DONE excluded),
+	// human = the one NEEDS-HUMAN, live = the fresh t1 claim.
+	if a := by["alpha"]; a.State != "active" || a.Env != "blue" || a.Pending != 2 || a.Human != 1 || !a.Live {
+		t.Fatalf("alpha card = %+v (want active/blue pending=2 human=1 live)", a)
+	}
+	// bravo: dormant (no ROI), empty plan, not live.
+	if b := by["bravo"]; b.State != "dormant" || b.Pending != 0 || b.Human != 0 || b.Live {
+		t.Fatalf("bravo card = %+v (want dormant, zero counts, not live)", b)
+	}
+	// charlie: bootstrap (ROI present, PLAN absent).
+	if c := by["charlie"]; c.State != "bootstrap" || c.Pending != 0 || c.Live {
+		t.Fatalf("charlie card = %+v (want bootstrap)", c)
+	}
+	// delta: active, its own green env, DONE excluded from pending, no fresh claim.
+	if d := by["delta"]; d.State != "active" || d.Env != "green" || d.Pending != 1 || d.Human != 0 || d.Live {
+		t.Fatalf("delta card = %+v (want active/green pending=1 human=0 not live)", d)
+	}
+
+	// The rendered dashboard wires the card grid: swarm-state + env badge classes
+	// and the card's own NEEDS-HUMAN link (class="needs-human", distinct from the
+	// always-present nav /human link so a broken card link still fails this).
+	page := get(t, s, "/")
+	if page.Code != 200 {
+		t.Fatalf("dashboard status %d", page.Code)
+	}
+	body := page.Body.String()
+	for _, want := range []string{
+		`class="cards"`,
+		"state-active", "state-dormant", "state-bootstrap",
+		"env-blue", "env-green",
+		`class="needs-human"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard html missing %q:\n%s", want, body)
+		}
+	}
+}

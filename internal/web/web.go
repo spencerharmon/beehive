@@ -115,20 +115,49 @@ func (s *Server) submodule(name string) (repo.Submodule, error) {
 	return repo.Submodule{}, os.ErrNotExist
 }
 
-// subView is dashboard per-submodule status.
+// subView is one submodule's dashboard card, derived from files on every request
+// (no cache — the "live" swarm status). State is the coarse swarm phase (dormant:
+// no ROI.md; bootstrap: ROI present but no PLAN.md; active: has a plan). Env is
+// the submodule's resolved blue/green active deployment (its INFRASTRUCTURE.md
+// via the artifacts model, defaulting to blue when absent). Pending and Human are
+// counted through the unified PLAN.md parser (internal/plan): Pending is every
+// non-DONE task, Human is NEEDS-HUMAN only. Live is true when any task carries a
+// fresh session+heartbeat claim (the unified "actively worked" signal — there is
+// no IN-PROGRESS status), driving the card's additive .active overlay.
 type subView struct {
 	Name    string
 	State   string
 	Stamp   string
+	Env     string
 	Pending int
+	Human   int
+	Live    bool
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
-	subs, err := s.repo.Submodules()
+	views, err := s.subViews(time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env})
+}
+
+// subViews builds the per-submodule dashboard cards from files on disk on every
+// request — this is the "live" swarm status, not a cache. now is injected (rather
+// than read inside) so the live-claim derivation is deterministically testable;
+// the handler passes time.Now(). Each card's counts and live flag come from the
+// unified PLAN.md parser (internal/plan) so they cannot drift from the plan view:
+// Pending is every non-DONE task, Human is NEEDS-HUMAN only (no double-count),
+// and Live is true when any task carries a fresh session+heartbeat claim within
+// the TTL (the unified "actively worked" signal — there is no IN-PROGRESS status).
+func (s *Server) subViews(now time.Time) ([]subView, error) {
+	subs, err := s.repo.Submodules()
+	if err != nil {
+		return nil, err
+	}
+	ttl := s.ttl()
 	var views []subView
 	for _, sm := range subs {
 		v := subView{Name: sm.Name, State: "active"}
@@ -139,17 +168,26 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 			v.State = "bootstrap"
 		}
 		v.Stamp, _ = sm.ROIStamp()
-		if p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl()); err == nil {
+		// Env badge: this submodule's own resolved blue/green active deployment
+		// (its INFRASTRUCTURE.md through the artifacts model; blue when absent).
+		smEnv, _ := parseEnv(filepath.Join(sm.Path, repo.InfraFile))
+		v.Env = smEnv.Active
+		if p, err := parsePlan(sm.PlanPath(), now, ttl); err == nil {
 			for _, it := range p.Items {
 				if it.Status != StatusDone {
 					v.Pending++
+				}
+				if it.Status == StatusHuman {
+					v.Human++
+				}
+				if it.Active {
+					v.Live = true
 				}
 			}
 		}
 		views = append(views, v)
 	}
-	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env})
+	return views, nil
 }
 
 func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
