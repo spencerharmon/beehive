@@ -15,7 +15,8 @@ go test -race ./...
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of the above + golangci-lint, and on
-`v*` tags cross-compiles, checksums, cosign-signs, and cuts a gh release.
+`v*` tags cross-compiles, checksums, cosign-signs, verifies
+(`scripts/verify-release.sh`), and cuts a gh release.
 
 ## Conventions
 
