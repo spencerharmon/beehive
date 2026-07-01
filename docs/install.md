@@ -102,12 +102,19 @@ Packages are built with [nfpm](https://nfpm.goreleaser.com) from `packaging/nfpm
 
 ## Release artifacts
 
-CI cross-compiles `linux`/`darwin` × `amd64`/`arm64` on `v*` tags, emits `SHA256SUMS-<os>-<arch>` and a cosign keyless signature. Verify:
+CI cross-compiles `linux`/`darwin` × `amd64`/`arm64` on `v*` tags, emits `SHA256SUMS-<os>-<arch>` plus a cosign **keyless** signature (`.sig`) and its certificate (`.pem`), and re-verifies every artifact before publishing. Verify a download yourself with [cosign](https://docs.sigstore.dev) (replace `<owner>/<repo>`):
 
 ```sh
-cosign verify-blob --signature SHA256SUMS-linux-amd64.sig SHA256SUMS-linux-amd64
+cosign verify-blob \
+  --certificate SHA256SUMS-linux-amd64.pem \
+  --signature   SHA256SUMS-linux-amd64.sig \
+  --certificate-identity-regexp '^https://github.com/<owner>/<repo>/[.]github/workflows/.+@refs/tags/v.+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS-linux-amd64
 sha256sum -c SHA256SUMS-linux-amd64
 ```
+
+Or run `scripts/verify-release.sh <dir>` over the download directory to do the static-binary check, checksums, and cosign verification in one step (the same script CI runs).
 
 ## Config (`/etc/beehive/config.yaml`)
 
