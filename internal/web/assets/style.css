@@ -211,6 +211,12 @@ small, .small { font-size: var(--text-sm); }
 }
 .card h3 { margin-bottom: var(--space-2); }
 .card h3 a { color: var(--text); }
+/* Dashboard submodule card: a wrapping badge row (swarm state, env, counts) and
+   a compact link row. Badge-links (the NEEDS-HUMAN count) drop the underline so
+   the pill reads as a pill, not link text. */
+.card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); }
+.card-meta a { text-decoration: none; }
+.card-links { font-size: var(--text-sm); }
 
 /* Badges (neutral pills; .live = success) -------------------------------- */
 .badge {
@@ -230,6 +236,12 @@ small, .small { font-size: var(--text-sm); }
   border-color: transparent;
   color: #fff;
 }
+/* Env deploy badge (dashboard cards): blue -> accent, green -> success, so the
+   badge tracks the light/dark tokens. Any other env value stays a neutral
+   badge. .badge.human tints the NEEDS-HUMAN count with the human status hue. */
+.badge.env-blue { background: var(--accent); border-color: transparent; color: var(--accent-contrast); }
+.badge.env-green { background: var(--success); border-color: transparent; color: #fff; }
+.badge.human { background: hsl(var(--hue-human) 60% 45%); border-color: transparent; color: #fff; }
 .ago { color: var(--text-muted); font-size: var(--text-xs); }
 .ok { color: var(--success); font-weight: 600; }
 .muted { color: var(--text-muted); }

@@ -116,19 +116,69 @@ func (s *Server) submodule(name string) (repo.Submodule, error) {
 	return repo.Submodule{}, os.ErrNotExist
 }
 
-// subView is dashboard per-submodule status.
+// subView is the dashboard's per-submodule card, all derived live from files
+// each request (no cache). State is the swarm status (active/dormant/bootstrap);
+// Pending/Human are task counts from the unified parser (internal/plan) so they
+// match what the runner/selector see; Env is the submodule's active blue/green
+// deploy env from the typed artifacts model ("" when it has no
+// INFRASTRUCTURE.md); Working is true when a task is actively claimed (a fresh
+// session+heartbeat), driving the card's live overlay.
 type subView struct {
 	Name    string
 	State   string
 	Stamp   string
 	Pending int
+	Human   int
+	Env     string
+	Working bool
+}
+
+// EnvClass is the design-system badge hue modifier for the active deploy env:
+// env-blue / env-green for the standard blue/green envs, "" (a neutral badge)
+// for any other or absent env. Resolving it in Go bounds the class names the
+// template can emit to a known set rather than interpolating a raw file value
+// into the class attribute.
+func (v subView) EnvClass() string {
+	switch v.Env {
+	case "blue":
+		return "env-blue"
+	case "green":
+		return "env-green"
+	default:
+		return ""
+	}
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
-	subs, err := s.repo.Submodules()
+	views, err := s.subViews(time.Now(), s.ttl())
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
+	}
+	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
+	// Read-only hygiene summary alongside the submodule cards. A scan error is
+	// surfaced inside the widget (not swallowed) rather than failing the whole
+	// dashboard, which is the operator's primary page.
+	hyg, err := scanHygiene(r.Context(), s.repo.Root, s.git)
+	if err != nil {
+		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
+	}
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg})
+}
+
+// subViews builds the dashboard card data for every submodule, derived live from
+// files (no cache) so the swarm status is always current: State
+// (active/dormant/bootstrap), the ROI Stamp, the Pending/Human task counts from
+// the unified parser (internal/plan via parsePlan — the same code the
+// runner/selector use), the active blue/green Env from the submodule's own
+// INFRASTRUCTURE.md via the typed artifacts model, and Working (a task carrying a
+// fresh session+heartbeat claim). now/ttl are passed in so the claim-freshness
+// derivation is deterministically testable; the handler supplies time.Now() and
+// the resolved TTL.
+func (s *Server) subViews(now time.Time, ttl time.Duration) ([]subView, error) {
+	subs, err := s.repo.Submodules()
+	if err != nil {
+		return nil, err
 	}
 	var views []subView
 	for _, sm := range subs {
@@ -140,24 +190,36 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 			v.State = "bootstrap"
 		}
 		v.Stamp, _ = sm.ROIStamp()
-		if p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl()); err == nil {
+		// Counts come from the unified parser: Pending = every task not DONE,
+		// Human = NEEDS-HUMAN only. A NEEDS-HUMAN task is BOTH pending and human —
+		// the two counters legitimately overlap, but each task increments each
+		// counter at most once (never double-counted within a counter). Working =
+		// any task with a fresh claim (session+heartbeat within the TTL). A parse
+		// error leaves this submodule's counts at zero rather than failing the
+		// whole dashboard (mirrors the pre-existing per-submodule resilience).
+		if p, err := parsePlan(sm.PlanPath(), now, ttl); err == nil {
 			for _, it := range p.Items {
 				if it.Status != StatusDone {
 					v.Pending++
 				}
+				if it.Status == StatusHuman {
+					v.Human++
+				}
+				if it.Active {
+					v.Working = true
+				}
 			}
+		}
+		// Env badge: the submodule's own blue/green deploy state via the typed
+		// artifacts model. An absent INFRASTRUCTURE.md leaves Env "" (no badge)
+		// instead of a misleading default; a read error is surfaced as no badge
+		// too (best-effort overview, never a dashboard-wide failure).
+		if in, err := artifacts.LoadInfra(filepath.Join(sm.Path, repo.InfraFile)); err == nil && in.Present() {
+			v.Env = in.Deployment().Active
 		}
 		views = append(views, v)
 	}
-	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
-	// Read-only hygiene summary alongside the submodule cards. A scan error is
-	// surfaced inside the widget (not swallowed) rather than failing the whole
-	// dashboard, which is the operator's primary page.
-	hyg, err := scanHygiene(r.Context(), s.repo.Root, s.git)
-	if err != nil {
-		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
-	}
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg})
+	return views, nil
 }
 
 func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
