@@ -1347,3 +1347,177 @@ func TestHygieneCleanAndWidget(t *testing.T) {
 		t.Fatalf("dashboard does not embed the hygiene widget:\n%s", dash.Body)
 	}
 }
+
+// --- publish-to-origin ------------------------------------------------------
+// Every frontend write funnels through publishMain, which must land the commit on
+// the repo's REMOTE (not just local main) so other hosts' honeybees — which branch
+// off origin/main — actually see the change. These tests stand up a real bare
+// `origin` and assert writes reach it, survive a concurrent advance (the
+// fetch+merge+retry path), and degrade to a clean local-only commit when there is
+// no remote.
+
+// setupOrigin builds a Server whose checkout tracks a bare `origin` on main with a
+// seed commit already pushed, so publishMain has a real remote to publish to. It
+// mirrors setup()'s alpha submodule + PLAN seed, then adds the initial commit, a
+// bare origin, the remote, and the push. Returns the server, the checkout root,
+// and the bare origin dir.
+func setupOrigin(t *testing.T) (*Server, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	if err := repo.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range [][]string{{"user.email", "t@t"}, {"user.name", "t"}} {
+		hygGit(t, root, "config", kv[0], kv[1])
+	}
+	sm := filepath.Join(root, "submodules", "alpha")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, repo.ROIFile), []byte("# alpha\n"), 0o644)
+	os.WriteFile(filepath.Join(sm, repo.PlanFile), []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## t1 [TODO] <!-- attempts=0 deps= weight=1 -->\nbuild\nDoc: br-t1.md\n"), 0o644)
+	hygGit(t, root, "add", "-A")
+	hygGit(t, root, "commit", "-qm", "seed")
+	origin := filepath.Join(t.TempDir(), "origin.git")
+	hygGit(t, root, "init", "--bare", "-q", origin)
+	// A default `git init --bare` leaves HEAD dangling at refs/heads/master, so a
+	// clone of this origin would check out no `main` — point HEAD at main like a
+	// real origin, so peer clones (advanceOrigin) land on main.
+	hygGit(t, origin, "symbolic-ref", "HEAD", "refs/heads/main")
+	hygGit(t, root, "remote", "add", "origin", origin)
+	hygGit(t, root, "push", "-q", "origin", "main")
+	r, err := repo.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(r, config.Defaults(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, root, origin
+}
+
+// showAt returns the contents of path at ref in the git repo at gitDir (works on a
+// bare repo too), and whether the path exists there. It is the test's window onto
+// what actually landed on origin.
+func showAt(t *testing.T, gitDir, ref, path string) (string, bool) {
+	t.Helper()
+	c := exec.Command("git", "show", ref+":"+path)
+	c.Dir = gitDir
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// advanceOrigin pushes an independent commit (file=content at the repo root) to
+// origin/main from a fresh clone, so the Server's next push is a non-fast-forward
+// and must fetch+merge+retry. It is the "another host raced us to the remote"
+// event.
+func advanceOrigin(t *testing.T, origin, file, content string) {
+	t.Helper()
+	dir := t.TempDir()
+	clone := filepath.Join(dir, "c")
+	hygGit(t, dir, "clone", "-q", origin, clone)
+	for _, kv := range [][]string{{"user.email", "o@o"}, {"user.name", "o"}} {
+		hygGit(t, clone, "config", kv[0], kv[1])
+	}
+	os.WriteFile(filepath.Join(clone, file), []byte(content), 0o644)
+	hygGit(t, clone, "add", "-A")
+	hygGit(t, clone, "commit", "-qm", "peer advance")
+	hygGit(t, clone, "push", "-q", "origin", "main")
+}
+
+// TestPublishMainLandsOnOrigin is the core contract: a frontend write does not
+// strand as a local-only commit — publishMain publishes it to the repo's remote,
+// advancing origin/main, so other hosts' honeybees (which branch off origin/main)
+// see it.
+func TestPublishMainLandsOnOrigin(t *testing.T) {
+	s, root, origin := setupOrigin(t)
+	before := hygGit(t, origin, "rev-parse", "main")
+
+	os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.ROIFile), []byte("# landed\n"), 0o644)
+	if err := s.publishMain(context.Background(), "frontend: edit ROI alpha"); err != nil {
+		t.Fatalf("publishMain: %v", err)
+	}
+
+	if after := hygGit(t, origin, "rev-parse", "main"); after == before {
+		t.Fatal("origin/main did not advance: the write never reached the remote")
+	}
+	if got, ok := showAt(t, origin, "main", "submodules/alpha/"+repo.ROIFile); !ok || got != "# landed\n" {
+		t.Fatalf("ROI not on origin/main: ok=%v got=%q", ok, got)
+	}
+}
+
+// TestPublishMainRetriesConcurrentAdvance proves the non-fast-forward path never
+// drops an edit: when the remote advanced under us (a peer pushed first) the push
+// fails, and publishMain fetches, merges the advanced tip, and retries — so BOTH
+// the peer's commit and our write end up on origin/main.
+func TestPublishMainRetriesConcurrentAdvance(t *testing.T) {
+	s, root, origin := setupOrigin(t)
+	advanceOrigin(t, origin, "peer.txt", "peer\n") // origin now ahead of local
+
+	os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.ROIFile), []byte("# raced\n"), 0o644)
+	if err := s.publishMain(context.Background(), "frontend: edit ROI alpha"); err != nil {
+		t.Fatalf("publishMain over a concurrent advance: %v", err)
+	}
+
+	// Our write reached origin despite the non-fast-forward...
+	if got, ok := showAt(t, origin, "main", "submodules/alpha/"+repo.ROIFile); !ok || got != "# raced\n" {
+		t.Fatalf("our write lost on retry: ok=%v got=%q", ok, got)
+	}
+	// ...and the peer's concurrent commit was preserved, not clobbered.
+	if got, ok := showAt(t, origin, "main", "peer.txt"); !ok || got != "peer\n" {
+		t.Fatalf("concurrent peer commit lost: ok=%v got=%q", ok, got)
+	}
+}
+
+// TestPublishMainNoOriginCommitsLocally proves the single-host degrade path: with
+// no remote configured, publishMain still commits locally (honeybees branch off
+// the local main it advances) and the absent-remote push is a clean no-op, not an
+// error.
+func TestPublishMainNoOriginCommitsLocally(t *testing.T) {
+	s, root := setup(t) // setup() configures no remote
+	if r := hygGit(t, root, "remote"); r != "" {
+		t.Fatalf("precondition: expected no remote, got %q", r)
+	}
+
+	os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.ROIFile), []byte("# local\n"), 0o644)
+	if err := s.publishMain(context.Background(), "frontend: edit ROI alpha"); err != nil {
+		t.Fatalf("publishMain without a remote must not error: %v", err)
+	}
+
+	if got, ok := showAt(t, root, "HEAD", "submodules/alpha/"+repo.ROIFile); !ok || got != "# local\n" {
+		t.Fatalf("write not committed to local main: ok=%v got=%q", ok, got)
+	}
+}
+
+// TestWriteHandlersPublishToOrigin drives the actual HTTP write handlers — a
+// no-tolerance one (roiPost) and two ErrNothing-tolerant ones (envDeploy,
+// submoduleLink) — end to end and asserts each lands on origin/main, proving the
+// handlers are wired through publishMain rather than just that publishMain works
+// in isolation.
+func TestWriteHandlersPublishToOrigin(t *testing.T) {
+	s, _, origin := setupOrigin(t)
+
+	if w := postForm(t, s, "/roi/alpha", url.Values{"body": {"# roi\n"}}); w.Code != 200 {
+		t.Fatalf("roi post %d: %s", w.Code, w.Body)
+	}
+	if w := postForm(t, s, "/env/deploy", url.Values{"target": {"green"}}); w.Code != 200 {
+		t.Fatalf("env deploy %d: %s", w.Code, w.Body)
+	}
+	if w := postForm(t, s, "/submodule/link", url.Values{"from": {"a"}, "to": {"b"}}); w.Code != http.StatusSeeOther {
+		t.Fatalf("submodule link %d: %s", w.Code, w.Body)
+	}
+
+	if got, ok := showAt(t, origin, "main", "submodules/alpha/"+repo.ROIFile); !ok || got != "# roi\n" {
+		t.Fatalf("roiPost did not publish to origin: ok=%v got=%q", ok, got)
+	}
+	if got, ok := showAt(t, origin, "main", repo.InfraFile); !ok || !strings.Contains(got, "Active: green") {
+		t.Fatalf("envDeploy did not publish to origin: ok=%v got=%q", ok, got)
+	}
+	if got, ok := showAt(t, origin, "main", repo.LinksFile); !ok || !strings.Contains(got, "a") || !strings.Contains(got, "b") {
+		t.Fatalf("submoduleLink did not publish to origin: ok=%v got=%q", ok, got)
+	}
+}
