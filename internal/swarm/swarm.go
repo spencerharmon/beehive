@@ -572,7 +572,27 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				res.GCMarked = true
 				res.Warning = fmt.Sprintf(
 					"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
-					sel.Task.ID, ferr)
+					taskID(sel), ferr)
+				return res, nil
+			}
+			// A nil publish is necessary but not sufficient: complete() judged LOCAL
+			// state, so a publish that returned success yet never advanced the
+			// published main (a silently rejected push, a no-op publisher) would read
+			// as a phantom DONE. Independently confirm the work's stamp actually landed
+			// on the published main before reporting complete; if it did not, treat it
+			// exactly like a failed publish — leave the claim unreleased for GC + retry.
+			if adv, aerr := r.publishedAdvanced(ctx, sel); !adv {
+				cleanup()
+				res.GCMarked = true
+				if aerr != nil {
+					res.Warning = fmt.Sprintf(
+						"task %s reached completion locally but verifying the publish advanced main failed: %v; left unreleased for retry",
+						taskID(sel), aerr)
+				} else {
+					res.Warning = fmt.Sprintf(
+						"task %s reached completion locally but main did not advance to the published stamp; left unreleased for retry",
+						taskID(sel))
+				}
 				return res, nil
 			}
 			res.Completed = true
@@ -717,6 +737,64 @@ func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
 	// Match by prefix (mirrors select.reconcileRange's check) so a short stamp
 	// that prefixes the full head clears the reconcile, firing exactly once.
 	return stamp != "" && strings.HasPrefix(head, stamp), nil
+}
+
+// publishedAdvanced verifies that the work a Bootstrap/Reconcile turn finished
+// LOCALLY actually became the PUBLISHED main, not merely a local commit on the
+// honeybee's own branch. complete() judges the honeybee's worktree state — it must,
+// because main does not advance until finish() publishes during this same turn, so
+// gating the local check itself on the published main would deadlock (the publish
+// only runs once complete() is already true). That leaves a gap: a publish that
+// returns nil yet never advanced main (a push rejected/blocked but reported as
+// success, a no-op publisher) would read as a phantom DONE. Called after finish()
+// succeeds, this reads the PUBLISHED main and confirms the expected stamp is present
+// before the turn reports complete; if it is not, the caller treats it exactly like
+// a failed publish (leave the claim unreleased, mark for GC, retry).
+//
+// The published main is the local refs/heads/main on a single-host hive (this
+// install: no remote — honeybees publish into the checked-out main via
+// updateInstead) or the remote-tracking <remote>/main on a distributed hive. Either
+// way it is DISTINCT from the honeybee's worktree branch that complete() inspected,
+// so reading it is what proves the work landed rather than a stranded local commit.
+// Only Bootstrap and Reconcile completion is verified here; Work/Review/Arbitrate
+// converge through a PLAN.md status transition the per-turn heartbeat already
+// publishes and re-observes, so they fall through as advanced.
+func (r *Runner) publishedAdvanced(ctx context.Context, sel *selectt.Selection) (bool, error) {
+	switch sel.Kind {
+	case selectt.Bootstrap, selectt.Reconcile:
+	default:
+		return true, nil
+	}
+	ref := "main"
+	if r.Remote != "" {
+		if err := r.Git.Fetch(ctx, r.Remote, "main"); err != nil {
+			return false, err
+		}
+		ref = r.Remote + "/main"
+	}
+	planRel := "submodules/" + sel.Submodule.Name + "/" + repo.PlanFile
+	content, err := r.Git.Show(ctx, ref, planRel)
+	if err != nil {
+		// PLAN.md is absent on the published main: the work never landed there.
+		return false, nil
+	}
+	if sel.Kind == selectt.Bootstrap {
+		// Bootstrap completes once PLAN.md exists; its presence on the published
+		// main IS the advance.
+		return true, nil
+	}
+	// Reconcile: the published PLAN.md must carry the ROI stamp we reconciled to
+	// locally (prefix match mirrors reconciled() — the stamp is often abbreviated),
+	// else our reconcile commit never reached the published main.
+	p, err := plan.Parse(content)
+	if err != nil {
+		return false, err
+	}
+	stamp, err := sel.Submodule.ROIStamp()
+	if err != nil {
+		return false, err
+	}
+	return stamp != "" && strings.HasPrefix(p.ROI, stamp), nil
 }
 
 // workDone verifies the PLAN.md status transitioned to a terminal/handoff state

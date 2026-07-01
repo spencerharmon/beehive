@@ -56,6 +56,26 @@ func gitInit(t *testing.T, dir string) *git.Repo {
 	return g
 }
 
+// bareOrigin inits a bare repo, adds it to g as `origin`, and pushes main, so g
+// has a published remote whose origin/main equals g's current main at call time.
+// Returns the remote name. Used to exercise guard 2 (publishedAdvanced), which
+// reads the remote-tracking <remote>/main branch when Remote != "".
+func bareOrigin(t *testing.T, g *git.Repo) string {
+	t.Helper()
+	ctx := context.Background()
+	bare := t.TempDir()
+	if _, err := git.New(bare).Run(ctx, "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("init bare origin: %v", err)
+	}
+	if _, err := g.Run(ctx, "remote", "add", "origin", bare); err != nil {
+		t.Fatalf("add origin: %v", err)
+	}
+	if err := g.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push origin main: %v", err)
+	}
+	return "origin"
+}
+
 func TestRunCompletes(t *testing.T) {
 	root := t.TempDir()
 	g := gitInit(t, root)
@@ -987,5 +1007,210 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// runReconcileGuard models the production (single-host, no-remote) hive: a honeybee
+// reconcile runs in its own agent worktree off main and publishes into the
+// checked-out main via updateInstead (Publish = wg.PublishToMain(ctx, "")). The
+// submodule sm starts with a committed ROI.md and an UNRECONCILED PLAN.md (no
+// Beehive-ROI stamp) on main; the agent stamps + commits the matching ROI into its
+// worktree PLAN.md so reconciled() fires LOCALLY. `propagate` decides whether the
+// publish actually advances main (true) or reports success while the commit stays on
+// the agent branch only (false) — the advanced-vs-local distinction guard 2 catches.
+func runReconcileGuard(t *testing.T, propagate bool) Result {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	// Unreconciled PLAN.md (no Beehive-ROI stamp) seeded on main.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed roi+plan")
+	roiHead, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || roiHead == "" {
+		t.Fatalf("roi head: %q %v", roiHead, err)
+	}
+
+	// The honeybee's agent worktree off main, exactly as cmd/honeybee creates it.
+	wtPath := filepath.Join(root, ".worktrees", "bee-reconcile")
+	if err := g.WorktreeAdd(ctx, wtPath, "bee-reconcile", "main"); err != nil {
+		t.Fatal(err)
+	}
+	wrp, _ := repo.Open(wtPath)
+	wg := git.New(wtPath)
+	subs, _ := wrp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+
+	// The agent stamps PLAN.md with the current ROI commit and commits it IN ITS
+	// WORKTREE (reconciled() then fires against the worktree). It never publishes;
+	// the publish closure does — or, when !propagate, nothing reaches main.
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		body := "<!-- Beehive-ROI: " + roiHead + " -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"
+		os.WriteFile(subs[0].PlanPath(), []byte(body), 0o644)
+		_ = wg.CommitPaths(ctx, "reconcile: stamp roi", "submodules/sm/PLAN.md")
+	}}}
+	r := &Runner{
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Publish: func(ctx context.Context) error {
+			if propagate {
+				return wg.PublishToMain(ctx, "") // advance the checked-out main
+			}
+			return nil // success reported, but the commit stays on the agent branch
+		},
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	return res
+}
+
+// TestReconcileCompletionRequiresPublishedStamp is the guard-2 (advanced-vs-local)
+// test for Reconcile: completion must judge the PUBLISHED main's stamp, not the
+// honeybee's local commit. A reconcile that advanced main completes; one whose
+// commit is stranded on the agent branch (publish returned nil but main never moved)
+// must NOT report Completed — it is left unreleased + GC-marked for retry.
+func TestReconcileCompletionRequiresPublishedStamp(t *testing.T) {
+	t.Run("advanced", func(t *testing.T) {
+		res := runReconcileGuard(t, true)
+		if !res.Completed {
+			t.Fatalf("main advanced to the reconciled stamp — must report Completed: %+v", res)
+		}
+		if res.GCMarked {
+			t.Fatalf("a successful published reconcile must not be GC-marked: %+v", res)
+		}
+	})
+	t.Run("local-only", func(t *testing.T) {
+		res := runReconcileGuard(t, false)
+		if res.Completed {
+			t.Fatalf("the reconcile commit never reached main — must NOT report Completed (phantom DONE): %+v", res)
+		}
+		if !res.GCMarked {
+			t.Fatalf("an unpublished reconcile must be GC-marked for retry: %+v", res)
+		}
+		if !strings.Contains(res.Warning, "did not advance") {
+			t.Fatalf("unpublished reconcile should warn that main did not advance: %+v", res)
+		}
+	})
+}
+
+// runBootstrapGuard models the production hive for Bootstrap: the submodule sm has a
+// committed ROI.md but NO PLAN.md on main. The agent writes + commits PLAN.md in its
+// worktree (the existence check fires locally) and publishes into main via
+// updateInstead. `propagate` decides whether the publish advances main (true) or
+// leaves PLAN.md on the agent branch only (false).
+func runBootstrapGuard(t *testing.T, propagate bool) Result {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	g.Commit(ctx, "seed roi") // no PLAN.md on main
+
+	wtPath := filepath.Join(root, ".worktrees", "bee-bootstrap")
+	if err := g.WorktreeAdd(ctx, wtPath, "bee-bootstrap", "main"); err != nil {
+		t.Fatal(err)
+	}
+	wrp, _ := repo.Open(wtPath)
+	wg := git.New(wtPath)
+	subs, _ := wrp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(subs[0].PlanPath(), []byte("<!-- Beehive-ROI: 0 -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		_ = wg.CommitPaths(ctx, "bootstrap: write plan", "submodules/sm/PLAN.md")
+	}}}
+	r := &Runner{
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Publish: func(ctx context.Context) error {
+			if propagate {
+				return wg.PublishToMain(ctx, "")
+			}
+			return nil
+		},
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	return res
+}
+
+// TestBootstrapCompletionRequiresPublishedPlan is the guard-2 (advanced-vs-local)
+// test for Bootstrap: completion requires PLAN.md on the PUBLISHED main, not just in
+// the honeybee's worktree. A published bootstrap completes; a PLAN.md stranded on the
+// agent branch (publish never advanced main) must NOT report Completed.
+func TestBootstrapCompletionRequiresPublishedPlan(t *testing.T) {
+	t.Run("advanced", func(t *testing.T) {
+		res := runBootstrapGuard(t, true)
+		if !res.Completed {
+			t.Fatalf("PLAN.md published to main — must report Completed: %+v", res)
+		}
+		if res.GCMarked {
+			t.Fatalf("a successful published bootstrap must not be GC-marked: %+v", res)
+		}
+	})
+	t.Run("local-only", func(t *testing.T) {
+		res := runBootstrapGuard(t, false)
+		if res.Completed {
+			t.Fatalf("PLAN.md never reached main — must NOT report Completed (phantom DONE): %+v", res)
+		}
+		if !res.GCMarked {
+			t.Fatalf("an unpublished bootstrap must be GC-marked for retry: %+v", res)
+		}
+		if !strings.Contains(res.Warning, "did not advance") {
+			t.Fatalf("unpublished bootstrap should warn that main did not advance: %+v", res)
+		}
+	})
+}
+
+// TestPublishedAdvancedRemoteRef covers the distributed-hive branch of
+// publishedAdvanced: when Remote != "" the published ref it verifies is the
+// remote-tracking <remote>/main (fetched fresh), not a local commit. A reconcile
+// whose stamped PLAN.md is committed locally but NOT pushed reads as not-advanced;
+// once the same commit is published to the bare origin it reads as advanced.
+func TestPublishedAdvancedRemoteRef(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed roi+plan")
+	roiHead, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || roiHead == "" {
+		t.Fatalf("roi head: %q %v", roiHead, err)
+	}
+	remote := bareOrigin(t, g) // origin/main == the unreconciled seed
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	r := &Runner{Repo: rp, Git: g, Remote: remote}
+
+	// Reconcile the stamp locally and commit it — but do NOT push. The local branch
+	// carries the stamp; origin still does not, so the publish has not advanced.
+	body := "<!-- Beehive-ROI: " + roiHead + " -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"
+	os.WriteFile(subs[0].PlanPath(), []byte(body), 0o644)
+	g.Commit(ctx, "reconcile: stamp roi")
+	if adv, err := r.publishedAdvanced(ctx, sel); err != nil || adv {
+		t.Fatalf("origin lacks the reconciled stamp — want not-advanced; adv=%v err=%v", adv, err)
+	}
+
+	// Publish to origin; now <remote>/main carries the stamp -> advanced.
+	if err := g.PublishToMain(ctx, remote); err != nil {
+		t.Fatalf("publish to origin: %v", err)
+	}
+	if adv, err := r.publishedAdvanced(ctx, sel); err != nil || !adv {
+		t.Fatalf("origin now has the reconciled stamp — want advanced; adv=%v err=%v", adv, err)
 	}
 }
