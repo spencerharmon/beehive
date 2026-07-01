@@ -63,6 +63,10 @@ type Config struct {
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+	// TrimInjection opts into per-turn injected-prompt trimming (swarm.Runner
+	// scopes the honeybee protocol + preamble to the running kind). Off by default:
+	// unset keeps the injected set byte-for-byte identical to the legacy behavior.
+	TrimInjection bool `yaml:"trim_injection"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -142,6 +146,11 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	// A bool flag can only be turned ON by a more-specific layer (false == unset),
+	// matching the zero-is-unset rule; no layer can silently switch trimming back off.
+	if over.TrimInjection {
+		out.TrimInjection = true
 	}
 	return out
 }

@@ -92,6 +92,15 @@ type Runner struct {
 	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
 	// backstop. 0 = no per-turn cap (tests).
 	TurnTimeout time.Duration
+
+	// TrimInject, when set, scopes the per-turn injected prompt set to the running
+	// kind (see inject.go): it strips the protocol's provenance boilerplate and the
+	// numbered steps for OTHER kinds from the system prompt, drops the redundant
+	// completion mechanics from the Work preamble, and moves them (with the concrete
+	// doc path) into the decision-point "continue" prompt. The Absolute rules and
+	// this kind's own steps are always retained. Off by default = byte-for-byte the
+	// legacy injection, so enabling it is an explicit opt-in (config trim_injection).
+	TrimInject bool
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -312,19 +321,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"The run completes when the task leaves NEEDS-ARBITRATION. Act autonomously.\n\n",
 			smName, sel.Task.ID)
 	case selectt.Work:
-		preamble = fmt.Sprintf(
-			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
-				"Coordination files (the beehive layer): submodules/%[1]s/ROI.md (read-only), "+
-				"submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/.\n"+
-				"Code worktree (already created and checked out for you): submodules/%[1]s/worktrees/%[2]s/ "+
-				"on branch %[2]s. Edit the submodule's CODE there; never write submodules/%[1]s/repo (the shared checkout).\n"+
-				"On completion of a Work task: PLAN.md -> NEEDS-REVIEW on main; commit the code on branch %[2]s "+
-				"with a `Beehive: %[3]s <doc-path>` stamp and ensure that commit is pushed to the submodule's origin; "+
-				"bump the submodule pointer.\n"+
-				"REQUIRED change doc path: submodules/%[1]s/docs/%[2]s-%[3]s.md (the beehive layer — NOT inside the code "+
-				"worktree). The runner's completion check looks for it exactly there; a doc elsewhere reads as 'not done'.\n"+
-				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
-			smName, res.Branch, taskID(sel))
+		preamble = workPreamble(smName, res.Branch, taskID(sel), r.TrimInject)
 	default: // Bootstrap, Reconcile: beehive-layer only, no code worktree.
 		preamble = fmt.Sprintf(
 			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
@@ -343,6 +340,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			r.Session, smName, sel.Task.ID)
 	}
 	first = preamble + first
+
+	// Scope the per-turn system prompt to this kind when trim is opted in. The
+	// system prompt is re-sent every turn, so this is the largest recurring saving;
+	// it is a no-op on an unrecognized (operator-customized) protocol.
+	if r.TrimInject {
+		system = scopeProtocol(system, sel.Kind)
+	}
 
 	if r.Debug != nil {
 		fmt.Fprintf(r.Debug, "[honeybee] dir=%s submodule=%s kind=%s opening session...\n", absRoot, sel.Submodule.Name, sel.Kind)
@@ -397,6 +401,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
+	// After turn 1 the driver sends this each turn. Default "continue" is byte-stable;
+	// a trimmed Work session instead sends the decision-point hint carrying the
+	// concrete change-doc path + commit stamp (the mechanics dropped from turn 1's
+	// preamble), so the completion guidance lands when the agent is about to finish.
+	continuePrompt := "continue"
+	if r.TrimInject && sel.Kind == selectt.Work {
+		continuePrompt = workContinueHint(smName, res.Branch, taskID(sel))
+	}
 	// finish stops the recorder, optionally records an abort warning to the
 	// transcript (so it shows in the UI), commits the final transcript to the
 	// session branch, then squashes+merges the durable final to main once and
@@ -588,7 +600,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if r.now().After(deadline) {
 			break
 		}
-		prompt = "continue"
+		prompt = continuePrompt
 	}
 	// Turn/wall cap hit: the agent never reached completion. Mirror the DONE path
 	// and reclaim the orphaned code worktree (cleanup -> wg.WorktreeRemove) so

@@ -173,6 +173,7 @@ func run() error {
 		SessionPublish: sessPublish, SessionPush: sessPush,
 		RestoreConfig: restoreRemotes,
 		TurnTimeout:   time.Duration(c.TurnTimeoutMinutes) * time.Minute,
+		TrimInject:    eff.TrimInjection,
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {
