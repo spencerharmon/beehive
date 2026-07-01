@@ -63,6 +63,15 @@ type Config struct {
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+	// BuildEnv is a set of environment variables the runner exports into its
+	// process (so runner-spawned/co-located children inherit them) and states
+	// once in the agent prompt preamble, so every build/test invocation runs
+	// with the host's mandated toolchain env (e.g. CGO_ENABLED=0 plus redirected
+	// GOTMPDIR/TMPDIR/GOCACHE) instead of the agent rediscovering it each session.
+	// Keys are literal environment variable names; nil/empty leaves the host
+	// unaffected (inert default). Layered like every other field (see mergeEnv):
+	// a more-specific layer overlays per-key, unset keys fall through.
+	BuildEnv map[string]string `yaml:"build_env"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -142,6 +151,26 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	out.BuildEnv = mergeEnv(base.BuildEnv, over.BuildEnv)
+	return out
+}
+
+// mergeEnv overlays over onto base per key: a key set in over wins, keys only in
+// base fall through. It never mutates either argument. An empty/nil over returns
+// base unchanged (so a layer that sets no build_env is a true no-op); an empty
+// base just yields a copy of over. The result is a fresh map (or base's nil when
+// both are empty) so callers cannot alias a layer's map.
+func mergeEnv(base, over map[string]string) map[string]string {
+	if len(over) == 0 {
+		return base
+	}
+	out := make(map[string]string, len(base)+len(over))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range over {
+		out[k] = v
 	}
 	return out
 }

@@ -989,3 +989,152 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// TestShellQuote covers the POSIX single-quote escaping: plain values wrap in
+// single quotes, and an embedded single quote uses the standard '\” idiom so the
+// value survives as one shell word.
+func TestShellQuote(t *testing.T) {
+	if got := shellQuote("0"); got != "'0'" {
+		t.Errorf("shellQuote(0) = %q, want '0'", got)
+	}
+	if got := shellQuote("/home/x/.cache"); got != "'/home/x/.cache'" {
+		t.Errorf("shellQuote(path) = %q, want '/home/x/.cache'", got)
+	}
+	if got, want := shellQuote("a'b"), `'a'\''b'`; got != want {
+		t.Errorf("shellQuote(a'b) = %q, want %q", got, want)
+	}
+}
+
+// TestBuildEnvPrefix proves the command prefix is deterministic (keys sorted),
+// each value shell-quoted, and empty for an unset map so the preamble stays
+// byte-stable on a host that never opts in.
+func TestBuildEnvPrefix(t *testing.T) {
+	if got := buildEnvPrefix(nil); got != "" {
+		t.Errorf("nil prefix = %q, want empty", got)
+	}
+	if got := buildEnvPrefix(map[string]string{}); got != "" {
+		t.Errorf("empty prefix = %q, want empty", got)
+	}
+	got := buildEnvPrefix(map[string]string{
+		"GOCACHE":     "/c",
+		"CGO_ENABLED": "0",
+		"GOTMPDIR":    "/t",
+	})
+	want := "CGO_ENABLED='0' GOCACHE='/c' GOTMPDIR='/t'"
+	if got != want {
+		t.Errorf("prefix = %q, want %q (sorted + quoted)", got, want)
+	}
+}
+
+// TestBuildEnvPreamble proves the told-once paragraph renders the mandated
+// invocation from the same map the runner exports (no drift), and is the empty
+// string when unset so an unconfigured host's preamble is byte-identical.
+func TestBuildEnvPreamble(t *testing.T) {
+	if got := buildEnvPreamble(nil); got != "" {
+		t.Errorf("nil preamble = %q, want empty (byte-stable)", got)
+	}
+	if got := buildEnvPreamble(map[string]string{}); got != "" {
+		t.Errorf("empty preamble = %q, want empty (byte-stable)", got)
+	}
+	got := buildEnvPreamble(map[string]string{"CGO_ENABLED": "0", "GOCACHE": "/c"})
+	if !strings.Contains(got, "CGO_ENABLED='0' GOCACHE='/c' go test ./...") {
+		t.Errorf("preamble missing rendered invocation; got:\n%s", got)
+	}
+	if !strings.HasSuffix(got, "\n\n") {
+		t.Errorf("preamble must end with a blank line for clean concatenation; got:\n%q", got)
+	}
+}
+
+// TestExportBuildEnvSetsProcessEnv proves exportBuildEnv writes each key into the
+// process environment (so runner-spawned/co-located children inherit it). Keys are
+// registered with t.Setenv so the harness restores them after the test even though
+// exportBuildEnv mutates the env via os.Setenv.
+func TestExportBuildEnvSetsProcessEnv(t *testing.T) {
+	t.Setenv("BEEHIVE_BUILDENV_A", "")
+	t.Setenv("BEEHIVE_BUILDENV_B", "")
+	r := &Runner{BuildEnv: map[string]string{
+		"BEEHIVE_BUILDENV_A": "0",
+		"BEEHIVE_BUILDENV_B": "/tmp/gocache",
+	}}
+	if err := r.exportBuildEnv(); err != nil {
+		t.Fatalf("exportBuildEnv: %v", err)
+	}
+	if got := os.Getenv("BEEHIVE_BUILDENV_A"); got != "0" {
+		t.Errorf("BEEHIVE_BUILDENV_A = %q, want 0", got)
+	}
+	if got := os.Getenv("BEEHIVE_BUILDENV_B"); got != "/tmp/gocache" {
+		t.Errorf("BEEHIVE_BUILDENV_B = %q, want /tmp/gocache", got)
+	}
+}
+
+// TestExportBuildEnvEmptyNoop proves the inert default: a nil or empty BuildEnv
+// exports nothing and returns no error, so a normal host process env is untouched.
+func TestExportBuildEnvEmptyNoop(t *testing.T) {
+	if err := (&Runner{}).exportBuildEnv(); err != nil {
+		t.Fatalf("nil BuildEnv should be a no-op, got %v", err)
+	}
+	if err := (&Runner{BuildEnv: map[string]string{}}).exportBuildEnv(); err != nil {
+		t.Fatalf("empty BuildEnv should be a no-op, got %v", err)
+	}
+}
+
+// reviewSelForBuildEnv seeds a minimal NEEDS-REVIEW task and returns the pieces a
+// Review Run needs (no code worktree, no heartbeat). The onTurn approves the task
+// so the run terminates cleanly after the first (captured) prompt.
+func reviewSelForBuildEnv(t *testing.T) (*Runner, *selectt.Selection, *string) {
+	t.Helper()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	return r, sel, &firstPrompt
+}
+
+// TestReviewPreambleStatesBuildEnv proves a claimed task's injected preamble states
+// the mandated build/test invocation when BuildEnv is set, sourced from the runner
+// config (so it can never drift from what is exported). CGO_ENABLED/GOCACHE are
+// snapshotted via t.Setenv because the Run also exports them into the process env.
+func TestReviewPreambleStatesBuildEnv(t *testing.T) {
+	t.Setenv("CGO_ENABLED", os.Getenv("CGO_ENABLED"))
+	t.Setenv("GOCACHE", os.Getenv("GOCACHE"))
+	r, sel, firstPrompt := reviewSelForBuildEnv(t)
+	r.BuildEnv = map[string]string{"CGO_ENABLED": "0", "GOCACHE": "/c"}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !contains(*firstPrompt, "CGO_ENABLED='0' GOCACHE='/c' go test ./...") {
+		t.Fatalf("preamble missing build-env invocation; got:\n%s", *firstPrompt)
+	}
+	// And the export floor took effect in this process.
+	if got := os.Getenv("CGO_ENABLED"); got != "0" {
+		t.Errorf("CGO_ENABLED = %q, want 0 (exported by Run)", got)
+	}
+}
+
+// TestReviewPreambleBuildEnvOmittedWhenUnset proves the inert default at the
+// preamble layer: with no BuildEnv, the injected prompt carries no build-env line,
+// so a normal host's preamble is byte-unchanged.
+func TestReviewPreambleBuildEnvOmittedWhenUnset(t *testing.T) {
+	r, sel, firstPrompt := reviewSelForBuildEnv(t)
+	// r.BuildEnv left nil.
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if contains(*firstPrompt, "Build/test env") {
+		t.Fatalf("unset BuildEnv must leave no build-env line; got:\n%s", *firstPrompt)
+	}
+}

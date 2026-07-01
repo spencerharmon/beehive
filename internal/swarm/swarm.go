@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -92,6 +93,14 @@ type Runner struct {
 	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
 	// backstop. 0 = no per-turn cap (tests).
 	TurnTimeout time.Duration
+
+	// BuildEnv is the host-mandated build/test environment (config.Config.BuildEnv,
+	// e.g. CGO_ENABLED=0 plus redirected GOTMPDIR/TMPDIR/GOCACHE). Run exports it
+	// into this process (exportBuildEnv) so runner-spawned/co-located children
+	// inherit it, and states the resulting invocation once in the task preamble
+	// (buildEnvPreamble) so the agent stops rediscovering it. nil/empty = inert:
+	// nothing is exported and the preamble is byte-unchanged (normal host default).
+	BuildEnv map[string]string
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -233,6 +242,11 @@ func branchFor(sel *selectt.Selection) string {
 // worktree (Work only), runs turns until completion or caps, and tidies up.
 func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first string) (Result, error) {
 	res := Result{Branch: branchFor(sel)}
+	// Export the host-mandated build/test env into this process before any work so
+	// runner-spawned/co-located children inherit it. Inert (no-op) when unset.
+	if err := r.exportBuildEnv(); err != nil {
+		return res, err
+	}
 	absRoot, err := filepath.Abs(r.Repo.Root)
 	if err != nil {
 		return res, err
@@ -341,6 +355,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"operator input, run: beehive task human %[2]s %[3]s --reason \"<specific blocker and exact input needed>\". "+
 				"Use exact status NEEDS-HUMAN; never write HUMAN-NEEDED.\n\n",
 			r.Session, smName, sel.Task.ID)
+		preamble += buildEnvPreamble(r.BuildEnv)
 	}
 	first = preamble + first
 
@@ -789,6 +804,71 @@ func hasTask(sel *selectt.Selection) bool {
 	default:
 		return false
 	}
+}
+
+// shellQuote wraps s in single quotes so it survives as one literal shell word,
+// escaping any embedded single quote with the standard '\” idiom. Values are
+// exported verbatim (os.Setenv), so quoting keeps the rendered preamble command
+// byte-for-byte equal to what the process env actually holds.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// buildEnvPrefix renders env as a deterministic `K='v'` command prefix, keys
+// sorted so the output (and every test/preamble byte) is stable. Empty/nil env
+// renders "" so an unconfigured host stays byte-identical.
+func buildEnvPrefix(env map[string]string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+shellQuote(env[k]))
+	}
+	return strings.Join(parts, " ")
+}
+
+// buildEnvPreamble is the told-once prompt paragraph that states the mandated
+// build/test invocation, sourced from the same env the runner exports so the two
+// never drift. It returns "" (byte-stable no-op) when env is empty, so a host
+// that never sets build_env gets an unchanged preamble.
+func buildEnvPreamble(env map[string]string) string {
+	prefix := buildEnvPrefix(env)
+	if prefix == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"Build/test env (host-mandated): the runner has already exported these into your process "+
+			"environment, but a tool call may spawn a fresh shell — so prefix every Go build or test with "+
+			"them, e.g. `%s go test ./...`. This host requires it (it avoids the broken cgo linker and the "+
+			"/tmp quota); do not spend turns rediscovering it.\n\n",
+		prefix)
+}
+
+// exportBuildEnv sets each BuildEnv key in this process's environment (sorted for
+// deterministic order) so runner-spawned and co-located children inherit the
+// host-mandated toolchain env. A nil/empty map is a no-op; a Setenv failure is
+// returned, never swallowed.
+func (r *Runner) exportBuildEnv() error {
+	if len(r.BuildEnv) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(r.BuildEnv))
+	for k := range r.BuildEnv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if err := os.Setenv(k, r.BuildEnv[k]); err != nil {
+			return fmt.Errorf("export build env %s: %w", k, err)
+		}
+	}
+	return nil
 }
 
 // syncWorktreeBase brings the submodule checkout to the tracked-branch tip
