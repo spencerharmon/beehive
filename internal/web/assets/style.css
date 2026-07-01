@@ -583,3 +583,31 @@ ul.secrets > li > code {
   font-size: var(--text-sm);
 }
 ul.secrets details.inline-edit { margin: 0; }
+
+/* Dashboard submodule cards (dashboard-cards) ----------------------------- *
+ * One .card per submodule in the .cards grid: a title + live swarm-status badge
+ * + blue/green env badge (the "badges" row), a counts row (pending /
+ * NEEDS-HUMAN + roi stamp), and a links row. Scoped to .sub-card so the branch
+ * view's own <section class="card"> is untouched. The env badge is an ADDITIVE
+ * .badge modifier keyed to the env name: blue/green reuse the design tokens
+ * (accent = blue, done hue = green); any other env falls back to neutral .badge.
+ * Keeps the design-system class names stable — this only adds. */
+.sub-card > * + * { margin-top: var(--space-3); }
+.sub-card .badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.sub-card .badges h3 { margin: 0 auto 0 0; }
+.sub-card .counts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  font-size: var(--text-sm);
+}
+.sub-card .links { color: var(--text-muted); }
+
+.badge.env-blue  { background: var(--accent); border-color: transparent; color: var(--accent-contrast); }
+.badge.env-green { background: hsl(var(--hue-done) 58% 40%); border-color: transparent; color: #fff; }

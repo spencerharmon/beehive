@@ -115,19 +115,31 @@ func (s *Server) submodule(name string) (repo.Submodule, error) {
 	return repo.Submodule{}, os.ErrNotExist
 }
 
-// subView is dashboard per-submodule status.
+// subView is one dashboard submodule card. State is the live swarm status
+// (active | dormant | bootstrap), derived from files each request. Pending and
+// Human are task counts from the UNIFIED plan parser (internal/plan) — pending =
+// not DONE, human = NEEDS-HUMAN (a NEEDS-HUMAN task counts in both). Env is the
+// submodule's resolved blue/green deploy env from the typed artifacts model, ""
+// when the submodule ships no INFRASTRUCTURE.md.
 type subView struct {
 	Name    string
 	State   string
 	Stamp   string
 	Pending int
+	Human   int
+	Env     string
 }
 
-func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+// subViews builds one status card per submodule. now/ttl are passed in (rather
+// than read from the wall clock) so the projection is deterministically testable;
+// the dashboard handler supplies time.Now() and the resolved claim TTL. Counts
+// come from parsePlan (the single internal/plan parser the runner/selector use),
+// never a divergent scanner, so the dashboard can never disagree with the plan
+// view about pending/NEEDS-HUMAN.
+func (s *Server) subViews(now time.Time, ttl time.Duration) ([]subView, error) {
 	subs, err := s.repo.Submodules()
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return nil, err
 	}
 	var views []subView
 	for _, sm := range subs {
@@ -139,15 +151,35 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 			v.State = "bootstrap"
 		}
 		v.Stamp, _ = sm.ROIStamp()
-		if p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl()); err == nil {
+		if p, err := parsePlan(sm.PlanPath(), now, ttl); err == nil {
 			for _, it := range p.Items {
 				if it.Status != StatusDone {
 					v.Pending++
 				}
+				if it.Status == StatusHuman {
+					v.Human++
+				}
 			}
+		}
+		// Per-submodule blue/green env through the typed artifacts model, shown
+		// only when the submodule actually ships an INFRASTRUCTURE.md (Present);
+		// an absent doc leaves Env "" so the card shows no (misleading) badge.
+		if in, err := artifacts.LoadInfra(filepath.Join(sm.Path, repo.InfraFile)); err == nil && in.Present() {
+			v.Env = in.Deployment().Active
 		}
 		views = append(views, v)
 	}
+	return views, nil
+}
+
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	views, err := s.subViews(time.Now(), s.ttl())
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	// The hive-wide deploy env (repo-root INFRASTRUCTURE.md) drives the top-of-page
+	// badge + the deploy/edit affordance; per-card Env is the submodule's own.
 	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
 	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env})
 }

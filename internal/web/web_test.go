@@ -141,6 +141,84 @@ func TestDashboard(t *testing.T) {
 	}
 }
 
+// TestDashboardCards is the core of dashboard-cards: the dashboard projects one
+// card per submodule carrying the LIVE swarm state (active/dormant/bootstrap),
+// the per-submodule blue/green deploy env, and pending/NEEDS-HUMAN counts that
+// come from the SAME internal/plan parser the runner/selector use — never a
+// divergent scan, so the card can't disagree with the plan view. subViews() is
+// driven directly (now/ttl injected) for the deterministic projection, then the
+// rendered page is asserted to wire each card's link, state badge, env badge and
+// the NEEDS-HUMAN affordance.
+func TestDashboardCards(t *testing.T) {
+	s, root := setup(t)
+	// alpha (setup: t1 TODO claim, t2 NEEDS-HUMAN, t3 DONE) ships an
+	// INFRASTRUCTURE.md deploying green -> its card shows an env-green badge; the
+	// counts come from its real PLAN (pending = t1+t2, needs-human = t2).
+	if err := os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.InfraFile),
+		[]byte("# alpha infra\n\nActive: green\nEnvironments: blue, green\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A bootstrap-pending target: ROI present, PLAN absent (NeedsBootstrap).
+	boot := filepath.Join(root, "submodules", "boot")
+	os.MkdirAll(boot, 0o755)
+	if err := os.WriteFile(filepath.Join(boot, repo.ROIFile), []byte("# boot\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A dormant target: no ROI at all (never selected, no infra, no plan).
+	os.MkdirAll(filepath.Join(root, "submodules", "dorm"), 0o755)
+
+	// now/ttl only steer parsePlan's active/stale derivation, not the counts; a
+	// fixed now keeps the projection deterministic regardless.
+	views, err := s.subViews(mustTime(t, "2026-06-30T11:30:00Z"), time.Hour)
+	if err != nil {
+		t.Fatalf("subViews: %v", err)
+	}
+	by := map[string]subView{}
+	for _, v := range views {
+		by[v.Name] = v
+	}
+	// alpha: live (ROI+PLAN), green deploy env, pending = t1+t2 (not DONE),
+	// needs-human = t2, roi stamp from PLAN's Beehive-ROI marker.
+	if a := by["alpha"]; a.State != "active" || a.Env != "green" || a.Pending != 2 || a.Human != 1 || a.Stamp != "abc123" {
+		t.Fatalf("alpha view = %+v, want {active green pending=2 human=1 abc123}", a)
+	}
+	// boot: bootstrap state, no infra doc (Env ""), no plan (0 counts).
+	if b := by["boot"]; b.State != "bootstrap" || b.Env != "" || b.Pending != 0 || b.Human != 0 {
+		t.Fatalf("boot view = %+v, want {bootstrap, env=\"\", 0, 0}", b)
+	}
+	// dorm: dormant (no ROI), no infra doc, no plan.
+	if d := by["dorm"]; d.State != "dormant" || d.Env != "" || d.Pending != 0 || d.Human != 0 {
+		t.Fatalf("dorm view = %+v, want {dormant, env=\"\", 0, 0}", d)
+	}
+
+	// Rendered page: a title link per submodule, the live-state badge on the
+	// active one and neutral badges on the others, alpha's per-card env-green
+	// badge, its pending count, and the NEEDS-HUMAN link into /human.
+	body := get(t, s, "/").Body.String()
+	for _, want := range []string{
+		`<a href="/submodule/alpha">alpha</a>`,
+		`<a href="/submodule/boot">boot</a>`,
+		`<a href="/submodule/dorm">dorm</a>`,
+		`class="badge live" title="live swarm status">active`,     // alpha is live
+		`title="live swarm status">dormant`,                       // dorm neutral badge
+		`title="live swarm status">bootstrap`,                     // boot neutral badge
+		`class="badge env-green" title="active deploy env">green`, // per-submodule env
+		`pending <b>2</b>`,                                        // alpha pending count
+		`title="tasks awaiting a human">needs-human <b>1</b></a>`, // NEEDS-HUMAN affordance
+		"Hive env:", // hive-wide env line
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard card render missing %q:\n%s", want, body)
+		}
+	}
+	// A submodule with no INFRASTRUCTURE.md shows NO env badge: only the hive-wide
+	// top badge and alpha's per-card badge exist (boot/dorm carry just a state
+	// badge), so the page holds exactly two "badge env-" spans.
+	if n := strings.Count(body, "badge env-"); n != 2 {
+		t.Fatalf("want exactly 2 env badges (hive + alpha), got %d:\n%s", n, body)
+	}
+}
+
 func TestPlanAndHuman(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/submodule/alpha/plan")
