@@ -989,3 +989,182 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// TestWorkBriefInjected proves a Work dispatch injects the runner-precomputed
+// task brief into the agent's first prompt: the resolved worktree path + branch,
+// the submodule base commit the worktree branched from (pointer/tracked tip),
+// the mandated change-doc path and commit stamp PROVIDED verbatim (not left for
+// the agent to derive), the task's own PLAN card, and bounded excerpts scoped to
+// exactly the task's Files — a sibling file NOT in Files must not leak into the
+// brief for the pass. The base commit asserted is the worktree's real HEAD, so
+// the brief reuses the setup's resolved pointer rather than a second derivation.
+func TestWorkBriefInjected(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	// Two files the task touches + one sibling it does NOT.
+	os.WriteFile(filepath.Join(repoDir, "target.go"), []byte("package p\n// TARGET_MARKER unique\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "helper.go"), []byte("package p\n// HELPER_MARKER unique\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "unrelated.go"), []byte("package p\n// UNRELATED_MARKER unique\n"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	subTip, err := git.New(repoDir).RevParse(context.Background(), "HEAD")
+	if err != nil || subTip == "" {
+		t.Fatalf("sub tip: %q %v", subTip, err)
+	}
+
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	// The selector hands the runner the FULL parsed task (Body included); mirror
+	// that so the brief can parse the card's Files: line.
+	task := plan.Task{ID: "T1", Status: plan.TODO, Body: []string{
+		"Do the thing. UNIQUE_CARD_INTENT here.",
+		"Files: target.go (the main change), helper.go.",
+		"Doc: docs/tasks/T1.md",
+		"Accept: it works.",
+	}}
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: task}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// 1) resolved worktree path + branch, and the pointer/tracked tip (the
+	// worktree's real HEAD — proving the brief reuses the setup's value).
+	for _, want := range []string{
+		"submodules/sm/worktrees/bee-T1", // worktree path
+		"branch bee-T1",                  // branch
+		subTip,                           // base commit / synced tracked tip
+	} {
+		if !contains(firstPrompt, want) {
+			t.Fatalf("brief missing %q; got:\n%s", want, firstPrompt)
+		}
+	}
+	// 3) the mandated doc path + commit stamp PROVIDED verbatim.
+	if !contains(firstPrompt, "submodules/sm/docs/bee-T1-T1.md") {
+		t.Fatalf("brief missing exact change-doc path; got:\n%s", firstPrompt)
+	}
+	if !contains(firstPrompt, "Beehive: T1 submodules/sm/docs/bee-T1-T1.md") {
+		t.Fatalf("brief missing exact commit stamp; got:\n%s", firstPrompt)
+	}
+	// the task's own PLAN card (its intent) travels in the brief.
+	if !contains(firstPrompt, "UNIQUE_CARD_INTENT") {
+		t.Fatalf("brief missing the task card intent; got:\n%s", firstPrompt)
+	}
+	// 2) task-file excerpts present, and scoped: the two Files are inlined, the
+	// sibling that is NOT in Files is not pulled into the brief for this pass.
+	if !contains(firstPrompt, "TARGET_MARKER") || !contains(firstPrompt, "HELPER_MARKER") {
+		t.Fatalf("brief missing task-file excerpts (target/helper); got:\n%s", firstPrompt)
+	}
+	if !contains(firstPrompt, "target.go") || !contains(firstPrompt, "helper.go") {
+		t.Fatalf("brief missing task-file names; got:\n%s", firstPrompt)
+	}
+	if contains(firstPrompt, "UNRELATED_MARKER") {
+		t.Fatalf("brief leaked a file NOT in the task's Files (unrelated.go); scope not honored:\n%s", firstPrompt)
+	}
+}
+
+// TestBuildTaskBriefFields asserts the assembly is correct field-by-field and
+// scoped to the task's Files: the doc path and commit stamp are derived
+// deterministically, and a sibling file present in the worktree but absent from
+// Files is not inlined into the rendered brief.
+func TestBuildTaskBriefFields(t *testing.T) {
+	wt := t.TempDir()
+	os.WriteFile(filepath.Join(wt, "a.go"), []byte("package a\nfunc A() {}\n"), 0o644)
+	os.WriteFile(filepath.Join(wt, "b.go"), []byte("package a\n// SIBLING_MARKER\n"), 0o644)
+
+	task := plan.Task{ID: "mytask", Status: plan.TODO, Body: []string{
+		"Intent line for the task.",
+		"Files: a.go.",
+		"Doc: docs/tasks/mytask.md",
+	}}
+	sub := repo.Submodule{Name: "sm", Path: "submodules/sm"}
+	b := buildTaskBrief(sub, task, "bee-mytask", "submodules/sm/worktrees/bee-mytask", wt, "abc123def456")
+
+	if b.Worktree != "submodules/sm/worktrees/bee-mytask" {
+		t.Fatalf("Worktree = %q", b.Worktree)
+	}
+	if b.Branch != "bee-mytask" {
+		t.Fatalf("Branch = %q", b.Branch)
+	}
+	if b.Pointer != "abc123def456" {
+		t.Fatalf("Pointer = %q", b.Pointer)
+	}
+	if b.DocPath != "submodules/sm/docs/bee-mytask-mytask.md" {
+		t.Fatalf("DocPath = %q", b.DocPath)
+	}
+	if b.CommitStamp != "Beehive: mytask submodules/sm/docs/bee-mytask-mytask.md" {
+		t.Fatalf("CommitStamp = %q", b.CommitStamp)
+	}
+	if len(b.Files) != 1 || b.Files[0] != "a.go" {
+		t.Fatalf("Files = %v, want [a.go]", b.Files)
+	}
+	s := b.String()
+	if !contains(s, "func A()") {
+		t.Fatalf("rendered brief missing a.go excerpt:\n%s", s)
+	}
+	if !contains(s, "Intent line for the task.") {
+		t.Fatalf("rendered brief missing the card body:\n%s", s)
+	}
+	if contains(s, "SIBLING_MARKER") {
+		t.Fatalf("rendered brief leaked sibling b.go (not in Files):\n%s", s)
+	}
+}
+
+// TestParseFilesLine covers the card Files: parser: it drops parenthetical notes
+// (including commas inside them) before splitting on commas, strips a trailing
+// sentence period, and ignores non-Files body lines (which may also carry commas).
+func TestParseFilesLine(t *testing.T) {
+	body := []string{
+		"A description line, with its own comma.",
+		"Files: internal/swarm (brief assembly, injection), swarm_test.go.",
+		"Doc: docs/tasks/x.md",
+	}
+	got := parseFilesLine(body)
+	want := []string{"internal/swarm", "swarm_test.go"}
+	if !equalStrs(got, want) {
+		t.Fatalf("parseFilesLine = %v, want %v", got, want)
+	}
+	// A soft-wrapped Files: value, exactly as PLAN cards wrap it: the parenthetical
+	// note opens on the Files: line and CLOSES on the continuation line, with a
+	// later file after the close. The continuation must be folded in before the
+	// comma-split, or swarm_test.go is lost and the note's commas corrupt the parse.
+	wrapped := []string{
+		"Files: internal/swarm (brief assembly + injection; reuse the resolved worktree/branch/pointer the Work",
+		"setup already computes), swarm_test.go.",
+		"Doc: docs/tasks/x.md",
+		"Accept: it works.",
+	}
+	if g := parseFilesLine(wrapped); !equalStrs(g, want) {
+		t.Fatalf("wrapped parseFilesLine = %v, want %v", g, want)
+	}
+	if parseFilesLine([]string{"no files here"}) != nil {
+		t.Fatalf("parseFilesLine with no Files: line should be nil")
+	}
+}
+
+func equalStrs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

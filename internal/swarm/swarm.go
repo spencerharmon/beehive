@@ -242,6 +242,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
 	var wg *git.Repo
 	var wtAbs string
+	// Resolved once by the Work setup and reused by the task brief so it never
+	// re-derives them: wtRel is the repo-relative worktree path, basePointer is
+	// the submodule commit the worktree branched from (the synced tracked tip).
+	var wtRel, basePointer string
 	if sel.Kind == selectt.Work {
 		// Absolute paths rooted at THIS honeybee's worktree (absRoot). A fresh
 		// `git worktree add` of the beehive repo does NOT populate submodules, so
@@ -276,6 +280,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		if err := wg.WorktreeAdd(ctx, wtAbs, res.Branch, "HEAD"); err != nil {
 			return res, fmt.Errorf("worktree add: %w", err)
+		}
+		// Capture the exact values the setup produced for the task brief (below):
+		// the commit the worktree branched from (the synced tracked tip) and the
+		// repo-relative worktree path the agent edits. Reused verbatim, not
+		// re-derived. Both are best-effort — the brief is additive, never fatal.
+		basePointer, _ = wg.RevParse(ctx, "HEAD")
+		if rel, relErr := filepath.Rel(absRoot, wtAbs); relErr == nil {
+			wtRel = rel
+		} else {
+			wtRel = wtAbs
 		}
 	}
 
@@ -325,6 +339,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"worktree). The runner's completion check looks for it exactly there; a doc elsewhere reads as 'not done'.\n"+
 				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
 			smName, res.Branch, taskID(sel))
+		// Runner-precomputed task brief: the resolved worktree/branch/pointer, the
+		// deterministic doc-path + commit stamp, the task's own PLAN card, and
+		// bounded excerpts scoped to the task's Files — so the agent starts from
+		// resolved mechanics instead of rediscovering them by exploring the tree.
+		preamble += "\n" + buildTaskBrief(sel.Submodule, sel.Task, res.Branch, wtRel, wtAbs, basePointer).String()
 	default: // Bootstrap, Reconcile: beehive-layer only, no code worktree.
 		preamble = fmt.Sprintf(
 			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
