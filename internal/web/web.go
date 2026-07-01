@@ -353,37 +353,62 @@ func (s *Server) planDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := s.commit(r.Context(), "frontend: delete PLAN "+sm.Name+" (force rebootstrap from ROI)"); err != nil {
+	if err := s.publishMain(r.Context(), "frontend: delete PLAN "+sm.Name+" (force rebootstrap from ROI)"); err != nil {
 		http.Error(w, err.Error(), 500)
-		return
-	}
-	if err := s.publishMain(r.Context()); err != nil {
-		http.Error(w, "deleted locally but publish to remote failed: "+err.Error(), 500)
 		return
 	}
 	http.Redirect(w, r, "/submodule/"+sm.Name+"/plan", http.StatusSeeOther)
 }
 
-// publishMain pushes the beehived primary checkout's main to the remote so other
-// hosts' honeybees (which branch off origin/main) see committed changes. No-op
-// when the repo has no remote (single-host: honeybees branch off local main,
-// already updated). On a non-fast-forward it fetches, merges, and retries.
-func (s *Server) publishMain(ctx context.Context) error {
+// publishMain commits the pending write with msg and publishes the beehived
+// primary checkout's main to origin, so a frontend edit lands locally AND reaches
+// the remote — a local-only commit silently orphans the write from other hosts'
+// honeybees, which branch off origin/main. Commit and push are one unit so no
+// write path can advance local main without publishing it:
+//   - a no-op write (nothing changed) returns git.ErrNothing WITHOUT pushing, so
+//     callers keep their existing ErrNothing tolerance;
+//   - no remote (single-host install) commits locally and skips the push, so bare
+//     setups keep working (local honeybees branch off the already-updated main);
+//   - a non-fast-forward push (a peer advanced origin under us) fetches + merges
+//     the remote branch and retries once, so the concurrent write is preserved
+//     rather than lost; a merge conflict is surfaced, never silently dropped.
+//
+// The branch is read from the repo, not hardcoded (mainBranch). Writes carry no
+// honeybee identity here, so the server-side ROI hook treats an ROI push as an
+// allowed frontend push (publishMain does not bypass it).
+func (s *Server) publishMain(ctx context.Context, msg string) error {
+	if err := s.commit(ctx, msg); err != nil {
+		return err // git.ErrNothing on a no-op write; the caller tolerates it
+	}
 	remote, err := s.git.Remote(ctx)
 	if err != nil || remote == "" {
-		return err
+		return err // no remote: the local commit IS the publish (single-host)
 	}
-	if err := s.git.Push(ctx, remote, "main"); err == nil {
+	branch := s.mainBranch(ctx)
+	if err := s.git.Push(ctx, remote, branch); err == nil {
 		return nil
 	}
-	if err := s.git.Fetch(ctx, remote, "main"); err != nil {
+	// origin/<branch> advanced under us: fetch it, merge, and retry once so the
+	// concurrent write is preserved rather than lost to a non-fast-forward.
+	if err := s.git.Fetch(ctx, remote, branch); err != nil {
 		return err
 	}
 	if _, err := s.git.Run(ctx, "merge", "--no-edit", "FETCH_HEAD"); err != nil {
 		_, _ = s.git.Run(ctx, "merge", "--abort")
 		return err
 	}
-	return s.git.Push(ctx, remote, "main")
+	return s.git.Push(ctx, remote, branch)
+}
+
+// mainBranch is the beehive primary checkout's current branch (its main),
+// resolved from the repo rather than hardcoded per the task caveat. It falls
+// back to "main" when the branch cannot be resolved or HEAD is detached.
+func (s *Server) mainBranch(ctx context.Context) string {
+	b, err := s.git.CurrentBranch(ctx)
+	if err != nil || b == "" || b == "HEAD" {
+		return "main"
+	}
+	return b
 }
 
 func (s *Server) roiGet(w http.ResponseWriter, r *http.Request) {
@@ -411,7 +436,7 @@ func (s *Server) roiPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := s.commit(r.Context(), "frontend: edit ROI "+sm.Name); err != nil {
+	if err := s.publishMain(r.Context(), "frontend: edit ROI "+sm.Name); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -438,7 +463,7 @@ func (s *Server) secretsPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := s.commit(r.Context(), "frontend: update secret "+key); err != nil {
+	if err := s.publishMain(r.Context(), "frontend: update secret "+key); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -470,7 +495,7 @@ func (s *Server) mergePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := s.commit(r.Context(), "frontend: merge "+branch+" in "+name); err != nil && !errors.Is(err, git.ErrNothing) {
+	if err := s.publishMain(r.Context(), "frontend: merge "+branch+" in "+name); err != nil && !errors.Is(err, git.ErrNothing) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -497,7 +522,7 @@ func (s *Server) submoduleAdd(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if err := s.commit(r.Context(), "frontend: add submodule "+added); err != nil && !errors.Is(err, git.ErrNothing) {
+	if err := s.publishMain(r.Context(), "frontend: add submodule "+added); err != nil && !errors.Is(err, git.ErrNothing) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -521,7 +546,7 @@ func (s *Server) submoduleLink(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if err := s.commit(r.Context(), "frontend: link "+from+" -> "+to); err != nil && !errors.Is(err, git.ErrNothing) {
+	if err := s.publishMain(r.Context(), "frontend: link "+from+" -> "+to); err != nil && !errors.Is(err, git.ErrNothing) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -543,7 +568,7 @@ func (s *Server) envDeploy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := s.commit(r.Context(), "frontend: deploy "+target); err != nil && !errors.Is(err, git.ErrNothing) {
+	if err := s.publishMain(r.Context(), "frontend: deploy "+target); err != nil && !errors.Is(err, git.ErrNothing) {
 		http.Error(w, err.Error(), 500)
 		return
 	}

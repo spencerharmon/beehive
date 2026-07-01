@@ -1448,3 +1448,155 @@ func TestHygieneCleanAndWidget(t *testing.T) {
 		t.Fatalf("dashboard does not embed the hygiene widget:\n%s", dash.Body)
 	}
 }
+
+// --- publishMain: frontend writes commit AND publish to origin ---------------
+
+// originBacked builds on setup(t) to model the real beehived deployment: a
+// primary checkout on branch main whose commits are published to an origin
+// remote. It makes the initial commit, forces the branch to main, creates a
+// bare origin, wires it as origin, and pushes. It returns the server, the
+// primary checkout root, and the bare origin path, so a test can read back what
+// a frontend write published (git show main:<path> in the bare origin).
+func originBacked(t *testing.T) (*Server, string, string) {
+	t.Helper()
+	s, root := setup(t)
+	hygGit(t, root, "add", "-A")
+	hygGit(t, root, "commit", "-q", "-m", "init")
+	hygGit(t, root, "branch", "-M", "main")
+	origin := filepath.Join(t.TempDir(), "origin.git")
+	hygGit(t, "", "init", "-q", "--bare", "-b", "main", origin)
+	hygGit(t, root, "remote", "add", "origin", origin)
+	hygGit(t, root, "push", "-q", "-u", "origin", "main")
+	return s, root, origin
+}
+
+// atOrigin returns the trimmed contents of path in origin's published main tree.
+// It fatals when the path is absent, so it doubles as an "it reached origin"
+// assertion. (hygGit trims trailing whitespace, so compare against trimmed text.)
+func atOrigin(t *testing.T, origin, path string) string {
+	t.Helper()
+	return hygGit(t, origin, "show", "main:"+path)
+}
+
+// originHasPath is a non-fatal probe for whether path exists in origin's main
+// tree, used to assert that a deletion was actually published.
+func originHasPath(t *testing.T, origin, path string) bool {
+	t.Helper()
+	c := exec.Command("git", "cat-file", "-e", "main:"+path)
+	c.Dir = origin
+	return c.Run() == nil
+}
+
+// TestPublishMainLandsWritesOnOrigin drives the portable frontend write handlers
+// end-to-end against a real origin and asserts each edit is not merely on local
+// disk but committed AND pushed to origin/main — the regression this task fixes
+// (writes that only committed locally silently never reached other hosts).
+func TestPublishMainLandsWritesOnOrigin(t *testing.T) {
+	s, _, origin := originBacked(t)
+
+	t.Run("roi edit", func(t *testing.T) {
+		if w := postForm(t, s, "/roi/alpha", url.Values{"body": {"# published intent\n"}}); w.Code != 200 {
+			t.Fatalf("roi post %d: %s", w.Code, w.Body)
+		}
+		if got := atOrigin(t, origin, "submodules/alpha/"+repo.ROIFile); got != "# published intent" {
+			t.Fatalf("ROI not published to origin: %q", got)
+		}
+	})
+
+	t.Run("env deploy", func(t *testing.T) {
+		if w := postForm(t, s, "/env/deploy", url.Values{"target": {"green"}}); w.Code != 200 {
+			t.Fatalf("deploy %d: %s", w.Code, w.Body)
+		}
+		if got := atOrigin(t, origin, repo.InfraFile); !strings.Contains(got, "Active: green") {
+			t.Fatalf("deploy not published to origin: %q", got)
+		}
+	})
+
+	t.Run("submodule link", func(t *testing.T) {
+		if w := postForm(t, s, "/submodule/link", url.Values{"from": {"x"}, "to": {"y"}}); w.Code != http.StatusSeeOther {
+			t.Fatalf("link %d: %s", w.Code, w.Body)
+		}
+		if got := atOrigin(t, origin, repo.LinksFile); !strings.Contains(got, "x") || !strings.Contains(got, "y") {
+			t.Fatalf("link not published to origin: %q", got)
+		}
+	})
+
+	t.Run("plan delete", func(t *testing.T) {
+		if !originHasPath(t, origin, "submodules/alpha/"+repo.PlanFile) {
+			t.Fatal("precondition: PLAN.md should be on origin before delete")
+		}
+		if w := postForm(t, s, "/submodule/alpha/plan/delete", url.Values{}); w.Code != http.StatusSeeOther {
+			t.Fatalf("plan delete %d: %s", w.Code, w.Body)
+		}
+		if originHasPath(t, origin, "submodules/alpha/"+repo.PlanFile) {
+			t.Fatal("PLAN.md deletion was not published to origin")
+		}
+	})
+}
+
+// TestPublishMainSubmoduleAddLandsOnOrigin proves the slow, 2m-bounded submodule
+// add path also publishes: its .gitmodules + gitlink commit reaches origin, not
+// just the local checkout.
+func TestPublishMainSubmoduleAddLandsOnOrigin(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	s, root, origin := originBacked(t)
+	src := srcRepo(t, "beta")
+
+	if w := postForm(t, s, "/submodule/add", url.Values{"url": {src}}); w.Code != http.StatusSeeOther {
+		t.Fatalf("add %d: %s", w.Code, w.Body)
+	}
+	if _, err := os.Stat(filepath.Join(root, "submodules", "beta", "repo", "f.txt")); err != nil {
+		t.Fatalf("submodule not checked out locally: %v", err)
+	}
+	if got := atOrigin(t, origin, ".gitmodules"); !strings.Contains(got, "submodules/beta/repo") {
+		t.Fatalf("submodule add not published to origin:\n%s", got)
+	}
+}
+
+// TestPublishMainConcurrentAdvanceRetries proves the non-fast-forward retry: a
+// peer advances origin/main under us, so the frontend's first push is rejected;
+// publishMain must fetch + merge + retry so BOTH the peer's commit and the
+// frontend edit survive on origin (the write is never dropped or force-lost).
+func TestPublishMainConcurrentAdvanceRetries(t *testing.T) {
+	s, _, origin := originBacked(t)
+
+	// A second writer clones origin, commits a disjoint file, and pushes,
+	// leaving root's local main one commit behind origin/main.
+	other := filepath.Join(t.TempDir(), "other")
+	hygGit(t, "", "clone", "-q", origin, other)
+	hygGit(t, other, "config", "user.email", "o@o")
+	hygGit(t, other, "config", "user.name", "o")
+	os.WriteFile(filepath.Join(other, "peer.txt"), []byte("peer write\n"), 0o644)
+	hygGit(t, other, "add", "-A")
+	hygGit(t, other, "commit", "-q", "-m", "peer advance")
+	hygGit(t, other, "push", "-q", "origin", "main")
+
+	// Frontend ROI edit on root: the first push is non-fast-forward, so it must
+	// reconcile with origin and retry rather than error or clobber.
+	if w := postForm(t, s, "/roi/alpha", url.Values{"body": {"# reconciled intent\n"}}); w.Code != 200 {
+		t.Fatalf("roi post %d: %s", w.Code, w.Body)
+	}
+	if got := atOrigin(t, origin, "submodules/alpha/"+repo.ROIFile); got != "# reconciled intent" {
+		t.Fatalf("frontend write missing on origin after retry: %q", got)
+	}
+	if got := atOrigin(t, origin, "peer.txt"); got != "peer write" {
+		t.Fatalf("peer commit lost by non-ff retry: %q", got)
+	}
+}
+
+// TestPublishMainNoRemoteCommitsLocally proves the single-host path: with no
+// remote configured, a frontend write still COMMITS locally (the commit is the
+// publish) and the handler succeeds — it does not error out for lack of a push
+// target. Asserted off HEAD (not just the worktree) so a skipped commit fails.
+func TestPublishMainNoRemoteCommitsLocally(t *testing.T) {
+	s, root := setup(t) // setup wires no remote
+	if got := hygGit(t, root, "remote"); got != "" {
+		t.Fatalf("precondition: expected no remote, got %q", got)
+	}
+	if w := postForm(t, s, "/roi/alpha", url.Values{"body": {"# local only\n"}}); w.Code != 200 {
+		t.Fatalf("roi post %d: %s", w.Code, w.Body)
+	}
+	if got := hygGit(t, root, "show", "HEAD:submodules/alpha/"+repo.ROIFile); got != "# local only" {
+		t.Fatalf("write not committed locally: %q", got)
+	}
+}
