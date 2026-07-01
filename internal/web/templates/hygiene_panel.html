@@ -1,0 +1,26 @@
+{{define "hygiene-widget"}}
+<section id="hygiene-widget" class="card" aria-label="hive hygiene">
+<h3><a href="/hygiene">hive hygiene</a></h3>
+{{if .Err}}
+<p class="muted">scan unavailable: {{.Err}}</p>
+{{else if .Clean}}
+<p><span class="badge live">clean</span> <span class="muted">no git cruft detected</span></p>
+{{else}}
+<p><span class="badge">{{.Total}}</span> item(s) of git cruft &middot; <span class="muted">diagnostic only</span></p>
+{{range .Classes}}
+<details class="hygiene-class">
+<summary><span class="badge">{{.Count}}</span> {{.Title}}</summary>
+{{if .Items}}
+<ul class="hygiene-list">{{range .Items}}<li><code>{{.Name}}</code> <span class="muted">{{.Detail}}</span></li>{{end}}</ul>
+{{else}}<p class="muted">none</p>{{end}}
+</details>
+{{end}}
+<p class="hygiene-remedy muted">Remediation: run the <code>{{.Skill}}</code> cleanup skill. This panel is read-only and never mutates git state — the operator triggers the fix.</p>
+{{end}}
+</section>
+{{end}}
+{{template "header"}}
+<h1>Hive hygiene</h1>
+<p class="muted">Read-only scan of the git cruft that accumulates under updateInstead. Diagnostic only — nothing here is mutated; the operator triggers any fix.</p>
+<div class="cards">{{template "hygiene-widget" .Hygiene}}</div>
+{{template "footer"}}

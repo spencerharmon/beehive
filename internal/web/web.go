@@ -78,6 +78,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /env", s.envGet)
 	mux.HandleFunc("POST /env/deploy", s.envDeploy)
 	mux.HandleFunc("GET /human", s.human)
+	mux.HandleFunc("GET /hygiene", s.hygiene)
 	// AI editor chat (browser): one worktree branch per session.
 	mux.HandleFunc("GET /edit", s.editNew)
 	mux.HandleFunc("GET /editor/{id}", s.editorPage)
@@ -149,7 +150,14 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		views = append(views, v)
 	}
 	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env})
+	// Read-only hygiene summary alongside the submodule cards. A scan error is
+	// surfaced inside the widget (not swallowed) rather than failing the whole
+	// dashboard, which is the operator's primary page.
+	hyg, err := scanHygiene(r.Context(), s.repo.Root, s.git)
+	if err != nil {
+		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
+	}
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg})
 }
 
 func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
@@ -496,6 +504,19 @@ func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.render(w, "human.html", map[string]interface{}{"Rows": rows})
+}
+
+// hygiene renders the standalone read-only hive-hygiene page: a full scan of the
+// git cruft that accumulates under updateInstead (stale worktrees, orphan
+// submodule gitlinks, drifted submodule checkouts, unexpected remotes), counts
+// with a drill-down, and the beehive-hygiene cleanup skill as the remediation
+// pointer. The handler is strictly diagnostic — scanHygiene mutates nothing.
+func (s *Server) hygiene(w http.ResponseWriter, r *http.Request) {
+	hyg, err := scanHygiene(r.Context(), s.repo.Root, s.git)
+	if err != nil {
+		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
+	}
+	s.render(w, "hygiene_panel.html", map[string]interface{}{"Hygiene": hyg})
 }
 
 func (s *Server) commit(ctx context.Context, msg string) error {

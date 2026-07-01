@@ -6,6 +6,7 @@
 <span class="badge">{{.State}}</span> pending: {{.Pending}} stamp: {{.Stamp}}
 <div><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">branches</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <a href="/roi/{{.Name}}">roi</a> · <a href="/edit?file=submodules/{{.Name}}/ROI.md">edit roi (AI)</a></div></div>{{else}}<p>no submodules</p>{{end}}
 </div>
+<div class="cards">{{template "hygiene-widget" .Hygiene}}</div>
 <form method="post" action="/submodule/add">
   <input name="url" placeholder="repo url (git@host:org/repo.git)" required>
   <input name="name" placeholder="name (optional)">

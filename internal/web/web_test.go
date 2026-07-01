@@ -1141,3 +1141,209 @@ func TestAssetsStyleHtmxPolish(t *testing.T) {
 		}
 	}
 }
+
+// hygGit runs git in dir, failing the test on error. Used to seed cruft and to
+// snapshot repo state for the read-only assertion.
+func hygGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	c := exec.Command("git", args...)
+	c.Dir = dir
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// seedHygieneCruft plants one instance of every cruft class in the beehive root
+// and returns the real HEAD of the drifted submodule checkout. It seeds:
+//   - two stale worktree dirs (edit-* and beehive-*) under .worktrees plus a
+//     genuinely-registered live worktree and a non-matching dir (both ignored);
+//   - an orphan gitlink (tracked 160000 with no .gitmodules entry);
+//   - a declared submodule whose checkout HEAD differs from its recorded gitlink;
+//   - an unexpected remote (alongside origin, which must not be flagged).
+//
+// gitlink SHAs are staged via `update-index --cacheinfo` LAST so a stray add -A
+// cannot overwrite the drift gitlink with the checkout's real SHA.
+func seedHygieneCruft(t *testing.T, root string) (driftHEAD string) {
+	t.Helper()
+	// A base commit so `git worktree add` (the live registered worktree) works.
+	os.WriteFile(filepath.Join(root, "seed"), []byte("x"), 0o644)
+	hygGit(t, root, "add", "-A")
+	hygGit(t, root, "commit", "-q", "-m", "seed")
+
+	// Stale worktree dirs: unregistered edit-*/beehive-* under .worktrees.
+	wtDir := filepath.Join(root, ".worktrees")
+	for _, n := range []string{"edit-roi-alpha-123", "beehive-1782800000-111"} {
+		if err := os.MkdirAll(filepath.Join(wtDir, n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A non-matching dir (must be ignored) and a genuinely registered live
+	// worktree (must NOT be flagged — it has a live git worktree entry).
+	os.MkdirAll(filepath.Join(wtDir, "random-keep"), 0o755)
+	hygGit(t, root, "worktree", "add", "--detach", filepath.Join(wtDir, "beehive-live-1"), "HEAD")
+
+	// A real submodule checkout whose HEAD will diverge from the recorded gitlink.
+	driftRepo := filepath.Join(root, "submodules", "drift", "repo")
+	os.MkdirAll(driftRepo, 0o755)
+	hygGit(t, driftRepo, "init", "-q")
+	hygGit(t, driftRepo, "config", "user.email", "t@t")
+	hygGit(t, driftRepo, "config", "user.name", "t")
+	os.WriteFile(filepath.Join(driftRepo, "f"), []byte("y"), 0o644)
+	hygGit(t, driftRepo, "add", "-A")
+	hygGit(t, driftRepo, "commit", "-q", "-m", "drift")
+	driftHEAD = hygGit(t, driftRepo, "rev-parse", "HEAD")
+
+	// Declare the drift submodule so its gitlink is a real submodule (drift class),
+	// not an orphan.
+	os.WriteFile(filepath.Join(root, ".gitmodules"), []byte(
+		"[submodule \"drift\"]\n\tpath = submodules/drift/repo\n\turl = ./x\n"), 0o644)
+
+	// Unexpected remote (origin alongside must NOT be flagged).
+	hygGit(t, root, "remote", "add", "origin", "https://example.invalid/origin.git")
+	hygGit(t, root, "remote", "add", "weird", "https://example.invalid/weird.git")
+
+	// Stage gitlinks LAST: a fake recorded SHA for the drift checkout (!= real
+	// HEAD => stale) and an orphan gitlink with no .gitmodules entry.
+	recorded := strings.Repeat("2", 40)
+	orphan := strings.Repeat("3", 40)
+	hygGit(t, root, "update-index", "--add", "--cacheinfo", "160000,"+recorded+",submodules/drift/repo")
+	hygGit(t, root, "update-index", "--add", "--cacheinfo", "160000,"+orphan+",submodules/orphan/worktrees/bee-x")
+	return driftHEAD
+}
+
+// TestHygieneScanAllClasses seeds one instance of every cruft class and asserts
+// the read-only scan reports the right per-class count and lists each item in the
+// drill-down (the core of the hive-hygiene-panel requirement).
+func TestHygieneScanAllClasses(t *testing.T) {
+	s, root := setup(t)
+	seedHygieneCruft(t, root)
+
+	h, err := scanHygiene(context.Background(), root, s.git)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if h.Clean() {
+		t.Fatal("scan reported clean despite seeded cruft")
+	}
+	byKey := map[string]CruftClass{}
+	for _, c := range h.Classes {
+		byKey[c.Key] = c
+	}
+	// Each class: expected count + the identifiers the drill-down must list.
+	cases := []struct {
+		key   string
+		count int
+		names []string
+	}{
+		{"worktrees", 2, []string{"edit-roi-alpha-123", "beehive-1782800000-111"}},
+		{"gitlinks", 1, []string{"submodules/orphan/worktrees/bee-x"}},
+		{"checkouts", 1, []string{"submodules/drift/repo"}},
+		{"remotes", 1, []string{"weird"}},
+	}
+	for _, c := range cases {
+		cl, ok := byKey[c.key]
+		if !ok {
+			t.Fatalf("class %q missing from scan", c.key)
+		}
+		if cl.Count() != c.count {
+			t.Fatalf("class %q count = %d, want %d: %+v", c.key, cl.Count(), c.count, cl.Items)
+		}
+		for _, name := range c.names {
+			found := false
+			for _, it := range cl.Items {
+				if it.Name == name {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("class %q drill-down missing %q: %+v", c.key, name, cl.Items)
+			}
+		}
+	}
+	// The live registered worktree and the non-matching dir must NOT be flagged.
+	for _, it := range byKey["worktrees"].Items {
+		if it.Name == "beehive-live-1" || it.Name == "random-keep" {
+			t.Fatalf("stale-worktree scan flagged a non-stale entry %q", it.Name)
+		}
+	}
+	// origin must NOT be flagged as unexpected.
+	for _, it := range byKey["remotes"].Items {
+		if it.Name == "origin" {
+			t.Fatal("origin was flagged as an unexpected remote")
+		}
+	}
+}
+
+// TestHygienePanelReadOnly drives GET /hygiene end-to-end: the page renders the
+// counts, the drill-down identifiers, and the beehive-hygiene remediation
+// pointer — and the handler MUTATES NOTHING (no worktree removed, no remote or
+// config touched, the index and the drifted checkout left exactly as found).
+func TestHygienePanelReadOnly(t *testing.T) {
+	s, root := setup(t)
+	driftHEAD := seedHygieneCruft(t, root)
+
+	// Snapshot the mutable repo state before the read-only handler runs.
+	lsBefore := hygGit(t, root, "ls-files", "-s")
+	remotesBefore := hygGit(t, root, "remote")
+	cfgBefore := hygGit(t, root, "config", "--get-regexp", "^remote\\.")
+	gmBefore, _ := os.ReadFile(filepath.Join(root, ".gitmodules"))
+	staleWT := filepath.Join(root, ".worktrees", "edit-roi-alpha-123")
+
+	w := get(t, s, "/hygiene")
+	if w.Code != 200 {
+		t.Fatalf("hygiene %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"hive hygiene",
+		"Stale worktrees", "edit-roi-alpha-123", "beehive-1782800000-111",
+		"Orphan submodule gitlinks", "submodules/orphan/worktrees/bee-x",
+		"Stale submodule checkouts", "submodules/drift/repo",
+		"Unexpected remotes", "weird",
+		"beehive-hygiene", // the remediation skill pointer
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("hygiene page missing %q:\n%s", want, body)
+		}
+	}
+
+	// Read-only: nothing the scan touched may have changed.
+	if _, err := os.Stat(staleWT); err != nil {
+		t.Fatalf("stale worktree dir was removed by a read-only scan: %v", err)
+	}
+	if got := hygGit(t, root, "ls-files", "-s"); got != lsBefore {
+		t.Fatalf("index changed:\nbefore:\n%s\nafter:\n%s", lsBefore, got)
+	}
+	if got := hygGit(t, root, "remote"); got != remotesBefore {
+		t.Fatalf("remotes changed: before %q after %q", remotesBefore, got)
+	}
+	if got := hygGit(t, root, "config", "--get-regexp", "^remote\\."); got != cfgBefore {
+		t.Fatalf("remote config changed:\nbefore:\n%s\nafter:\n%s", cfgBefore, got)
+	}
+	if gm, _ := os.ReadFile(filepath.Join(root, ".gitmodules")); string(gm) != string(gmBefore) {
+		t.Fatalf(".gitmodules changed:\nbefore:\n%s\nafter:\n%s", gmBefore, gm)
+	}
+	if got := hygGit(t, filepath.Join(root, "submodules", "drift", "repo"), "rev-parse", "HEAD"); got != driftHEAD {
+		t.Fatalf("drift checkout HEAD changed: before %q after %q", driftHEAD, got)
+	}
+}
+
+// TestHygieneCleanAndWidget proves the clean state and the dashboard embed: a
+// fresh repo (no cruft) reports clean on /hygiene, and the dashboard carries the
+// shared hygiene widget so the summary is visible without leaving the home page.
+func TestHygieneCleanAndWidget(t *testing.T) {
+	s, _ := setup(t)
+	hp := get(t, s, "/hygiene")
+	if hp.Code != 200 {
+		t.Fatalf("hygiene %d: %s", hp.Code, hp.Body)
+	}
+	if b := hp.Body.String(); !strings.Contains(b, "clean") || !strings.Contains(b, "no git cruft detected") {
+		t.Fatalf("fresh repo should report clean:\n%s", b)
+	}
+	dash := get(t, s, "/")
+	if !strings.Contains(dash.Body.String(), `id="hygiene-widget"`) {
+		t.Fatalf("dashboard does not embed the hygiene widget:\n%s", dash.Body)
+	}
+}
