@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -361,5 +362,125 @@ func TestReconcilePrefixStampNoDrift(t *testing.T) {
 	}
 	if rng != "" {
 		t.Fatalf("short prefix stamp must read as no-drift, got range %q", rng)
+	}
+}
+
+// initBare inits an empty bare repo (default branch main) to act as a shared
+// origin the hive and a simulated peer push to and pull from.
+func initBare(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if _, err := git.New(dir).Run(context.Background(), "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("bare init: %v", err)
+	}
+	return dir
+}
+
+// peerClone clones origin into a fresh temp dir with a committer identity, so a
+// test can simulate ANOTHER honeybee folding+pushing an ROI delta the local hive
+// has not yet pulled.
+func peerClone(t *testing.T, origin string) (string, *git.Repo) {
+	t.Helper()
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "peer")
+	if _, err := git.New(t.TempDir()).Run(ctx, "clone", "-q", origin, dir); err != nil {
+		t.Fatalf("clone peer: %v", err)
+	}
+	g := git.New(dir)
+	for _, a := range [][]string{{"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		g.Run(ctx, a...)
+	}
+	return dir, g
+}
+
+// TestReconcileDedupSuppressesAppliedFold is the core dedup guard: the local hive
+// shows ROI drift (PLAN.md stamped at a dead sha) but a PEER has already folded
+// the delta — stamping PLAN.md at the current ROI head — and pushed it to origin.
+// The pre-dispatch pull must fast-forward the local tree to that fold so NO
+// reconcile is emitted; the workable task is selected instead. This is the
+// audited back-to-back loop (a stamp landed on origin suppresses a local
+// re-reconcile) plus the ff-pull acceptance criterion.
+func TestReconcileDedupSuppressesAppliedFold(t *testing.T) {
+	ctx := context.Background()
+	origin := initBare(t)
+	_, g, root := hive(t)
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatal(err)
+	}
+	// Local drift: ROI committed, PLAN stamped at a dead sha, plus a TODO task.
+	sub(root, "a", map[string]string{
+		"ROI.md":  "intent\n",
+		"PLAN.md": "<!-- Beehive-ROI: dead -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	if err := g.Commit(ctx, "seed drift"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Push(ctx, "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	// Peer folds the delta (stamps PLAN.md at the current ROI head) and pushes.
+	pdir, pg := peerClone(t, origin)
+	head, err := pg.LastCommit(ctx, "submodules/a/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("peer ROI head: %q %v", head, err)
+	}
+	if err := os.WriteFile(filepath.Join(pdir, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.Commit(ctx, "peer: fold"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	// Local selection: reconcileRange sees the stale drift, but the pre-dispatch
+	// pull fast-forwards to the fold, so the reconcile is suppressed and the real
+	// task is picked.
+	s, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if s == nil || s.Kind != Work || s.Task.ID != "T1" {
+		t.Fatalf("an already-folded ROI delta must suppress reconcile and pick the task; got %+v", s)
+	}
+	// Prove the guard actually pulled: the local PLAN.md now carries the fold, not
+	// the stale "dead" stamp.
+	b, _ := os.ReadFile(filepath.Join(root, "submodules/a/PLAN.md"))
+	if !strings.Contains(string(b), head) || strings.Contains(string(b), "dead") {
+		t.Fatalf("pre-dispatch pull did not fast-forward local PLAN.md to the fold: %q", string(b))
+	}
+}
+
+// TestReconcileDispatchedWhenDriftSurvivesPull proves the guard never
+// over-suppresses: with a genuine drift that is ALSO the freshest published state
+// (no peer fold), the pre-dispatch pull is a no-op and exactly one reconcile is
+// dispatched. Orthogonal to the suppression path — a legitimately-needed
+// reconcile still fires.
+func TestReconcileDispatchedWhenDriftSurvivesPull(t *testing.T) {
+	ctx := context.Background()
+	origin := initBare(t)
+	_, g, root := hive(t)
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatal(err)
+	}
+	sub(root, "a", map[string]string{
+		"ROI.md":  "intent\n",
+		"PLAN.md": "<!-- Beehive-ROI: dead -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	if err := g.Commit(ctx, "seed drift"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Push(ctx, "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	// No peer fold: origin == local, so the pull changes nothing and the drift
+	// survives — a reconcile must be dispatched.
+	s, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if s == nil || s.Kind != Reconcile || s.DiffRange == "" {
+		t.Fatalf("genuine drift at the freshest tip must still dispatch reconcile, got %+v", s)
 	}
 }

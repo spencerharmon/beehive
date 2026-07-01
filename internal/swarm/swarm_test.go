@@ -17,10 +17,12 @@ import (
 
 // mockClient records prompts and lets the test drive the submodule to terminal.
 type mockClient struct {
-	sess *mockSession
+	sess  *mockSession
+	opens int // number of Open calls, so a test can prove no session was spawned
 }
 
 func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	m.opens++
 	if m.sess == nil {
 		m.sess = &mockSession{}
 	}
@@ -987,5 +989,154 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// TestRunReconcileSkipsAlreadyAppliedFold is the pre-dispatch idempotency gate:
+// when PLAN.md is already stamped at the current ROI head, Runner.Run for a
+// Reconcile must complete as a deterministic no-op WITHOUT opening a session (the
+// zero-progress reconcile pass the audit found). No remote is needed — the gate
+// reuses the local prefix compare.
+func TestRunReconcileSkipsAlreadyAppliedFold(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	// PLAN.md already stamped at the current ROI head: the delta is folded.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("an already-applied reconcile must complete as a no-op, got %+v", res)
+	}
+	if mc.opens != 0 {
+		t.Fatalf("no session may be spawned for an already-applied reconcile; opens=%d", mc.opens)
+	}
+	if res.SessionID != "" || res.Turns != 0 {
+		t.Fatalf("a no-op reconcile must not run a session or turns, got %+v", res)
+	}
+}
+
+// TestRunReconcileGatePullsFoldAndSkips proves the dispatch-time gate pulls the
+// freshest main BEFORE deciding: a peer folds the ROI delta on origin AFTER the
+// local drift was seen, and the gate must fast-forward to that fold and skip the
+// session entirely (no bee re-folds an already-stamped delta). This is the
+// swarm-layer counterpart of the audited race that spawned reconciles after
+// PLAN.md was already at the new stamp.
+func TestRunReconcileGatePullsFoldAndSkips(t *testing.T) {
+	ctx := context.Background()
+	origin := t.TempDir()
+	if _, err := git.New(origin).Run(ctx, "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("bare init: %v", err)
+	}
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatal(err)
+	}
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: dead -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed drift")
+	if err := g.Push(ctx, "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	// A peer clones, folds the delta (stamps PLAN.md at the ROI head), and pushes.
+	peer := filepath.Join(t.TempDir(), "peer")
+	if _, err := git.New(t.TempDir()).Run(ctx, "clone", "-q", origin, peer); err != nil {
+		t.Fatal(err)
+	}
+	pg := git.New(peer)
+	pg.Run(ctx, "config", "user.email", "t@t")
+	pg.Run(ctx, "config", "user.name", "t")
+	head, err := pg.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("peer ROI head: %q %v", head, err)
+	}
+	os.WriteFile(filepath.Join(peer, "submodules/sm/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	pg.Commit(ctx, "peer: fold")
+	if err := pg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Remote: "origin"}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed || mc.opens != 0 {
+		t.Fatalf("dispatch-time pull must suppress the folded reconcile with no session; res=%+v opens=%d", res, mc.opens)
+	}
+	// Prove the gate pulled: local PLAN.md now carries the peer's fold.
+	b, _ := os.ReadFile(filepath.Join(sm, "PLAN.md"))
+	if !strings.Contains(string(b), head) {
+		t.Fatalf("gate did not fast-forward local main to the fold: %q", string(b))
+	}
+}
+
+// TestRunReconcileDispatchesGenuineDrift proves the gate never over-suppresses: a
+// still-unfolded ROI delta spawns exactly one session, and the run completes once
+// the agent folds the delta (stamps PLAN.md at the ROI head) during its turn.
+func TestRunReconcileDispatchesGenuineDrift(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	// Genuine drift: stamped at a dead sha, not the ROI head.
+	os.WriteFile(planPath, []byte("<!-- Beehive-ROI: dead -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed drift")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	// The reconcile agent folds the delta during its turn: stamps PLAN.md at head.
+	mc := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a genuine reconcile must run and complete, got %+v", res)
+	}
+	if mc.opens != 1 {
+		t.Fatalf("a genuine reconcile must spawn exactly one session; opens=%d", mc.opens)
 	}
 }

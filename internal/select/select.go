@@ -94,6 +94,18 @@ func (s *Selector) fromSubmodule(ctx context.Context, sm repo.Submodule, now tim
 		return nil, err
 	}
 	if rng != "" {
+		// Apparent ROI drift. Before committing to a reconcile, re-evaluate against
+		// the freshest published main: a peer may have already folded and stamped
+		// this exact ROI delta into PLAN.md (the audited back-to-back reconcile
+		// loop), in which case the pulled tree shows no drift and no reconcile is
+		// dispatched — the process picks real work instead. Only drift that survives
+		// the newest tip warrants a session.
+		rng, err = s.reconcileRangeAtTip(ctx, sm)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if rng != "" {
 		return &Selection{Kind: Reconcile, Submodule: sm, DiffRange: rng}, nil
 	}
 	b, err := os.ReadFile(sm.PlanPath())
@@ -178,6 +190,21 @@ func (s *Selector) reconcileRange(ctx context.Context, sm repo.Submodule) (strin
 		from = emptyTree
 	}
 	return from + ".." + head, nil
+}
+
+// reconcileRangeAtTip re-evaluates reconcileRange after fast-forwarding the
+// beehive repo to the freshest published main, so an ROI fold a peer already
+// stamped into PLAN.md suppresses a redundant local reconcile (the audited
+// back-to-back loop). The pull is best-effort: no remote, or a non-fast-forward
+// tree (local ahead / diverged), leaves the checkout as-is and the local
+// evaluation stands. The guard only ever SUPPRESSES a reconcile the newest tip
+// proves is already folded — a genuine ROI advance still yields a range, so a
+// legitimately-needed reconcile is never masked.
+func (s *Selector) reconcileRangeAtTip(ctx context.Context, sm repo.Submodule) (string, error) {
+	if remote, err := s.Git.Remote(ctx); err == nil && remote != "" {
+		_ = s.Git.Pull(ctx, remote, "main")
+	}
+	return s.reconcileRange(ctx, sm)
 }
 
 // weightedOrder returns submodules shuffled, each repeated by its weight, so

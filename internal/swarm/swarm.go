@@ -233,6 +233,28 @@ func branchFor(sel *selectt.Selection) string {
 // worktree (Work only), runs turns until completion or caps, and tidies up.
 func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first string) (Result, error) {
 	res := Result{Branch: branchFor(sel)}
+
+	// Reconcile is a beehive-layer no-op the moment its ROI delta is folded at the
+	// freshest published tip. A peer may have folded+stamped it between selection
+	// and dispatch (the audited back-to-back reconcile loop). Pull main and re-run
+	// the prefix compare BEFORE opening a session; if already applied, complete as
+	// a deterministic no-op with no session spawned — the pre-dispatch idempotency
+	// guard the audit calls for. A genuine, still-unfolded drift falls through and
+	// dispatches exactly one session as before.
+	if sel.Kind == selectt.Reconcile {
+		applied, err := r.reconcileApplied(ctx, sel)
+		if err != nil {
+			return res, err
+		}
+		if applied {
+			res.Completed = true
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] reconcile for %s already applied at the freshest tip; no session spawned\n", sel.Submodule.Name)
+			}
+			return res, nil
+		}
+	}
+
 	absRoot, err := filepath.Abs(r.Repo.Root)
 	if err != nil {
 		return res, err
@@ -700,6 +722,21 @@ func (r *Runner) statusLeft(sel *selectt.Selection, from plan.Status) (bool, err
 		return false, nil
 	}
 	return t.Status != from, nil
+}
+
+// reconcileApplied fast-forwards to the freshest published main and reports
+// whether this reconcile's ROI delta is already folded — PLAN.md's Beehive-ROI
+// stamp prefixes the current ROI head. It is the pre-dispatch idempotency gate:
+// a true result means a peer already reconciled this delta (the audited
+// back-to-back loop) and no session need run. The pull is best-effort (no remote
+// / non-fast-forward keeps local state); the check then reuses reconciled()'s
+// prefix compare, so a suppressed reconcile is exactly one the newest tip proves
+// is done — a genuine ROI advance still returns false and dispatches a session.
+func (r *Runner) reconcileApplied(ctx context.Context, sel *selectt.Selection) (bool, error) {
+	if r.Remote != "" {
+		_ = r.Git.Pull(ctx, r.Remote, "main")
+	}
+	return r.reconciled(sel)
 }
 
 func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
