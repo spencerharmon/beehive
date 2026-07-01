@@ -91,24 +91,28 @@ type Session struct {
 
 	client agentClient
 	wt     *git.Repo // worktree git
+	mgr    *Manager  // owner, for persistence callbacks (nil in ad-hoc tests)
 
-	mu   sync.Mutex
-	oc   swarm.Session // opencode session (lazy: created on first chat)
-	log  []Turn
-	busy bool
-	err  string // last turn error, surfaced in the panel
+	mu         sync.Mutex
+	oc         swarm.Session // opencode session (lazy: created on first chat)
+	log        []Turn
+	busy       bool
+	err        string    // last turn error, surfaced in the panel
+	lastActive time.Time // last user/agent activity; drives the startup prune TTL
 }
 
 // Manager owns active editor sessions and the worktrees backing them.
 type Manager struct {
-	root    string
-	absRoot string
-	cfg     config.Config
-	primary *git.Repo
-	client  agentClient
+	root      string
+	absRoot   string
+	cfg       config.Config
+	primary   *git.Repo
+	client    agentClient
+	storePath string // persisted-session store (under the repo git dir); "" disables persistence
 
-	mu   sync.Mutex
-	byID map[string]*Session
+	saveMu sync.Mutex // serializes store writes
+	mu     sync.Mutex
+	byID   map[string]*Session
 }
 
 // NewManager builds a Manager over the beehive repo at root.
@@ -118,12 +122,13 @@ func NewManager(root string, cfg config.Config) (*Manager, error) {
 		return nil, err
 	}
 	return &Manager{
-		root:    root,
-		absRoot: abs,
-		cfg:     cfg,
-		primary: git.New(root),
-		client:  &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}},
-		byID:    map[string]*Session{},
+		root:      root,
+		absRoot:   abs,
+		cfg:       cfg,
+		primary:   git.New(root),
+		client:    &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}},
+		storePath: resolveStorePath(abs),
+		byID:      map[string]*Session{},
 	}, nil
 }
 
@@ -192,19 +197,27 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 		return nil, fmt.Errorf("worktree add: %w", err)
 	}
 	s := &Session{
-		ID:       branch,
-		File:     file,
-		Branch:   branch,
-		wtPath:   wtPath,
-		remote:   trusted,
-		baseMain: baseMain,
-		client:   m.client,
-		wt:       git.New(wtPath),
-		sys:      systemPrompt(file),
+		ID:         branch,
+		File:       file,
+		Branch:     branch,
+		wtPath:     wtPath,
+		remote:     trusted,
+		baseMain:   baseMain,
+		client:     m.client,
+		wt:         git.New(wtPath),
+		mgr:        m,
+		sys:        systemPrompt(file),
+		lastActive: time.Now(),
 	}
 	m.mu.Lock()
 	m.byID[s.ID] = s
 	m.mu.Unlock()
+	// Persist immediately so a beehived restart resumes this session instead of
+	// pruning its worktree as an orphan. Best-effort: a store-write failure is
+	// surfaced in the panel, never fatal to opening the edit.
+	if err := m.save(); err != nil {
+		s.setErr("persist: " + err.Error())
+	}
 	return s, nil
 }
 
@@ -245,7 +258,7 @@ func (m *Manager) Close(ctx context.Context, id string) error {
 	s.mu.Unlock()
 	_ = m.primary.WorktreeRemove(ctx, s.wtPath)
 	_, _ = m.primary.Run(ctx, "branch", "-D", s.Branch)
-	return nil
+	return m.save()
 }
 
 // StartChat appends the user's message and runs the agent turn in the
@@ -260,6 +273,7 @@ func (s *Session) StartChat(bg context.Context, msg string) error {
 	s.busy = true
 	s.err = ""
 	s.log = append(s.log, Turn{Role: "user", Text: msg, At: time.Now()})
+	s.lastActive = time.Now()
 	s.mu.Unlock()
 
 	go s.runTurn(bg, msg)
@@ -277,11 +291,23 @@ func (s *Session) Chat(ctx context.Context, msg string) (string, error) {
 	s.busy = true
 	s.err = ""
 	s.log = append(s.log, Turn{Role: "user", Text: msg, At: time.Now()})
+	s.lastActive = time.Now()
 	s.mu.Unlock()
 	return s.runTurn(ctx, msg)
 }
 
 func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
+	// Persist the session (log/activity) on the way out so it survives a beehived
+	// restart on every exit path — a successful turn OR an agent error (the user
+	// still interacted, so the worktree must stay fresh, not look prunable).
+	// Runs after the body's unlocks; setErr re-locks, so there is no deadlock.
+	defer func() {
+		if s.mgr != nil {
+			if perr := s.mgr.save(); perr != nil {
+				s.setErr("persist: " + perr.Error())
+			}
+		}
+	}()
 	reply, err := s.prompt(ctx, msg)
 	s.mu.Lock()
 	if err != nil {
@@ -293,6 +319,7 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 	doMerge := strings.Contains(reply, mergeMarker)
 	display := strings.TrimSpace(strings.ReplaceAll(reply, mergeMarker, ""))
 	s.log = append(s.log, Turn{Role: "agent", Text: display, At: time.Now()})
+	s.lastActive = time.Now()
 	s.mu.Unlock()
 
 	// Commit whatever the agent wrote so the branch carries the proposal (and a

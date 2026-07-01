@@ -51,6 +51,12 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Resume in-flight editor sessions and prune stale/orphaned edit worktrees
+	// left by a previous run (mirrors swarm gc-worktree-reclaim). Runs once at
+	// startup, before serving.
+	if err := em.Resume(context.Background()); err != nil {
+		return nil, err
+	}
 	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em}, nil
 }
 
