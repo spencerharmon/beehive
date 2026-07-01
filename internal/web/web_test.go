@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -172,7 +173,7 @@ func TestDashboardCards(t *testing.T) {
 	// t1's heartbeat is 2026-06-30T11:00:00Z; 30m before now with a 60m TTL => a
 	// fresh claim, so alpha is Working.
 	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
-	views, err := s.subViews(now, time.Hour)
+	views, err := s.subViews(s.head(context.Background()), now, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +220,7 @@ func TestDashboardCards(t *testing.T) {
 
 	// A claim well past the TTL must NOT read as Working (the card's live overlay
 	// is derived from claim freshness, not a status).
-	stale, err := s.subViews(now.Add(48*time.Hour), time.Hour)
+	stale, err := s.subViews(s.head(context.Background()), now.Add(48*time.Hour), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1446,5 +1447,273 @@ func TestHygieneCleanAndWidget(t *testing.T) {
 	dash := get(t, s, "/")
 	if !strings.Contains(dash.Body.String(), `id="hygiene-widget"`) {
 		t.Fatalf("dashboard does not embed the hygiene widget:\n%s", dash.Body)
+	}
+}
+
+// commitAll stages the whole worktree at dir and records one commit, moving HEAD
+// so the frontend parse cache (keyed on repo HEAD) invalidates. --allow-empty so
+// it reliably advances HEAD even when the tree is unchanged (a commit anywhere in
+// the hive is enough to drop the cache). setup() only git-inits the repo (no
+// commit), so a test must commit before the cache is even consulted — until then
+// s.head() is "" and reads bypass the cache.
+func commitAll(t *testing.T, dir, msg string) {
+	t.Helper()
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-q", "--allow-empty", "-m", msg}} {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
+// TestParseCacheHeadKeyed is the core of frontend-perf-cache: the read path parses
+// PLAN.md at most once per repo HEAD and reparses only when HEAD moves. It proves
+// (1) the cached planView equals the uncached parsePlan reference exactly, (2) a
+// second read within the same HEAD is a hit (no reparse), (3) an UNCOMMITTED
+// rewrite is deliberately NOT observed within a HEAD (conservative correctness:
+// the checked-out main only changes via commits), and (4) committing that rewrite
+// moves HEAD and forces a single reparse that reflects the new content. builds
+// (real parses) is the seam: 1 across the whole no-commit window, 2 after the
+// commit.
+func TestParseCacheHeadKeyed(t *testing.T) {
+	s, root := setup(t)
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+	ttl := time.Hour
+
+	// setup() only git-inits; commit so HEAD (the cache key) resolves.
+	commitAll(t, root, "seed")
+	h1 := s.head(context.Background())
+	if h1 == "" {
+		t.Fatal("head empty after commit; cache would bypass")
+	}
+
+	// First read: a real parse. It must equal the uncached reference byte-for-byte
+	// (both go through loadPlanFile + projectPlan).
+	got1, err := s.planView(h1, planPath, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref1, err := parsePlan(planPath, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got1, ref1) {
+		t.Fatalf("cached planView != uncached parsePlan:\n cached=%+v\n   ref=%+v", got1, ref1)
+	}
+	if s.cache.builds != 1 {
+		t.Fatalf("builds = %d after first read, want 1 (one real parse)", s.cache.builds)
+	}
+
+	// Second read at the same HEAD is served from cache: no new parse.
+	if _, err := s.planView(h1, planPath, now, ttl); err != nil {
+		t.Fatal(err)
+	}
+	if s.cache.builds != 1 {
+		t.Fatalf("builds = %d after same-HEAD reread, want 1 (cache hit, no reparse)", s.cache.builds)
+	}
+
+	// Rewrite PLAN.md on disk WITHOUT committing. HEAD does not move, so the cache
+	// must keep serving the original parse — the checked-out tree only advances via
+	// commits, so an uncommitted edit is (correctly) invisible to the read path.
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: zzz999 -->\n# Plan\n\n"+
+			"## only [TODO] <!-- attempts=0 deps= -->\nrewritten but uncommitted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := s.planView(h1, planPath, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.cache.builds != 1 {
+		t.Fatalf("builds = %d after uncommitted rewrite, want 1 (served from cache)", s.cache.builds)
+	}
+	if !reflect.DeepEqual(stale, got1) {
+		t.Fatalf("cache served changed content within one HEAD; want the original 3-task parse, got %+v", stale.Items)
+	}
+
+	// Commit the rewrite: HEAD moves, the whole cache drops, and the next read
+	// reparses the NEW content exactly once.
+	commitAll(t, root, "rewrite plan")
+	h2 := s.head(context.Background())
+	if h2 == "" || h2 == h1 {
+		t.Fatalf("HEAD did not advance after commit: h1=%s h2=%s", h1, h2)
+	}
+	fresh, err := s.planView(h2, planPath, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.cache.builds != 2 {
+		t.Fatalf("builds = %d after HEAD change, want 2 (exactly one reparse on the new HEAD)", s.cache.builds)
+	}
+	if len(fresh.Items) != 1 || fresh.Items[0].ID != "only" {
+		t.Fatalf("post-invalidation plan did not reflect the committed rewrite: %+v", fresh.Items)
+	}
+	ref2, err := parsePlan(planPath, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fresh, ref2) {
+		t.Fatalf("post-invalidation planView != uncached parse of new content:\n cached=%+v\n   ref=%+v", fresh, ref2)
+	}
+}
+
+// TestParseCacheBypassNoHead proves the safety valve: when HEAD cannot be resolved
+// (a brand-new repo with no commit) reads bypass the cache entirely and always
+// build fresh, so a not-yet-committed tree is never served stale and nothing is
+// memoized under an empty key. builds stays 0 because the bypass returns the build
+// directly without recording it.
+func TestParseCacheBypassNoHead(t *testing.T) {
+	s, root := setup(t) // git init, but NO commit -> head == ""
+	if h := s.head(context.Background()); h != "" {
+		t.Fatalf("head = %q, want empty (no commit yet)", h)
+	}
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+
+	if _, err := s.planView("", planPath, now, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if s.cache.builds != 0 {
+		t.Fatalf("builds = %d on bypass, want 0 (head==\"\" must not populate the cache)", s.cache.builds)
+	}
+
+	// With no cache to go stale, an on-disk rewrite is observed immediately.
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: q -->\n# Plan\n\n## only [TODO] <!-- attempts=0 deps= -->\nx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.planView("", planPath, now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 || got.Items[0].ID != "only" {
+		t.Fatalf("bypass read did not reflect the rewrite: %+v", got.Items)
+	}
+}
+
+// TestEnvViewCachedMatchesReference proves the INFRASTRUCTURE.md parse is cached
+// once per HEAD and shared: envView equals the uncached parseEnv reference, and a
+// second envView plus an infraView both reuse the same memoized parse (they share
+// the "infra:<path>" key), so neither adds a build.
+func TestEnvViewCachedMatchesReference(t *testing.T) {
+	s, root := setup(t)
+	infra := filepath.Join(root, "submodules", "alpha", repo.InfraFile)
+	if err := os.WriteFile(infra,
+		[]byte("# infra\nActive: green\nEnvironments: blue, green\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAll(t, root, "seed infra")
+	h := s.head(context.Background())
+	if h == "" {
+		t.Fatal("head empty after commit")
+	}
+
+	got, err := s.envView(h, infra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := parseEnv(infra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, ref) {
+		t.Fatalf("cached envView %+v != uncached parseEnv %+v", got, ref)
+	}
+	if got.Active != "green" {
+		t.Fatalf("env Active = %q, want green (from INFRASTRUCTURE.md)", got.Active)
+	}
+	builds := s.cache.builds
+	if builds != 1 {
+		t.Fatalf("builds = %d after first envView, want 1", builds)
+	}
+	// A second envView and an infraView both hit the shared cached parse.
+	if _, err := s.envView(h, infra); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.infraView(h, infra); err != nil {
+		t.Fatal(err)
+	}
+	if s.cache.builds != builds {
+		t.Fatalf("envView/infraView did not share one cached parse: builds %d -> %d", builds, s.cache.builds)
+	}
+}
+
+// TestSubViewsCacheAcrossSubmodules exercises the real dashboard path over a fleet
+// and pins down the whole-cache-drop-per-commit semantics whose scaling limit is
+// the documented supported-submodule ceiling. subViews parses one PLAN.md + one
+// INFRASTRUCTURE.md per submodule, so a cold dashboard builds exactly 2×N entries;
+// a burst of same-HEAD polls (the HTMX refresh case) reparses nothing; and a
+// single commit ANYWHERE moves HEAD and evicts EVERY submodule's parse, so the
+// next dashboard rebuilds all 2×N. That eviction of unrelated entries on any
+// commit is precisely the amortization the ceiling bounds (per-file invalidation
+// is the deferred scaling path past it).
+func TestSubViewsCacheAcrossSubmodules(t *testing.T) {
+	s, root := setup(t) // alpha exists (ROI + PLAN)
+	// A second active submodule so the fleet is >1 and the whole-cache-drop spans
+	// more than one submodule's entries.
+	bravo := filepath.Join(root, "submodules", "bravo")
+	if err := os.MkdirAll(bravo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bravo, repo.ROIFile), []byte("# bravo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bravo, repo.PlanFile), []byte(
+		"<!-- Beehive-ROI: b -->\n# Plan\n\n## bt1 [TODO] <!-- attempts=0 deps= -->\nwork\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+	ttl := time.Hour
+	commitAll(t, root, "seed fleet")
+	h1 := s.head(context.Background())
+	if h1 == "" {
+		t.Fatal("head empty after commit")
+	}
+
+	subs, err := s.repo.Submodules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := len(subs)
+	if n < 2 {
+		t.Fatalf("want >=2 submodules for a fleet test, got %d", n)
+	}
+
+	// Cold dashboard: one PLAN.md parse + one INFRASTRUCTURE.md parse per submodule
+	// (a missing file still caches its empty/not-present parse, so the count is
+	// exactly 2×N regardless of which docs exist).
+	if _, err := s.subViews(h1, now, ttl); err != nil {
+		t.Fatal(err)
+	}
+	if s.cache.builds != 2*n {
+		t.Fatalf("cold subViews builds = %d, want %d (plan+infra per submodule)", s.cache.builds, 2*n)
+	}
+
+	// A burst of same-HEAD dashboard polls (HTMX refresh with no commit between)
+	// reparses nothing.
+	for i := 0; i < 3; i++ {
+		if _, err := s.subViews(h1, now, ttl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.cache.builds != 2*n {
+		t.Fatalf("same-HEAD poll burst reparsed: builds = %d, want %d (all hits)", s.cache.builds, 2*n)
+	}
+
+	// One commit anywhere moves HEAD and drops the WHOLE cache; the next dashboard
+	// rebuilds every submodule's parse (2×N more).
+	commitAll(t, root, "unrelated commit")
+	h2 := s.head(context.Background())
+	if h2 == h1 {
+		t.Fatal("HEAD did not advance after commit")
+	}
+	if _, err := s.subViews(h2, now, ttl); err != nil {
+		t.Fatal(err)
+	}
+	if s.cache.builds != 4*n {
+		t.Fatalf("post-commit subViews builds = %d, want %d (whole cache dropped, all reparsed)", s.cache.builds, 4*n)
 	}
 }

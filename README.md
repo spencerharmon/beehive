@@ -78,6 +78,8 @@ Override listen address when needed:
 beehived -addr 0.0.0.0:8955 -repo /path/to/beehive-repo
 ```
 
+The frontend memoizes its file parses (`PLAN.md`, `INFRASTRUCTURE.md`, `ARTIFACTS.md`) keyed by the beehive repo's HEAD commit, so a burst of dashboard polls between commits reparses nothing; any commit moves HEAD and invalidates the cache. This is sized for a single host's realistic fleet — on the order of 100 submodules. Far beyond that the per-commit whole-cache-drop amortizes poorly; the deferred scaling path is per-file invalidation. See `docs/frontend-components.md` for details.
+
 ## Quick start
 
 ```sh

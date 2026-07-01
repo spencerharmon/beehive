@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/spencerharmon/beehive/internal/artifacts"
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/git"
@@ -39,6 +38,7 @@ type Server struct {
 	git     *git.Repo
 	tmpl    *template.Template
 	editors *editor.Manager
+	cache   *parseCache // parse-once cache for file-derived views, keyed by repo HEAD
 }
 
 // New builds a Server over the beehive repo at root.
@@ -51,7 +51,7 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em}, nil
+	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em, cache: newParseCache()}, nil
 }
 
 // Routes returns the mux wired to all handlers.
@@ -150,12 +150,16 @@ func (v subView) EnvClass() string {
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
-	views, err := s.subViews(time.Now(), s.ttl())
+	// Resolve the repo HEAD once and thread it into every cached read below, so
+	// this whole dashboard (all submodule plans + infra + the root env) pays a
+	// single rev-parse and shares one cache generation.
+	head := s.head(r.Context())
+	views, err := s.subViews(head, time.Now(), s.ttl())
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
+	env, _ := s.envView(head, filepath.Join(s.repo.Root, repo.InfraFile))
 	// Read-only hygiene summary alongside the submodule cards. A scan error is
 	// surfaced inside the widget (not swallowed) rather than failing the whole
 	// dashboard, which is the operator's primary page.
@@ -166,16 +170,19 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg})
 }
 
-// subViews builds the dashboard card data for every submodule, derived live from
-// files (no cache) so the swarm status is always current: State
-// (active/dormant/bootstrap), the ROI Stamp, the Pending/Human task counts from
-// the unified parser (internal/plan via parsePlan — the same code the
-// runner/selector use), the active blue/green Env from the submodule's own
-// INFRASTRUCTURE.md via the typed artifacts model, and Working (a task carrying a
-// fresh session+heartbeat claim). now/ttl are passed in so the claim-freshness
-// derivation is deterministically testable; the handler supplies time.Now() and
-// the resolved TTL.
-func (s *Server) subViews(now time.Time, ttl time.Duration) ([]subView, error) {
+// subViews builds the dashboard card data for every submodule. The plan counts
+// and the env badge are served through the HEAD-keyed parse cache (planView /
+// infraView) so a burst of dashboard polls between commits reparses nothing;
+// head is the shared cache generation resolved once by the handler ("" bypasses
+// the cache, always fresh). State (active/dormant/bootstrap), the ROI Stamp, the
+// Pending/Human task counts from the unified parser (internal/plan), the active
+// blue/green Env from the submodule's own INFRASTRUCTURE.md via the typed
+// artifacts model, and Working (a task carrying a fresh session+heartbeat claim)
+// are all still derived live — the cache only removes the repeated read+parse,
+// not the derivation. now/ttl are passed in so the claim-freshness derivation is
+// deterministically testable; the handler supplies time.Now() and the resolved
+// TTL.
+func (s *Server) subViews(head string, now time.Time, ttl time.Duration) ([]subView, error) {
 	subs, err := s.repo.Submodules()
 	if err != nil {
 		return nil, err
@@ -197,7 +204,7 @@ func (s *Server) subViews(now time.Time, ttl time.Duration) ([]subView, error) {
 		// any task with a fresh claim (session+heartbeat within the TTL). A parse
 		// error leaves this submodule's counts at zero rather than failing the
 		// whole dashboard (mirrors the pre-existing per-submodule resilience).
-		if p, err := parsePlan(sm.PlanPath(), now, ttl); err == nil {
+		if p, err := s.planView(head, sm.PlanPath(), now, ttl); err == nil {
 			for _, it := range p.Items {
 				if it.Status != StatusDone {
 					v.Pending++
@@ -214,7 +221,7 @@ func (s *Server) subViews(now time.Time, ttl time.Duration) ([]subView, error) {
 		// artifacts model. An absent INFRASTRUCTURE.md leaves Env "" (no badge)
 		// instead of a misleading default; a read error is surfaced as no badge
 		// too (best-effort overview, never a dashboard-wide failure).
-		if in, err := artifacts.LoadInfra(filepath.Join(sm.Path, repo.InfraFile)); err == nil && in.Present() {
+		if in, err := s.infraView(head, filepath.Join(sm.Path, repo.InfraFile)); err == nil && in.Present() {
 			v.Env = in.Deployment().Active
 		}
 		views = append(views, v)
@@ -242,11 +249,14 @@ func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 	// INFRASTRUCTURE.md and ARTIFACTS.md are read through internal/artifacts (the
 	// typed model) instead of raw text: the rendered HTML is the model's
 	// round-tripped serialization, and the same parse feeds the dashboard env
-	// badge. An absent doc is skipped (Present()==false).
-	if in, err := artifacts.LoadInfra(filepath.Join(sm.Path, repo.InfraFile)); err == nil && in.Present() {
+	// badge. Served through the HEAD-keyed cache (infraView/artifactsView) so the
+	// explorer shares the dashboard's memoized parse. An absent doc is skipped
+	// (Present()==false).
+	head := s.head(r.Context())
+	if in, err := s.infraView(head, filepath.Join(sm.Path, repo.InfraFile)); err == nil && in.Present() {
 		docs["INFRA"] = renderMarkdown(in.String())
 	}
-	if a, err := artifacts.LoadArtifacts(filepath.Join(sm.Path, repo.Artifacts)); err == nil && a.Present() {
+	if a, err := s.artifactsView(head, filepath.Join(sm.Path, repo.Artifacts)); err == nil && a.Present() {
 		docs["ARTIFACTS"] = renderMarkdown(a.String())
 	}
 	s.render(w, "explorer.html", map[string]interface{}{"Name": sm.Name, "Docs": docs})
@@ -315,7 +325,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl())
+	p, err := s.planView(s.head(r.Context()), sm.PlanPath(), time.Now(), s.ttl())
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -529,7 +539,7 @@ func (s *Server) submoduleLink(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) envGet(w http.ResponseWriter, r *http.Request) {
-	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
+	env, _ := s.envView(s.head(r.Context()), filepath.Join(s.repo.Root, repo.InfraFile))
 	s.render(w, "env_panel.html", map[string]interface{}{"Env": env})
 }
 
@@ -552,13 +562,14 @@ func (s *Server) envDeploy(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 	subs, _ := s.repo.Submodules()
+	head := s.head(r.Context())
 	type row struct {
 		Sub  string
 		Item PlanItem
 	}
 	var rows []row
 	for _, sm := range subs {
-		p, _ := parsePlan(sm.PlanPath(), time.Now(), s.ttl())
+		p, _ := s.planView(head, sm.PlanPath(), time.Now(), s.ttl())
 		for _, it := range p.Items {
 			if it.Status == StatusHuman {
 				rows = append(rows, row{Sub: sm.Name, Item: it})
