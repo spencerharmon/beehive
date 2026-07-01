@@ -79,6 +79,13 @@ type Runner struct {
 	SessionPublish func(context.Context) error
 	SessionPush    func(context.Context) error
 
+	// SessionCommitIvl is the minimum interval between session-transcript stream
+	// commits (and pushes when distributed) to the session branch a remote-host
+	// beehived follows. It coalesces rapid transcript changes into at most one
+	// commit per interval, bounding commit/push churn for off-box runs. 0 falls
+	// back to 1s (the historical cadence, and what tests get without setting it).
+	SessionCommitIvl time.Duration
+
 	// RestoreConfig, when set, reverts any change to the beehive repo's git config
 	// (remotes) that the agent introduced during a turn. git config is shared
 	// across all worktrees, so a `git remote add` an agent runs in its worktree
@@ -357,7 +364,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// (submodules/<sm>/sessions/<branch>.md) and, when Debug is set, tees live
 	// activity (reasoning, tool commands + output) to stderr. beehived reads the
 	// repo file, so opencode is polled exactly once regardless of UI viewers.
-	recCtx, recStop := context.WithCancel(ctx)
 	sid := SessionID(res.Branch, r.now())
 	res.SessionID = sid
 	// The transcript streams as rapid commits to the isolated session branch (via
@@ -380,7 +386,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	if r.SessionGit != nil {
 		rec.commit = func(c context.Context) { _ = r.streamSession(c, sessionRel) }
-		rec.commitIvl = time.Second
+		rec.commitIvl = r.SessionCommitIvl
+		if rec.commitIvl <= 0 {
+			rec.commitIvl = time.Second
+		}
 	}
 	// Plant the stub on main and capture the squash base BEFORE the recorder starts
 	// overwriting the file with the transcript.
@@ -388,6 +397,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if err != nil {
 		return res, err
 	}
+	// Create the recorder's cancel context only after the fallible setup above;
+	// declaring it earlier leaked the cancel on the startSession error return
+	// (go vet lostcancel).
+	recCtx, recStop := context.WithCancel(ctx)
 	recDone := make(chan struct{})
 	go func() { rec.loop(recCtx); close(recDone) }()
 

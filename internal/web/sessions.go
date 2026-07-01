@@ -100,10 +100,11 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sessRel := "submodules/" + sm.Name + "/sessions/" + branch + ".md"
+	sync := s.sync.view(time.Now(), syncStaleAfter)
 	b, err := os.ReadFile(filepath.Join(sm.SessionsDir(), branch+".md"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.render(w, "session_body.html", map[string]interface{}{"Body": "(waiting for session output…)"})
+			s.render(w, "session_body.html", map[string]interface{}{"Body": "(waiting for session output…)", "Sync": sync})
 			return
 		}
 		http.Error(w, err.Error(), 500)
@@ -127,7 +128,7 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.render(w, "session_body.html", map[string]interface{}{"Body": body})
+	s.render(w, "session_body.html", map[string]interface{}{"Body": body, "Sync": sync})
 }
 
 // readSessionBranch returns the transcript file as it stands on the isolated

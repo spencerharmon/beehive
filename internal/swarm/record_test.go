@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // stubSession returns a scripted, growing message list so the recorder renders a
@@ -65,4 +66,59 @@ func statModTime(t *testing.T, path string) int64 {
 		t.Fatalf("stat %s: %v", path, err)
 	}
 	return fi.ModTime().UnixNano()
+}
+
+// TestRecorderCoalescesCommitsPerInterval locks the "commits coalesced per
+// interval" contract remote-host-session-view depends on: a beehived following an
+// off-box run must be fed at most one stream commit per commitIvl, and only when
+// the transcript actually changed — never one commit per poll, never an empty
+// commit for an unchanged transcript. A controlled clock makes the throttle
+// deterministic (no wall-clock flakiness).
+func TestRecorderCoalescesCommitsPerInterval(t *testing.T) {
+	dir := t.TempDir()
+	text := "one"
+	sess := &stubSession{msgs: func() []Message {
+		return []Message{{ID: "m1", Role: "assistant", Parts: []Part{{Type: "text", Text: text}}}}
+	}}
+	clock := time.Unix(1000, 0)
+	commits := 0
+	rc := &recorder{
+		sess:      sess,
+		path:      filepath.Join(dir, "s.md"),
+		header:    "# s\n",
+		commit:    func(context.Context) { commits++ },
+		commitIvl: time.Second,
+		now:       func() time.Time { return clock },
+		toolSt:    map[string]string{},
+		partLen:   map[string]int{},
+		started:   map[string]bool{},
+	}
+	ctx := context.Background()
+
+	// First change ever streams one commit (lastCommit is zero == "commit now").
+	rc.snapshot(ctx)
+	if commits != 1 {
+		t.Fatalf("first change: commits=%d, want 1", commits)
+	}
+	// Two further changes within the same interval coalesce into no new commit.
+	text = "one two"
+	rc.snapshot(ctx)
+	text = "one two three"
+	rc.snapshot(ctx)
+	if commits != 1 {
+		t.Fatalf("within interval: commits=%d, want 1 (coalesced)", commits)
+	}
+	// The interval elapses and the transcript changed: exactly one more commit.
+	clock = clock.Add(time.Second)
+	text = "one two three four"
+	rc.snapshot(ctx)
+	if commits != 2 {
+		t.Fatalf("after interval + change: commits=%d, want 2", commits)
+	}
+	// The interval elapses but the transcript is unchanged: no empty commit.
+	clock = clock.Add(10 * time.Second)
+	rc.snapshot(ctx)
+	if commits != 2 {
+		t.Fatalf("after interval, unchanged: commits=%d, want 2 (no empty commit)", commits)
+	}
 }

@@ -39,6 +39,10 @@ type Server struct {
 	git     *git.Repo
 	tmpl    *template.Template
 	editors *editor.Manager
+	// sync tracks the periodic follower pull that keeps the local checkout current
+	// with off-box honeybee runs; syncEvery is how often SyncLoop runs it.
+	sync      *remoteSync
+	syncEvery time.Duration
 }
 
 // New builds a Server over the beehive repo at root.
@@ -51,7 +55,10 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em}, nil
+	return &Server{
+		repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em,
+		sync: &remoteSync{}, syncEvery: syncInterval,
+	}, nil
 }
 
 // Routes returns the mux wired to all handlers.

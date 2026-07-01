@@ -63,19 +63,27 @@ type Config struct {
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+	// SessionCommitSeconds is the minimum interval between session-transcript
+	// stream commits (and, when distributed, pushes) to the isolated session
+	// branch a beehived on another host follows. Coalescing per interval bounds
+	// commit/push churn for off-box runs (see docs/tasks/remote-host-session-view);
+	// the recorder still only commits when the transcript actually changed. 0 falls
+	// back to the 1s default, so an unconfigured install keeps today's cadence.
+	SessionCommitSeconds int `yaml:"session_commit_seconds"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
 func Defaults(dir string) Config {
 	return Config{
-		Dir:                dir,
-		GPGHome:            filepath.Join(dir, "gnupg"),
-		AgentCmd:           "opencode",
-		AgentURL:           "http://127.0.0.1:4096",
-		TTLMinutes:         60,
-		MaxTurns:           15,
-		RejectLimit:        3,
-		TurnTimeoutMinutes: 60,
+		Dir:                  dir,
+		GPGHome:              filepath.Join(dir, "gnupg"),
+		AgentCmd:             "opencode",
+		AgentURL:             "http://127.0.0.1:4096",
+		TTLMinutes:           60,
+		MaxTurns:             15,
+		RejectLimit:          3,
+		TurnTimeoutMinutes:   60,
+		SessionCommitSeconds: 1,
 	}
 }
 
@@ -142,6 +150,9 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	if over.SessionCommitSeconds != 0 {
+		out.SessionCommitSeconds = over.SessionCommitSeconds
 	}
 	return out
 }

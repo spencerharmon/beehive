@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -44,6 +45,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("web: %v", err)
 	}
+	// Follow off-box honeybee runs: a background loop periodically fast-forwards
+	// the beehive repo's main from the remote so session stubs and finalized
+	// transcripts written on another host surface in the file-derived views. It is
+	// a no-op on a single-host repo (no remote). Runs for the process lifetime.
+	go s.SyncLoop(context.Background())
 	log.Printf("beehived listening on %s (repo %s)", *addr, entry.Root)
 	log.Fatal(http.ListenAndServe(*addr, s.Routes()))
 }

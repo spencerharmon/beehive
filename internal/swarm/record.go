@@ -34,6 +34,10 @@ type recorder struct {
 	commitIvl  time.Duration
 	lastCommit time.Time
 
+	// now, when set, replaces time.Now for the commit throttle so the coalescing
+	// behavior is testable with a controlled clock. Nil == wall clock.
+	now func() time.Time
+
 	// debug-stream state (incremental, append-only diffing)
 	toolSt  map[string]string // callID -> last status streamed
 	partLen map[string]int    // "<kind>:<partID>" -> chars streamed
@@ -81,13 +85,21 @@ func (rc *recorder) snapshot(ctx context.Context) error {
 	}
 	// Stream to the session branch so beehived sees it near real time, throttled.
 	if rc.commit != nil {
-		now := time.Now()
+		now := rc.clock()
 		if rc.lastCommit.IsZero() || now.Sub(rc.lastCommit) >= rc.commitIvl {
 			rc.lastCommit = now
 			rc.commit(ctx)
 		}
 	}
 	return nil
+}
+
+// clock returns the recorder's time source (a test may override rc.now).
+func (rc *recorder) clock() time.Time {
+	if rc.now != nil {
+		return rc.now()
+	}
+	return time.Now()
 }
 
 // appendWarning records an abort notice at the end of the session file so it is

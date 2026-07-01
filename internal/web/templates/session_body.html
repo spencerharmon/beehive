@@ -1,1 +1,2 @@
+{{with .Sync}}{{if .Remote}}<p class="session-sync{{if .Stale}} stale{{end}}" data-sync>{{if .Synced}}remote synced {{.Ago}} ago{{else}}following remote…{{end}}{{if .Note}} · {{.Note}}{{end}}</p>{{end}}{{end}}
 <pre class="session" id="session-transcript" data-scroll-preserve data-scroll-pin>{{.Body}}</pre>
