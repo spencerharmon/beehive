@@ -1141,3 +1141,138 @@ func TestAssetsStyleHtmxPolish(t *testing.T) {
 		}
 	}
 }
+
+// TestViewerFollowsOffBoxSessions is the consumer half of remote-host-session-
+// view: a beehived that shares no filesystem with a honeybee must still show
+// that agent's session. The viewer fast-forwards local main from the remote so a
+// session stub + transcript another host pushed become visible; and when local
+// main has diverged from the remote it must NOT merge (ff-only) — it renders the
+// last good state and surfaces the stall in the pane, never authoring a merge
+// commit or moving HEAD. Deterministic: a bare origin plus an off-box "producer"
+// clone stand in for the other host — no network, no sleeps.
+func TestViewerFollowsOffBoxSessions(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file") // clone/push over local file paths
+	s, root := setup(t)
+	s.pullIvl = 0 // no coalescing: every polled request actually pulls (determinism)
+
+	gitOK := func(dir string, args ...string) string {
+		t.Helper()
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		out, err := c.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git -C %s %v: %v\n%s", dir, args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	writeAt := func(dir, rel, content string) {
+		t.Helper()
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Root beehive checkout: seed main (setup only `git init`ed it) and normalize
+	// the branch name to main regardless of the host's init.defaultBranch.
+	writeAt(root, "seed", "x")
+	gitOK(root, "add", "-A")
+	gitOK(root, "commit", "-q", "-m", "seed")
+	gitOK(root, "branch", "-M", "main")
+
+	// Bare origin = the shared remote both hosts converge on; publish root main.
+	origin := filepath.Join(t.TempDir(), "origin.git")
+	gitOK(filepath.Dir(origin), "init", "-q", "--bare", "-b", "main", "origin.git")
+	gitOK(root, "remote", "add", "origin", origin)
+	gitOK(root, "push", "-q", "origin", "main")
+
+	sessRel := "submodules/alpha/sessions/bee-remote.md"
+	localSess := filepath.Join(root, filepath.FromSlash(sessRel))
+
+	// Off-box honeybee: a clone of origin on "another host". It streams its
+	// transcript to an isolated session branch and plants the stub on main —
+	// exactly what the streaming producer does — then pushes both.
+	work := t.TempDir()
+	gitOK(work, "clone", "-q", origin, "producer")
+	prod := filepath.Join(work, "producer")
+	gitOK(prod, "config", "user.email", "b@b")
+	gitOK(prod, "config", "user.name", "bee")
+
+	// Transcript lives on the stream branch at the session path.
+	gitOK(prod, "checkout", "-q", "-b", "bee-remote-stream")
+	writeAt(prod, sessRel, "# session bee-remote\n\nhello from off-box\n")
+	gitOK(prod, "add", "-A")
+	gitOK(prod, "commit", "-q", "-m", "stream turn 1")
+	gitOK(prod, "push", "-q", "origin", "bee-remote-stream")
+	// Stub (naming the stream branch) lives on main at the same path.
+	gitOK(prod, "checkout", "-q", "main")
+	writeAt(prod, sessRel, repo.SessionStub("bee-remote-stream"))
+	gitOK(prod, "add", "-A")
+	gitOK(prod, "commit", "-q", "-m", "publish session stub")
+	gitOK(prod, "push", "-q", "origin", "main")
+
+	// Before any request the off-box session is invisible here: local main is
+	// still at seed, so the stub is not on disk.
+	if _, err := os.Stat(localSess); !os.IsNotExist(err) {
+		t.Fatalf("precondition: off-box session must be absent before a follow, stat err=%v", err)
+	}
+
+	// The session pane pulls, so the stub arrives and the transcript (resolved
+	// from the fetched stream branch) renders — proving the viewer followed a run
+	// it never shared a filesystem with.
+	wb := get(t, s, "/submodule/alpha/session/bee-remote/body")
+	if wb.Code != 200 {
+		t.Fatalf("body status %d: %s", wb.Code, wb.Body)
+	}
+	body := wb.Body.String()
+	if !strings.Contains(body, "hello from off-box") {
+		t.Fatalf("followed transcript not rendered from the stream branch:\n%s", body)
+	}
+	if !strings.Contains(body, "followed") {
+		t.Fatalf("session pane missing the freshness banner:\n%s", body)
+	}
+	if strings.Contains(body, "pull stalled") {
+		t.Fatalf("a clean fast-forward must not report a stall:\n%s", body)
+	}
+	if _, err := os.Stat(localSess); err != nil {
+		t.Fatalf("follow did not fast-forward the stub onto local main: %v", err)
+	}
+	// The list view surfaces the followed session too.
+	if lb := get(t, s, "/submodule/alpha/sessions/body"); !strings.Contains(lb.Body.String(), "bee-remote") {
+		t.Fatalf("followed session missing from the list:\n%s", lb.Body)
+	}
+
+	// --- Divergence: local main and the remote both advance independently. ---
+	// The remote gains a second off-box session...
+	writeAt(prod, "submodules/alpha/sessions/bee-remote2.md", repo.SessionStub("bee-remote2-stream"))
+	gitOK(prod, "add", "-A")
+	gitOK(prod, "commit", "-q", "-m", "publish second session stub")
+	gitOK(prod, "push", "-q", "origin", "main")
+	// ...while THIS host makes a local-only main commit (e.g. a frontend edit), so
+	// local main is neither ahead of nor behind the remote — it has diverged.
+	writeAt(root, "local-only", "y")
+	gitOK(root, "add", "-A")
+	gitOK(root, "commit", "-q", "-m", "local frontend edit")
+
+	headBefore := gitOK(root, "rev-parse", "HEAD")
+	wd := get(t, s, "/submodule/alpha/sessions/body")
+	if wd.Code != 200 {
+		t.Fatalf("a diverged follow must still serve the pane, got %d: %s", wd.Code, wd.Body)
+	}
+	db := wd.Body.String()
+	if !strings.Contains(db, "pull stalled") {
+		t.Fatalf("a non-fast-forward divergence must surface as a stall:\n%s", db)
+	}
+	if strings.Contains(db, "bee-remote2") {
+		t.Fatalf("the un-fast-forwardable off-box session must NOT appear locally:\n%s", db)
+	}
+	if got := gitOK(root, "rev-parse", "HEAD"); got != headBefore {
+		t.Fatalf("ff-only pull moved local HEAD on divergence: %s -> %s", headBefore, got)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".git", "MERGE_HEAD")); !os.IsNotExist(err) {
+		t.Fatalf("ff-only pull must never start a merge (MERGE_HEAD present): err=%v", err)
+	}
+}

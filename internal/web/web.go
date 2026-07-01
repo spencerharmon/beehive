@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/artifacts"
@@ -39,6 +40,23 @@ type Server struct {
 	git     *git.Repo
 	tmpl    *template.Template
 	editors *editor.Manager
+
+	// gitMu serializes operations that mutate the primary beehive checkout (where
+	// main is checked out): the viewer's periodic `git pull --ff-only main` that
+	// follows off-box sessions, and the frontend's own commit/publish. Without it a
+	// poll-driven pull races a concurrent frontend commit on the shared index
+	// (index.lock). Read-only git (log/show/status) is not guarded.
+	gitMu sync.Mutex
+
+	// pullIvl coalesces the follow-the-remote pulls: many open session panes each
+	// poll every ~2s, but only one actual pull runs per interval. 0 disables
+	// coalescing (tests). syncMu guards the last-pull bookkeeping (pulled/lastPull/
+	// pullErr) that backs the session panes' staleness banner.
+	pullIvl  time.Duration
+	syncMu   sync.Mutex
+	pulled   bool
+	lastPull time.Time
+	pullErr  error
 }
 
 // New builds a Server over the beehive repo at root.
@@ -51,7 +69,18 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em}, nil
+	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em, pullIvl: pullInterval(cfg)}, nil
+}
+
+// pullInterval is the resolved follow-the-remote coalescing window (config
+// session_pull_seconds), defaulting to 2s when unset. It bounds how often the
+// polled session panes actually hit the remote to fast-forward local main.
+func pullInterval(cfg config.Config) time.Duration {
+	s := cfg.SessionPullSeconds
+	if s <= 0 {
+		s = 2
+	}
+	return time.Duration(s) * time.Second
 }
 
 // Routes returns the mux wired to all handlers.
@@ -299,6 +328,10 @@ func (s *Server) planDelete(w http.ResponseWriter, r *http.Request) {
 // when the repo has no remote (single-host: honeybees branch off local main,
 // already updated). On a non-fast-forward it fetches, merges, and retries.
 func (s *Server) publishMain(ctx context.Context) error {
+	// Serialize against the follow-the-remote pull and other frontend writes: all
+	// touch the primary checkout's index/refs (index.lock).
+	s.gitMu.Lock()
+	defer s.gitMu.Unlock()
 	remote, err := s.git.Remote(ctx)
 	if err != nil || remote == "" {
 		return err
@@ -501,6 +534,10 @@ func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 func (s *Server) commit(ctx context.Context, msg string) error {
 	c, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	// Serialize against the follow-the-remote pull (both mutate the primary
+	// checkout's index): a poll-driven `git pull` must not race `git add -A`.
+	s.gitMu.Lock()
+	defer s.gitMu.Unlock()
 	return s.git.Commit(c, msg)
 }
 

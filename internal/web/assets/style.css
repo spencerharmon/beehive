@@ -373,6 +373,17 @@ ul.sessions li {
 }
 ul.sessions .ago { margin-left: auto; }
 
+/* Remote-follow staleness banner: how fresh the pane is relative to the remote
+   (last `git pull --ff-only main`). .stale flags a pull that could not advance
+   local main (e.g. a non-fast-forward divergence), so the reader knows the view
+   may be behind the off-box run. */
+.sync-status {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  margin: 0 0 var(--space-2);
+}
+.sync-status.stale { color: var(--danger); }
+
 /* Preformatted / transcript ---------------------------------------------- */
 pre {
   background: var(--surface-2);

@@ -63,6 +63,12 @@ type Config struct {
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+	// SessionPullSeconds is how often the frontend fast-forwards local main from
+	// the remote to follow off-box honeybee sessions (session stubs + final
+	// transcripts an agent on another host published). It coalesces the polled
+	// session panes so many open viewers make at most one `git pull --ff-only` per
+	// interval. 0 = the 2s default. Ignored on a single-host repo (no remote).
+	SessionPullSeconds int `yaml:"session_pull_seconds"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -76,6 +82,7 @@ func Defaults(dir string) Config {
 		MaxTurns:           15,
 		RejectLimit:        3,
 		TurnTimeoutMinutes: 60,
+		SessionPullSeconds: 2,
 	}
 }
 
@@ -142,6 +149,9 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	if over.SessionPullSeconds != 0 {
+		out.SessionPullSeconds = over.SessionPullSeconds
 	}
 	return out
 }
