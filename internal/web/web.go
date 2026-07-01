@@ -54,6 +54,15 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em}, nil
 }
 
+// RecoverEditors runs the editor's startup recovery: it re-registers persisted
+// in-flight edit sessions and prunes stale/abandoned edit worktrees left behind
+// by a previous beehived (see editor.Manager.Reload). It is best-effort startup
+// housekeeping — the daemon calls it once before serving and treats a failure as
+// non-fatal — so a recovery hiccup never blocks the frontend from starting.
+func (s *Server) RecoverEditors(ctx context.Context) error {
+	return s.editors.Reload(ctx)
+}
+
 // Routes returns the mux wired to all handlers.
 func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()

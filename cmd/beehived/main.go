@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -43,6 +44,12 @@ func main() {
 	s, err := web.New(r, cfg)
 	if err != nil {
 		log.Fatalf("web: %v", err)
+	}
+	// Startup housekeeping: recover in-flight editor sessions and prune stale
+	// edit worktrees a prior beehived left behind. Best-effort — a failure here
+	// must not stop the daemon from serving.
+	if err := s.RecoverEditors(context.Background()); err != nil {
+		log.Printf("editor recovery: %v", err)
 	}
 	log.Printf("beehived listening on %s (repo %s)", *addr, entry.Root)
 	log.Fatal(http.ListenAndServe(*addr, s.Routes()))

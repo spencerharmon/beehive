@@ -91,12 +91,14 @@ type Session struct {
 
 	client agentClient
 	wt     *git.Repo // worktree git
+	mgr    *Manager  // owner, for persistence on activity
 
-	mu   sync.Mutex
-	oc   swarm.Session // opencode session (lazy: created on first chat)
-	log  []Turn
-	busy bool
-	err  string // last turn error, surfaced in the panel
+	mu       sync.Mutex
+	oc       swarm.Session // opencode session (lazy: created on first chat)
+	log      []Turn
+	busy     bool
+	err      string    // last turn error, surfaced in the panel
+	activity time.Time // last open/chat/merge, drives startup staleness
 }
 
 // Manager owns active editor sessions and the worktrees backing them.
@@ -107,9 +109,19 @@ type Manager struct {
 	primary *git.Repo
 	client  agentClient
 
+	store *store           // persisted session state (survives restart)
+	ttl   time.Duration    // staleness cutoff for startup prune
+	now   func() time.Time // clock (overridable in tests)
+
 	mu   sync.Mutex
 	byID map[string]*Session
 }
+
+// defaultSessionTTL is the fallback staleness cutoff when config sets no TTL. An
+// edit worktree older than this AND carrying no pending change is treated as an
+// abandoned leak and reclaimed at startup; a pending (unpublished) change is
+// always kept regardless of age.
+const defaultSessionTTL = 60 * time.Minute
 
 // NewManager builds a Manager over the beehive repo at root.
 func NewManager(root string, cfg config.Config) (*Manager, error) {
@@ -117,12 +129,19 @@ func NewManager(root string, cfg config.Config) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	ttl := time.Duration(cfg.TTLMinutes) * time.Minute
+	if ttl <= 0 {
+		ttl = defaultSessionTTL
+	}
 	return &Manager{
 		root:    root,
 		absRoot: abs,
 		cfg:     cfg,
 		primary: git.New(root),
 		client:  &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}},
+		store:   newStore(filepath.Join(abs, ".worktrees", sessionsFile)),
+		ttl:     ttl,
+		now:     time.Now,
 		byID:    map[string]*Session{},
 	}, nil
 }
@@ -200,11 +219,16 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 		baseMain: baseMain,
 		client:   m.client,
 		wt:       git.New(wtPath),
+		mgr:      m,
 		sys:      systemPrompt(file),
+		activity: m.now(),
 	}
 	m.mu.Lock()
 	m.byID[s.ID] = s
 	m.mu.Unlock()
+	if err := m.persist(); err != nil {
+		return nil, fmt.Errorf("persist session: %w", err)
+	}
 	return s, nil
 }
 
@@ -245,7 +269,214 @@ func (m *Manager) Close(ctx context.Context, id string) error {
 	s.mu.Unlock()
 	_ = m.primary.WorktreeRemove(ctx, s.wtPath)
 	_, _ = m.primary.Run(ctx, "branch", "-D", s.Branch)
+	return m.persist()
+}
+
+// snapshot projects a Session to its persistable record under the session lock.
+func (s *Session) snapshot() sessionRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	logCopy := make([]Turn, len(s.log))
+	copy(logCopy, s.log)
+	return sessionRecord{
+		ID:       s.ID,
+		File:     s.File,
+		Branch:   s.Branch,
+		WtPath:   s.wtPath,
+		Remote:   s.remote,
+		BaseMain: s.baseMain,
+		Activity: s.activity,
+		Log:      logCopy,
+	}
+}
+
+// persist snapshots every live session and atomically rewrites the store. It is
+// called on every state change (open, chat turn, close) so a beehived restart
+// recovers the exact set of open edits. Lock order is m.mu then each s.mu, never
+// the reverse, so this is deadlock-free against the per-session turn path.
+func (m *Manager) persist() error {
+	m.mu.Lock()
+	recs := make([]sessionRecord, 0, len(m.byID))
+	for _, s := range m.byID {
+		recs = append(recs, s.snapshot())
+	}
+	m.mu.Unlock()
+	return m.store.save(recs)
+}
+
+// isEditBranch reports whether a worktree branch is an AI-editor branch (created
+// by Open as edit-<slug>-<unix>). The startup prune acts ONLY on these; honeybee
+// bee-* branches, the runner's beehive-* pass worktrees, and the primary main
+// checkout are never enumerated for removal.
+func isEditBranch(branch string) bool {
+	return strings.HasPrefix(branch, "edit-")
+}
+
+// Reload recovers persisted editor sessions and prunes stale edit worktrees at
+// beehived startup. It is the mirror of swarm gc-worktree-reclaim for the editor:
+// enumerate the root repo's edit-* worktrees and, for each,
+//
+//   - KEEP + re-register it as a live Session when it has a fresh persisted record
+//     (within ttl) OR carries a pending unpublished change (dirty tree or an
+//     unmerged commit) — a pending/approved change is NEVER reclaimed, whatever
+//     its age; and
+//   - RECLAIM it (git worktree remove + branch -D) when it is both stale (no fresh
+//     record) and clean (no pending change) — the abandoned-edit leak.
+//
+// Non-edit worktrees (bee-*, beehive-*, main) are skipped entirely. The store is
+// rewritten to exactly the surviving sessions, so the prune is idempotent: a
+// second Reload with nothing new to remove is a no-op. Reload is safe to call
+// once at startup before the Manager serves any request.
+func (m *Manager) Reload(ctx context.Context) error {
+	recs, err := m.store.load()
+	if err != nil {
+		return err
+	}
+	byBranch := make(map[string]sessionRecord, len(recs))
+	for _, rec := range recs {
+		byBranch[rec.Branch] = rec
+	}
+	wts, err := m.primary.Worktrees(ctx)
+	if err != nil {
+		return err
+	}
+	now := m.now()
+	for _, w := range wts {
+		if !isEditBranch(w.Branch) {
+			continue
+		}
+		rec, hasRec := byBranch[w.Branch]
+		pending, perr := m.worktreePending(ctx, w)
+		if perr != nil {
+			return perr
+		}
+		fresh := hasRec && now.Sub(rec.Activity) < m.ttl
+		if fresh || pending {
+			s, serr := m.restore(ctx, w, rec, hasRec)
+			if serr != nil {
+				return serr
+			}
+			if s != nil {
+				m.mu.Lock()
+				m.byID[s.ID] = s
+				m.mu.Unlock()
+			}
+			continue
+		}
+		if err := m.reclaim(ctx, w); err != nil {
+			return err
+		}
+	}
+	return m.persist()
+}
+
+// worktreePending reports whether an edit worktree holds an unpublished change
+// that must be preserved: uncommitted working-tree changes, or commits on the
+// branch not yet on main. The three-dot diff (merge-base(main,branch)..branch)
+// scopes "unmerged" to what the branch itself changed, so main advancing after
+// the fork does not read as pending.
+func (m *Manager) worktreePending(ctx context.Context, w git.Worktree) (bool, error) {
+	wg := git.New(w.Path)
+	clean, err := wg.Clean(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !clean {
+		return true, nil
+	}
+	out, err := wg.Run(ctx, "diff", "--name-only", "main..."+w.Branch)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// reclaim removes a stale edit worktree and deletes its branch, mirroring the
+// swarm gc-worktree-reclaim cleanup (force-remove the worktree, then branch -D).
+func (m *Manager) reclaim(ctx context.Context, w git.Worktree) error {
+	if err := m.primary.WorktreeRemove(ctx, w.Path); err != nil {
+		return err
+	}
+	_, _ = m.primary.Run(ctx, "branch", "-D", w.Branch)
 	return nil
+}
+
+// restore rebuilds a live *Session from a surviving edit worktree so the resumed
+// edit is fully operable (diff/state/merge) after a restart. With a persisted
+// record it uses the recorded file/remote/base/log/activity verbatim; without one
+// (a pending worktree whose store entry was lost) it best-effort derives the
+// edited file from git and the publish remote from the repo, returning (nil, nil)
+// only when no edited file can be determined (the worktree is still kept on disk,
+// never destroyed, by Reload's pending guard).
+func (m *Manager) restore(ctx context.Context, w git.Worktree, rec sessionRecord, hasRec bool) (*Session, error) {
+	file := rec.File
+	remote := rec.Remote
+	baseMain := rec.BaseMain
+	log := rec.Log
+	activity := rec.Activity
+	if !hasRec {
+		f, err := m.editedFile(ctx, w)
+		if err != nil {
+			return nil, err
+		}
+		if f == "" {
+			return nil, nil
+		}
+		file = f
+		if r, rerr := m.primary.Remote(ctx); rerr == nil {
+			remote = r
+		}
+		activity = m.now()
+	}
+	s := &Session{
+		ID:       w.Branch,
+		File:     file,
+		Branch:   w.Branch,
+		wtPath:   w.Path,
+		remote:   remote,
+		baseMain: baseMain,
+		client:   m.client,
+		wt:       git.New(w.Path),
+		mgr:      m,
+		sys:      systemPrompt(file),
+		log:      log,
+		activity: activity,
+	}
+	return s, nil
+}
+
+// editedFile derives the repo-relative file an edit worktree changed, for the
+// recovery of a pending worktree whose store record was lost. It prefers the
+// committed change (three-dot diff vs main), falling back to the uncommitted
+// working-tree change, and returns the first path that is a valid editable file.
+func (m *Manager) editedFile(ctx context.Context, w git.Worktree) (string, error) {
+	wg := git.New(w.Path)
+	committed, err := wg.Run(ctx, "diff", "--name-only", "main..."+w.Branch)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(committed, "\n") {
+		if f := strings.TrimSpace(line); f != "" && ValidateFile(f) == nil {
+			return filepath.ToSlash(filepath.Clean(f)), nil
+		}
+	}
+	status, err := wg.Run(ctx, "status", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(status, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Porcelain: "XY <path>" (rename shows "orig -> new"; take the new path).
+		fields := strings.Fields(line)
+		f := fields[len(fields)-1]
+		if ValidateFile(f) == nil {
+			return filepath.ToSlash(filepath.Clean(f)), nil
+		}
+	}
+	return "", nil
 }
 
 // StartChat appends the user's message and runs the agent turn in the
@@ -310,7 +541,11 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 	}
 	s.mu.Lock()
 	s.busy = false
+	s.activity = s.mgr.now()
 	s.mu.Unlock()
+	if perr := s.mgr.persist(); perr != nil {
+		s.setErr("persist: " + perr.Error())
+	}
 	return display, nil
 }
 

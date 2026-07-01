@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/git"
@@ -376,5 +377,217 @@ func TestSessionMergeAutoPushesRemote(t *testing.T) {
 	}
 	if !strings.Contains(out, "remote goal") {
 		t.Fatalf("remote main missing the change:\n%s", out)
+	}
+}
+
+func branchExists(t *testing.T, g *git.Repo, branch string) bool {
+	t.Helper()
+	_, err := g.Run(context.Background(), "rev-parse", "--verify", "refs/heads/"+branch)
+	return err == nil
+}
+
+// TestReloadPrunesStaleKeepsActivePendingAndBee is the startup-prune acceptance:
+// over a root repo carrying several worktrees, Reload removes EXACTLY the stale,
+// change-free edit worktrees (and their branches), while it keeps and re-registers
+// active (fresh record) and pending-change edit worktrees, and never touches
+// honeybee bee-* worktrees or the main checkout.
+func TestReloadPrunesStaleKeepsActivePendingAndBee(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	g := git.New(root)
+	reloadNow := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	addWt := func(branch string) string {
+		wt := filepath.Join(root, ".worktrees", branch)
+		if _, err := g.Run(ctx, "worktree", "add", "-b", branch, wt, "main"); err != nil {
+			t.Fatalf("worktree add %s: %v", branch, err)
+		}
+		return wt
+	}
+
+	// 1) stale + clean (no pending change) -> PRUNED.
+	staleBranch := "edit-stale-100"
+	staleWt := addWt(staleBranch)
+
+	// 2) active (fresh persisted record) + clean -> KEPT and re-registered.
+	activeBranch := "edit-active-200"
+	activeWt := addWt(activeBranch)
+
+	// 3) stale record-LESS worktree carrying a committed, unmerged change ->
+	//    KEPT (pending-change safety) and recovered via derived file.
+	pendingBranch := "edit-pending-300"
+	pendingWt := addWt(pendingBranch)
+	pf := filepath.Join(pendingWt, "submodules", "sm", repo.InfraFile)
+	if err := os.WriteFile(pf, []byte("pending infra\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pg := git.New(pendingWt)
+	if _, err := pg.Run(ctx, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.Run(ctx, "commit", "-m", "pending edit"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4) honeybee worktree -> NEVER enumerated for prune or registered.
+	beeBranch := "bee-sometask-400"
+	beeWt := addWt(beeBranch)
+
+	m := newTestManager(t, root, &fakeClient{})
+	m.now = func() time.Time { return reloadNow }
+	// Persist a store: active is fresh; stale is old; pending is intentionally
+	// absent (its record was "lost") to prove pending is kept regardless.
+	recs := []sessionRecord{
+		{ID: staleBranch, File: "submodules/sm/ROI.md", Branch: staleBranch, WtPath: staleWt, Activity: reloadNow.Add(-120 * time.Minute)},
+		{ID: activeBranch, File: "submodules/sm/" + repo.InfraFile, Branch: activeBranch, WtPath: activeWt, Activity: reloadNow.Add(-1 * time.Minute)},
+	}
+	if err := m.store.save(recs); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Reload(ctx); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	// Stale: worktree + branch gone, not registered.
+	if _, err := os.Stat(staleWt); !os.IsNotExist(err) {
+		t.Fatalf("stale worktree not removed (stat err=%v)", err)
+	}
+	if branchExists(t, g, staleBranch) {
+		t.Fatalf("stale branch %s not deleted", staleBranch)
+	}
+	if _, ok := m.Get(staleBranch); ok {
+		t.Fatalf("stale session must not be registered")
+	}
+
+	// Active: kept and registered.
+	if _, err := os.Stat(activeWt); err != nil {
+		t.Fatalf("active worktree wrongly removed: %v", err)
+	}
+	if !branchExists(t, g, activeBranch) {
+		t.Fatalf("active branch %s wrongly deleted", activeBranch)
+	}
+	if _, ok := m.Get(activeBranch); !ok {
+		t.Fatalf("active session not re-registered after reload")
+	}
+
+	// Pending: kept and registered (recovered with the derived edited file).
+	if _, err := os.Stat(pendingWt); err != nil {
+		t.Fatalf("pending worktree wrongly removed: %v", err)
+	}
+	if !branchExists(t, g, pendingBranch) {
+		t.Fatalf("pending branch %s wrongly deleted", pendingBranch)
+	}
+	ps, ok := m.Get(pendingBranch)
+	if !ok {
+		t.Fatalf("pending session not recovered")
+	}
+	if ps.File != "submodules/sm/"+repo.InfraFile {
+		t.Fatalf("pending recovered file = %q, want submodules/sm/%s", ps.File, repo.InfraFile)
+	}
+
+	// Bee: never touched, never registered as an editor session.
+	if _, err := os.Stat(beeWt); err != nil {
+		t.Fatalf("honeybee worktree wrongly removed: %v", err)
+	}
+	if !branchExists(t, g, beeBranch) {
+		t.Fatalf("honeybee branch %s wrongly deleted", beeBranch)
+	}
+	if _, ok := m.Get(beeBranch); ok {
+		t.Fatalf("honeybee worktree must never be an editor session")
+	}
+
+	// Idempotent: a second reload removes nothing more and keeps the same set.
+	if err := m.Reload(ctx); err != nil {
+		t.Fatalf("second reload: %v", err)
+	}
+	if _, ok := m.Get(activeBranch); !ok {
+		t.Fatalf("active lost after second reload")
+	}
+	if _, ok := m.Get(pendingBranch); !ok {
+		t.Fatalf("pending lost after second reload")
+	}
+	if branchExists(t, g, staleBranch) {
+		t.Fatalf("stale branch reappeared after second reload")
+	}
+}
+
+// TestSessionStateSurvivesRestart is the persistence acceptance: an in-flight
+// edit (open + one agent turn leaving a pending proposal) is recovered by a fresh
+// Manager over the same repo after a simulated beehived restart — same open file,
+// same pending diff, still mergeable, chat log intact.
+func TestSessionStateSurvivesRestart(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	file := "submodules/sm/ROI.md"
+	fc := &fakeClient{reply: "added a goal."}
+	fc.editFn = func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(file))
+		b, _ := os.ReadFile(p)
+		_ = os.WriteFile(p, append(b, []byte("second goal\n")...), 0o644)
+	}
+
+	// Manager A: open and run one turn, leaving a pending (dirty) proposal.
+	mA := newTestManager(t, root, fc)
+	sess, err := mA.Open(ctx, file)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := sess.Chat(ctx, "add a goal"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if st := sess.State(ctx); st != "dirty" {
+		t.Fatalf("pre-restart want dirty, got %s (err=%s)", st, sess.Err())
+	}
+	id := sess.ID
+
+	// Simulated restart: a brand-new Manager over the SAME root recovers state
+	// purely from the persisted store (no shared memory with mA).
+	mB := newTestManager(t, root, fc)
+	if _, ok := mB.Get(id); ok {
+		t.Fatalf("fresh manager should start empty before reload")
+	}
+	if err := mB.Reload(ctx); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	got, ok := mB.Get(id)
+	if !ok {
+		t.Fatalf("session %s not recovered after restart", id)
+	}
+	if got.File != file {
+		t.Fatalf("recovered file = %q, want %q", got.File, file)
+	}
+	if st := got.State(ctx); st != "dirty" {
+		t.Fatalf("recovered session want dirty, got %s", st)
+	}
+	base, proposed, _ := got.Diff(ctx)
+	if strings.Contains(base, "second goal") || !strings.Contains(proposed, "second goal") {
+		t.Fatalf("recovered diff wrong: base=%q proposed=%q", base, proposed)
+	}
+	if len(got.Log()) == 0 {
+		t.Fatalf("recovered session lost its chat log")
+	}
+	// The recovered proposal is still live and mergeable.
+	if err := got.Merge(ctx); err != nil {
+		t.Fatalf("merge recovered session: %v", err)
+	}
+	onMain, _ := os.ReadFile(filepath.Join(root, filepath.FromSlash(file)))
+	if !strings.Contains(string(onMain), "second goal") {
+		t.Fatalf("recovered merge did not reach main: %q", string(onMain))
+	}
+}
+
+// TestReloadEmptyIsNoop confirms recovery on a repo with no editor state is a
+// clean no-op: no sessions, no error, and a written (empty) store.
+func TestReloadEmptyIsNoop(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	m := newTestManager(t, root, &fakeClient{})
+	if err := m.Reload(ctx); err != nil {
+		t.Fatalf("reload empty: %v", err)
+	}
+	if n := len(m.List()); n != 0 {
+		t.Fatalf("want 0 sessions after empty reload, got %d", n)
 	}
 }
