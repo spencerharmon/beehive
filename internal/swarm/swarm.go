@@ -92,6 +92,15 @@ type Runner struct {
 	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
 	// backstop. 0 = no per-turn cap (tests).
 	TurnTimeout time.Duration
+
+	// CompactContext bounds each continue turn's injected context to (changed-file
+	// diffs + a rolling transcript summary) instead of the bare "continue" that
+	// leaves the agent to re-read unchanged files and re-scan the full prior
+	// transcript (ROI Priority 1 — cut tokens per honeybee: pin files + feed
+	// diffs, roll history into a summary). INERT BY DEFAULT: when false the
+	// continue feed is byte-identical to the historical path — correctness of the
+	// pass outranks the byte cut, so the compressor ships behind this knob.
+	CompactContext bool
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -397,6 +406,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
+	// Per-turn context compressor. Nil (and thus a no-op) unless CompactContext is
+	// set, so the default continue feed stays byte-identical to the historical path.
+	var tc *turnContext
+	if r.CompactContext {
+		tc = newTurnContext(0)
+	}
 	// finish stops the recorder, optionally records an abort warning to the
 	// transcript (so it shows in the UI), commits the final transcript to the
 	// session branch, then squashes+merges the durable final to main once and
@@ -588,7 +603,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if r.now().After(deadline) {
 			break
 		}
-		prompt = "continue"
+		prompt = r.nextTurnPrompt(ctx, sess, tc)
 	}
 	// Turn/wall cap hit: the agent never reached completion. Mirror the DONE path
 	// and reclaim the orphaned code worktree (cleanup -> wg.WorktreeRemove) so
@@ -606,6 +621,24 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	cleanup()
 	return res, nil
+}
+
+// nextTurnPrompt builds the feed for the upcoming continue turn. With the context
+// compressor off (tc == nil, the default) it is the bare "continue" — byte-identical
+// to the historical path. With it on, it folds the just-finished turn into the
+// rolling summary and returns the bounded (summary + changed-file diffs) feed;
+// reading the session is best-effort, so any error degrades safely to bare
+// "continue" (never a lost or broken turn — correctness outranks the byte cut).
+func (r *Runner) nextTurnPrompt(ctx context.Context, sess Session, tc *turnContext) string {
+	if tc == nil {
+		return "continue"
+	}
+	msgs, err := sess.Messages(ctx)
+	if err != nil {
+		return "continue"
+	}
+	tc.observe(msgs)
+	return tc.assemble(filesFromMessages(msgs))
 }
 
 // taskRemoved checks whether the operator deleted the plan or removed this

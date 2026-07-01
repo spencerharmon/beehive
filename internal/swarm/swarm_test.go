@@ -3,6 +3,7 @@ package swarm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,15 +29,20 @@ func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, err
 }
 
 type mockSession struct {
-	prompts int
-	onTurn  func(turn int)
-	capture *string // when set, records the first prompt text
+	prompts    int
+	onTurn     func(turn int)
+	capture    *string   // when set, records the first prompt text
+	allPrompts *[]string // when set, records every prompt text in order
+	msgs       []Message // when set, returned by Messages() (drives the compressor)
 }
 
 func (s *mockSession) Prompt(ctx context.Context, text string) (string, error) {
 	s.prompts++
 	if s.capture != nil && s.prompts == 1 {
 		*s.capture = text
+	}
+	if s.allPrompts != nil {
+		*s.allPrompts = append(*s.allPrompts, text)
 	}
 	if s.onTurn != nil {
 		s.onTurn(s.prompts)
@@ -45,7 +51,7 @@ func (s *mockSession) Prompt(ctx context.Context, text string) (string, error) {
 }
 func (s *mockSession) Close() error { return nil }
 
-func (s *mockSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+func (s *mockSession) Messages(ctx context.Context) ([]Message, error) { return s.msgs, nil }
 
 func gitInit(t *testing.T, dir string) *git.Repo {
 	g := git.New(dir)
@@ -987,5 +993,231 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// TestTurnContextPinsAndDiffsFiles is the multi-turn working-set fixture: a file
+// read on turn N must NOT be re-sent in full on turn N+1 when unchanged (only a
+// pinned no-op), a changed file must be sent as a diff (not the whole body), and
+// the per-turn injected bytes must drop below the re-inject-everything baseline.
+func TestTurnContextPinsAndDiffsFiles(t *testing.T) {
+	tc := newTurnContext(4096)
+	bigA := strings.Repeat("alpha line\n", 200) // ~2200 bytes, distinctive
+	bigB := strings.Repeat("beta line\n", 200)
+
+	// Turn 1: both files are NEW -> sent in full (and pinned).
+	out1 := tc.assemble(map[string]string{"a.go": bigA, "b.go": bigB})
+	if !strings.Contains(out1, bigA) || !strings.Contains(out1, bigB) {
+		t.Fatal("turn 1 must send new files in full")
+	}
+
+	// Turn 2: a.go UNCHANGED, b.go CHANGED (append a distinctive line).
+	bigB2 := bigB + "beta EXTRA appended\n"
+	out2 := tc.assemble(map[string]string{"a.go": bigA, "b.go": bigB2})
+
+	// (1) The unchanged file is NOT re-sent in full — only a pinned no-op line.
+	if strings.Contains(out2, bigA) {
+		t.Fatalf("unchanged file a.go was re-sent in full on turn 2; feed:\n%s", out2)
+	}
+	if !strings.Contains(out2, "a.go (unchanged") {
+		t.Fatalf("unchanged file a.go must be reported as a pinned no-op; got:\n%s", out2)
+	}
+	// (2) The changed file is a diff (only the added line), not the whole old body.
+	if strings.Contains(out2, bigB) {
+		t.Fatalf("changed file b.go was re-sent in full instead of a diff; feed:\n%s", out2)
+	}
+	if !strings.Contains(out2, "b.go (changed)") || !strings.Contains(out2, "+beta EXTRA appended") {
+		t.Fatalf("changed file b.go must be a diff showing the added line; got:\n%s", out2)
+	}
+	// (3) Per-turn injected bytes drop vs the re-inject-everything baseline (both
+	// files sent in full every turn).
+	baseline := len(bigA) + len(bigB2)
+	if len(out2) >= baseline {
+		t.Fatalf("compact turn-2 feed (%d bytes) did not drop below the re-inject baseline (%d)", len(out2), baseline)
+	}
+}
+
+// TestTurnContextRollingSummaryBounded proves the prior-turn transcript is folded
+// into a BOUNDED rolling summary that preserves the decisions/actions a turn needs
+// to continue while dropping the verbatim scrollback (tool output), and that the
+// summary never grows past its cap as turns accumulate.
+func TestTurnContextRollingSummaryBounded(t *testing.T) {
+	tc := newTurnContext(300) // small cap to force rolling
+	bigOutput := strings.Repeat("VERBOSE-TOOL-OUTPUT ", 500)
+	msgs := []Message{
+		{ID: "u1", Role: "user", Parts: []Part{{Type: "text", Text: "first prompt: do the task"}}},
+		{ID: "a1", Role: "assistant", Parts: []Part{
+			{Type: "text", Text: "I will read the target file and decide.\nmore detail follows"},
+			{Type: "tool", Tool: "read", CallID: "c1", Status: "completed",
+				Input: map[string]any{"filePath": "x.go"}, Output: bigOutput},
+		}},
+	}
+	tc.observe(msgs)
+	s := tc.renderSummary()
+
+	// Verbatim scrollback (the huge tool output) must be DROPPED, not summarized.
+	if strings.Contains(s, "VERBOSE-TOOL-OUTPUT VERBOSE-TOOL-OUTPUT") {
+		t.Fatalf("rolling summary must drop verbatim tool output; got:\n%s", s)
+	}
+	// The decisions/actions needed to continue must be PRESERVED (headline + tool action).
+	if !strings.Contains(s, "I will read the target file") {
+		t.Fatalf("summary must keep the decision headline; got:\n%s", s)
+	}
+	if !strings.Contains(s, "read x.go") {
+		t.Fatalf("summary must keep the tool ACTION (read x.go); got:\n%s", s)
+	}
+	// observe is a cursor: re-observing the same messages does not duplicate.
+	tc.observe(msgs)
+	if s2 := tc.renderSummary(); s2 != s {
+		t.Fatalf("re-observing processed messages changed the summary:\n%q\nvs\n%q", s2, s)
+	}
+
+	// Rolling bound: many further turns must not grow the summary past the cap;
+	// the newest survive and the oldest are elided.
+	var many []Message
+	many = append(many, Message{ID: "old", Role: "assistant",
+		Parts: []Part{{Type: "text", Text: "OLDEST-SENTINEL decision"}}})
+	for i := 0; i < 100; i++ {
+		many = append(many, Message{ID: fmt.Sprintf("mid%d", i), Role: "assistant",
+			Parts: []Part{{Type: "text", Text: strings.Repeat("pad ", 15) + fmt.Sprintf("mid %d", i)}}})
+	}
+	many = append(many, Message{ID: "new", Role: "assistant",
+		Parts: []Part{{Type: "text", Text: "NEWEST-SENTINEL decision"}}})
+	tc.observe(many)
+	s3 := tc.renderSummary()
+	if len(s3) > tc.maxSummary+64 { // cap + slack for the elision marker + final line boundary
+		t.Fatalf("rolling summary not bounded: %d bytes > cap %d", len(s3), tc.maxSummary)
+	}
+	if !strings.Contains(s3, "NEWEST-SENTINEL") {
+		t.Fatalf("rolling summary dropped the newest turn; got:\n%s", s3)
+	}
+	if strings.Contains(s3, "OLDEST-SENTINEL") {
+		t.Fatalf("rolling summary retained an elided oldest turn; got:\n%s", s3)
+	}
+}
+
+// TestRunCompletesWithCompactContext proves the runner wiring: with CompactContext
+// on, the task STILL completes (no completion-check regression), turn 1 carries the
+// seeded first prompt, and the turn-2 feed is the BOUNDED compact context (opens
+// with the continue boundary, carries the rolling summary + pinned/diffed working
+// set) rather than a bare re-inject-everything continue.
+func TestRunCompletesWithCompactContext(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	var prompts []string
+	// The session reports it read a file (so the compressor has a working set to
+	// pin) and drives the task terminal on turn 2 (so a turn-2 feed exists).
+	sess := &mockSession{
+		allPrompts: &prompts,
+		msgs: []Message{{ID: "a1", Role: "assistant", Parts: []Part{
+			{Type: "text", Text: "reading the target file"},
+			{Type: "tool", Tool: "read", CallID: "c1", Status: "completed",
+				Input: map[string]any{"filePath": "repo/f"}, Output: strings.Repeat("file body line\n", 50)},
+		}}},
+		onTurn: func(turn int) {
+			if turn == 2 {
+				os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+				os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+			}
+		},
+	}
+	r := &Runner{
+		Repo: rp, Git: g, Client: &mockClient{sess: sess},
+		MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, CompactContext: true,
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	// (1) No completion-check regression: the task still completes.
+	if !res.Completed || res.GCMarked {
+		t.Fatalf("compact-context run must still complete, got %+v", res)
+	}
+	if len(prompts) < 2 {
+		t.Fatalf("want >=2 turns, got prompts=%v", prompts)
+	}
+	// (2) Turn 1 carries the seeded first prompt.
+	if !strings.Contains(prompts[0], "first") {
+		t.Fatalf("turn 1 should carry the seeded first prompt; got:\n%s", prompts[0])
+	}
+	// (3) Turn 2 is the bounded compact context, not a bare re-inject.
+	feed2 := prompts[1]
+	if !strings.HasPrefix(feed2, "continue") {
+		t.Fatalf("turn 2 feed must still open with the continue boundary; got:\n%s", feed2)
+	}
+	if !strings.Contains(feed2, "rolling summary") || !strings.Contains(feed2, "working-set files") {
+		t.Fatalf("turn 2 feed must carry the compact context sections; got:\n%s", feed2)
+	}
+	if !strings.Contains(feed2, "repo/f") {
+		t.Fatalf("turn 2 feed must reference the pinned working-set file; got:\n%s", feed2)
+	}
+}
+
+// TestContinueFeedInertByDefault guards the "ship inert on the default path"
+// invariant: with CompactContext unset, the continue turn feed is byte-identical
+// to the historical bare "continue" — the compressor never changes the default
+// path.
+func TestContinueFeedInertByDefault(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	var prompts []string
+	sess := &mockSession{
+		allPrompts: &prompts,
+		// Even with a rich working set available, the default path must ignore it.
+		msgs: []Message{{ID: "a1", Role: "assistant", Parts: []Part{
+			{Type: "tool", Tool: "read", CallID: "c1", Status: "completed",
+				Input: map[string]any{"filePath": "repo/f"}, Output: strings.Repeat("body\n", 50)},
+		}}},
+		onTurn: func(turn int) {
+			if turn == 2 {
+				os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+				os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+			}
+		},
+	}
+	r := &Runner{
+		Repo: rp, Git: g, Client: &mockClient{sess: sess},
+		MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, // CompactContext defaults to false
+	}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(prompts) < 2 {
+		t.Fatalf("want >=2 turns, got prompts=%v", prompts)
+	}
+	if prompts[1] != "continue" {
+		t.Fatalf("default path must send bare \"continue\" on turn 2, got: %q", prompts[1])
 	}
 }
