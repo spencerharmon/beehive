@@ -1,5 +1,5 @@
 // Command beehive is the deterministic CLI: repo init, submodule add/link, plan
-// rollback, secret add/update/edit, worktree add/rm, task human escalation,
+// archive, secret add/update/edit, worktree add/rm, task human escalation,
 // honeybee start, and git-hook
 // install (ROI-protect pre-commit + submodule-sync post-receive). No LLM; every
 // command is plain git + file ops.
@@ -26,6 +26,7 @@ func main() {
 		secretCmd(),
 		worktreeCmd(),
 		taskCmd(),
+		planCmd(),
 		honeybeeCmd(),
 		hookCmd(),
 		lintCmd(),
