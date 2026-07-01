@@ -27,6 +27,7 @@ type sessionRecord struct {
 	WtPath   string    `json:"wt_path"`
 	Remote   string    `json:"remote,omitempty"`
 	BaseMain string    `json:"base_main,omitempty"`
+	Generic  bool      `json:"generic,omitempty"`
 	Activity time.Time `json:"activity"`
 	Log      []Turn    `json:"log,omitempty"`
 }

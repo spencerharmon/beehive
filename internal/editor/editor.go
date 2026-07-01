@@ -17,10 +17,11 @@ import (
 	"github.com/spencerharmon/beehive/internal/swarm"
 )
 
-// agentClient is the slice of the opencode client the editor needs: a session
+// AgentClient is the slice of the opencode client the editor needs: a session
 // seeded with a system prompt and a first message, returning the reply. Narrowed
-// to an interface so tests can inject a fake. (*swarm.Opencode) satisfies it.
-type agentClient interface {
+// to an interface so tests (including other packages, e.g. web) can inject a
+// fake via Manager.SetClient. (*swarm.Opencode) satisfies it.
+type AgentClient interface {
 	NewSession(ctx context.Context, cwd, system, first string) (swarm.Session, string, error)
 }
 
@@ -89,9 +90,16 @@ type Session struct {
 	remote   string
 	baseMain string
 
-	client agentClient
+	client AgentClient
 	wt     *git.Repo // worktree git
 	mgr    *Manager  // owner, for persistence on activity
+
+	// generic marks a session opened over an ARBITRARY repo file (Manager.OpenPath)
+	// rather than the restricted human-owned coordination-file set (Manager.Open).
+	// A generic session drives the chat-diff approval flow: its turns edit the
+	// worktree but do NOT auto-commit or honor the agent merge-marker; the proposal
+	// stays uncommitted until an explicit Approve (commit) or Reject (discard).
+	generic bool
 
 	mu       sync.Mutex
 	oc       swarm.Session // opencode session (lazy: created on first chat)
@@ -107,7 +115,7 @@ type Manager struct {
 	absRoot string
 	cfg     config.Config
 	primary *git.Repo
-	client  agentClient
+	client  AgentClient
 
 	store *store           // persisted session state (survives restart)
 	ttl   time.Duration    // staleness cutoff for startup prune
@@ -146,18 +154,44 @@ func NewManager(root string, cfg config.Config) (*Manager, error) {
 	}, nil
 }
 
+// SetClient overrides the opencode client. It exists so tests (including other
+// packages, e.g. web_test, which reach the Manager through the Server) can inject
+// a fake AgentClient in place of the live opencode HTTP client. Production wires
+// the real client in NewManager; nothing else calls this.
+func (m *Manager) SetClient(c AgentClient) { m.client = c }
+
 // ValidateFile reports whether file (repo-relative) is an editable coordination
 // file and is safe (no traversal). It does not require the file to exist yet.
 func ValidateFile(file string) error {
-	clean := filepath.ToSlash(filepath.Clean(file))
-	if clean == "." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "..") || strings.Contains(clean, "../") {
-		return fmt.Errorf("invalid file path %q", file)
+	if err := validatePath(file); err != nil {
+		return err
 	}
-	if !editableBasenames[filepath.Base(clean)] {
+	if !editableBasenames[filepath.Base(filepath.ToSlash(filepath.Clean(file)))] {
 		return fmt.Errorf("%q is not an editable file", file)
 	}
 	return nil
 }
+
+// validatePath rejects an unsafe repo-relative path (empty/".", absolute, or any
+// traversal that escapes the repo root). It is the shared safety gate under both
+// ValidateFile (restricted coordination files) and ValidateAnyPath (the generic
+// chat-diff surface): a session's worktree is cut from the repo, so a path must
+// stay inside it. It does not require the target to exist yet (new-file creation).
+func validatePath(file string) error {
+	clean := filepath.ToSlash(filepath.Clean(file))
+	if clean == "." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "..") || strings.Contains(clean, "../") {
+		return fmt.Errorf("invalid file path %q", file)
+	}
+	return nil
+}
+
+// ValidateAnyPath reports whether file (repo-relative) is a safe target for the
+// GENERIC chat-diff editor: any path INSIDE the repo, existing or new. Unlike
+// ValidateFile it does not restrict the basename to the human-owned coordination
+// set — the generic surface edits arbitrary repo files — but it applies the same
+// traversal guard so a path can never escape the repo (the "path traversal
+// rejected" acceptance).
+func ValidateAnyPath(file string) error { return validatePath(file) }
 
 // Open creates a worktree+branch for editing file and registers a session.
 //
@@ -173,6 +207,29 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 	if err := ValidateFile(file); err != nil {
 		return nil, err
 	}
+	return m.open(ctx, file, false)
+}
+
+// OpenPath opens a GENERIC chat-diff session over an ARBITRARY repo file — the
+// generalized surface (chat-diff-editor-core): any path inside the repo, not just
+// the human-owned coordination set Open restricts to. The worktree/branch/base
+// machinery is identical to Open (same isolated root-repo edit-<slug> worktree,
+// same safety-hardened base selection and destructive-deletion base guard); the
+// difference is the arbitrary-path validator and the generic approval flow — its
+// turns propose (edit the worktree) but do NOT auto-commit, so a change lands
+// only on an explicit Approve and Reject discards it.
+func (m *Manager) OpenPath(ctx context.Context, file string) (*Session, error) {
+	file = filepath.ToSlash(filepath.Clean(file))
+	if err := ValidateAnyPath(file); err != nil {
+		return nil, err
+	}
+	return m.open(ctx, file, true)
+}
+
+// open is the shared worktree+session setup behind Open (restricted) and OpenPath
+// (generic). file is already cleaned and validated by the caller; generic selects
+// the arbitrary-file approval flow (deferred commit) and its system prompt.
+func (m *Manager) open(ctx context.Context, file string, generic bool) (*Session, error) {
 	remote, err := m.primary.Remote(ctx)
 	if err != nil {
 		return nil, err
@@ -217,10 +274,11 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 		wtPath:   wtPath,
 		remote:   trusted,
 		baseMain: baseMain,
+		generic:  generic,
 		client:   m.client,
 		wt:       git.New(wtPath),
 		mgr:      m,
-		sys:      systemPrompt(file),
+		sys:      promptFor(file, generic),
 		activity: m.now(),
 	}
 	m.mu.Lock()
@@ -285,6 +343,7 @@ func (s *Session) snapshot() sessionRecord {
 		WtPath:   s.wtPath,
 		Remote:   s.remote,
 		BaseMain: s.baseMain,
+		Generic:  s.generic,
 		Activity: s.activity,
 		Log:      logCopy,
 	}
@@ -412,6 +471,7 @@ func (m *Manager) restore(ctx context.Context, w git.Worktree, rec sessionRecord
 	file := rec.File
 	remote := rec.Remote
 	baseMain := rec.BaseMain
+	generic := rec.Generic
 	log := rec.Log
 	activity := rec.Activity
 	if !hasRec {
@@ -435,10 +495,11 @@ func (m *Manager) restore(ctx context.Context, w git.Worktree, rec sessionRecord
 		wtPath:   w.Path,
 		remote:   remote,
 		baseMain: baseMain,
+		generic:  generic,
 		client:   m.client,
 		wt:       git.New(w.Path),
 		mgr:      m,
-		sys:      systemPrompt(file),
+		sys:      promptFor(file, generic),
 		log:      log,
 		activity: activity,
 	}
@@ -521,22 +582,30 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 		s.mu.Unlock()
 		return "", err
 	}
-	doMerge := strings.Contains(reply, mergeMarker)
+	doMerge := !s.generic && strings.Contains(reply, mergeMarker)
 	display := strings.TrimSpace(strings.ReplaceAll(reply, mergeMarker, ""))
 	s.log = append(s.log, Turn{Role: "agent", Text: display, At: time.Now()})
+	generic := s.generic
 	s.mu.Unlock()
 
-	// Commit whatever the agent wrote so the branch carries the proposal (and a
-	// merge can fast-forward). Nothing-to-commit is fine (agent only answered).
-	if cerr := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); cerr != nil && cerr != git.ErrNothing {
-		s.setErr("commit: " + cerr.Error())
-	}
-	if doMerge {
-		// An agent-driven merge can NEVER confirm a protected whole-file deletion;
-		// that requires an explicit human action. A phantom deletion (e.g. a wrong
-		// base) surfaces here as a panel error instead of silently publishing.
-		if merr := s.merge(ctx, false); merr != nil {
-			s.setErr("merge: " + merr.Error())
+	// Restricted coordination-file sessions auto-commit each proposal (and merge on
+	// the agent marker) so the branch always carries the change. A GENERIC chat-diff
+	// session (OpenPath) DEFERS: its turns leave the edit uncommitted in the worktree
+	// so Diff renders it as a proposal, and it lands only on an explicit human
+	// Approve (commit) or is dropped by Reject (discard) — the approval gate.
+	if !generic {
+		// Commit whatever the agent wrote so the branch carries the proposal (and a
+		// merge can fast-forward). Nothing-to-commit is fine (agent only answered).
+		if cerr := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); cerr != nil && cerr != git.ErrNothing {
+			s.setErr("commit: " + cerr.Error())
+		}
+		if doMerge {
+			// An agent-driven merge can NEVER confirm a protected whole-file deletion;
+			// that requires an explicit human action. A phantom deletion (e.g. a wrong
+			// base) surfaces here as a panel error instead of silently publishing.
+			if merr := s.merge(ctx, false); merr != nil {
+				s.setErr("merge: " + merr.Error())
+			}
 		}
 	}
 	s.mu.Lock()
@@ -619,6 +688,50 @@ func (s *Session) merge(ctx context.Context, confirmDelete bool) error {
 	return s.wt.UpdateLocalMain(ctx)
 }
 
+// Approve accepts the pending proposal of a GENERIC chat-diff session, committing
+// the agent's uncommitted worktree edit onto the session's edit branch. A generic
+// session never auto-commits its turns (runTurn defers), so the change lives only
+// in the worktree until Approve records it as a commit — the human-approval gate.
+// Approve deliberately does NOT publish to main; making the committed edit live on
+// main is a separate, later step. Nothing-to-commit (no pending change) is a no-op
+// success so a double-click cannot error.
+func (s *Session) Approve(ctx context.Context) error {
+	if err := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); err != nil && err != git.ErrNothing {
+		return err
+	}
+	s.mu.Lock()
+	s.activity = s.mgr.now()
+	s.mu.Unlock()
+	return s.mgr.persist()
+}
+
+// Reject discards the pending proposal of a GENERIC chat-diff session, restoring
+// the file to its last committed state on the edit branch — a true no-op against
+// the repo (nothing is committed, nothing published). A file that exists at the
+// branch HEAD is checked back out from HEAD (dropping the agent's uncommitted
+// edit); a brand-new file the agent created (absent at HEAD) is removed. The
+// session stays open so the human can keep iterating from a clean base. An
+// already-clean worktree makes Reject a no-op success.
+func (s *Session) Reject(ctx context.Context) error {
+	if s.wt.Exists(ctx, "HEAD", s.File) {
+		if _, err := s.wt.Run(ctx, "checkout", "HEAD", "--", s.File); err != nil {
+			return err
+		}
+	} else if err := os.Remove(filepath.Join(s.wtPath, filepath.FromSlash(s.File))); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	s.mu.Lock()
+	s.activity = s.mgr.now()
+	s.mu.Unlock()
+	return s.mgr.persist()
+}
+
+// Generic reports whether this session was opened over an arbitrary repo file via
+// OpenPath (the chat-diff approval flow) rather than the restricted human-owned
+// coordination set via Open. The web layer uses it to render the Approve/Reject
+// controls instead of Merge.
+func (s *Session) Generic() bool { return s.generic }
+
 // Diff returns the file content on main (base) and in the worktree (proposed).
 func (s *Session) Diff(ctx context.Context) (base, proposed string, err error) {
 	base, _ = s.wt.Show(ctx, "main", s.File) // "" when the file is new on main
@@ -642,6 +755,22 @@ func (s *Session) State(ctx context.Context) string {
 		return "live"
 	}
 	return "dirty"
+}
+
+// Pending reports whether a GENERIC chat-diff session holds an UNCOMMITTED
+// proposal in its worktree — an edit the agent produced that a human has not yet
+// accepted. Unlike State (worktree vs main) this is worktree vs HEAD: Approve
+// commits the pending edit onto the branch, after which Pending is false even
+// though the branch still differs from main (publishing to main is a separate
+// step); Reject also clears it. It drives whether the Approve/Reject controls are
+// offered. A porcelain status of the single edited path is the source of truth,
+// so both a modified tracked file and a brand-new untracked one count as pending.
+func (s *Session) Pending(ctx context.Context) bool {
+	out, err := s.wt.Run(ctx, "status", "--porcelain", "--", s.File)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(out) != ""
 }
 
 // Log returns a copy of the chat log.
@@ -671,6 +800,17 @@ func slugFile(file string) string {
 	return strings.Trim(r.Replace(file), "-")
 }
 
+// promptFor selects the opencode system prompt for a session: the restricted
+// coordination-file prompt (systemPrompt, which arms the agent merge-marker) or
+// the GENERIC chat-diff prompt (genericSystemPrompt, no marker — a generic edit
+// is landed by the human Approve control, never an agent-driven merge).
+func promptFor(file string, generic bool) string {
+	if generic {
+		return genericSystemPrompt(file)
+	}
+	return systemPrompt(file)
+}
+
 func systemPrompt(file string) string {
 	return fmt.Sprintf(`You are a collaborative editor for ONE file in a git repository: %s.
 
@@ -681,4 +821,20 @@ Rules:
 - Ask a brief clarifying question only if the request is genuinely ambiguous.
 - When, and ONLY when, the user explicitly approves merging/publishing the change, end your reply with a final line containing exactly: %s`,
 		file, file, file, mergeMarker)
+}
+
+// genericSystemPrompt is the system prompt for a GENERIC chat-diff session over an
+// arbitrary repo file. It mirrors systemPrompt's single-file discipline but omits
+// the merge-marker instruction entirely: a generic proposal is reviewed as a diff
+// and accepted or discarded by the human via Approve/Reject, so the agent must
+// never try to publish or signal a merge — it only proposes an edit to the file.
+func genericSystemPrompt(file string) string {
+	return fmt.Sprintf(`You are a collaborative editor for ONE file in a git repository: %s.
+
+Rules:
+- ONLY edit %s. Never touch any other file. Never run git, never commit, never merge; the system records and applies your change only after a human reviews the diff and approves it.
+- Make exactly the change the user asks for by editing %s directly with your file tools.
+- Reply in ONE short sentence naming what you changed, e.g. "I added a Goals section and tightened the intro. How does that look?". Do not paste file contents or the diff; the UI shows them.
+- Ask a brief clarifying question only if the request is genuinely ambiguous.`,
+		file, file, file)
 }
