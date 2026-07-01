@@ -20,7 +20,7 @@ func versionCmd() *cobra.Command {
 func initCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "init <path>",
-		Short: "scaffold a beehive repo and install the git hooks (ROI-protect + submodule-sync)",
+		Short: "scaffold a beehive repo and install the git hooks (ROI-protect pre-commit + pre-receive, submodule-sync post-receive)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
@@ -49,13 +49,13 @@ func hookCmd() *cobra.Command {
 	c := &cobra.Command{Use: "hook", Short: "git hook management"}
 	c.AddCommand(&cobra.Command{
 		Use:   "install <repo>",
-		Short: "install (or re-install) all beehive git hooks: ROI-protect pre-commit + submodule-sync post-receive",
+		Short: "install (or re-install) all beehive git hooks: ROI-protect pre-commit + pre-receive, submodule-sync post-receive",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if err := config.InstallHooks(args[0]); err != nil {
 				return err
 			}
-			fmt.Println("beehive git hooks installed (pre-commit + post-receive)")
+			fmt.Println("beehive git hooks installed (pre-commit + pre-receive + post-receive)")
 			return nil
 		},
 	})

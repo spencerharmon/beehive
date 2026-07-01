@@ -143,6 +143,7 @@ func TestInstallHooks(t *testing.T) {
 	}
 	for name, want := range map[string]string{
 		"pre-commit":   preCommitHook,
+		"pre-receive":  preReceiveHook,
 		"post-receive": postReceiveHook,
 	} {
 		p := filepath.Join(root, ".git", "hooks", name)
@@ -171,6 +172,19 @@ func TestInstallHooks(t *testing.T) {
 			t.Fatalf("post-receive hook missing %q:\n%s", want, postReceiveHook)
 		}
 	}
+	// The pre-receive hook carries the server-side ROI guard: gate on the
+	// honeybee identity from BOTH signals (the transport-independent push option
+	// beehive-honeybee=1 via GIT_PUSH_OPTION_COUNT, and the BEEHIVE_HONEYBEE env
+	// for local pushes), read the stdin ref triples, and reject a ROI.md-touching
+	// push (matching the pre-commit path regex).
+	for _, want := range []string{
+		"BEEHIVE_HONEYBEE", "beehive-honeybee=1", "GIT_PUSH_OPTION_COUNT",
+		"while read -r old new ref", `(^|/)ROI\.md$`, "may not push changes to ROI.md",
+	} {
+		if !strings.Contains(preReceiveHook, want) {
+			t.Fatalf("pre-receive hook missing %q:\n%s", want, preReceiveHook)
+		}
+	}
 }
 
 // TestInstallHooksIdempotent proves a re-install is byte-identical (no
@@ -192,7 +206,7 @@ func TestInstallHooksIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := map[string][]byte{}
-	for _, n := range []string{"pre-commit", "post-receive"} {
+	for _, n := range []string{"pre-commit", "pre-receive", "post-receive"} {
 		b, err := os.ReadFile(filepath.Join(hooksDir, n))
 		if err != nil {
 			t.Fatal(err)
@@ -210,7 +224,7 @@ func TestInstallHooksIdempotent(t *testing.T) {
 	if err := InstallHooks(root); err != nil {
 		t.Fatal(err)
 	}
-	for _, n := range []string{"pre-commit", "post-receive"} {
+	for _, n := range []string{"pre-commit", "pre-receive", "post-receive"} {
 		b, err := os.ReadFile(filepath.Join(hooksDir, n))
 		if err != nil {
 			t.Fatal(err)
@@ -223,8 +237,8 @@ func TestInstallHooksIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ents) != 2 {
-		t.Fatalf("hooks dir has %d entries, want exactly 2 (no duplication): %v", len(ents), ents)
+	if len(ents) != 3 {
+		t.Fatalf("hooks dir has %d entries, want exactly 3 (no duplication): %v", len(ents), ents)
 	}
 }
 
@@ -336,5 +350,165 @@ func TestPostReceiveSkipsOrphanGitlink(t *testing.T) {
 	// the hook's skip is load-bearing, not cosmetic.
 	if out, err := runGit(root, "submodule", "update", "--init", "--force"); err == nil {
 		t.Fatalf("expected a blind `submodule update --init --force` to fatal on the orphan gitlink, but it succeeded:\n%s", out)
+	}
+}
+
+// preReceiveEnv builds a hermetic environment for driving the pre-receive hook:
+// it drops the repo-locating GIT_* vars (so a child git resolves from cmd.Dir,
+// not an inherited GIT_DIR), BEEHIVE_HONEYBEE (so the "frontend" case is truly
+// unset regardless of the runner's own environment), AND any ambient
+// GIT_PUSH_OPTION* (so a case that does not pass -o cannot inherit a stray push
+// option — this test may itself run inside a honeybee receive-pack hook).
+// honeybee=true re-adds BEEHIVE_HONEYBEE=1, one of the two identity signals the
+// hook keys on (the other, the push option, is passed explicitly via -o).
+func preReceiveEnv(honeybee bool) []string {
+	drop := map[string]bool{
+		"GIT_DIR": true, "GIT_WORK_TREE": true, "GIT_INDEX_FILE": true,
+		"GIT_QUARANTINE_PATH": true, "GIT_OBJECT_DIRECTORY": true,
+		"GIT_COMMON_DIR": true, "GIT_PREFIX": true, "BEEHIVE_HONEYBEE": true,
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		if drop[k] || strings.HasPrefix(k, "GIT_PUSH_OPTION") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	if honeybee {
+		env = append(env, "BEEHIVE_HONEYBEE=1")
+	}
+	return env
+}
+
+// TestPreReceiveRejectsHoneybeeROIPush drives the installed server-side
+// pre-receive hook through REAL pushes into a repo configured exactly like a
+// beehive convergence target (receive.denyCurrentBranch=updateInstead, push
+// options advertised, no remote). It proves the identity rule end-to-end for BOTH
+// honeybee signals:
+//   - a honeybee-identity push via the BEEHIVE_HONEYBEE=1 env touching ROI.md is
+//     REJECTED (the local-push signal);
+//   - a frontend push (no signal) touching ROI.md is ACCEPTED;
+//   - a honeybee push (env) that leaves ROI.md alone is ACCEPTED;
+//   - a honeybee-identity push via the transport-independent push option
+//     `-o beehive-honeybee=1` (env UNSET) touching ROI.md is REJECTED.
+//
+// The env signal reaches the hook because honeybees publish by a LOCAL push, whose
+// receive-pack + hooks inherit the pusher's environment; the push option is the
+// signal a real remote push carries (it does not depend on client env), which is
+// what the design caveat requires. A no-op hook would let the first push through,
+// so this test bites.
+func TestPreReceiveRejectsHoneybeeROIPush(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	runGit := func(dir string, env []string, args ...string) (string, error) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		if out, err := runGit(dir, preReceiveEnv(false), args...); err != nil {
+			t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+		}
+	}
+
+	// Convergence target: a repo on main with updateInstead + advertised push
+	// options + the pre-receive hook.
+	dest := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "t@t"},
+		{"config", "user.name", "t"},
+		{"config", "receive.denyCurrentBranch", "updateInstead"},
+		{"config", "receive.advertisePushOptions", "true"},
+	} {
+		mustGit(dest, a...)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "ROI.md"), []byte("intent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "code.txt"), []byte("v0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(dest, "add", "ROI.md", "code.txt")
+	mustGit(dest, "commit", "-qm", "seed")
+	if err := InstallPreReceiveHook(dest); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse dest HEAD: %v\n%s", err, seed)
+	}
+	seed = strings.TrimSpace(seed)
+
+	// A working clone to push from (clone run from a neutral cwd).
+	neutral := t.TempDir()
+	work := filepath.Join(t.TempDir(), "work")
+	if out, err := runGit(neutral, preReceiveEnv(false), "clone", "-q", dest, work); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+	mustGit(work, "config", "user.email", "t@t")
+	mustGit(work, "config", "user.name", "t")
+
+	// (A) Honeybee push touching ROI.md -> REJECTED, and dest HEAD unmoved.
+	if err := os.WriteFile(filepath.Join(work, "ROI.md"), []byte("intent\nbee tampering\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(work, "commit", "-qam", "bee edits ROI")
+	out, err := runGit(work, preReceiveEnv(true), "push", "origin", "main")
+	if err == nil {
+		t.Fatalf("honeybee push touching ROI.md must be REJECTED, but it succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "may not push changes to ROI.md") {
+		t.Fatalf("rejection missing the guard message:\n%s", out)
+	}
+	if head, _ := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD"); strings.TrimSpace(head) != seed {
+		t.Fatalf("dest HEAD advanced despite a rejected honeybee ROI push: %s != seed %s", strings.TrimSpace(head), seed)
+	}
+	// Drop the tampering commit so the later cases start from origin.
+	mustGit(work, "reset", "--hard", "origin/main")
+
+	// (B) Frontend push (env unset) touching ROI.md -> ACCEPTED.
+	if err := os.WriteFile(filepath.Join(work, "ROI.md"), []byte("intent\nhuman-approved edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(work, "commit", "-qam", "frontend edits ROI")
+	if out, err := runGit(work, preReceiveEnv(false), "push", "origin", "main"); err != nil {
+		t.Fatalf("frontend push touching ROI.md must be ACCEPTED, got: %v\n%s", err, out)
+	}
+
+	// (C) Honeybee push that leaves ROI.md alone -> ACCEPTED.
+	if err := os.WriteFile(filepath.Join(work, "code.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(work, "commit", "-qam", "bee edits code only")
+	if out, err := runGit(work, preReceiveEnv(true), "push", "origin", "main"); err != nil {
+		t.Fatalf("honeybee push with no ROI.md change must be ACCEPTED, got: %v\n%s", err, out)
+	}
+
+	// (D) Honeybee identity via the transport-independent PUSH OPTION (env unset)
+	// touching ROI.md -> REJECTED. This is the signal a real remote push carries
+	// (the env does not traverse a remote), so it proves the guard does not depend
+	// on client-only env; the dest advertises push options (configured above).
+	if err := os.WriteFile(filepath.Join(work, "ROI.md"), []byte("intent\nbee via push option\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(work, "commit", "-qam", "bee edits ROI via push option")
+	pinned, err := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse dest HEAD: %v\n%s", err, pinned)
+	}
+	pinned = strings.TrimSpace(pinned)
+	if out, err := runGit(work, preReceiveEnv(false), "push", "-o", "beehive-honeybee=1", "origin", "main"); err == nil {
+		t.Fatalf("push-option honeybee push touching ROI.md must be REJECTED, but it succeeded:\n%s", out)
+	} else if !strings.Contains(out, "may not push changes to ROI.md") {
+		t.Fatalf("push-option rejection missing the guard message:\n%s", out)
+	}
+	if head, _ := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD"); strings.TrimSpace(head) != pinned {
+		t.Fatalf("dest HEAD advanced despite a rejected push-option ROI push: %s != %s", strings.TrimSpace(head), pinned)
 	}
 }
