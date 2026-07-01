@@ -106,7 +106,7 @@ func (c *Claimer) Claim(ctx context.Context, taskID string, ts time.Time) error 
 	if err := c.save(p); err != nil {
 		return err
 	}
-	if err := c.Git.Commit(ctx, stampMsg(taskID, "claim")); err != nil && err != git.ErrNothing {
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "claim"), c.Sub.PlanRel()); err != nil && err != git.ErrNothing {
 		return err
 	}
 	if c.Publish != nil {
@@ -169,7 +169,7 @@ func (c *Claimer) Heartbeat(ctx context.Context, taskID string, from plan.Status
 	if err := c.save(p); err != nil {
 		return err
 	}
-	if err := c.Git.Commit(ctx, stampMsg(taskID, "heartbeat")); err != nil && err != git.ErrNothing {
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "heartbeat"), c.Sub.PlanRel()); err != nil && err != git.ErrNothing {
 		return err
 	}
 	if c.Publish != nil {
@@ -201,7 +201,7 @@ func (c *Claimer) Release(ctx context.Context, taskID string) error {
 	if err := c.save(p); err != nil {
 		return err
 	}
-	if err := c.Git.Commit(ctx, stampMsg(taskID, "release")); err != nil && err != git.ErrNothing {
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "release"), c.Sub.PlanRel()); err != nil && err != git.ErrNothing {
 		return err
 	}
 	if c.Publish != nil {
@@ -242,7 +242,7 @@ func (c *Claimer) Reject(ctx context.Context, taskID string, limit int) (plan.St
 	if err := c.save(p); err != nil {
 		return "", err
 	}
-	if err := c.Git.Commit(ctx, stampMsg(taskID, "reject")); err != nil && err != git.ErrNothing {
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "reject"), c.Sub.PlanRel()); err != nil && err != git.ErrNothing {
 		return "", err
 	}
 	return t.Status, nil

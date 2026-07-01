@@ -91,6 +91,134 @@ func TestRunCompletes(t *testing.T) {
 	}
 }
 
+// TestRunLeavesNoWorktreeGitlink drives a full Work pass (worktree created, a
+// per-turn Heartbeat commits while it exists) and asserts the beehive index never
+// ends up with a gitlink under submodules/*/worktrees/* — the end-to-end proof
+// the code worktree is never absorbed as an orphan gitlink.
+func TestRunLeavesNoWorktreeGitlink(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	ctx := context.Background()
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(ctx, "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	links, err := g.TrackedGitlinks(ctx)
+	if err != nil {
+		t.Fatalf("tracked gitlinks: %v", err)
+	}
+	for _, l := range links {
+		if strings.Contains(l.Path, "/worktrees/") {
+			t.Fatalf("Work run leaked a code worktree gitlink: %s", l.Path)
+		}
+	}
+}
+
+// TestSweepWorktreeGitlinksHeals seeds an orphan worktree gitlink that fatals
+// `git submodule update --init`, runs the sweep, and asserts the orphan is gone
+// and submodule update no longer fatals — a leaked worktree self-heals.
+func TestSweepWorktreeGitlinksHeals(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	ctx := context.Background()
+	const orphan = "submodules/sm/worktrees/bee-x"
+	const sha = "1111111111111111111111111111111111111111"
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+sha+","+orphan); err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-q", "-m", "seed orphan"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+	if _, err := g.Run(ctx, "submodule", "update", "--init"); err == nil {
+		t.Fatal("expected submodule update --init to fatal on orphan before sweep")
+	}
+	rp, _ := repo.Open(root)
+	r := &Runner{Repo: rp, Git: g}
+	if err := r.sweepWorktreeGitlinks(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	links, err := g.TrackedGitlinks(ctx)
+	if err != nil {
+		t.Fatalf("tracked gitlinks: %v", err)
+	}
+	if len(links) != 0 {
+		t.Fatalf("orphan survived sweep: %+v", links)
+	}
+	if _, err := g.Run(ctx, "submodule", "update", "--init"); err != nil {
+		t.Fatalf("submodule update --init still fatals after sweep: %v", err)
+	}
+}
+
+// TestSweepKeepsRegisteredSubmodule proves the sweep NEVER removes a declared
+// submodule gitlink (the absolute rule) while still dropping an orphan worktree
+// gitlink alongside it.
+func TestSweepKeepsRegisteredSubmodule(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(root, ".gitmodules"),
+		[]byte("[submodule \"sm\"]\n\tpath = submodules/sm/repo\n\turl = ./sm.git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const sha = "1111111111111111111111111111111111111111"
+	for _, p := range []string{"submodules/sm/repo", "submodules/sm/worktrees/bee-x"} {
+		if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+sha+","+p); err != nil {
+			t.Fatalf("seed %s: %v", p, err)
+		}
+	}
+	if _, err := g.Run(ctx, "add", "--", ".gitmodules"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Run(ctx, "commit", "-q", "-m", "seed declared+orphan"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+	rp, _ := repo.Open(root)
+	r := &Runner{Repo: rp, Git: g}
+	if err := r.sweepWorktreeGitlinks(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	links, err := g.TrackedGitlinks(ctx)
+	if err != nil {
+		t.Fatalf("tracked gitlinks: %v", err)
+	}
+	var declared, orphan bool
+	for _, l := range links {
+		switch l.Path {
+		case "submodules/sm/repo":
+			declared = true
+		case "submodules/sm/worktrees/bee-x":
+			orphan = true
+		}
+	}
+	if orphan {
+		t.Fatal("orphan worktree gitlink survived sweep")
+	}
+	if !declared {
+		t.Fatal("sweep removed the DECLARED submodule gitlink (submodules/sm/repo)")
+	}
+}
+
 func TestRunGCCap(t *testing.T) {
 	root := t.TempDir()
 	g := gitInit(t, root)

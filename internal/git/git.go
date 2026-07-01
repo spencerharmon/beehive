@@ -50,8 +50,22 @@ func (r *Repo) CurrentBranch(ctx context.Context) (string, error) {
 // Commit stages everything and commits with msg. ErrNothing if tree clean.
 var ErrNothing = errors.New("git: nothing to commit")
 
+// worktreeGitlinkExcludes are the pathspecs Commit subtracts from `add -A` so a
+// blanket stage never captures a submodule *code* worktree (or a beehive-repo
+// worktree) that git sees as a nested checkout. Left unexcluded, `add -A` records
+// such a checkout as an orphan gitlink (mode 160000) with no `.gitmodules` entry,
+// which later wedges `git submodule update` (rc 128: "No url found for submodule
+// path"). The runner creates these worktrees under `submodules/<sm>/worktrees/`
+// and `.worktrees/`; declared submodules (e.g. `submodules/<sm>/repo`) live
+// elsewhere and are untouched by these excludes.
+var worktreeGitlinkExcludes = []string{
+	":(exclude)submodules/*/worktrees/*",
+	":(exclude).worktrees/*",
+}
+
 func (r *Repo) Commit(ctx context.Context, msg string) error {
-	if _, err := r.Run(ctx, "add", "-A"); err != nil {
+	addArgs := append([]string{"add", "-A", "--", "."}, worktreeGitlinkExcludes...)
+	if _, err := r.Run(ctx, addArgs...); err != nil {
 		return err
 	}
 	clean, err := r.Clean(ctx)
@@ -354,7 +368,7 @@ func (r *Repo) healLocalMain(ctx context.Context) error {
 		return err
 	}
 	_, _ = m.Run(ctx, "submodule", "sync", "--quiet")
-	paths, err := m.declaredSubmodulePaths(ctx)
+	paths, err := m.DeclaredSubmodulePaths(ctx)
 	if err != nil {
 		return err
 	}
@@ -398,10 +412,10 @@ func (r *Repo) mainWorktreeDir(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("git: no worktrees listed")
 }
 
-// declaredSubmodulePaths returns the submodule paths declared in .gitmodules
+// DeclaredSubmodulePaths returns the submodule paths declared in .gitmodules
 // (none when there is no .gitmodules), so callers can sync real submodules
 // without tripping over orphan gitlinks that have no declaration.
-func (r *Repo) declaredSubmodulePaths(ctx context.Context) ([]string, error) {
+func (r *Repo) DeclaredSubmodulePaths(ctx context.Context) ([]string, error) {
 	if _, statErr := os.Stat(filepath.Join(r.Dir, ".gitmodules")); statErr != nil {
 		return nil, nil
 	}
@@ -419,6 +433,70 @@ func (r *Repo) declaredSubmodulePaths(ctx context.Context) ([]string, error) {
 		}
 	}
 	return paths, nil
+}
+
+// Gitlink is one tracked submodule index entry (mode 160000): the repo-relative
+// path and the recorded commit SHA the gitlink points at.
+type Gitlink struct {
+	Path string
+	SHA  string
+}
+
+// TrackedGitlinks lists every mode-160000 entry in the index (the recorded
+// submodule gitlinks), parsed from `git ls-files -s`. It is how a caller finds
+// orphan gitlinks — tracked submodule pointers with no .gitmodules declaration,
+// e.g. a honeybee code worktree that leaked in via a blanket `add` — so it can
+// remove them and unwedge `git submodule update`.
+func (r *Repo) TrackedGitlinks(ctx context.Context) ([]Gitlink, error) {
+	out, err := r.Run(ctx, "ls-files", "-s")
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(out) == "" {
+		return nil, nil
+	}
+	var links []Gitlink
+	for _, line := range strings.Split(out, "\n") {
+		// "<mode> <sha> <stage>\t<path>"; gitlinks are mode 160000.
+		if !strings.HasPrefix(line, "160000 ") {
+			continue
+		}
+		tab := strings.IndexByte(line, '\t')
+		if tab < 0 {
+			continue
+		}
+		fields := strings.Fields(line[:tab])
+		if len(fields) < 2 {
+			continue
+		}
+		links = append(links, Gitlink{Path: line[tab+1:], SHA: fields[1]})
+	}
+	return links, nil
+}
+
+// RemoveCached unstages the given paths from the index without touching the
+// working tree (`git rm --cached --force`), so a tracked orphan gitlink can be
+// dropped from tracking while its on-disk checkout (a live honeybee worktree)
+// is preserved. No-op when paths is empty.
+func (r *Repo) RemoveCached(ctx context.Context, paths ...string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	args := append([]string{"rm", "--cached", "--force", "--"}, paths...)
+	_, err := r.Run(ctx, args...)
+	return err
+}
+
+// CommitStaged commits exactly what is already staged in the index, adding
+// nothing. Unlike Commit it never runs `add`, so a caller that has precisely
+// staged an index change (e.g. RemoveCached of an orphan gitlink) records that
+// and only that. ErrNothing when the index matches HEAD (nothing staged).
+func (r *Repo) CommitStaged(ctx context.Context, msg string) error {
+	if _, err := r.Run(ctx, "diff", "--cached", "--quiet"); err == nil {
+		return ErrNothing // exit 0 => no staged changes
+	}
+	_, err := r.Run(ctx, "commit", "-m", msg)
+	return err
 }
 
 // Worktree is one entry from `git worktree list`.

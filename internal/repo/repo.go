@@ -48,6 +48,12 @@ func (s Submodule) PlanPath() string     { return filepath.Join(s.Path, PlanFile
 func (s Submodule) ROIPath() string      { return filepath.Join(s.Path, ROIFile) }
 func (s Submodule) WorktreesDir() string { return filepath.Join(s.Path, "worktrees") }
 
+// PlanRel is PlanPath as a repo-root-relative pathspec (submodules/<name>/PLAN.md).
+// Claim commits stage PLAN.md with this EXPLICIT pathspec rather than a blanket
+// `add -A`, so a commit taken while a code worktree exists under
+// submodules/<name>/worktrees/ can never absorb that worktree as an orphan gitlink.
+func (s Submodule) PlanRel() string { return filepath.Join("submodules", s.Name, PlanFile) }
+
 // SessionsDir holds recorded honeybee session transcripts (one .md per branch).
 func (s Submodule) SessionsDir() string { return filepath.Join(s.Path, "sessions") }
 

@@ -229,6 +229,63 @@ func branchFor(sel *selectt.Selection) string {
 	}
 }
 
+// isWorktreeGitlink reports whether an index path is a leaked code-worktree
+// gitlink: a submodules/<sm>/worktrees/<branch> pointer (the ephemeral per-task
+// checkout the runner creates), as opposed to a declared submodule at
+// submodules/<sm>/repo. Matched structurally with forward slashes, which is how
+// git reports index paths on every platform.
+func isWorktreeGitlink(p string) bool {
+	parts := strings.Split(p, "/")
+	// submodules / <name> / worktrees / <branch> [ / ... ]
+	return len(parts) >= 4 && parts[0] == "submodules" && parts[2] == "worktrees"
+}
+
+// sweepWorktreeGitlinks removes any ORPHAN gitlink under submodules/*/worktrees/*
+// from the beehive index and commits the removal, so a code worktree a prior pass
+// leaked (via a blanket `add`) stops fataling `git submodule update`. It NEVER
+// touches a declared submodule (one with a .gitmodules entry) — only tracked
+// gitlinks under worktrees/ that are absent from .gitmodules — and it leaves the
+// on-disk worktree checkout intact (git rm --cached). No-op (and no commit) when
+// there is nothing to sweep. Errors are surfaced, never swallowed.
+func (r *Runner) sweepWorktreeGitlinks(ctx context.Context) error {
+	links, err := r.Git.TrackedGitlinks(ctx)
+	if err != nil {
+		return err
+	}
+	if len(links) == 0 {
+		return nil
+	}
+	declaredPaths, err := r.Git.DeclaredSubmodulePaths(ctx)
+	if err != nil {
+		return err
+	}
+	declared := make(map[string]bool, len(declaredPaths))
+	for _, p := range declaredPaths {
+		declared[p] = true
+	}
+	var orphans []string
+	for _, l := range links {
+		if declared[l.Path] {
+			continue // a real submodule: never touch it
+		}
+		if !isWorktreeGitlink(l.Path) {
+			continue // some other orphan gitlink is out of this task's scope
+		}
+		orphans = append(orphans, l.Path)
+	}
+	if len(orphans) == 0 {
+		return nil
+	}
+	if err := r.Git.RemoveCached(ctx, orphans...); err != nil {
+		return err
+	}
+	msg := fmt.Sprintf("swarm: sweep %d orphan worktree gitlink(s)\n\nBeehive: sweep worktree-gitlink", len(orphans))
+	if err := r.Git.CommitStaged(ctx, msg); err != nil && !errors.Is(err, git.ErrNothing) {
+		return err
+	}
+	return nil
+}
+
 // Run executes the loop for one selection. It claims work tasks, creates a
 // worktree (Work only), runs turns until completion or caps, and tidies up.
 func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first string) (Result, error) {
@@ -236,6 +293,15 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	absRoot, err := filepath.Abs(r.Repo.Root)
 	if err != nil {
 		return res, err
+	}
+
+	// Self-heal before anything reads submodules: drop any orphan gitlink a prior
+	// pass leaked under submodules/*/worktrees/* (a committed code worktree with no
+	// .gitmodules entry). Left in place it FATALS the `git submodule update` this
+	// Work setup runs below and every host's sync. Runs for every kind so a
+	// bootstrap/reconcile pass heals it too. Surfaced, never swallowed.
+	if err := r.sweepWorktreeGitlinks(ctx); err != nil {
+		return res, fmt.Errorf("sweep worktree gitlinks: %w", err)
 	}
 
 	// Only a main Work task edits the submodule repo and needs a worktree.

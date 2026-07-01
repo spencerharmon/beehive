@@ -5,8 +5,108 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// nestedCheckout creates a standalone git checkout at repo-relative rel inside r
+// (an embedded repository git records as a mode-160000 gitlink if a blanket add
+// stages it), returning its HEAD sha. It models a honeybee code worktree living
+// under submodules/<sm>/worktrees/<branch>.
+func nestedCheckout(t *testing.T, r *Repo, rel string) string {
+	t.Helper()
+	ctx := context.Background()
+	dir := filepath.Join(r.Dir, rel)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", rel, err)
+	}
+	n := New(dir)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "n@n"}, {"config", "user.name", "n"}} {
+		if _, err := n.Run(ctx, a...); err != nil {
+			t.Fatalf("nested init %v: %v", a, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "code.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("nested write: %v", err)
+	}
+	if _, err := n.Run(ctx, "add", "-A"); err != nil {
+		t.Fatalf("nested add: %v", err)
+	}
+	if _, err := n.Run(ctx, "commit", "-q", "-m", "base"); err != nil {
+		t.Fatalf("nested commit: %v", err)
+	}
+	sha, err := n.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("nested HEAD: %v", err)
+	}
+	return sha
+}
+
+// TestCommitExcludesWorktreeGitlinks proves the Commit choke point never absorbs
+// a nested checkout under submodules/*/worktrees/* or .worktrees/* as an orphan
+// gitlink, while still committing real coordination files.
+func TestCommitExcludesWorktreeGitlinks(t *testing.T) {
+	r := initRepo(t)
+	ctx := context.Background()
+	nestedCheckout(t, r, filepath.Join("submodules", "sm", "worktrees", "bee-x"))
+	nestedCheckout(t, r, filepath.Join(".worktrees", "beehive-y"))
+	if err := os.MkdirAll(filepath.Join(r.Dir, "submodules", "sm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, r, filepath.Join("submodules", "sm", "PLAN.md"), "## T [TODO]\n")
+	if err := r.Commit(ctx, "coord"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	links, err := r.TrackedGitlinks(ctx)
+	if err != nil {
+		t.Fatalf("tracked gitlinks: %v", err)
+	}
+	if len(links) != 0 {
+		t.Fatalf("worktree checkouts leaked as gitlinks: %+v", links)
+	}
+	out, err := r.Run(ctx, "ls-files")
+	if err != nil {
+		t.Fatalf("ls-files: %v", err)
+	}
+	if !strings.Contains(out, "submodules/sm/PLAN.md") {
+		t.Fatalf("PLAN.md not committed; ls-files=%q", out)
+	}
+}
+
+// TestTrackedGitlinksRemoveCachedCommitStaged exercises the sweep primitives: a
+// seeded orphan gitlink is enumerated, dropped from the index without deleting
+// its on-disk checkout, and the removal committed; a clean index is ErrNothing.
+func TestTrackedGitlinksRemoveCachedCommitStaged(t *testing.T) {
+	r := initRepo(t)
+	ctx := context.Background()
+	const rel = "submodules/sm/worktrees/bee-x"
+	sha := nestedCheckout(t, r, rel)
+	if _, err := r.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+sha+","+rel); err != nil {
+		t.Fatalf("seed gitlink: %v", err)
+	}
+	if _, err := r.Run(ctx, "commit", "-q", "-m", "orphan"); err != nil {
+		t.Fatalf("commit orphan: %v", err)
+	}
+	links, err := r.TrackedGitlinks(ctx)
+	if err != nil || len(links) != 1 || links[0].Path != rel {
+		t.Fatalf("want one seeded gitlink %q, got %+v (err %v)", rel, links, err)
+	}
+	if err := r.RemoveCached(ctx, rel); err != nil {
+		t.Fatalf("remove cached: %v", err)
+	}
+	if err := r.CommitStaged(ctx, "sweep"); err != nil {
+		t.Fatalf("commit staged: %v", err)
+	}
+	if links, _ = r.TrackedGitlinks(ctx); len(links) != 0 {
+		t.Fatalf("gitlink survived sweep: %+v", links)
+	}
+	if err := r.CommitStaged(ctx, "noop"); err != ErrNothing {
+		t.Fatalf("want ErrNothing on clean index, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.Dir, rel, "code.txt")); err != nil {
+		t.Fatalf("on-disk worktree checkout not preserved: %v", err)
+	}
+}
 
 func initRepo(t *testing.T) *Repo {
 	t.Helper()

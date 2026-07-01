@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,56 @@ func writePlan(t *testing.T, c *Claimer, ctx context.Context, body string) {
 	}
 	if err := c.Git.Commit(ctx, "edit plan"); err != nil && err != git.ErrNothing {
 		t.Fatal(err)
+	}
+}
+
+// TestClaimCommitsExcludeWorktreeGitlink proves the claim commits — the frequent
+// leak producer, since a per-turn Heartbeat commits while a code worktree exists
+// under submodules/<sm>/worktrees/<branch> — stage ONLY PLAN.md and never absorb
+// that worktree checkout as an orphan gitlink into the beehive repo.
+func TestClaimCommitsExcludeWorktreeGitlink(t *testing.T) {
+	c, ctx := setup(t)
+	wt := filepath.Join(c.Sub.WorktreesDir(), "bee-T1")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	n := git.New(wt)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "n@n"}, {"config", "user.name", "n"}} {
+		if _, err := n.Run(ctx, a...); err != nil {
+			t.Fatalf("worktree init %v: %v", a, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(wt, "code.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Run(ctx, "add", "-A"); err != nil {
+		t.Fatalf("worktree add: %v", err)
+	}
+	if _, err := n.Run(ctx, "commit", "-q", "-m", "code"); err != nil {
+		t.Fatalf("worktree commit: %v", err)
+	}
+
+	ts := time.Now().UTC()
+	if err := c.Claim(ctx, "T1", ts); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := c.Heartbeat(ctx, "T1", plan.TODO, ts.Add(time.Minute)); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+
+	links, err := c.Git.TrackedGitlinks(ctx)
+	if err != nil {
+		t.Fatalf("tracked gitlinks: %v", err)
+	}
+	for _, l := range links {
+		if strings.Contains(l.Path, "/worktrees/") {
+			t.Fatalf("claim leaked code worktree as gitlink: %s", l.Path)
+		}
+	}
+	// The stamp still landed on PLAN.md.
+	p, _ := c.load()
+	if tk := p.Find("T1"); tk == nil || tk.Session != "bee-A" {
+		t.Fatalf("claim did not stamp PLAN.md: %+v", tk)
 	}
 }
 
