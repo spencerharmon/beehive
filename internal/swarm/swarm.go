@@ -100,6 +100,17 @@ type Runner struct {
 	// runner flips it on from an env flag (see cmd/honeybee). The protocol is
 	// re-sent on every turn, so trimming compounds across a session.
 	LeanInject bool
+
+	// ContextDiff bounds the per-turn injected context to (new/changed content +
+	// a rolling summary of prior turns) instead of letting each continue turn lean
+	// on the full accumulated scrollback. When on, the continue prompt carries a
+	// bounded block assembled from the session transcript (turnContext): files the
+	// agent has already SEEN are pinned and emitted as a DIFF (or omitted when
+	// unchanged) rather than re-read/re-sent in full, and prior turns are folded
+	// into a bounded rolling summary. Off by default so the continue prompt is the
+	// bare nextPrompt output, byte-identical to the historical path; the runner
+	// flips it on from an env flag (see cmd/honeybee), matching LeanInject.
+	ContextDiff bool
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -425,6 +436,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
+	// Per-run context assembler for ContextDiff mode (inert when off): pins seen
+	// files and rolls the transcript summary across turns so each continue prompt
+	// carries only (new/changed content + summary), not everything seen so far.
+	tc := newTurnContext()
 	// finish stops the recorder, optionally records an abort warning to the
 	// transcript (so it shows in the UI), commits the final transcript to the
 	// session branch, then squashes+merges the durable final to main once and
@@ -616,7 +631,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if r.now().After(deadline) {
 			break
 		}
-		prompt = r.nextPrompt(sel, res.Branch)
+		prompt = r.continuePrompt(ctx, sess, sel, res.Branch, tc)
 	}
 	// Turn/wall cap hit: the agent never reached completion. Mirror the DONE path
 	// and reclaim the orphaned code worktree (cleanup -> wg.WorktreeRemove) so
@@ -655,6 +670,31 @@ func (r *Runner) nextPrompt(sel *selectt.Selection, branch string) string {
 			"`Beehive: %[3]s <doc-path>` stamp and push it to the submodule's origin, bump the submodule "+
 			"pointer, then flip the PLAN.md task to NEEDS-REVIEW on main.",
 		sel.Submodule.Name, branch, sel.Task.ID)
+}
+
+// continuePrompt builds the prompt for the next turn. Default (ContextDiff off):
+// the bare nextPrompt output, byte-identical to the historical loop. With
+// ContextDiff on it augments that base with a bounded context block (rolling
+// summary of prior turns + diffs of files the agent already saw, unchanged files
+// omitted) assembled from the session transcript, so the same files and full
+// scrollback are not effectively re-sent every turn. The base instruction is
+// always kept first and verbatim, so completion is never starved. A transcript
+// fetch failure is surfaced to Debug and falls back to the bare base — never
+// fatal, worst case is today's behavior. This changes WHAT is sent per turn, not
+// WHEN a turn ends (consistent with the opencode-turn-poll idle boundary).
+func (r *Runner) continuePrompt(ctx context.Context, sess Session, sel *selectt.Selection, branch string, tc *turnContext) string {
+	base := r.nextPrompt(sel, branch)
+	if !r.ContextDiff {
+		return base
+	}
+	msgs, err := sess.Messages(ctx)
+	if err != nil {
+		if r.Debug != nil {
+			fmt.Fprintf(r.Debug, "[honeybee] context-diff: transcript fetch failed, sending bare prompt: %v\n", err)
+		}
+		return base
+	}
+	return tc.assemble(base, msgs)
 }
 
 // taskRemoved checks whether the operator deleted the plan or removed this

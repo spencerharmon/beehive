@@ -178,6 +178,10 @@ func run() error {
 		// and gating here keeps the injected set byte-identical to the historical
 		// path until a site sets BEEHIVE_LEAN_INJECT=1.
 		LeanInject: os.Getenv("BEEHIVE_LEAN_INJECT") == "1",
+		// Opt-in per-turn context diffing. Same rationale as LeanInject: an env flag,
+		// not a config knob, keeps the continue prompt byte-identical to the historical
+		// path until a site sets BEEHIVE_CONTEXT_DIFF=1.
+		ContextDiff: os.Getenv("BEEHIVE_CONTEXT_DIFF") == "1",
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {
