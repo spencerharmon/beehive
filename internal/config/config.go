@@ -63,6 +63,16 @@ type Config struct {
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+	// BuildEnv is the host's mandated build/test environment (e.g. CGO_ENABLED=0,
+	// GOFLAGS, and a root-fs GOTMPDIR/TMPDIR/GOCACHE for a host whose /tmp is
+	// quota-limited or whose default cgo linker is broken). The runner exports it
+	// into the agent process at spawn and states it once in the prompt preamble, so
+	// no honeybee has to rediscover it. Layered PER KEY (a more specific layer adds
+	// or overrides individual vars; keys it does not set fall through). Nil/empty is
+	// "unset" — inert defaults leave a normal host untouched. Values are
+	// host-specific: LOCALS.md is the human record of what to put here, NOT
+	// hard-coded here.
+	BuildEnv map[string]string `yaml:"build_env"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -142,6 +152,27 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	// BuildEnv layers PER KEY (not whole-map replace): a more specific layer adds
+	// or overrides individual vars while keys it does not set fall through from the
+	// lower layer. An empty/nil over.BuildEnv is "unset" and leaves base as-is.
+	if len(over.BuildEnv) > 0 {
+		out.BuildEnv = mergeEnv(base.BuildEnv, over.BuildEnv)
+	}
+	return out
+}
+
+// mergeEnv overlays over onto a fresh copy of base (most-specific key wins) and
+// never mutates either argument — base may be shared across layer merges. A key
+// present only in base falls through; a key in over overrides it. Returns a new
+// map so the per-key "zero == unset, fall through" rule holds without aliasing.
+func mergeEnv(base, over map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(over))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range over {
+		out[k] = v
 	}
 	return out
 }

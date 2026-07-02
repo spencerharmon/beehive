@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/spencerharmon/beehive/internal/config"
@@ -28,7 +29,7 @@ func TestServeTargetSingleEntryByteIdentical(t *testing.T) {
 	if entry.Root != root {
 		t.Errorf("served root = %q, want %q", entry.Root, root)
 	}
-	if served != cfg {
+	if !reflect.DeepEqual(served, cfg) {
 		t.Fatalf("served config not byte-identical to single config:\n got %+v\nwant %+v", served, cfg)
 	}
 }

@@ -16,11 +16,18 @@ import (
 )
 
 // mockClient records prompts and lets the test drive the submodule to terminal.
+// onOpen, when set, runs at the moment Open is called — i.e. AFTER the runner has
+// exported the build env into the process — so a test can snapshot os.Getenv and
+// prove the child inherits it.
 type mockClient struct {
-	sess *mockSession
+	sess   *mockSession
+	onOpen func()
 }
 
 func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	if m.onOpen != nil {
+		m.onOpen()
+	}
 	if m.sess == nil {
 		m.sess = &mockSession{}
 	}
@@ -987,5 +994,158 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// TestApplyBuildEnvNilNoop proves an unconfigured host is untouched: applying a
+// nil or empty build env sets nothing and returns no error, so the process
+// environment is byte-for-byte what it was.
+func TestApplyBuildEnvNilNoop(t *testing.T) {
+	before := os.Environ()
+	if err := applyBuildEnv(nil); err != nil {
+		t.Fatalf("nil build env must be a no-op, got %v", err)
+	}
+	if err := applyBuildEnv(map[string]string{}); err != nil {
+		t.Fatalf("empty build env must be a no-op, got %v", err)
+	}
+	if after := os.Environ(); len(after) != len(before) {
+		t.Fatalf("no-op applyBuildEnv changed the environment: %d -> %d vars", len(before), len(after))
+	}
+}
+
+// TestBuildEnvPreamble proves the told-once build-env line is rendered
+// deterministically (sorted keys, byte-stable, insertion-order independent) when
+// set, and is empty when unset so the injected prompt is unchanged on a plain host.
+func TestBuildEnvPreamble(t *testing.T) {
+	if got := buildEnvPreamble(nil); got != "" {
+		t.Fatalf("nil build env must render no preamble, got %q", got)
+	}
+	if got := buildEnvPreamble(map[string]string{}); got != "" {
+		t.Fatalf("empty build env must render no preamble, got %q", got)
+	}
+	env := map[string]string{"GOTMPDIR": "/root/tmp", "CGO_ENABLED": "0"}
+	got := buildEnvPreamble(env)
+	// Keys render in sorted order regardless of map iteration order.
+	if !contains(got, "CGO_ENABLED=0 GOTMPDIR=/root/tmp") {
+		t.Fatalf("preamble missing deterministic sorted invocation, got:\n%s", got)
+	}
+	if got != buildEnvPreamble(env) {
+		t.Fatal("preamble not byte-stable across calls")
+	}
+	// Same contents, different insertion order -> identical output (keys sorted).
+	env2 := map[string]string{"CGO_ENABLED": "0", "GOTMPDIR": "/root/tmp"}
+	if got != buildEnvPreamble(env2) {
+		t.Fatal("preamble depends on map insertion order; keys must be sorted")
+	}
+}
+
+// TestRunExportsBuildEnvToChild proves the runner exports the resolved host build
+// env into its own process BEFORE opening the agent child (so the opencode session
+// and every bash tool call it spawns inherit it), and states the same invocation
+// once in the injected preamble. This is the core of moving the audited
+// static-build + tmp-redirect rediscovery off each honeybee.
+func TestRunExportsBuildEnvToChild(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	// A root-fs cache/tmp redirect plus a static-build flag — the exact class of
+	// vars the audit found each honeybee re-deriving. Real dirs so the run's own
+	// git operations stay healthy; t.Setenv clears ambient values AND restores them.
+	cacheDir := t.TempDir()
+	buildEnv := map[string]string{
+		"CGO_ENABLED": "0",
+		"GOCACHE":     filepath.Join(cacheDir, "go-build"),
+		"GOTMPDIR":    cacheDir,
+	}
+	for k := range buildEnv {
+		t.Setenv(k, "") // clear any ambient value; auto-restored at test end
+	}
+
+	var atOpen map[string]string
+	var firstPrompt string
+	cl := &mockClient{
+		onOpen: func() {
+			// Snapshot the process env at the instant the child is opened.
+			atOpen = map[string]string{}
+			for k := range buildEnv {
+				atOpen[k] = os.Getenv(k)
+			}
+		},
+		sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		}},
+	}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, BuildEnv: buildEnv}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("want completed, got %+v", res)
+	}
+	// 1) Every configured var was exported into the process BEFORE the child opened.
+	if atOpen == nil {
+		t.Fatal("Open was never called; cannot prove the export preceded the child")
+	}
+	for k, v := range buildEnv {
+		if atOpen[k] != v {
+			t.Fatalf("at child Open, %s=%q, want %q (env not exported before spawn)", k, atOpen[k], v)
+		}
+	}
+	// 2) The same invocation is stated once in the injected preamble (sorted keys).
+	if !contains(firstPrompt, "CGO_ENABLED=0 GOCACHE="+buildEnv["GOCACHE"]+" GOTMPDIR="+buildEnv["GOTMPDIR"]) {
+		t.Fatalf("preamble missing the mandated build-env invocation; got:\n%s", firstPrompt)
+	}
+}
+
+// TestRunNoBuildEnvLeavesPromptUnchanged proves an unconfigured host (nil BuildEnv)
+// injects no build-env line, so the first prompt is byte-identical to the
+// pre-feature default and no build vars are spuriously exported.
+func TestRunNoBuildEnvLeavesPromptUnchanged(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour} // BuildEnv nil
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if contains(firstPrompt, "Build/test environment") {
+		t.Fatalf("unconfigured host must inject no build-env line; got:\n%s", firstPrompt)
 	}
 }

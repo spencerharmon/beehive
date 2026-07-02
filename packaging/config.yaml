@@ -4,3 +4,17 @@ agent_cmd: opencode
 ttl_minutes: 60
 max_turns: 15
 reject_limit: 3
+
+# Optional build/test environment. When set, the runner exports these into the
+# honeybee process (so runner-spawned/co-located children inherit them) AND states
+# the resulting invocation once in the agent's prompt, so every Go build/test uses
+# the host's mandated toolchain env instead of the agent rediscovering it each
+# session. Merged per key across layers (host -> in-repo global -> per-submodule),
+# like every other field. Values are set verbatim: use concrete absolute paths (no
+# ~ or $VAR expansion). Leave unset to keep the host unaffected. Example for a host
+# whose cgo linker is broken and whose /tmp is a small tmpfs:
+# build_env:
+#   CGO_ENABLED: "0"
+#   GOTMPDIR: /var/lib/beehive/gotmp
+#   TMPDIR: /var/lib/beehive/gotmp
+#   GOCACHE: /var/lib/beehive/go-build

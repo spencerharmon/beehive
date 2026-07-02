@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -96,6 +97,67 @@ max_tokens: 500
 	}
 }
 
+// TestResolveBuildEnvLayering checks that build_env merges PER KEY across layers
+// (not whole-map replace): each var independently takes its most-specific value
+// while vars a layer omits fall through. This is what lets a host set the base
+// build/test env once and a submodule tweak a single var without restating the rest.
+func TestResolveBuildEnvLayering(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+
+	// Host: the base build env (CGO_ENABLED kept; GOCACHE overridden higher up).
+	write(t, filepath.Join(hostDir, "config.yaml"), `
+build_env:
+  CGO_ENABLED: "0"
+  GOCACHE: /host/cache
+`)
+	// Global: overrides GOCACHE, adds GOTMPDIR (later overridden by submodule).
+	write(t, filepath.Join(root, "config.yaml"), `
+build_env:
+  GOCACHE: /global/cache
+  GOTMPDIR: /global/tmp
+`)
+	// Submodule (most specific): overrides GOTMPDIR, adds TMPDIR.
+	write(t, filepath.Join(root, "submodules", "x", "config.yaml"), `
+build_env:
+  GOTMPDIR: /sub/tmp
+  TMPDIR: /sub/tmp
+`)
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]string{
+		"CGO_ENABLED": "0",             // only host sets it -> falls through untouched
+		"GOCACHE":     "/global/cache", // global overrides host
+		"GOTMPDIR":    "/sub/tmp",      // submodule overrides global
+		"TMPDIR":      "/sub/tmp",      // only submodule sets it
+	}
+	if !reflect.DeepEqual(c.BuildEnv, want) {
+		t.Fatalf("BuildEnv = %+v, want %+v (per-key layering)", c.BuildEnv, want)
+	}
+}
+
+// TestResolveBuildEnvUnset confirms build_env is nil when no layer sets it, so an
+// unconfigured host exports and states nothing (byte-identical to pre-feature).
+func TestResolveBuildEnvUnset(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+	write(t, filepath.Join(root, "config.yaml"), "model: global/model\n")
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.BuildEnv) != 0 {
+		t.Fatalf("BuildEnv = %+v, want empty (no layer sets build_env)", c.BuildEnv)
+	}
+}
+
 // TestResolveNoSubmoduleLayer confirms submodule="" resolves only host+global,
 // and that an absent submodule file is a skipped layer (global stays most
 // specific) rather than an error.
@@ -140,7 +202,7 @@ func TestResolveBareInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Defaults(hostDir)
-	if c != want {
+	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("bare Resolve = %+v, want Defaults %+v", c, want)
 	}
 }

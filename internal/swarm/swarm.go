@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -92,6 +93,17 @@ type Runner struct {
 	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
 	// backstop. 0 = no per-turn cap (tests).
 	TurnTimeout time.Duration
+
+	// BuildEnv is the host's mandated build/test environment (resolved from the
+	// layered config: CGO_ENABLED, a root-fs GOTMPDIR/TMPDIR/GOCACHE, …). The runner
+	// EXPORTS it into this process at the agent-spawn path so the agent child and
+	// every `bash` tool call it makes inherit it, and states it once in the injected
+	// preamble — moving the #1 audited time sink (each honeybee re-deriving the
+	// static-build + tmp-redirect fix) off the agent. Empty (the default) exports
+	// and states nothing, so the injected prompt and process env are byte-for-byte
+	// unchanged on an unconfigured host. This sets the floor; the agent may still
+	// override a var for a one-off.
+	BuildEnv map[string]string
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -342,10 +354,22 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"Use exact status NEEDS-HUMAN; never write HUMAN-NEEDED.\n\n",
 			r.Session, smName, sel.Task.ID)
 	}
+	// Told-once build/test environment: state the host's mandated invocation,
+	// sourced from the SAME resolved config the runner exports into the agent's
+	// process env (below), so the two never drift. Empty config appends nothing,
+	// keeping the injected prompt byte-identical on an unconfigured host.
+	preamble += buildEnvPreamble(r.BuildEnv)
 	first = preamble + first
 
 	if r.Debug != nil {
 		fmt.Fprintf(r.Debug, "[honeybee] dir=%s submodule=%s kind=%s opening session...\n", absRoot, sel.Submodule.Name, sel.Kind)
+	}
+	// Export the resolved host build/test env into THIS process before the agent
+	// child is opened, so the opencode session and every `bash` tool call it
+	// spawns inherit CGO_ENABLED=0 + the root-fs GOTMPDIR/TMPDIR/GOCACHE instead of
+	// each honeybee rediscovering them. A nil/empty map is a no-op (host untouched).
+	if err := applyBuildEnv(r.BuildEnv); err != nil {
+		return res, err
 	}
 	sess, err := r.Client.Open(ctx, absRoot, system)
 	if err != nil {
@@ -789,6 +813,65 @@ func hasTask(sel *selectt.Selection) bool {
 	default:
 		return false
 	}
+}
+
+// sortedEnvKeys returns env's keys in lexical order so both the exported env and
+// the rendered preamble are deterministic (stable across runs and test asserts).
+func sortedEnvKeys(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// applyBuildEnv exports each resolved build-env var into THIS process's
+// environment via os.Setenv, so the agent child (the opencode session) and every
+// `bash` tool call it launches inherit the host's mandated build/test settings
+// (e.g. CGO_ENABLED=0 and a root-fs GOTMPDIR/TMPDIR/GOCACHE). A nil/empty map is a
+// no-op, leaving the process env untouched so a normal host is unaffected. Errors
+// are surfaced, never swallowed. This sets the floor; the agent can still override
+// a var for a one-off within its own tool call.
+func applyBuildEnv(env map[string]string) error {
+	for _, k := range sortedEnvKeys(env) {
+		if err := os.Setenv(k, env[k]); err != nil {
+			return fmt.Errorf("export build env %s: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// buildEnvInline renders the resolved build env as a single space-separated
+// `KEY=VALUE ...` string in deterministic key order — the exact prefix an agent
+// can put in front of a go command.
+func buildEnvInline(env map[string]string) string {
+	keys := sortedEnvKeys(env)
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = k + "=" + env[k]
+	}
+	return strings.Join(parts, " ")
+}
+
+// buildEnvPreamble renders the told-once line stating this host's mandated
+// build/test invocation, sourced from the SAME resolved config the runner exports
+// into the agent's process env (so the stated command never drifts from the actual
+// environment). It states the invocation to APPLY (a prefix that is always correct,
+// even if the agent's shell is a separate process that did not inherit the export).
+// An empty/nil map renders "" so the injected prompt is byte-identical to the
+// pre-feature default path on an unconfigured host.
+func buildEnvPreamble(env map[string]string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	inv := buildEnvInline(env)
+	return fmt.Sprintf(
+		"# Build/test environment (this host — told once, do not re-derive)\n"+
+			"Mandated build/test env: %[1]s. Run go build/test/vet with exactly this — the runner also "+
+			"exports it into its own environment, but prefix any command that lacks it (e.g. `%[1]s go test ./...`). "+
+			"Do not spend turns rediscovering the host build environment; this is the known-good invocation.\n\n",
+		inv)
 }
 
 // syncWorktreeBase brings the submodule checkout to the tracked-branch tip
