@@ -55,11 +55,23 @@ type Selector struct {
 	Git  *git.Repo // beehive repo root, for ROI commit lookup
 	Rand *rand.Rand
 	TTL  time.Duration
+	// Remote is the beehive repo's tracking remote ("" = local-only install or a
+	// test). When set, Select fast-forwards the checkout to the published main tip
+	// before evaluating drift, so a reconcile whose ROI delta a peer already folded
+	// and stamped into PLAN.md is never re-selected from a stale local main (the
+	// audited zero-progress reconcile loop). Best-effort — see pullMain.
+	Remote string
 }
 
 // Select walks weighted-random submodules and returns the first workable item.
 // nil is returned only when no submodule has any workable task.
 func (s *Selector) Select(ctx context.Context) (*Selection, error) {
+	// Evaluate against the PUBLISHED plan: fast-forward main first so a reconcile
+	// whose ROI delta a peer already folded + stamped is not re-selected from a
+	// stale local main (the audited reconcile loop that re-folded an applied delta).
+	// Best-effort; a no-remote install or a transient failure just uses the local
+	// tip. See pullMain.
+	s.pullMain(ctx)
 	subs, err := s.Repo.Submodules()
 	if err != nil {
 		return nil, err
@@ -154,6 +166,18 @@ func graphGate(sm repo.Submodule, cands []plan.Task, graph *Graph) []plan.Task {
 		out = append(out, t)
 	}
 	return out
+}
+
+// pullMain fast-forwards the selector's checkout to the tracked main tip so drift
+// is judged against the published plan rather than a stale local main. It is
+// best-effort: with no remote it is a no-op, and a non-fast-forward (the checkout
+// carries local commits) or a transient failure leaves the local tip in place, so
+// selection proceeds exactly as it did before this refresh, never blocked on it.
+func (s *Selector) pullMain(ctx context.Context) {
+	if s.Remote == "" {
+		return
+	}
+	_ = s.Git.Pull(ctx, s.Remote, "main")
 }
 
 // reconcileRange returns "<stamp>..<roiHead>" when ROI.md drifted, else "".

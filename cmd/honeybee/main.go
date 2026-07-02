@@ -155,7 +155,7 @@ func run() error {
 		sessPush = func(ctx context.Context) error { return sessGit.Push(ctx, remote, sessBranch) }
 	}
 
-	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl}
+	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl, Remote: remote}
 	// Rebind the primary selection onto the worktree repo so attempt 0 works the
 	// exact submodule the worktrees are named after.
 	seed, err := rebindSelection(rp, sel0)
@@ -255,8 +255,15 @@ func run() error {
 			return err
 		}
 		sessionBranchDisposable = res.SessionPublished
-		if res.Lost {
+		// A lost claim OR an already-applied reconcile (Redundant: the pre-dispatch
+		// guard pulled main, saw PLAN.md already stamped at the ROI head, and opened
+		// no session) both mean "this selection is spent" — mark it tried and reselect
+		// so the honeybee does real work instead of exiting idle on a no-op reconcile.
+		if res.Lost || res.Redundant {
 			tried[key] = true
+			if res.Redundant {
+				fmt.Fprintf(os.Stderr, "honeybee: reconcile for %s already applied on main; reselecting\n", sel.Submodule.Name)
+			}
 			if res.Warning != "" {
 				fmt.Fprintf(os.Stderr, "honeybee: %s\n", res.Warning)
 			}

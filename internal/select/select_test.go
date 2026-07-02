@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -361,5 +362,218 @@ func TestReconcilePrefixStampNoDrift(t *testing.T) {
 	}
 	if rng != "" {
 		t.Fatalf("short prefix stamp must read as no-drift, got range %q", rng)
+	}
+}
+
+// beehiveOrigin creates an origin beehive repo with submodule `sm`: ROI.md (v1)
+// committed and PLAN.md stamped at that ROI head (in sync, no drift). It returns
+// the origin git handle, its dir, and the v1 ROI head sha. A test drives origin
+// forward from here (bumpROI/stampPlan) and clones it (cloneHive) to exercise a
+// selector that fast-forwards to the published tip before judging drift.
+func beehiveOrigin(t *testing.T) (*git.Repo, string, string) {
+	t.Helper()
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "origin")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	og := git.New(dir)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		og.Run(ctx, a...)
+	}
+	os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("# agents\n"), 0o644)
+	smd := filepath.Join(dir, "submodules", "sm")
+	if err := os.MkdirAll(smd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(smd, "ROI.md"), []byte("intent v1\n"), 0o644)
+	if err := og.Commit(ctx, "roi v1"); err != nil {
+		t.Fatal(err)
+	}
+	roiV1, err := og.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || roiV1 == "" {
+		t.Fatalf("roiV1: %q %v", roiV1, err)
+	}
+	os.WriteFile(filepath.Join(smd, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+roiV1+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	if err := og.Commit(ctx, "plan stamped v1"); err != nil {
+		t.Fatal(err)
+	}
+	return og, dir, roiV1
+}
+
+// cloneHive clones origin into a fresh local checkout (its `origin` remote points
+// back at originDir) and returns the local dir + git handle. The clone captures
+// origin's CURRENT tip, so where a test clones in the origin timeline decides
+// whether the local checkout starts in sync or already drifted.
+func cloneHive(t *testing.T, originDir string) (string, *git.Repo) {
+	t.Helper()
+	ctx := context.Background()
+	localDir := filepath.Join(t.TempDir(), "local")
+	if _, err := git.New(originDir).Run(ctx, "clone", originDir, localDir); err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	lg := git.New(localDir)
+	for _, a := range [][]string{{"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		lg.Run(ctx, a...)
+	}
+	return localDir, lg
+}
+
+// bumpROI advances submodule sm's ROI.md in origin (leaving PLAN.md stamped at the
+// prior head, i.e. introducing drift) and returns the new ROI head sha.
+func bumpROI(t *testing.T, og *git.Repo, originDir, body string) string {
+	t.Helper()
+	ctx := context.Background()
+	os.WriteFile(filepath.Join(originDir, "submodules", "sm", "ROI.md"), []byte(body), 0o644)
+	if err := og.Commit(ctx, "roi bump"); err != nil {
+		t.Fatal(err)
+	}
+	h, err := og.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || h == "" {
+		t.Fatalf("roi head: %q %v", h, err)
+	}
+	return h
+}
+
+// stampPlan restamps submodule sm's PLAN.md in origin at sha (a peer folding the
+// ROI delta) and commits it.
+func stampPlan(t *testing.T, og *git.Repo, originDir, sha string) {
+	t.Helper()
+	ctx := context.Background()
+	os.WriteFile(filepath.Join(originDir, "submodules", "sm", "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+sha+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	if err := og.Commit(ctx, "plan restamp"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustOpen(t *testing.T, dir string) *repo.Repo {
+	t.Helper()
+	rp, err := repo.Open(dir)
+	if err != nil {
+		t.Fatalf("open %s: %v", dir, err)
+	}
+	return rp
+}
+
+func smOf(t *testing.T, rp *repo.Repo) repo.Submodule {
+	t.Helper()
+	subs, err := rp.Submodules()
+	if err != nil || len(subs) == 0 {
+		t.Fatalf("submodules: %v (%d)", err, len(subs))
+	}
+	return subs[0]
+}
+
+// TestSelectReconcilePullsSuppressesAppliedDelta reproduces + fixes the audited
+// re-reconcile: the local checkout is stale (PLAN stamped at v1 while ROI has
+// advanced to v2), so a naive Select re-emits a reconcile whose delta a peer has
+// ALREADY folded + stamped on the published main. With Remote set, Select must
+// fast-forward to that tip first, see PLAN now stamped at the ROI head, and yield
+// the real Work task instead of a redundant Reconcile.
+func TestSelectReconcilePullsSuppressesAppliedDelta(t *testing.T) {
+	ctx := context.Background()
+	og, originDir, _ := beehiveOrigin(t)              // origin in sync at v1
+	roiV2 := bumpROI(t, og, originDir, "intent v2\n") // origin drifts (PLAN v1, ROI v2)
+	localDir, lg := cloneHive(t, originDir)           // clone at the drift point
+	rp := mustOpen(t, localDir)
+	sm := smOf(t, rp)
+
+	// Precondition: the STALE local view (no pull) still shows drift — a naive
+	// selector would re-reconcile the already-applied delta.
+	pre, err := (&Selector{Repo: rp, Git: lg, TTL: time.Hour}).reconcileRange(ctx, sm)
+	if err != nil {
+		t.Fatalf("pre reconcileRange: %v", err)
+	}
+	if pre == "" {
+		t.Fatal("precondition: stale local must show drift before the pull")
+	}
+
+	// A peer folds the delta and restamps PLAN at the ROI head on origin.
+	stampPlan(t, og, originDir, roiV2)
+
+	s := &Selector{Repo: rp, Git: lg, Rand: rand.New(rand.NewSource(1)), TTL: time.Hour, Remote: "origin"}
+	got, err := s.Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if got == nil || got.Kind != Work || got.Task.ID != "T1" {
+		t.Fatalf("an applied delta must suppress the reconcile and yield Work/T1, got %+v", got)
+	}
+	// Prove the pull happened: the local PLAN.md now carries the ROI head stamp.
+	b, _ := os.ReadFile(filepath.Join(localDir, "submodules/sm/PLAN.md"))
+	if !strings.Contains(string(b), roiV2) {
+		t.Fatalf("Select did not fast-forward to the peer fold; PLAN still stale:\n%s", string(b))
+	}
+}
+
+// TestSelectReconcilePullsSurfacesGenuineDrift is the negative control: a genuine
+// unreconciled ROI advance published to main must still be selected as Reconcile
+// after the pull. The local checkout starts IN SYNC (so a stale selector would
+// see nothing to do); the pull surfaces the drift and Select emits a Reconcile
+// spanning exactly the v1..v2 ROI range.
+func TestSelectReconcilePullsSurfacesGenuineDrift(t *testing.T) {
+	ctx := context.Background()
+	og, originDir, roiV1 := beehiveOrigin(t) // origin in sync at v1
+	localDir, lg := cloneHive(t, originDir)  // clone while still in sync
+	rp := mustOpen(t, localDir)
+	sm := smOf(t, rp)
+
+	// Precondition: the in-sync local (no pull) sees NO drift — it would miss the
+	// reconcile a peer just published.
+	pre, err := (&Selector{Repo: rp, Git: lg, TTL: time.Hour}).reconcileRange(ctx, sm)
+	if err != nil {
+		t.Fatalf("pre reconcileRange: %v", err)
+	}
+	if pre != "" {
+		t.Fatalf("precondition: in-sync local must show no drift, got %q", pre)
+	}
+
+	// Origin's ROI advances and is NOT folded — genuine, unreconciled drift on main.
+	roiV2 := bumpROI(t, og, originDir, "intent v2\n")
+
+	s := &Selector{Repo: rp, Git: lg, Rand: rand.New(rand.NewSource(1)), TTL: time.Hour, Remote: "origin"}
+	got, err := s.Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if got == nil || got.Kind != Reconcile {
+		t.Fatalf("pulled genuine drift must select Reconcile, got %+v", got)
+	}
+	if want := roiV1 + ".." + roiV2; got.DiffRange != want {
+		t.Fatalf("reconcile range = %q, want %q", got.DiffRange, want)
+	}
+}
+
+// TestSelectReconcileNoReEmitAtStampedHead proves idempotency: once PLAN.md is
+// stamped at the ROI head, repeated selection cycles never re-emit a reconcile
+// and the ROI head does not move — the reconcile fires once and stays quiet.
+func TestSelectReconcileNoReEmitAtStampedHead(t *testing.T) {
+	_, g, root := hive(t)
+	ctx := context.Background()
+	sub(root, "a", map[string]string{"ROI.md": "x", "PLAN.md": "placeholder\n"})
+	g.Commit(ctx, "seed")
+	head, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+	os.WriteFile(filepath.Join(root, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	headBefore, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+	for i := 0; i < 2; i++ {
+		s, err := sel(root, g).Select(ctx)
+		if err != nil {
+			t.Fatalf("cycle %d: %v", i, err)
+		}
+		if s == nil || s.Kind == Reconcile {
+			t.Fatalf("cycle %d: a stamped head must not re-emit a reconcile, got %+v", i, s)
+		}
+		if s.Kind != Work || s.Task.ID != "T1" {
+			t.Fatalf("cycle %d: want Work/T1, got %+v", i, s)
+		}
+	}
+	headAfter, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+	if headBefore != headAfter {
+		t.Fatalf("ROI head moved across cycles (%s -> %s); a no-drift reconcile must be a no-op", headBefore, headAfter)
 	}
 }

@@ -223,6 +223,13 @@ type Result struct {
 	// main. Callers may delete stream branch only when this is true; otherwise that
 	// branch is only remaining transcript source.
 	SessionPublished bool
+	// Redundant is set when a reconcile selection was already applied on the pulled
+	// main tip (PLAN.md's Beehive-ROI stamp already prefixes the current ROI head),
+	// so Run short-circuited pre-dispatch WITHOUT opening a session — the whole
+	// point of this guard is that an already-folded ROI delta never spawns another
+	// zero-progress reconcile pass. Like a lost claim, it tells the caller to
+	// reselect real work rather than burn the pass idling on an applied reconcile.
+	Redundant bool
 }
 
 // branchFor names the worktree branch and doc stem for a task selection.
@@ -241,6 +248,27 @@ func branchFor(sel *selectt.Selection) string {
 // worktree (Work only), runs turns until completion or caps, and tidies up.
 func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first string) (Result, error) {
 	res := Result{Branch: branchFor(sel)}
+
+	// Pre-dispatch reconcile dedup: a reconcile whose ROI delta is already folded
+	// and stamped into PLAN.md on the published main must never open a session (the
+	// audited loop burned whole passes — ~132 turns / ~581 KB — re-folding an
+	// already-applied delta). Pull main so we judge against the tracked tip a peer
+	// may have reconciled already, then reuse the reconcile-prefix-match compare.
+	// Already applied -> report Redundant (no session, zero turns) so the caller
+	// reselects real work. The pull is best-effort: a transient failure degrades to
+	// the local tip, i.e. the pre-change behavior, never blocking dispatch.
+	if sel.Kind == selectt.Reconcile {
+		r.pullMain(ctx)
+		done, err := r.reconciled(sel)
+		if err != nil {
+			return res, err
+		}
+		if done {
+			res.Redundant = true
+			return res, nil
+		}
+	}
+
 	absRoot, err := filepath.Abs(r.Repo.Root)
 	if err != nil {
 		return res, err
@@ -749,6 +777,18 @@ func (r *Runner) statusLeft(sel *selectt.Selection, from plan.Status) (bool, err
 		return false, nil
 	}
 	return t.Status != from, nil
+}
+
+// pullMain fast-forwards this honeybee's checkout to the tracked main tip so the
+// pre-dispatch reconcile check sees a peer's already-published fold + restamp.
+// Best-effort: no remote is a no-op, and a non-fast-forward (the branch carries
+// local publish commits) or a transient failure leaves the local tip — the check
+// then evaluates local state exactly as before, never blocking dispatch.
+func (r *Runner) pullMain(ctx context.Context) {
+	if r.Remote == "" {
+		return
+	}
+	_ = r.Git.Pull(ctx, r.Remote, "main")
 }
 
 func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {

@@ -19,9 +19,11 @@ import (
 type mockClient struct {
 	sess      *mockSession
 	gotSystem *string // when set, records the system prompt Open was given
+	opens     int     // number of times Open was called (0 proves no session spawned)
 }
 
 func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	m.opens++
 	if m.gotSystem != nil {
 		*m.gotSystem = system
 	}
@@ -995,5 +997,160 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// buildReconcileOrigin builds an origin beehive repo whose submodule `sm` has a
+// GENUINE reconcile drift (PLAN.md stamped at the v1 ROI head while ROI.md has
+// since advanced to v2), then clones it to a local checkout that inherits that
+// drift — exactly the audited stale checkout: an old PLAN stamp under a newer ROI
+// head. It returns the local dir, the origin dir + git handle (so a test can push
+// a peer's fold onto origin), and the v2 ROI head sha the stamp must reach. The
+// clone's `origin` remote points at originDir, so a Runner with Remote:"origin"
+// pulls from it.
+func buildReconcileOrigin(t *testing.T) (localDir, originDir string, og *git.Repo, roiV2 string) {
+	t.Helper()
+	ctx := context.Background()
+	originDir = filepath.Join(t.TempDir(), "origin")
+	if err := os.MkdirAll(originDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	og = gitInit(t, originDir)
+	// AGENTS.md at the root so the clone opens as a beehive repo (repo.Open).
+	os.WriteFile(filepath.Join(originDir, "AGENTS.md"), []byte("# agents\n"), 0o644)
+	osm := filepath.Join(originDir, "submodules", "sm")
+	if err := os.MkdirAll(osm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(osm, "ROI.md"), []byte("intent v1\n"), 0o644)
+	if err := og.Commit(ctx, "roi v1"); err != nil {
+		t.Fatal(err)
+	}
+	roiV1, err := og.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || roiV1 == "" {
+		t.Fatalf("roiV1: %q %v", roiV1, err)
+	}
+	os.WriteFile(filepath.Join(osm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+roiV1+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	if err := og.Commit(ctx, "plan stamped v1"); err != nil {
+		t.Fatal(err)
+	}
+	// ROI advances to v2 but PLAN is NOT restamped: drift now exists on origin.
+	os.WriteFile(filepath.Join(osm, "ROI.md"), []byte("intent v2\n"), 0o644)
+	if err := og.Commit(ctx, "roi v2"); err != nil {
+		t.Fatal(err)
+	}
+	roiV2, err = og.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || roiV2 == "" {
+		t.Fatalf("roiV2: %q %v", roiV2, err)
+	}
+	// Clone at the drift point: the local checkout carries PLAN stamped v1 under
+	// ROI head v2 — the stale checkout the guard must refresh.
+	localDir = filepath.Join(t.TempDir(), "local")
+	if _, err := og.Run(ctx, "clone", originDir, localDir); err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	lg := git.New(localDir)
+	lg.Run(ctx, "config", "user.email", "t@t")
+	lg.Run(ctx, "config", "user.name", "t")
+	return localDir, originDir, og, roiV2
+}
+
+// TestReconcileAlreadyAppliedSpawnsNoSession is the core dedup guard: a reconcile
+// whose ROI delta a peer already folded + stamped into PLAN.md on the published
+// main must open NO session. The local checkout is stale (old PLAN stamp, newer
+// ROI head), so a naive dispatch would burn a whole pass re-folding an applied
+// delta (the audited ~132-turn zero-progress loop). Run must pull main, see the
+// peer's fold, and short-circuit with Redundant (no session, zero turns) so the
+// caller reselects real work.
+func TestReconcileAlreadyAppliedSpawnsNoSession(t *testing.T) {
+	ctx := context.Background()
+	localDir, originDir, og, roiV2 := buildReconcileOrigin(t)
+	// A peer folds the ROI delta and restamps PLAN at the ROI head, publishing to
+	// origin (the tip the guard will pull).
+	os.WriteFile(filepath.Join(originDir, "submodules", "sm", "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+roiV2+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	if err := og.Commit(ctx, "plan restamped v2 (peer fold)"); err != nil {
+		t.Fatal(err)
+	}
+
+	rp, err := repo.Open(localDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	g := git.New(localDir)
+
+	// Precondition: from the STALE local tip the reconcile is genuinely warranted
+	// (drift unresolved). Only the guard's pull may suppress it — this rules out a
+	// tautological pass where the check was already satisfied pre-pull.
+	if done, err := (&Runner{Repo: rp, Git: g}).reconciled(sel); err != nil || done {
+		t.Fatalf("precondition: local drift must be unreconciled before the pull (done=%v err=%v)", done, err)
+	}
+
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Remote: "origin"}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Redundant {
+		t.Fatalf("an already-applied reconcile must report Redundant, got %+v", res)
+	}
+	if res.Completed {
+		t.Fatalf("a redundant reconcile did no work; it must not report Completed: %+v", res)
+	}
+	if res.Turns != 0 {
+		t.Fatalf("no turn loop may run for a redundant reconcile, got Turns=%d", res.Turns)
+	}
+	if mc.opens != 0 {
+		t.Fatalf("a redundant reconcile must open NO opencode session, got opens=%d", mc.opens)
+	}
+	// The guard must have fast-forwarded the local checkout to the peer's fold: the
+	// working-tree PLAN.md now carries the ROI head stamp.
+	b, _ := os.ReadFile(subs[0].PlanPath())
+	if !strings.Contains(string(b), roiV2) {
+		t.Fatalf("guard did not pull the peer fold; PLAN.md still stale:\n%s", string(b))
+	}
+}
+
+// TestReconcileGenuineDriftOpensSession is the negative control: when the ROI
+// delta is NOT yet folded on the pulled main tip (origin still carries the
+// drift), the guard must NOT suppress the reconcile — it opens a session and runs
+// the pass to completion once the agent folds + restamps. Proves the dedup guard
+// only short-circuits an ALREADY-APPLIED delta, never a real one.
+func TestReconcileGenuineDriftOpensSession(t *testing.T) {
+	ctx := context.Background()
+	localDir, _, _, roiV2 := buildReconcileOrigin(t) // origin stays drifted (no peer fold)
+
+	rp, err := repo.Open(localDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	g := git.New(localDir)
+	planPath := subs[0].PlanPath()
+
+	// The reconcile agent folds the ROI delta and restamps PLAN at the ROI head
+	// during its turn (working tree only; reconciled() reads the working tree).
+	mc := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath,
+			[]byte("<!-- Beehive-ROI: "+roiV2+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Remote: "origin"}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Redundant {
+		t.Fatalf("origin still carries the drift; a genuine reconcile must NOT be Redundant: %+v", res)
+	}
+	if !res.Completed {
+		t.Fatalf("a genuine reconcile the agent folds must complete: %+v", res)
+	}
+	if mc.opens == 0 {
+		t.Fatalf("a genuine reconcile must open a session, got opens=%d", mc.opens)
 	}
 }
