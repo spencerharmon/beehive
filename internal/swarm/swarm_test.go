@@ -561,6 +561,136 @@ func TestWorkPreambleHasDocPath(t *testing.T) {
 	if !contains(firstPrompt, "submodules/sm/worktrees/bee-T1") {
 		t.Fatalf("preamble missing code worktree path; got:\n%s", firstPrompt)
 	}
+	// The precomputed task brief is OFF by default: the default injected set stays
+	// byte-identical to the historical path (this Runner never set TaskBrief).
+	if contains(firstPrompt, "Task brief (precomputed by the runner") {
+		t.Fatalf("task brief must be inert on the default path; got:\n%s", firstPrompt)
+	}
+}
+
+// TestWorkBriefInjected proves a Work dispatch with TaskBrief on injects a brief
+// that carries the RESOLVED worktree path, branch, submodule pointer + tracked
+// tip, the task's PLAN card, the PROVIDED change-doc path + commit stamp, and
+// bounded excerpts of exactly the files the task's `Files:` line names — and that
+// a file NOT in that line is not pulled into the brief (working set is scoped to
+// the task's files, not the whole tree). The resolved values match what the Work
+// setup actually produced (same worktree/branch/pointer), not a second derivation.
+func TestWorkBriefInjected(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(filepath.Join(repoDir, "internal", "foo"), 0o755)
+	gitInit(t, repoDir)
+	// Two files the task declares (in scope) + one it does NOT (must be excluded).
+	os.WriteFile(filepath.Join(repoDir, "internal", "foo", "foo.go"),
+		[]byte("package foo\n\n// FooMarker is in scope.\nfunc Foo() {}\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "internal", "foo", "foo_test.go"),
+		[]byte("package foo\n\n// FooTestMarker is in scope.\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "internal", "foo", "unrelated.go"),
+		[]byte("package foo\n\n// UnrelatedMarker must NOT appear in the brief.\n"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	base, err := git.New(repoDir).RevParse(context.Background(), "HEAD")
+	if err != nil {
+		t.Fatalf("resolve base: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	task := plan.Task{
+		ID:     "T1",
+		Status: plan.TODO,
+		Weight: 128,
+		Body: []string{
+			"A fixture task card body line.",
+			"Files: internal/foo/foo.go (the unit under change), internal/foo/foo_test.go.",
+			"Doc: docs/tasks/T1.md",
+		},
+	}
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: task}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, TaskBrief: true}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	wantWt := filepath.Join(subs[0].WorktreesDir(), "bee-T1") // exactly the wtAbs Run resolved
+	want := []string{
+		"# Task brief (precomputed by the runner", // the brief is present
+		wantWt,                           // resolved code-worktree path (absolute)
+		"Branch: bee-T1",                 // resolved branch name
+		base,                             // submodule pointer / tracked tip (no remote => equal)
+		"## T1 [TODO]",                   // the task's own PLAN card
+		"A fixture task card body line.", // card body, verbatim
+		// The deterministic protocol choices are PROVIDED, not left to derive:
+		"submodules/sm/docs/bee-T1-T1.md",             // change-doc path
+		"Beehive: T1 submodules/sm/docs/bee-T1-T1.md", // commit stamp
+		// Task-file excerpts, scoped to the Files: line:
+		"internal/foo/foo.go",        // in-scope file listed
+		"FooMarker is in scope.",     // excerpt content of an in-scope file
+		"FooTestMarker is in scope.", // excerpt of the other in-scope file
+	}
+	for _, w := range want {
+		if !contains(firstPrompt, w) {
+			t.Fatalf("brief missing %q; got:\n%s", w, firstPrompt)
+		}
+	}
+	// Scoped: a file NOT named on the task's Files line is not pulled in.
+	if contains(firstPrompt, "UnrelatedMarker") || contains(firstPrompt, "unrelated.go") {
+		t.Fatalf("brief pulled in a file outside the task's Files: line; got:\n%s", firstPrompt)
+	}
+}
+
+// TestFilesFromCard covers the `Files:` line parser: parenthetical annotations
+// (which may carry commas) are stripped, concrete file/dir paths are kept, and
+// glob/prose tokens are dropped. No Files line yields nil.
+func TestFilesFromCard(t *testing.T) {
+	cases := []struct {
+		name string
+		body []string
+		want []string
+	}{
+		{
+			name: "package dir + concrete file, annotation with a comma stripped",
+			body: []string{
+				"Some prose.",
+				"Files: internal/swarm (brief assembly + injection, reuse setup), swarm_test.go.",
+				"Doc: docs/tasks/x.md",
+			},
+			want: []string{"internal/swarm", "swarm_test.go"},
+		},
+		{
+			name: "globs and leading-prose tokens dropped",
+			body: []string{"Files: new internal/artifacts/*, internal/web/web.go, *_test.go."},
+			want: []string{"internal/web/web.go"},
+		},
+		{
+			name: "duplicate tokens de-duplicated",
+			body: []string{"Files: a/b.go, a/b.go, c/d.go."},
+			want: []string{"a/b.go", "c/d.go"},
+		},
+		{
+			name: "no Files line",
+			body: []string{"no files here", "Doc: y.md"},
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		got := filesFromCard(tc.body)
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Fatalf("%s: filesFromCard = %v, want %v", tc.name, got, tc.want)
+		}
+	}
 }
 
 // TestReviewCompletesOnStatusChange: a Review session is NOT claimed/clobbered

@@ -178,6 +178,11 @@ func run() error {
 		// and gating here keeps the injected set byte-identical to the historical
 		// path until a site sets BEEHIVE_LEAN_INJECT=1.
 		LeanInject: os.Getenv("BEEHIVE_LEAN_INJECT") == "1",
+		// Opt-in runner-precomputed task brief (resolved worktree/branch/pointer +
+		// task card + change-doc path/commit stamp + task-file excerpts). Same env
+		// gating rationale as LeanInject: inert until a site sets BEEHIVE_TASK_BRIEF=1,
+		// so the default injected set is byte-identical to the historical path.
+		TaskBrief: os.Getenv("BEEHIVE_TASK_BRIEF") == "1",
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {

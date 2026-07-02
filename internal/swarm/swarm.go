@@ -100,6 +100,16 @@ type Runner struct {
 	// runner flips it on from an env flag (see cmd/honeybee). The protocol is
 	// re-sent on every turn, so trimming compounds across a session.
 	LeanInject bool
+
+	// TaskBrief injects a runner-PRECOMPUTED task brief on a Work dispatch: the
+	// resolved worktree/branch/pointer the Work setup already produced, the task's
+	// PLAN card, the deterministic protocol choices (change-doc path + commit
+	// stamp) as answers, and bounded excerpts of exactly the files the task's
+	// `Files:` line names — so the agent does not re-run discovery git plumbing or
+	// read the whole submodule tree just to orient. Off by default (additive; the
+	// default injected set stays byte-identical to the historical path); the runner
+	// flips it on from an env flag (see cmd/honeybee).
+	TaskBrief bool
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -346,6 +356,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"worktree). The runner's completion check looks for it exactly there; a doc elsewhere reads as 'not done'.\n"+
 				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
 			smName, res.Branch, taskID(sel), onComplete)
+		// Precompute the task brief (resolved worktree/branch/pointer + task card +
+		// change-doc path/commit stamp + task-file excerpts) so the agent orients
+		// from its own files instead of re-deriving git/submodule mechanics. Reuses
+		// the SAME wtAbs/branch/wg the Work setup above produced. Off by default.
+		if r.TaskBrief {
+			preamble += r.workBrief(ctx, sel, res.Branch, wtAbs, absRoot, wg)
+		}
 	default: // Bootstrap, Reconcile: beehive-layer only, no code worktree.
 		preamble = fmt.Sprintf(
 			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
