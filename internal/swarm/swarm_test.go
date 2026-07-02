@@ -16,11 +16,15 @@ import (
 )
 
 // mockClient records prompts and lets the test drive the submodule to terminal.
+// opens counts Open calls so a test can prove a pass short-circuited BEFORE ever
+// starting a session (the reconcile pre-dispatch dedup skip).
 type mockClient struct {
-	sess *mockSession
+	sess  *mockSession
+	opens int
 }
 
 func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	m.opens++
 	if m.sess == nil {
 		m.sess = &mockSession{}
 	}
@@ -795,6 +799,178 @@ func TestReconciledPrefixMatch(t *testing.T) {
 				t.Fatalf("stamp %q: got reconciled=%v want %v (head %s)", c.stamp, got, c.want, head)
 			}
 		})
+	}
+}
+
+// bareOrigin creates an empty bare repo with a main branch to act as a push
+// remote (fake origin) for the reconcile pull-before-dispatch test.
+func bareOrigin(t *testing.T) string {
+	t.Helper()
+	base := t.TempDir()
+	origin := filepath.Join(base, "origin.git")
+	if _, err := git.New(base).Run(context.Background(), "init", "-q", "--bare", "-b", "main", origin); err != nil {
+		t.Fatalf("init bare origin: %v", err)
+	}
+	return origin
+}
+
+// landOnOrigin clones origin into a throwaway checkout, runs mutate() against it,
+// then commits and pushes to origin/main — simulating another host publishing an
+// already-folded reconcile (PLAN.md stamped) that the local hive has not pulled.
+func landOnOrigin(t *testing.T, origin string, mutate func(dir string)) {
+	t.Helper()
+	ctx := context.Background()
+	base := t.TempDir()
+	dir := filepath.Join(base, "other")
+	if _, err := git.New(base).Run(ctx, "clone", "-q", origin, dir); err != nil {
+		t.Fatalf("clone origin: %v", err)
+	}
+	g := git.New(dir)
+	for _, a := range [][]string{{"config", "user.email", "o@o"}, {"config", "user.name", "o"}} {
+		g.Run(ctx, a...)
+	}
+	mutate(dir)
+	if err := g.Commit(ctx, "land on origin"); err != nil {
+		t.Fatalf("commit land: %v", err)
+	}
+	if _, err := g.Run(ctx, "push", "-q", "origin", "HEAD:main"); err != nil {
+		t.Fatalf("push land: %v", err)
+	}
+}
+
+// TestReconcileAppliedSkipsDispatch proves the pre-dispatch dedup: a Reconcile
+// selection whose PLAN.md ROI stamp already covers the ROI head is a deterministic
+// no-op — Run returns Skipped WITHOUT ever opening a session (opens==0) and never
+// reports Completed/GCMarked. This is the guard for the audited reconcile_loop
+// where an already-folded ROI delta was re-dispatched as fresh agent passes.
+func TestReconcileAppliedSkipsDispatch(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	// PLAN.md already stamped at the ROI head: the reconcile is folded.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("an already-applied reconcile must be Skipped, got %+v", res)
+	}
+	if mc.opens != 0 {
+		t.Fatalf("skip must NOT open a session, opens=%d", mc.opens)
+	}
+	if !res.SessionPublished {
+		t.Fatalf("skip must mark SessionPublished so the caller reclaims the empty session branch, got %+v", res)
+	}
+	if res.Completed || res.GCMarked {
+		t.Fatalf("skip is neither a completion nor a GC, got %+v", res)
+	}
+}
+
+// TestReconcileDispatchesWhenDrift proves the guard does not over-suppress: a
+// genuinely drifted ROI (stamp does not cover head) still dispatches exactly one
+// reconcile pass. The agent folds the delta (re-stamps PLAN.md at head) and the
+// run completes normally.
+func TestReconcileDispatchesWhenDrift(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("<!-- Beehive-ROI: deadbeefcafe -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed drift")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	// The reconcile agent folds the ROI delta by re-stamping PLAN.md at the head.
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Skipped {
+		t.Fatalf("a genuinely drifted reconcile must dispatch, not skip: %+v", res)
+	}
+	if cl.opens != 1 {
+		t.Fatalf("drift must open exactly one session, opens=%d", cl.opens)
+	}
+	if !res.Completed || res.Turns != 1 {
+		t.Fatalf("want completion on turn 1 after the fold, got %+v", res)
+	}
+}
+
+// TestReconcileAppliedPullsOrigin proves the skip observes the FRESHEST published
+// tip, not the stale local tree: locally the reconcile still looks drifted
+// (PLAN.md unstamped), but the matching stamp has landed on origin/main. With
+// Remote set, Run pulls first, sees the stamp, and skips — the distributed half of
+// the dedup guard. Without the pull it would wrongly re-dispatch.
+func TestReconcileAppliedPullsOrigin(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	origin := bareOrigin(t)
+	ctx := context.Background()
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatalf("add remote: %v", err)
+	}
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	// Locally UNSTAMPED: reconcile looks drifted until we pull origin.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed unstamped")
+	if _, err := g.Run(ctx, "push", "-q", "-u", "origin", "main"); err != nil {
+		t.Fatalf("push seed: %v", err)
+	}
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	// Another host folds the reconcile (stamps PLAN.md at head) and publishes it.
+	landOnOrigin(t, origin, func(dir string) {
+		os.WriteFile(filepath.Join(dir, "submodules", "sm", "PLAN.md"),
+			[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	})
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Remote: "origin"}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Skipped || mc.opens != 0 {
+		t.Fatalf("origin stamp must suppress the reconcile after the pull (skip, no session), got %+v opens=%d", res, mc.opens)
 	}
 }
 

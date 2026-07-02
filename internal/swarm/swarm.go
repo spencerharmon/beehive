@@ -215,6 +215,12 @@ type Result struct {
 	// main. Callers may delete stream branch only when this is true; otherwise that
 	// branch is only remaining transcript source.
 	SessionPublished bool
+	// Skipped is true when a Reconcile selection was found already-applied at the
+	// freshest tip and short-circuited WITHOUT opening a session — the deterministic
+	// pre-dispatch dedup that keeps an already-folded ROI delta from ever spawning an
+	// agent pass (the audited reconcile_loop). SessionPublished is set alongside it so
+	// the caller tears down the empty pre-created session branch instead of leaking it.
+	Skipped bool
 }
 
 // branchFor names the worktree branch and doc stem for a task selection.
@@ -233,6 +239,29 @@ func branchFor(sel *selectt.Selection) string {
 // worktree (Work only), runs turns until completion or caps, and tidies up.
 func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first string) (Result, error) {
 	res := Result{Branch: branchFor(sel)}
+	// Pre-dispatch reconcile dedup: an already-applied reconcile must NEVER spawn an
+	// agent pass. Re-pull main and, reusing the reconcile prefix compare, short out
+	// to a no-op skip when PLAN.md's ROI stamp already covers the current ROI head at
+	// the freshest tip. This is the deterministic guard the audit demanded — the
+	// audited reconcile_loop re-folded the same ROI delta (two passes even AFTER
+	// PLAN.md was already stamped). No session is opened and nothing is flipped; the
+	// skip marks SessionPublished so the caller reclaims the empty pre-created session
+	// branch. A genuinely-drifted ROI (stamp does not cover the pulled head) falls
+	// through and dispatches exactly one reconcile as before.
+	if sel.Kind == selectt.Reconcile {
+		applied, err := r.reconcileApplied(ctx, sel)
+		if err != nil {
+			return res, err
+		}
+		if applied {
+			res.Skipped = true
+			res.SessionPublished = true
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] reconcile for %s already applied at the pulled tip; skipping dispatch (no session)\n", sel.Submodule.Name)
+			}
+			return res, nil
+		}
+	}
 	absRoot, err := filepath.Abs(r.Repo.Root)
 	if err != nil {
 		return res, err
@@ -703,8 +732,20 @@ func (r *Runner) statusLeft(sel *selectt.Selection, from plan.Status) (bool, err
 }
 
 func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
+	return r.stampCoversROIHead(context.Background(), sel)
+}
+
+// stampCoversROIHead reports whether PLAN.md's Beehive-ROI stamp already prefixes
+// the current ROI head — i.e. the reconcile delta is folded. The PLAN.md ROI stamp
+// is often abbreviated while head is the full %H sha, so an exact compare ~never
+// matches and reconcile reports "never done"; matching by prefix (mirrors
+// select.reconcileRange) lets a short stamp that prefixes the full head clear the
+// reconcile, firing exactly once. An empty or non-prefix stamp does not clear.
+// Shared by the completion check (reconciled) and the pre-dispatch dedup guard
+// (reconcileApplied) so both judge "already reconciled" identically.
+func (r *Runner) stampCoversROIHead(ctx context.Context, sel *selectt.Selection) (bool, error) {
 	roiPath := "submodules/" + sel.Submodule.Name + "/" + repo.ROIFile
-	head, err := r.Git.LastCommit(context.Background(), roiPath)
+	head, err := r.Git.LastCommit(ctx, roiPath)
 	if err != nil {
 		return false, err
 	}
@@ -712,11 +753,31 @@ func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// The PLAN.md ROI stamp is often abbreviated while head is the full %H sha,
-	// so an exact compare ~never matches and reconcile reports "never done".
-	// Match by prefix (mirrors select.reconcileRange's check) so a short stamp
-	// that prefixes the full head clears the reconcile, firing exactly once.
 	return stamp != "" && strings.HasPrefix(head, stamp), nil
+}
+
+// reconcileApplied re-pulls main and reports whether the reconcile is already
+// folded at that freshest tip. It is the pre-dispatch dedup predicate: a true
+// result means no agent pass should run for this reconcile. The pull is
+// best-effort (see pullMain); the decision then reuses the exact same prefix
+// compare as the completion check, so a reconcile is suppressed on precisely the
+// condition under which it would immediately report itself complete.
+func (r *Runner) reconcileApplied(ctx context.Context, sel *selectt.Selection) (bool, error) {
+	r.pullMain(ctx)
+	return r.stampCoversROIHead(ctx, sel)
+}
+
+// pullMain best-effort fast-forwards this honeybee's isolated beehive worktree to
+// the tracked main so the reconcile dedup guard evaluates the freshest published
+// stamp instead of the tree this pass branched from. It runs against a private
+// per-honeybee worktree (never the shared primary), so a --ff-only pull is always
+// safe here. --ff-only is non-destructive on divergence and a no-remote hive is a
+// no-op, so the guard never blocks on a pull that cannot fast-forward.
+func (r *Runner) pullMain(ctx context.Context) {
+	if r.Remote == "" {
+		return
+	}
+	_ = r.Git.Pull(ctx, r.Remote, "main")
 }
 
 // workDone verifies the PLAN.md status transitioned to a terminal/handoff state

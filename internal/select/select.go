@@ -60,6 +60,15 @@ type Selector struct {
 // Select walks weighted-random submodules and returns the first workable item.
 // nil is returned only when no submodule has any workable task.
 func (s *Selector) Select(ctx context.Context) (*Selection, error) {
+	// Refresh to the freshest published main BEFORE deciding, so an already-applied
+	// reconcile — whose ROI stamp another pass folded into PLAN.md and pushed — is
+	// seen as done and never re-emitted. This is the selection half of the reconcile
+	// dedup guard: it stops the audited reconcile_loop where several dispatch cycles
+	// re-fold the same ROI delta against a not-yet-pulled tree. Best-effort/no-op
+	// without a remote (see pullTrackedMain), so single-host installs and tests are
+	// unaffected; the swarm's own pre-dispatch check re-pulls and re-verifies before
+	// ever opening a session, so a stale seed can never spawn a redundant pass.
+	s.pullTrackedMain(ctx)
 	subs, err := s.Repo.Submodules()
 	if err != nil {
 		return nil, err
@@ -178,6 +187,24 @@ func (s *Selector) reconcileRange(ctx context.Context, sm repo.Submodule) (strin
 		from = emptyTree
 	}
 	return from + ".." + head, nil
+}
+
+// pullTrackedMain best-effort fast-forwards the beehive checkout to the tracked
+// main so the reconcile decision (reconcileRange) evaluates the freshest published
+// PLAN.md stamp and ROI head rather than a stale local tree — the fix for the
+// audited reconcile_loop that re-emitted a reconcile whose stamp had already
+// landed on origin. It derives the push remote from the checkout itself, so no
+// caller wiring is needed; with no remote (single-host install, tests) it is a
+// no-op. It acts only when a remote exists, and in a remote hive the local tree
+// is a read replica (publishes go to origin, not here), so a --ff-only pull races
+// no in-flight publish. --ff-only never rewrites history and errors are swallowed,
+// so a tree that cannot fast-forward is simply left as-is and selection proceeds.
+func (s *Selector) pullTrackedMain(ctx context.Context) {
+	rem, err := s.Git.Remote(ctx)
+	if err != nil || rem == "" {
+		return
+	}
+	_ = s.Git.Pull(ctx, rem, "main")
 }
 
 // weightedOrder returns submodules shuffled, each repeated by its weight, so

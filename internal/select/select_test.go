@@ -54,6 +54,30 @@ func TestSelectWork(t *testing.T) {
 	}
 }
 
+// TestSelectStampedHeadNoReemitAcrossCycles is the audited reconcile_loop
+// regression: once PLAN.md is stamped at the current ROI head, TWO back-to-back
+// selection cycles must BOTH decline to emit a reconcile (they fall through to the
+// ordinary Work tier) rather than re-folding the same already-applied ROI delta.
+func TestSelectStampedHeadNoReemitAcrossCycles(t *testing.T) {
+	ctx := context.Background()
+	_, g, root := hive(t)
+	sub(root, "a", map[string]string{"ROI.md": "x", "PLAN.md": "## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	g.Commit(ctx, "seed")
+	head, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+	os.WriteFile(filepath.Join(root, "submodules/a/PLAN.md"), []byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+	s := sel(root, g)
+	for cycle := 1; cycle <= 2; cycle++ {
+		got, err := s.Select(ctx)
+		if err != nil {
+			t.Fatalf("cycle %d select: %v", cycle, err)
+		}
+		if got == nil || got.Kind == Reconcile {
+			t.Fatalf("cycle %d re-emitted a reconcile at an already-stamped head: %+v", cycle, got)
+		}
+	}
+}
+
 func TestDormantSkipped(t *testing.T) {
 	_, g, root := hive(t)
 	sub(root, "a", map[string]string{}) // no ROI -> dormant
@@ -331,6 +355,134 @@ func TestReconcileRangeEmptyBase(t *testing.T) {
 	// base makes the whole ROI show up as additions.
 	if _, err := g.Run(ctx, "diff", "--stat", rng); err != nil {
 		t.Fatalf("range %q is not a valid git diff arg: %v", rng, err)
+	}
+}
+
+// subByName resolves a submodule by name from a hive root, failing the test if
+// it is absent. Used by tests that call reconcileRange directly on one submodule.
+func subByName(t *testing.T, root, name string) repo.Submodule {
+	t.Helper()
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	for _, s := range subs {
+		if s.Name == name {
+			return s
+		}
+	}
+	t.Fatalf("submodule %s not found in %s", name, root)
+	return repo.Submodule{}
+}
+
+// bareOrigin creates an empty bare repo with a main branch to act as a push
+// remote (fake origin) for the pull-before-reconcile tests.
+func bareOrigin(t *testing.T) string {
+	t.Helper()
+	base := t.TempDir()
+	origin := filepath.Join(base, "origin.git")
+	if _, err := git.New(base).Run(context.Background(), "init", "-q", "--bare", "-b", "main", origin); err != nil {
+		t.Fatalf("init bare origin: %v", err)
+	}
+	return origin
+}
+
+// landOnOrigin clones origin into a throwaway checkout, runs mutate() against it,
+// then commits and pushes to origin/main — simulating ANOTHER host advancing the
+// tracked main (e.g. a reconcile pass that stamped PLAN.md and published). The
+// local hive under test is left behind origin until it pulls.
+func landOnOrigin(t *testing.T, origin string, mutate func(dir string)) {
+	t.Helper()
+	ctx := context.Background()
+	base := t.TempDir()
+	dir := filepath.Join(base, "other")
+	if _, err := git.New(base).Run(ctx, "clone", "-q", origin, dir); err != nil {
+		t.Fatalf("clone origin: %v", err)
+	}
+	g := git.New(dir)
+	for _, a := range [][]string{{"config", "user.email", "o@o"}, {"config", "user.name", "o"}} {
+		g.Run(ctx, a...)
+	}
+	mutate(dir)
+	if err := g.Commit(ctx, "land on origin"); err != nil {
+		t.Fatalf("commit land: %v", err)
+	}
+	if _, err := g.Run(ctx, "push", "-q", "origin", "HEAD:main"); err != nil {
+		t.Fatalf("push land: %v", err)
+	}
+}
+
+// TestSelectPullsOriginStampAndSuppressesReconcile is the reconcile-dedup guard's
+// selection half: with the local tree still unstamped (drift) but the matching ROI
+// stamp already landed on origin/main by another pass, Select() must pull the
+// tracked tip FIRST, observe the stamp, and NOT re-emit a reconcile (the audited
+// reconcile_loop). With the drift gone it proceeds to the ordinary Work tier.
+func TestSelectPullsOriginStampAndSuppressesReconcile(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	_, g, root := hive(t)
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatalf("add remote: %v", err)
+	}
+	// Seed an UNSTAMPED plan (drift) and publish it to origin.
+	sub(root, "a", map[string]string{"ROI.md": "x", "PLAN.md": "## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	g.Commit(ctx, "seed")
+	if _, err := g.Run(ctx, "push", "-q", "-u", "origin", "main"); err != nil {
+		t.Fatalf("push seed: %v", err)
+	}
+	head, err := g.LastCommit(ctx, "submodules/a/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("roi head: %q %v", head, err)
+	}
+
+	// Precondition: pre-pull, reconcileRange (which does NOT pull) sees local drift,
+	// proving the suppression below is the pull's doing and not a stale no-op.
+	sm := subByName(t, root, "a")
+	if rng, err := sel(root, g).reconcileRange(ctx, sm); err != nil || rng == "" {
+		t.Fatalf("precondition: want local drift before pull, got rng=%q err=%v", rng, err)
+	}
+
+	// Another host stamps PLAN.md at the ROI head and pushes to origin/main.
+	landOnOrigin(t, origin, func(dir string) {
+		os.WriteFile(filepath.Join(dir, "submodules", "a", "PLAN.md"),
+			[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	})
+
+	s, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if s == nil || s.Kind == Reconcile {
+		t.Fatalf("origin stamp must suppress the reconcile after the pull, got %+v", s)
+	}
+	if s.Kind != Work || s.Task.ID != "T1" {
+		t.Fatalf("want Work/T1 once the reconcile is suppressed, got %+v", s)
+	}
+}
+
+// TestSelectStillReconcilesWhenOriginAlsoDrifted proves the pull does not blanket-
+// suppress reconciles: when origin/main is ALSO unstamped (the ROI genuinely
+// advanced everywhere), Select() still emits exactly one reconcile after pulling.
+func TestSelectStillReconcilesWhenOriginAlsoDrifted(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	_, g, root := hive(t)
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatalf("add remote: %v", err)
+	}
+	sub(root, "a", map[string]string{"ROI.md": "x", "PLAN.md": "<!-- Beehive-ROI: dead -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	g.Commit(ctx, "seed")
+	if _, err := g.Run(ctx, "push", "-q", "-u", "origin", "main"); err != nil {
+		t.Fatalf("push seed: %v", err)
+	}
+	// Origin advances ROI.md again (still no matching stamp) — real drift everywhere.
+	landOnOrigin(t, origin, func(dir string) {
+		os.WriteFile(filepath.Join(dir, "submodules", "a", "ROI.md"), []byte("x2\n"), 0o644)
+	})
+	s, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if s == nil || s.Kind != Reconcile || s.DiffRange == "" {
+		t.Fatalf("genuine drift must still emit a reconcile after the pull, got %+v", s)
 	}
 }
 
