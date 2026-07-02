@@ -26,6 +26,7 @@ func main() {
 		secretCmd(),
 		worktreeCmd(),
 		taskCmd(),
+		planCmd(),
 		honeybeeCmd(),
 		hookCmd(),
 		lintCmd(),
