@@ -95,14 +95,17 @@ type Runner struct {
 	TurnTimeout time.Duration
 
 	// BuildEnv is the host's mandated build/test environment (resolved from the
-	// layered config: CGO_ENABLED, a root-fs GOTMPDIR/TMPDIR/GOCACHE, …). The runner
-	// EXPORTS it into this process at the agent-spawn path so the agent child and
-	// every `bash` tool call it makes inherit it, and states it once in the injected
-	// preamble — moving the #1 audited time sink (each honeybee re-deriving the
-	// static-build + tmp-redirect fix) off the agent. Empty (the default) exports
-	// and states nothing, so the injected prompt and process env are byte-for-byte
-	// unchanged on an unconfigured host. This sets the floor; the agent may still
-	// override a var for a one-off.
+	// layered config: CGO_ENABLED, a root-fs GOTMPDIR/TMPDIR/GOCACHE, …). At the
+	// agent-spawn path the runner EXPORTS it into this honeybee process — so every
+	// subprocess the honeybee itself spawns that inherits os.Environ (git in
+	// internal/git in particular) gets it — AND states it once in the injected
+	// preamble, which is what reaches the agent's own commands: opencode runs as a
+	// SEPARATE server process the honeybee drives over HTTP, so it does NOT inherit
+	// this export and must be told the invocation to apply. Together they move the #1
+	// audited time sink (each honeybee re-deriving the static-build + tmp-redirect
+	// fix) off the agent. Empty (the default) exports and states nothing, so the
+	// injected prompt and process env are byte-for-byte unchanged on an unconfigured
+	// host. This sets the floor; the agent may still override a var for a one-off.
 	BuildEnv map[string]string
 }
 
@@ -827,12 +830,14 @@ func sortedEnvKeys(env map[string]string) []string {
 }
 
 // applyBuildEnv exports each resolved build-env var into THIS process's
-// environment via os.Setenv, so the agent child (the opencode session) and every
-// `bash` tool call it launches inherit the host's mandated build/test settings
-// (e.g. CGO_ENABLED=0 and a root-fs GOTMPDIR/TMPDIR/GOCACHE). A nil/empty map is a
-// no-op, leaving the process env untouched so a normal host is unaffected. Errors
-// are surfaced, never swallowed. This sets the floor; the agent can still override
-// a var for a one-off within its own tool call.
+// environment via os.Setenv, so every subprocess the honeybee itself spawns that
+// inherits os.Environ (git in internal/git in particular) gets the host's mandated
+// build/test settings (e.g. CGO_ENABLED=0 and a root-fs GOTMPDIR/TMPDIR/GOCACHE).
+// It does NOT reach the agent's own commands: opencode is a separate server process
+// (driven over HTTP) that does not inherit this export — that is what the told-once
+// preamble (buildEnvPreamble) is for. A nil/empty map is a no-op, leaving the
+// process env untouched so a normal host is unaffected. Errors are surfaced, never
+// swallowed. This sets the floor; the agent can still override a var for a one-off.
 func applyBuildEnv(env map[string]string) error {
 	for _, k := range sortedEnvKeys(env) {
 		if err := os.Setenv(k, env[k]); err != nil {

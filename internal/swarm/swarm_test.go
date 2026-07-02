@@ -1039,12 +1039,14 @@ func TestBuildEnvPreamble(t *testing.T) {
 	}
 }
 
-// TestRunExportsBuildEnvToChild proves the runner exports the resolved host build
-// env into its own process BEFORE opening the agent child (so the opencode session
-// and every bash tool call it spawns inherit it), and states the same invocation
-// once in the injected preamble. This is the core of moving the audited
-// static-build + tmp-redirect rediscovery off each honeybee.
-func TestRunExportsBuildEnvToChild(t *testing.T) {
+// TestRunExportsBuildEnvBeforeAgentOpen proves the runner exports the resolved host
+// build env into its own process BEFORE opening the agent session (so honeybee-
+// spawned subprocesses that inherit os.Environ, e.g. git, get it), and states the
+// same invocation once in the injected preamble — the lever that reaches the agent's
+// own commands, since opencode is a separate process that does not inherit the
+// export. This is the core of moving the audited static-build + tmp-redirect
+// rediscovery off each honeybee.
+func TestRunExportsBuildEnvBeforeAgentOpen(t *testing.T) {
 	root := t.TempDir()
 	g := gitInit(t, root)
 	repo.Init(root)
