@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
@@ -220,5 +222,110 @@ func submodulePlanCmd() *cobra.Command {
 			return nil
 		},
 	})
+	c.AddCommand(&cobra.Command{
+		Use:   "archive <submodule>",
+		Short: "move DONE tasks' Impl/Review narrative out of PLAN.md into docs/plan-archive/<id>.md, leaving lean cards",
+		Long: "Keep PLAN.md proportional to OPEN work. Every DONE task's post-hoc\n" +
+			"Impl/Review/Reconciled/Arbitration narrative is moved into\n" +
+			"submodules/<sm>/docs/plan-archive/<id>.md, leaving the lean card (header +\n" +
+			"description + Files/Doc/Accept) plus a one-line pointer. OPEN tasks and all\n" +
+			"claim metadata are untouched; a re-run is a no-op. Run it in a beehive-layer\n" +
+			"worktree so the leaned PLAN.md publishes via the normal path — never edit the\n" +
+			"live tree in place (it would race the runner's heartbeat).",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			subName, err := taskSubmoduleName(args[0])
+			if err != nil {
+				return err
+			}
+			n, err := archivePlan(cmd.Context(), root, subName)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				fmt.Printf("%s: PLAN.md already lean (nothing to archive)\n", subName)
+			} else {
+				fmt.Printf("%s: archived %d DONE task narrative(s) to submodules/%s/%s/\n",
+					subName, n, subName, plan.ArchiveDir)
+			}
+			return nil
+		},
+	})
 	return c
+}
+
+// archivePlan leans a submodule's PLAN.md: it moves every DONE task's post-hoc
+// narrative into docs/plan-archive/<id>.md, rewrites PLAN.md with the lean cards,
+// and commits the two together (the worktree->publish path). It never touches
+// ROI.md, an OPEN task, or any claim metadata. Returns the number of tasks
+// archived; 0 means the plan was already lean (a no-op, nothing committed).
+func archivePlan(ctx context.Context, root, subName string) (int, error) {
+	planRel := filepath.Join("submodules", subName, repo.PlanFile)
+	planPath := filepath.Join(root, planRel)
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		return 0, err
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		return 0, err
+	}
+	archived := p.ArchiveDone()
+	if len(archived) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, 0, len(archived))
+	for id := range archived {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	paths := []string{planRel}
+	for _, id := range ids {
+		rel := filepath.Join("submodules", subName, plan.ArchivePath(id))
+		abs := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return 0, err
+		}
+		if err := writeArchive(abs, id, archived[id]); err != nil {
+			return 0, err
+		}
+		paths = append(paths, rel)
+	}
+	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+		return 0, err
+	}
+	msg := fmt.Sprintf("plan: archive %d DONE narrative(s) for %s\n\nBeehive: %s plan-archive",
+		len(ids), subName, subName)
+	if err := git.New(root).CommitPaths(ctx, msg, paths...); err != nil && err != git.ErrNothing {
+		return 0, err
+	}
+	return len(ids), nil
+}
+
+// writeArchive creates, or appends to, a task's archive file. Appending (rather
+// than overwriting) preserves a prior epoch's narrative when a task was reopened
+// and re-completed; because ArchiveDone only returns tasks that still carry
+// narrative, a plain re-run appends nothing.
+func writeArchive(abs, id string, narrative []string) error {
+	prev, err := os.ReadFile(abs)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	var out strings.Builder
+	if len(prev) == 0 {
+		out.WriteString("# " + id + " (archived plan narrative)\n\n")
+	} else {
+		out.Write(prev)
+		if !strings.HasSuffix(string(prev), "\n") {
+			out.WriteString("\n")
+		}
+		out.WriteString("\n")
+	}
+	out.WriteString(strings.Join(narrative, "\n"))
+	out.WriteString("\n")
+	return os.WriteFile(abs, []byte(out.String()), 0o644)
 }
