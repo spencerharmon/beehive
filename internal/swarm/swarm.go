@@ -242,6 +242,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
 	var wg *git.Repo
 	var wtAbs string
+	// workBriefText is the runner-precomputed task brief injected into the Work
+	// preamble below. It is assembled here (not in the switch) because it needs the
+	// resolved worktree/branch/pointer this setup produces; empty for other kinds.
+	var workBriefText string
 	if sel.Kind == selectt.Work {
 		// Absolute paths rooted at THIS honeybee's worktree (absRoot). A fresh
 		// `git worktree add` of the beehive repo does NOT populate submodules, so
@@ -277,6 +281,24 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if err := wg.WorktreeAdd(ctx, wtAbs, res.Branch, "HEAD"); err != nil {
 			return res, fmt.Errorf("worktree add: %w", err)
 		}
+		// Precompute the task brief from the SAME resolved worktree/branch/pointer
+		// this setup just produced (never a second, divergent derivation): the
+		// worktree base commit is wg's HEAD the worktree branched from, already
+		// synced to the tracked tip above. The agent gets these as answers, not
+		// plumbing to re-run.
+		repoRel, relErr := filepath.Rel(absRoot, repoDir)
+		if relErr != nil {
+			return res, fmt.Errorf("resolve submodule path for brief: %w", relErr)
+		}
+		pointer, ptrErr := wg.RevParse(ctx, "HEAD")
+		if ptrErr != nil {
+			return res, fmt.Errorf("resolve worktree base commit: %w", ptrErr)
+		}
+		wtRel, wtErr := filepath.Rel(absRoot, wtAbs)
+		if wtErr != nil {
+			return res, fmt.Errorf("resolve worktree path for brief: %w", wtErr)
+		}
+		workBriefText = r.workBrief(sel, res.Branch, wtAbs, wtRel, pointer, r.trackedBranch(ctx, repoRel))
 	}
 
 	// Context preamble: shipped in the binary (NOT the on-disk AGENTS.md, which is
@@ -324,7 +346,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"REQUIRED change doc path: submodules/%[1]s/docs/%[2]s-%[3]s.md (the beehive layer — NOT inside the code "+
 				"worktree). The runner's completion check looks for it exactly there; a doc elsewhere reads as 'not done'.\n"+
 				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
-			smName, res.Branch, taskID(sel))
+			smName, res.Branch, taskID(sel)) + workBriefText
 	default: // Bootstrap, Reconcile: beehive-layer only, no code worktree.
 		preamble = fmt.Sprintf(
 			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+

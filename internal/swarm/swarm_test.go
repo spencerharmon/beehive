@@ -555,6 +555,84 @@ func TestWorkPreambleHasDocPath(t *testing.T) {
 	}
 }
 
+// TestWorkBriefInjected proves the runner PRECOMPUTES a compact task brief for a
+// Work dispatch and injects it into the first prompt so the agent never re-runs
+// discovery git plumbing or reads the whole tree: the resolved code-worktree
+// path, branch, the submodule pointer the worktree branched from (the tracked
+// tip), the task's own PLAN card, the mandated change-doc path + commit stamp
+// (PROVIDED, not left for the agent to derive), and excerpts of ONLY the files
+// named on the task's Files: line. A second file present in the checkout but NOT
+// on the Files: line must be ABSENT from the brief — proving the working set is
+// scoped to the task, not the submodule tree.
+func TestWorkBriefInjected(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	// Two files live in the submodule checkout; only alpha.go is on the task's
+	// Files: line, so only its contents may appear in the brief.
+	os.WriteFile(filepath.Join(repoDir, "alpha.go"), []byte("package a\n\nconst Mark = \"ALPHA_MARKER_UNIQUE\"\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "beta.go"), []byte("package a\n\nconst Mark = \"BETA_MARKER_UNIQUE\"\n"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	// The production selector populates Task.Body (incl. the Files: line); build it
+	// explicitly here since the test constructs the Selection inline.
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{
+		ID: "T1", Status: plan.TODO,
+		Body: []string{"Implement the alpha behavior.", "Files: alpha.go"},
+	}}
+
+	// Capture the worktree base the setup actually branched from, so we can assert
+	// the brief's pointer equals it (a real precompute, not a re-derived value).
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	var wtBase string
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		if b, err := git.New(wtDir).RevParse(context.Background(), "HEAD"); err == nil {
+			wtBase = b
+		}
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if wtBase == "" {
+		t.Fatal("worktree base was never captured; the worktree was not created")
+	}
+	for _, want := range []string{
+		"# Task brief",                    // the injected brief section
+		"submodules/sm/worktrees/bee-T1",  // resolved code-worktree path
+		"bee-T1",                          // branch
+		wtBase,                            // submodule pointer / tracked tip
+		"submodules/sm/docs/bee-T1-T1.md", // mandated change-doc path
+		"Beehive: T1 submodules/sm/docs/bee-T1-T1.md", // resolved commit stamp (only in the brief)
+		"## T1 [TODO]",        // the task's own PLAN card
+		"Files: alpha.go",     // the task card body
+		"ALPHA_MARKER_UNIQUE", // an excerpt of the task's file
+	} {
+		if !contains(firstPrompt, want) {
+			t.Fatalf("brief missing %q; got:\n%s", want, firstPrompt)
+		}
+	}
+	// The working set is SCOPED to the task's Files: a file present in the checkout
+	// but not named must not be dumped into the brief.
+	if contains(firstPrompt, "BETA_MARKER_UNIQUE") {
+		t.Fatalf("brief leaked a non-task file (beta.go) into the working set; got:\n%s", firstPrompt)
+	}
+}
+
 // TestReviewCompletesOnStatusChange: a Review session is NOT claimed/clobbered
 // and completes the moment the agent moves the task out of NEEDS-REVIEW (here
 // -> DONE on approve). No code worktree, no heartbeat, no change-doc requirement
