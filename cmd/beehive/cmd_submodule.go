@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
@@ -200,6 +201,11 @@ func submoduleLinkCmd() *cobra.Command {
 	}
 }
 
+// archiveStoreRel is the submodule-relative store for archived PLAN.md closure
+// narratives. It matches the `Archived:` pointer left on each leaned card and the
+// `Doc: docs/...` convention (submodule-relative, forward-slashed).
+const archiveStoreRel = "docs/plan-archive"
+
 func submodulePlanCmd() *cobra.Command {
 	c := &cobra.Command{Use: "plan", Short: "submodule plan operations"}
 	c.AddCommand(&cobra.Command{
@@ -220,5 +226,95 @@ func submodulePlanCmd() *cobra.Command {
 			return nil
 		},
 	})
+	c.AddCommand(submodulePlanArchiveCmd())
 	return c
+}
+
+// submodulePlanArchiveCmd moves each DONE task's Impl/Review/Reconciled/
+// Arbitration closure prose out of PLAN.md into docs/plan-archive/<id>.md,
+// leaving the lean task card (header + description + Files/Doc/Accept + an
+// `Archived:` pointer). It keeps PLAN.md proportional to OPEN work — every
+// honeybee re-reads the whole file each session — without losing the DONE record.
+// Behavior-preserving (plan.Parse round-trips the same tasks/statuses/deps/
+// weights/claims) and idempotent (a re-run over an already-lean plan is a no-op).
+//
+// Run it from a beehive-repo worktree and let the commit publish/merge to main —
+// never against the live main checkout under a running runner, whose heartbeat
+// restamps PLAN.md (an in-place rewrite of the live tree would race it).
+func submodulePlanArchiveCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "archive <submodule>",
+		Short: "move DONE tasks' closure prose out of PLAN.md into docs/plan-archive/, leaving lean cards",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			subName, err := taskSubmoduleName(args[0])
+			if err != nil {
+				return err
+			}
+			planRel := filepath.Join("submodules", subName, repo.PlanFile)
+			planPath := filepath.Join(root, planRel)
+			b, err := os.ReadFile(planPath)
+			if err != nil {
+				return err
+			}
+			p, err := plan.Parse(string(b))
+			if err != nil {
+				return err
+			}
+			archived := p.ArchiveDone(archiveStoreRel)
+			if len(archived) == 0 {
+				fmt.Printf("%s: nothing to archive (PLAN.md already lean)\n", subName)
+				return nil
+			}
+			archiveDirRel := filepath.Join("submodules", subName, "docs", "plan-archive")
+			if err := os.MkdirAll(filepath.Join(root, archiveDirRel), 0o755); err != nil {
+				return err
+			}
+			paths := []string{planRel}
+			for _, a := range archived {
+				rel := filepath.Join(archiveDirRel, a.ID+".md")
+				if err := writeArchiveDoc(filepath.Join(root, rel), a.ID, a.Narrative); err != nil {
+					return err
+				}
+				paths = append(paths, rel)
+			}
+			if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+				return err
+			}
+			msg := fmt.Sprintf("plan: archive %d DONE narrative(s) for %s", len(archived), subName)
+			if err := git.New(root).CommitPaths(cmd.Context(), msg, paths...); err != nil && err != git.ErrNothing {
+				return err
+			}
+			fmt.Printf("%s: archived %d DONE task(s) -> %s/\n", subName, len(archived), archiveDirRel)
+			return nil
+		},
+	}
+}
+
+// archiveDocContent renders the archive file for one task: a titled preamble
+// plus the moved narrative verbatim. Deterministic (no timestamps) so re-runs and
+// tests are reproducible.
+func archiveDocContent(id, narrative string) string {
+	return "# " + id + " — archived PLAN.md closure narrative\n\n" +
+		"Moved out of PLAN.md by `beehive submodule plan archive` to keep the plan proportional to\n" +
+		"open work. The task's change doc under docs/ remains the authoritative record; this file\n" +
+		"preserves the plan-embedded Impl/Review/Reconciled/Arbitration prose verbatim.\n\n" +
+		narrative + "\n"
+}
+
+// writeArchiveDoc writes an archived narrative to path. If a prior archive for
+// this id already exists (a DONE task that was re-opened then re-closed), the new
+// section is appended under a divider so no closure record is ever lost.
+func writeArchiveDoc(path, id, narrative string) error {
+	content := archiveDocContent(id, narrative)
+	if existing, err := os.ReadFile(path); err == nil && len(existing) > 0 {
+		content = strings.TrimRight(string(existing), "\n") + "\n\n<!-- re-archived after re-open -->\n\n" + content
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
 }
