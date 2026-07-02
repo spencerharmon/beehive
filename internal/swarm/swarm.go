@@ -92,6 +92,22 @@ type Runner struct {
 	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
 	// backstop. 0 = no per-turn cap (tests).
 	TurnTimeout time.Duration
+
+	// ContextDiff bounds the per-turn context fed to the agent to (files that are
+	// new or changed since its last turn, as diffs) + (a rolling summary of prior
+	// turns), instead of re-reading every file in full and re-injecting the whole
+	// transcript each turn — the ROI "Working set / retrieval" + "History" token
+	// levers. SummaryMax caps the rolling summary in bytes (0 = built-in default).
+	//
+	// OFF BY DEFAULT and inert: the loop sends a bare "continue" on every turn
+	// after the first exactly as before (opencode holds the conversation
+	// server-side), so the durable session transcript is byte-for-byte unchanged.
+	// This ships the bounded-context ASSEMBLER (turnContext) and the loop seam that
+	// feeds it; the coherent production feed (which must reset the opencode session
+	// so the bound actually reduces model-side tokens rather than appending to a
+	// persistent history) rides this assembler in a follow-up. See context.go.
+	ContextDiff bool
+	SummaryMax  int
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -397,6 +413,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
+	// tc bounds the per-turn context on continue turns when enabled; nil (the
+	// default) makes continuePrompt return a bare "continue", so nothing here
+	// allocates or polls on the default path. absRoot is the opencode session cwd.
+	var tc *turnContext
+	if r.ContextDiff {
+		tc = newTurnContext(r.SummaryMax)
+	}
 	// finish stops the recorder, optionally records an abort warning to the
 	// transcript (so it shows in the UI), commits the final transcript to the
 	// session branch, then squashes+merges the durable final to main once and
@@ -588,7 +611,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if r.now().After(deadline) {
 			break
 		}
-		prompt = "continue"
+		prompt = r.continuePrompt(ctx, sess, absRoot, tc)
 	}
 	// Turn/wall cap hit: the agent never reached completion. Mirror the DONE path
 	// and reclaim the orphaned code worktree (cleanup -> wg.WorktreeRemove) so
@@ -608,7 +631,25 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	return res, nil
 }
 
-// taskRemoved checks whether the operator deleted the plan or removed this
+// continuePrompt returns the directive that drives the next turn. On the default
+// path (tc == nil) it returns the bare "continue" the loop has always sent —
+// byte-for-byte identical, no session poll, nothing allocated — so the durable
+// transcript is unchanged. When context diffing is enabled it instead returns a
+// BOUNDED prompt assembled at this turn-idle boundary: a rolling summary of prior
+// turns + only the files new or changed since the agent's last turn (see
+// turnContext.assemble). Context assembly is best-effort: any transcript read
+// error falls back to "continue" so a transient poll blip never stalls the loop.
+func (r *Runner) continuePrompt(ctx context.Context, sess Session, cwd string, tc *turnContext) string {
+	if tc == nil {
+		return "continue"
+	}
+	msgs, err := sess.Messages(ctx)
+	if err != nil {
+		return "continue"
+	}
+	return tc.assemble("continue", filesFromTranscript(msgs, cwd), msgs)
+}
+
 // honeybee's task on the beehive's main branch after the honeybee started. It
 // pulls the remote (if any), and only if main advanced and PLAN.md actually
 // changed does it re-read the plan: a missing PLAN.md or a missing task means

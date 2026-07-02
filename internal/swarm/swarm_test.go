@@ -31,12 +31,22 @@ type mockSession struct {
 	prompts int
 	onTurn  func(turn int)
 	capture *string // when set, records the first prompt text
+
+	// allPrompts, when set, records EVERY prompt text turn-by-turn (so a test can
+	// inspect the turn-2 continue directive). msgs, when set, is returned by
+	// Messages so a test can feed the context assembler a fixed transcript. Both
+	// default nil, leaving existing tests unaffected.
+	allPrompts *[]string
+	msgs       []Message
 }
 
 func (s *mockSession) Prompt(ctx context.Context, text string) (string, error) {
 	s.prompts++
 	if s.capture != nil && s.prompts == 1 {
 		*s.capture = text
+	}
+	if s.allPrompts != nil {
+		*s.allPrompts = append(*s.allPrompts, text)
 	}
 	if s.onTurn != nil {
 		s.onTurn(s.prompts)
@@ -45,7 +55,7 @@ func (s *mockSession) Prompt(ctx context.Context, text string) (string, error) {
 }
 func (s *mockSession) Close() error { return nil }
 
-func (s *mockSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+func (s *mockSession) Messages(ctx context.Context) ([]Message, error) { return s.msgs, nil }
 
 func gitInit(t *testing.T, dir string) *git.Repo {
 	g := git.New(dir)
@@ -987,5 +997,105 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// newWorkFixture builds a minimal beehive repo with one submodule and a single
+// work task (matching TestRunCompletes' setup) for turn-loop seam tests.
+func newWorkFixture(t *testing.T) (rp *repo.Repo, sm, planPath string, g *git.Repo, sel *selectt.Selection) {
+	t.Helper()
+	root := t.TempDir()
+	g = gitInit(t, root)
+	repo.Init(root)
+	sm = filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath = filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+	rp, _ = repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel = &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+	return
+}
+
+// completeOnTurn2 writes the completion artifacts (doc + DONE plan flip) only on
+// turn 2, so the loop must issue exactly one continue directive (turn 2's prompt)
+// before completing — that directive is what the seam tests inspect.
+func completeOnTurn2(sm, planPath string) func(int) {
+	return func(turn int) {
+		if turn != 2 {
+			return
+		}
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}
+}
+
+// TestContinuePromptDefaultInert pins the inert default: with ContextDiff off the
+// loop sends a bare "continue" on turn 2, byte-for-byte as before, so the durable
+// transcript and every existing test are unaffected.
+func TestContinuePromptDefaultInert(t *testing.T) {
+	rp, sm, planPath, g, sel := newWorkFixture(t)
+	var prompts []string
+	cl := &mockClient{sess: &mockSession{allPrompts: &prompts, onTurn: completeOnTurn2(sm, planPath)}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("expected completion, got %+v", res)
+	}
+	if len(prompts) < 2 {
+		t.Fatalf("expected at least 2 turns, got prompts=%v", prompts)
+	}
+	if prompts[1] != "continue" {
+		t.Fatalf("default path must send bare \"continue\" on turn 2, got %q", prompts[1])
+	}
+}
+
+// TestContinuePromptBounded proves the enabled path: turn 2's directive is the
+// bounded context (rolling summary of prior turns, verbatim tool output dropped)
+// instead of a bare continue, the continue directive still rides along, and the
+// deterministic completion check is unaffected (the pass still finishes).
+func TestContinuePromptBounded(t *testing.T) {
+	rp, sm, planPath, g, sel := newWorkFixture(t)
+	var prompts []string
+	msgs := []Message{{ID: "a1", Role: "assistant", Parts: []Part{
+		{Type: "text", Text: "Investigated the config loader and decided to add a default."},
+		{Type: "tool", Tool: "read", Input: map[string]any{"filePath": "/does/not/exist"}, Output: strings.Repeat("VERBATIM", 500)},
+	}}}
+	cl := &mockClient{sess: &mockSession{allPrompts: &prompts, msgs: msgs, onTurn: completeOnTurn2(sm, planPath)}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, ContextDiff: true}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("completion check regressed under ContextDiff, got %+v", res)
+	}
+	if len(prompts) < 2 {
+		t.Fatalf("expected at least 2 turns, got prompts=%v", prompts)
+	}
+	turn2 := prompts[1]
+	if turn2 == "continue" {
+		t.Fatalf("bounded path must not send a bare continue on turn 2")
+	}
+	if !contains(turn2, "Turn context") || !contains(turn2, "rolling summary") {
+		t.Fatalf("turn-2 prompt missing bounded-context framing:\n%s", turn2)
+	}
+	if !contains(turn2, "add a default") {
+		t.Fatalf("rolling summary dropped the prior-turn decision:\n%s", turn2)
+	}
+	if contains(turn2, "VERBATIM") {
+		t.Fatalf("bounded summary must drop verbatim tool output:\n%s", turn2)
+	}
+	if !strings.HasSuffix(turn2, "continue") {
+		t.Fatalf("bounded prompt must still end with the continue directive:\n%s", turn2)
 	}
 }
