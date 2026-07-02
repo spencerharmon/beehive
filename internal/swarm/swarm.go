@@ -603,6 +603,31 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					sel.Task.ID, ferr)
 				return res, nil
 			}
+			// Second publish-tree guard (bootstrap/reconcile): finish() published,
+			// but a publish can succeed as a NO-OP — classically the agent left the
+			// new PLAN.md uncommitted in the worktree, so the branch merge to main
+			// carried nothing — meaning the green LOCAL complete() above does NOT
+			// prove the plan/stamp reached main. Re-verify the completion predicate
+			// against the PUBLISHED main; if main did not actually advance, treat it
+			// exactly like a failed publish: mark for GC and do NOT report Completed,
+			// so the work is re-driven rather than recorded as a phantom DONE. A
+			// verification error is fail-closed (also blocks completion). For all
+			// other kinds and in no-publish local mode mainAdvanced returns true, so
+			// this is a no-op there.
+			if adv, aerr := r.mainAdvanced(ctx, sel); aerr != nil || !adv {
+				cleanup()
+				res.GCMarked = true
+				if aerr != nil {
+					res.Warning = fmt.Sprintf(
+						"task %s reached completion locally but verifying main advanced failed: %v; left for retry",
+						taskID(sel), aerr)
+				} else {
+					res.Warning = fmt.Sprintf(
+						"task %s reached completion locally but main did not advance after publish (no-op publish); left for retry",
+						taskID(sel))
+				}
+				return res, nil
+			}
 			res.Completed = true
 			if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
 				res.Warning = w
@@ -765,6 +790,76 @@ func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
 	// so an exact compare ~never matches and reconcile reports "never done".
 	// Match by prefix (mirrors select.reconcileRange's check) so a short stamp
 	// that prefixes the full head clears the reconcile, firing exactly once.
+	return stamp != "" && strings.HasPrefix(head, stamp), nil
+}
+
+// mainAdvanced is the second publish-tree guard: it verifies that a bootstrap/
+// reconcile task's output actually reached the PUBLISHED main, not merely this
+// honeybee's working tree. complete() fires on the LOCAL artifact (an on-disk
+// PLAN.md or its working-tree ROI stamp) and finish() then publishes, but a
+// publish can succeed as a NO-OP — most commonly when the agent wrote the file
+// to the worktree but never committed it, so the branch merge carries nothing —
+// leaving the local check "done" while origin main never gained the stamp. This
+// re-checks the completion predicate against the published ref (origin/main when
+// distributed, else local main), so a local-only or unpushed change fails the
+// check instead of reporting done. It runs AFTER finish() (the only place these
+// kinds publish), which is why it is a distinct post-publish gate rather than a
+// change to reconciled() (that stays the local trigger, and is pinned to the
+// working-tree read by TestReconciledPrefixMatch / the reconcile-prefix-match
+// overlap).
+//
+// Scope: bootstrap/reconcile only — the beehive-layer kinds whose entire output
+// is a stamp/plan on main. Work/Review/Arbitrate are already gated by guard (1)
+// (a rejected publish returns an error from finish and blocks completion) and
+// only ever reach the task-bearing done path, so they return true here. The
+// no-publish local mode (Publish == nil, tests/single-host with no convergence)
+// has no separate "main" to advance beyond the local commit, so it also returns
+// true. Every git failure is surfaced (fail-closed: the caller treats an error
+// as "not advanced" and re-drives), never swallowed into a false "done".
+func (r *Runner) mainAdvanced(ctx context.Context, sel *selectt.Selection) (bool, error) {
+	if r.Publish == nil {
+		return true, nil
+	}
+	switch sel.Kind {
+	case selectt.Bootstrap, selectt.Reconcile:
+	default:
+		return true, nil
+	}
+	// Resolve the published ref exactly as taskRemoved does: origin/main when a
+	// remote is configured (fetch it first so the tracking ref is current), else
+	// the local main branch that a no-remote publish updates in place.
+	ref := "main"
+	if r.Remote != "" {
+		if err := r.Git.Fetch(ctx, r.Remote, "main"); err != nil {
+			return false, err
+		}
+		ref = r.Remote + "/main"
+	}
+	planRel := "submodules/" + sel.Submodule.Name + "/" + repo.PlanFile
+	if sel.Kind == selectt.Bootstrap {
+		// Bootstrap's local check is "PLAN.md exists on disk"; its published form
+		// is "PLAN.md exists on main".
+		return r.Git.Exists(ctx, ref, planRel), nil
+	}
+	// Reconcile: apply the exact reconciled() predicate — the PLAN.md ROI stamp
+	// prefixes main's ROI head — but read the stamp from the PUBLISHED PLAN.md
+	// rather than the working tree. ROI.md is not touched by a reconcile, so its
+	// head is identical on the branch and on main; only the stamp must have
+	// landed.
+	roiPath := "submodules/" + sel.Submodule.Name + "/" + repo.ROIFile
+	head, err := r.Git.LastCommit(ctx, roiPath)
+	if err != nil {
+		return false, err
+	}
+	body, err := r.Git.Show(ctx, ref, planRel)
+	if err != nil {
+		return false, nil // no PLAN.md published to main -> not advanced
+	}
+	p, err := plan.Parse(body)
+	if err != nil {
+		return false, err
+	}
+	stamp := p.ROIStamp()
 	return stamp != "" && strings.HasPrefix(head, stamp), nil
 }
 
