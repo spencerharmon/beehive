@@ -98,8 +98,9 @@ func ResolveRegistry(root string) (Registry, error) {
 // SingleEntryRegistry synthesizes the legacy single-repo registry: a one-entry
 // Registry projecting an already-resolved single Config + repo root into the
 // multi-repo shape. It is the inverse of RepoEntry.Config — for the synthesized
-// entry e, e.Config(cfg) == cfg — so a bare single-host install (no repos.yaml)
-// is served byte-identically to before, just through the registry abstraction.
+// entry e, e.Config(cfg) deep-equals cfg — so a bare single-host install (no
+// repos.yaml) is served byte-identically to before, just through the registry
+// abstraction.
 //
 // The entry carries the resolved config's OWN keyring (GPGHome + GPGRecipient,
 // the "legacy keyring preserved" requirement) and its agent settings as per-repo

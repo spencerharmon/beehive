@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -100,6 +101,20 @@ type Runner struct {
 	// runner flips it on from an env flag (see cmd/honeybee). The protocol is
 	// re-sent on every turn, so trimming compounds across a session.
 	LeanInject bool
+
+	// BuildEnv is the host build/test environment (from layered config, e.g.
+	// CGO_ENABLED=0 + root-fs GOTMPDIR/TMPDIR/GOCACHE that LOCALS.md documents),
+	// resolved by the runner so a honeybee never re-derives it. At the agent-spawn
+	// path the runner (a) EXPORTS every key into its own process environment
+	// (exportBuildEnv) so tool subprocesses the agent's shell launches inherit the
+	// mandated invocation, and (b) states it ONCE in the injected preamble
+	// (buildEnvLine) — both sourced from THIS map so they never drift. Empty/nil =
+	// unconfigured: nothing is exported and the preamble is byte-identical.
+	BuildEnv map[string]string
+	// setenv applies one build-env key to the process environment; nil defaults to
+	// os.Setenv. A test seam so a fake can capture the exported env without
+	// mutating the real process (see exportBuildEnv).
+	setenv func(key, value string) error
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -362,6 +377,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"operator input, run: beehive task human %[2]s %[3]s --reason \"<specific blocker and exact input needed>\". "+
 				"Use exact status NEEDS-HUMAN; never write HUMAN-NEEDED.\n\n",
 			r.Session, smName, sel.Task.ID)
+		// Told once: the mandated host build/test invocation (same map the runner
+		// exports into the agent's shell env), so the agent never re-derives the
+		// broken-linker / quota-tmp fix. Empty when unconfigured -> byte-identical.
+		preamble += buildEnvLine(r.BuildEnv)
 	}
 	first = preamble + first
 
@@ -374,6 +393,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// the injected system is byte-identical to the historical full protocol.
 	if r.LeanInject {
 		system = trimProtocol(system, sel.Kind)
+	}
+	// Export the resolved host build/test env into this process so the tool
+	// subprocesses the agent's shell launches inherit the mandated invocation
+	// (same map stated once in the preamble above). No-op when unconfigured.
+	if err := r.exportBuildEnv(); err != nil {
+		return res, err
 	}
 	sess, err := r.Client.Open(ctx, absRoot, system)
 	if err != nil {
@@ -655,6 +680,61 @@ func (r *Runner) nextPrompt(sel *selectt.Selection, branch string) string {
 			"`Beehive: %[3]s <doc-path>` stamp and push it to the submodule's origin, bump the submodule "+
 			"pointer, then flip the PLAN.md task to NEEDS-REVIEW on main.",
 		sel.Submodule.Name, branch, sel.Task.ID)
+}
+
+// exportBuildEnv applies the resolved host build/test environment (r.BuildEnv)
+// into this process's environment at the agent-spawn path, so every tool
+// subprocess the agent's shell launches inherits the mandated static invocation
+// (CGO_ENABLED=0 + a root-fs GOTMPDIR/GOCACHE) instead of the honeybee
+// re-deriving it every session. Empty/nil = unconfigured: a no-op, so an
+// ordinary host is unaffected. Keys are applied in sorted order for
+// determinism; setenv defaults to os.Setenv (a test seam captures it instead of
+// mutating the real process). A failing setenv is surfaced, never swallowed.
+func (r *Runner) exportBuildEnv() error {
+	if len(r.BuildEnv) == 0 {
+		return nil
+	}
+	set := r.setenv
+	if set == nil {
+		set = os.Setenv
+	}
+	for _, k := range sortedKeys(r.BuildEnv) {
+		if err := set(k, r.BuildEnv[k]); err != nil {
+			return fmt.Errorf("export build env %s: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// buildEnvLine renders the told-once build/test invocation from the resolved
+// build env for the injected preamble, so the agent is told the mandated env
+// ONCE rather than rediscovering the broken-linker / quota-tmp fix every session.
+// It is sourced from the SAME map exportBuildEnv exports, so the stated line and
+// the exported process env can never drift. An empty/nil map returns "" so the
+// preamble stays byte-identical to the historical path; keys are sorted so the
+// line is deterministic.
+func buildEnvLine(env map[string]string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Build/test env for this host is already exported into your shell — use it, do not re-derive or override it:")
+	for _, k := range sortedKeys(env) {
+		fmt.Fprintf(&b, " %s=%s", k, env[k])
+	}
+	b.WriteString(". Prefix go build/test invocations with this environment.\n\n")
+	return b.String()
+}
+
+// sortedKeys returns m's keys in ascending order (deterministic env export and
+// preamble rendering).
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // taskRemoved checks whether the operator deleted the plan or removed this

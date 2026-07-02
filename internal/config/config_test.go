@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -96,6 +97,63 @@ max_tokens: 500
 	}
 }
 
+// TestResolveBuildEnvLayering checks the build_env map merges per-KEY across
+// layers (most-specific key wins) and that unset keys fall through — the runner
+// exports these into the agent so a honeybee never re-derives CGO_ENABLED=0 +
+// root-fs GOTMPDIR/GOCACHE. It also confirms the bare/default case leaves
+// BuildEnv nil (inert; a normal host is unaffected).
+func TestResolveBuildEnvLayering(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+
+	// Host layer sets the two host-wide keys (CGO_ENABLED kept; GOCACHE overridden).
+	write(t, filepath.Join(hostDir, "config.yaml"), `
+build_env:
+  CGO_ENABLED: "0"
+  GOCACHE: /host/cache
+`)
+	// In-repo global adds GOFLAGS (kept) and redirects the tmp dirs.
+	write(t, filepath.Join(root, "config.yaml"), `
+build_env:
+  GOFLAGS: -mod=mod
+  GOTMPDIR: /global/tmp
+  TMPDIR: /global/tmp
+`)
+	// Per-submodule overrides only GOCACHE; every other key falls through.
+	write(t, filepath.Join(root, "submodules", "x", "config.yaml"), `
+build_env:
+  GOCACHE: /sub/cache
+`)
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"CGO_ENABLED": "0",           // host, falls all the way through
+		"GOFLAGS":     "-mod=mod",    // only global sets it
+		"GOTMPDIR":    "/global/tmp", // global sets it, submodule leaves it
+		"TMPDIR":      "/global/tmp",
+		"GOCACHE":     "/sub/cache", // submodule wins over host
+	}
+	if !reflect.DeepEqual(c.BuildEnv, want) {
+		t.Fatalf("BuildEnv = %#v, want %#v", c.BuildEnv, want)
+	}
+
+	// A layer that sets no build_env must not clobber a lower layer's map.
+	c2, err := Resolve(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.BuildEnv["GOCACHE"] != "/host/cache" {
+		t.Errorf("no-submodule GOCACHE = %q, want /host/cache (global has no build_env, host shows through)", c2.BuildEnv["GOCACHE"])
+	}
+	if c2.BuildEnv["GOFLAGS"] != "-mod=mod" {
+		t.Errorf("no-submodule GOFLAGS = %q, want -mod=mod (global key merged per-key, not wholesale)", c2.BuildEnv["GOFLAGS"])
+	}
+}
+
 // TestResolveNoSubmoduleLayer confirms submodule="" resolves only host+global,
 // and that an absent submodule file is a skipped layer (global stays most
 // specific) rather than an error.
@@ -140,8 +198,13 @@ func TestResolveBareInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Defaults(hostDir)
-	if c != want {
+	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("bare Resolve = %+v, want Defaults %+v", c, want)
+	}
+	// Inert build env: a normal (unconfigured) host carries no build_env, so the
+	// runner exports nothing and the injected preamble is byte-identical.
+	if c.BuildEnv != nil {
+		t.Errorf("bare BuildEnv = %#v, want nil (inert default)", c.BuildEnv)
 	}
 }
 

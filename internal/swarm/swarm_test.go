@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -995,5 +997,164 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// TestExportBuildEnvAppliesSortedResolvedKeys proves the runner exports EVERY
+// resolved build-env key into the process (via the injected seam, so the real
+// environment is never mutated), in deterministic sorted order, and that the
+// mandated static invocation (CGO_ENABLED=0) plus the root-fs tmp/cache
+// redirects LOCALS.md documents all arrive verbatim.
+func TestExportBuildEnvAppliesSortedResolvedKeys(t *testing.T) {
+	env := map[string]string{
+		"GOTMPDIR":    "/h/.cache/gotmp",
+		"CGO_ENABLED": "0",
+		"GOCACHE":     "/h/.cache/go-build",
+		"TMPDIR":      "/h/.cache/gotmp",
+	}
+	var order []string
+	got := map[string]string{}
+	r := &Runner{BuildEnv: env, setenv: func(k, v string) error {
+		order = append(order, k)
+		got[k] = v
+		return nil
+	}}
+	if err := r.exportBuildEnv(); err != nil {
+		t.Fatalf("exportBuildEnv: %v", err)
+	}
+	if !reflect.DeepEqual(got, env) {
+		t.Fatalf("exported env = %v, want %v", got, env)
+	}
+	if !sort.StringsAreSorted(order) {
+		t.Fatalf("keys not applied in deterministic sorted order: %v", order)
+	}
+	if got["CGO_ENABLED"] != "0" {
+		t.Fatalf("mandated CGO_ENABLED not exported as 0, got %q", got["CGO_ENABLED"])
+	}
+}
+
+// TestExportBuildEnvEmptyIsNoop proves an unconfigured host is untouched: neither
+// a nil nor an empty (non-nil) map applies anything, so an ordinary install keeps
+// its ambient environment.
+func TestExportBuildEnvEmptyIsNoop(t *testing.T) {
+	called := false
+	r := &Runner{setenv: func(k, v string) error { called = true; return nil }} // BuildEnv nil
+	if err := r.exportBuildEnv(); err != nil {
+		t.Fatalf("nil export: %v", err)
+	}
+	r.BuildEnv = map[string]string{} // empty, non-nil
+	if err := r.exportBuildEnv(); err != nil {
+		t.Fatalf("empty export: %v", err)
+	}
+	if called {
+		t.Fatal("unconfigured build env must not touch the process environment")
+	}
+}
+
+// TestExportBuildEnvSurfacesError proves a failed setenv is surfaced (naming the
+// offending key), never swallowed — a broken export fails the pass loudly.
+func TestExportBuildEnvSurfacesError(t *testing.T) {
+	r := &Runner{
+		BuildEnv: map[string]string{"CGO_ENABLED": "0"},
+		setenv:   func(k, v string) error { return errors.New("boom") },
+	}
+	err := r.exportBuildEnv()
+	if err == nil || !contains(err.Error(), "CGO_ENABLED") || !contains(err.Error(), "boom") {
+		t.Fatalf("export error must surface the key and cause, got %v", err)
+	}
+}
+
+// TestBuildEnvLineDeterministicAndEmpty proves the told-once preamble line is
+// empty for an unconfigured host (byte-identical to the historical preamble) and
+// otherwise deterministic and sorted.
+func TestBuildEnvLineDeterministicAndEmpty(t *testing.T) {
+	if got := buildEnvLine(nil); got != "" {
+		t.Fatalf("nil build env must render empty, got %q", got)
+	}
+	if got := buildEnvLine(map[string]string{}); got != "" {
+		t.Fatalf("empty build env must render empty, got %q", got)
+	}
+	env := map[string]string{"GOTMPDIR": "/t", "CGO_ENABLED": "0"}
+	if a, b := buildEnvLine(env), buildEnvLine(env); a != b {
+		t.Fatalf("build-env line not deterministic:\n%q\n%q", a, b)
+	}
+	line := buildEnvLine(env)
+	if strings.Index(line, "CGO_ENABLED=0") > strings.Index(line, "GOTMPDIR=/t") {
+		t.Fatalf("keys not sorted in rendered line: %q", line)
+	}
+	for _, kv := range []string{"CGO_ENABLED=0", "GOTMPDIR=/t"} {
+		if !contains(line, kv) {
+			t.Fatalf("line missing %q: %q", kv, line)
+		}
+	}
+}
+
+// runWorkCaptureFirst drives a Work pass to completion and returns the injected
+// first-turn prompt, exporting build env through the given seam. It isolates the
+// one variable under test (BuildEnv) so two runs differ only by configuration.
+func runWorkCaptureFirst(t *testing.T, buildEnv map[string]string, setenv func(string, string) error) string {
+	t.Helper()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, BuildEnv: buildEnv, setenv: setenv}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	return firstPrompt
+}
+
+// TestWorkPreambleBuildEnvExactInsertion proves the spawn path (a) exports EXACTLY
+// the resolved build env into the process and (b) inserts EXACTLY one told-once
+// line into the preamble — the configured preamble equals the unconfigured one
+// with just that line added, so a configured host never perturbs the rest of the
+// injected brief. It is the end-to-end proof that both levers read the same map.
+func TestWorkPreambleBuildEnvExactInsertion(t *testing.T) {
+	env := map[string]string{
+		"CGO_ENABLED": "0",
+		"GOTMPDIR":    "/h/.cache/gotmp",
+		"GOCACHE":     "/h/.cache/go-build",
+	}
+	// exportBuildEnv runs synchronously on the Run goroutine before the session
+	// opens (and before the recorder starts), so this map is written race-free.
+	exported := map[string]string{}
+	configured := runWorkCaptureFirst(t, env, func(k, v string) error { exported[k] = v; return nil })
+	unconfigured := runWorkCaptureFirst(t, nil, nil)
+
+	if !reflect.DeepEqual(exported, env) {
+		t.Fatalf("spawn path exported %v, want the resolved env %v", exported, env)
+	}
+	if contains(unconfigured, "Build/test env") {
+		t.Fatalf("unconfigured preamble leaked a build-env line:\n%s", unconfigured)
+	}
+	line := buildEnvLine(env)
+	if line == "" || !contains(configured, line) {
+		t.Fatalf("configured preamble missing told-once line %q\n%s", line, configured)
+	}
+	if !contains(line, "CGO_ENABLED=0") {
+		t.Fatalf("told-once line missing mandated CGO_ENABLED=0: %q", line)
+	}
+	if got := strings.Replace(configured, line, "", 1); got != unconfigured {
+		t.Fatalf("build env perturbed the preamble beyond the single inserted line:\n--- configured minus line ---\n%s\n--- unconfigured ---\n%s", got, unconfigured)
 	}
 }

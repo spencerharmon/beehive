@@ -178,6 +178,11 @@ func run() error {
 		// and gating here keeps the injected set byte-identical to the historical
 		// path until a site sets BEEHIVE_LEAN_INJECT=1.
 		LeanInject: os.Getenv("BEEHIVE_LEAN_INJECT") == "1",
+		// Resolved host build/test env (layered config): exported into the agent's
+		// process and stated once in the preamble so a honeybee never re-derives the
+		// host's mandated invocation. nil/unset = inert (byte-identical preamble, no
+		// env exported), so an ordinary host is unaffected.
+		BuildEnv: eff.BuildEnv,
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {

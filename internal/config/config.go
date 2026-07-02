@@ -63,6 +63,15 @@ type Config struct {
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+	// BuildEnv is the host build/test environment the runner exports into the agent
+	// so a honeybee never re-derives it: the mandated static invocation (e.g.
+	// CGO_ENABLED=0 plus a root-fs GOTMPDIR/TMPDIR/GOCACHE) that LOCALS.md
+	// documents. The runner exports these into the agent process (so every tool
+	// shell inherits them) and states them once in the injected preamble. Layered
+	// per-KEY, most-specific wins: a nil/empty map is unset and falls through, and
+	// a more specific layer overrides only the individual keys it sets (see merge).
+	// Empty by default (inert) so an unconfigured host is unaffected.
+	BuildEnv map[string]string `yaml:"build_env"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -107,7 +116,10 @@ func loadFile(path string) (layer Config, ok bool, err error) {
 // merge overlays over onto base field-wise: a field set in over (non-zero) wins;
 // an unset (zero) field falls through to base. This is the "most-specific wins,
 // zero == unset" rule shared by every layer. Dir is metadata (yaml:"-") and is
-// never carried from a file layer.
+// never carried from a file layer. BuildEnv is the one map field: it merges
+// per-KEY (a fresh map is built so neither input is mutated) so a more specific
+// layer overrides only the individual keys it sets and unset keys fall through —
+// an empty/nil over.BuildEnv leaves base's map untouched.
 func merge(base, over Config) Config {
 	out := base
 	if over.GPGHome != "" {
@@ -142,6 +154,19 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	if len(over.BuildEnv) > 0 {
+		// Per-key overlay into a FRESH map so neither base's nor over's map is
+		// mutated (out aliases base's map header until we replace it): copy base
+		// first, then let over's keys win. Unset keys stay from base (fall through).
+		m := make(map[string]string, len(base.BuildEnv)+len(over.BuildEnv))
+		for k, v := range base.BuildEnv {
+			m[k] = v
+		}
+		for k, v := range over.BuildEnv {
+			m[k] = v
+		}
+		out.BuildEnv = m
 	}
 	return out
 }
