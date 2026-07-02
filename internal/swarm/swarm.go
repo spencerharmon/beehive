@@ -100,6 +100,17 @@ type Runner struct {
 	// runner flips it on from an env flag (see cmd/honeybee). The protocol is
 	// re-sent on every turn, so trimming compounds across a session.
 	LeanInject bool
+
+	// LeanContext bounds the per-turn context the runner hands a Work agent to
+	// (changed-file diffs + a rolling transcript summary) instead of the bare
+	// "continue" that leaves the agent to re-read the same files and re-scan the
+	// whole prior transcript every turn (ROI Priority 1 — "feed diffs, not full
+	// re-reads"; "rolling summary of prior turns"). Off by default: the per-turn
+	// prompt is the byte-identical "continue"/lean hint (nextPrompt) and no extra
+	// session poll runs. The runner flips it on from an env flag (see cmd/honeybee).
+	// A compression of the working context only — the authoritative transcript still
+	// streams verbatim to the session branch.
+	LeanContext bool
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -425,6 +436,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
+	// LeanContext bounds each post-first turn's prompt to (changed-file diffs +
+	// rolling summary) via tc; nil (the default, and every non-Work kind) leaves
+	// the loop on the byte-identical bare "continue"/lean-hint path.
+	var tc *turnCompactor
+	if r.LeanContext && sel.Kind == selectt.Work {
+		tc = newTurnCompactor()
+	}
 	// finish stops the recorder, optionally records an abort warning to the
 	// transcript (so it shows in the UI), commits the final transcript to the
 	// session branch, then squashes+merges the durable final to main once and
@@ -616,7 +634,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if r.now().After(deadline) {
 			break
 		}
-		prompt = r.nextPrompt(sel, res.Branch)
+		if tc != nil {
+			prompt = r.leanContextPrompt(ctx, sess, tc, sel, res.Branch)
+		} else {
+			prompt = r.nextPrompt(sel, res.Branch)
+		}
 	}
 	// Turn/wall cap hit: the agent never reached completion. Mirror the DONE path
 	// and reclaim the orphaned code worktree (cleanup -> wg.WorktreeRemove) so
@@ -655,6 +677,30 @@ func (r *Runner) nextPrompt(sel *selectt.Selection, branch string) string {
 			"`Beehive: %[3]s <doc-path>` stamp and push it to the submodule's origin, bump the submodule "+
 			"pointer, then flip the PLAN.md task to NEEDS-REVIEW on main.",
 		sel.Submodule.Name, branch, sel.Task.ID)
+}
+
+// leanContextPrompt is the LeanContext next-turn prompt for a Work task: it wraps
+// the same continue/completion instruction nextPrompt would send with a bounded
+// re-orientation brief — the diffs of files that changed since last turn plus a
+// rolling summary of prior turns (turnCompactor.assemble) — so the agent continues
+// without re-reading unchanged files or re-scanning the whole transcript. It polls
+// the live session to build that brief; if the poll fails it degrades to the plain
+// nextPrompt instruction (byte-identical to the default path) rather than failing
+// the turn — a digest is an optimization, never a correctness dependency. The
+// authoritative transcript still streams verbatim to the session branch; this only
+// bounds what the runner asks the agent to re-process each turn.
+func (r *Runner) leanContextPrompt(ctx context.Context, sess Session, tc *turnCompactor, sel *selectt.Selection, branch string) string {
+	instruction := r.nextPrompt(sel, branch)
+	msgs, err := sess.Messages(ctx)
+	if err != nil {
+		// Can't read history this turn — advance no pins and send the plain
+		// instruction so the turn still proceeds exactly as the default loop would.
+		if r.Debug != nil {
+			fmt.Fprintf(r.Debug, "\n  \u00b7 lean-context: session poll failed, sending plain continue: %v\n", err)
+		}
+		return instruction
+	}
+	return tc.assemble(instruction, transcriptText(msgs), latestFileContents(msgs))
 }
 
 // taskRemoved checks whether the operator deleted the plan or removed this
