@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -552,6 +553,137 @@ func TestWorkPreambleHasDocPath(t *testing.T) {
 	}
 	if !contains(firstPrompt, "submodules/sm/worktrees/bee-T1") {
 		t.Fatalf("preamble missing code worktree path; got:\n%s", firstPrompt)
+	}
+}
+
+// TestWorkInjectsTaskBrief proves a Work dispatch injects the precomputed task
+// brief: the resolved worktree path + branch, the base commit (== the synced sub
+// tip) the branch is cut from, the PROVIDED change-doc path and commit stamp (not
+// left for the agent to derive), the task's own PLAN card, and excerpts of exactly
+// the files the task's Files: line names — scoped to the task, NOT the whole tree
+// (a submodule file the task does not list is never pulled in).
+func TestWorkInjectsTaskBrief(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	// Two files live in the submodule: one the task lists (must be excerpted) and
+	// one it does not (must NOT be pulled in — proves scoping to the task's Files).
+	os.WriteFile(filepath.Join(repoDir, "in_scope.go"), []byte("package w\n\n// IN_SCOPE_MARKER_ZZZ\nfunc In() {}\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "out_scope.go"), []byte("package w\n\n// OUT_SCOPE_MARKER_ZZZ\nfunc Out() {}\n"), 0o644)
+	ctx := context.Background()
+	git.New(repoDir).Commit(ctx, "base")
+	subHead, err := git.New(repoDir).RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("sub head: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	// The selection carries the task's real body (Files/Doc), which the brief reads.
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{
+		ID: "T1", Status: plan.TODO, Weight: 128, Body: []string{
+			"Implement the WIDGET behaviour in the in-scope file.",
+			"Files: in_scope.go",
+			"Doc: docs/tasks/t1.md",
+		},
+	}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	var firstPrompt, wtBase string
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		if b, err := git.New(wtDir).RevParse(ctx, "HEAD"); err == nil {
+			wtBase = b
+		}
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	cl.sess.capture = &firstPrompt
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("want completed, got %+v", res)
+	}
+
+	// The brief must be present and framed as runner-precomputed.
+	if !contains(firstPrompt, "Task brief") {
+		t.Fatalf("brief missing; got:\n%s", firstPrompt)
+	}
+	// Resolved worktree + branch.
+	if !contains(firstPrompt, "submodules/sm/worktrees/bee-T1") || !contains(firstPrompt, "bee-T1") {
+		t.Fatalf("brief missing worktree/branch; got:\n%s", firstPrompt)
+	}
+	// Base commit / tracked tip must be the REUSED resolved value (the worktree's
+	// actual base), not re-derived — no remote here, so base == sub HEAD.
+	if wtBase == "" {
+		t.Fatal("worktree base never captured; the worktree was not created")
+	}
+	if wtBase != subHead {
+		t.Fatalf("worktree base %s != sub head %s", wtBase, subHead)
+	}
+	if !contains(firstPrompt, subHead) {
+		t.Fatalf("brief missing the resolved base/tracked commit %s; got:\n%s", subHead, firstPrompt)
+	}
+	// Provided doc path + commit stamp (the agent must not derive them).
+	if !contains(firstPrompt, "submodules/sm/docs/bee-T1-T1.md") {
+		t.Fatalf("brief missing provided doc path; got:\n%s", firstPrompt)
+	}
+	if !contains(firstPrompt, "Beehive: T1 submodules/sm/docs/bee-T1-T1.md") {
+		t.Fatalf("brief missing provided commit stamp; got:\n%s", firstPrompt)
+	}
+	// The task's own PLAN card (a body line proves it is the card, not just the header).
+	if !contains(firstPrompt, "Implement the WIDGET behaviour") {
+		t.Fatalf("brief missing the task's PLAN card body; got:\n%s", firstPrompt)
+	}
+	// Scoping: the listed file is excerpted; the unlisted file is NOT pulled in.
+	if !contains(firstPrompt, "IN_SCOPE_MARKER_ZZZ") {
+		t.Fatalf("brief missing the in-scope file excerpt; got:\n%s", firstPrompt)
+	}
+	if contains(firstPrompt, "OUT_SCOPE_MARKER_ZZZ") {
+		t.Fatalf("brief pulled in a file the task does not list (not scoped to Files:); got:\n%s", firstPrompt)
+	}
+}
+
+// TestParseFilesLine exercises the Files: line parser directly: single and
+// multi-line values, parenthetical notes containing commas (stripped before the
+// comma split), trailing punctuation, de-duplication, globs/dirs preserved, prose
+// tokens (with spaces) dropped, and the value ending at the next "Key:" field.
+func TestParseFilesLine(t *testing.T) {
+	cases := []struct {
+		name string
+		body []string
+		want []string
+	}{
+		{"simple", []string{"Files: a.go, b.go"}, []string{"a.go", "b.go"}},
+		{"paren-with-comma", []string{"Files: internal/swarm (assembly, injection), swarm_test.go."}, []string{"internal/swarm", "swarm_test.go"}},
+		{"multiline", []string{
+			"Files: internal/swarm (brief assembly + injection; reuse the resolved",
+			"worktree the Work setup computes), swarm_test.go.",
+			"Doc: docs/tasks/x.md",
+		}, []string{"internal/swarm", "swarm_test.go"}},
+		{"trailing-period-and-dedup", []string{"Files: a.go, a.go, b.go."}, []string{"a.go", "b.go"}},
+		{"glob-and-dir", []string{"Files: cmd/*.go, internal/plan"}, []string{"cmd/*.go", "internal/plan"}},
+		{"prose-tokens-dropped", []string{"Files: the whole tree, real.go"}, []string{"real.go"}},
+		{"stops-at-field", []string{"Files: a.go", "Accept: it works, really"}, []string{"a.go"}},
+		{"no-files-line", []string{"Do a thing.", "Doc: d.md"}, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := parseFilesLine(c.body)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("parseFilesLine(%v) = %v, want %v", c.body, got, c.want)
+			}
+		})
 	}
 }
 

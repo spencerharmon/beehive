@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -242,6 +243,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
 	var wg *git.Repo
 	var wtAbs string
+	var brief string
 	if sel.Kind == selectt.Work {
 		// Absolute paths rooted at THIS honeybee's worktree (absRoot). A fresh
 		// `git worktree add` of the beehive repo does NOT populate submodules, so
@@ -277,6 +279,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if err := wg.WorktreeAdd(ctx, wtAbs, res.Branch, "HEAD"); err != nil {
 			return res, fmt.Errorf("worktree add: %w", err)
 		}
+		// Precompute a compact task brief from the values just resolved (worktree,
+		// branch, synced base) so the agent never re-runs discovery git plumbing or
+		// reads the whole submodule tree. Additive and best-effort: it never fails
+		// the run, and is appended to the preamble below.
+		brief = r.workBrief(ctx, sel, wg, wtAbs, res.Branch, absRoot)
 	}
 
 	// Context preamble: shipped in the binary (NOT the on-disk AGENTS.md, which is
@@ -342,6 +349,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"Use exact status NEEDS-HUMAN; never write HUMAN-NEEDED.\n\n",
 			r.Session, smName, sel.Task.ID)
 	}
+	// Work-only precomputed task brief ("" for other kinds, so this is a no-op).
+	// Appended after the claim note so the STOP-on-lost-race instruction stays
+	// adjacent to the kind framing.
+	preamble += brief
 	first = preamble + first
 
 	if r.Debug != nil {
@@ -789,6 +800,206 @@ func hasTask(sel *selectt.Selection) bool {
 	default:
 		return false
 	}
+}
+
+// briefExcerptLines caps how many leading lines of each task file the brief
+// inlines: enough to orient the agent without re-sending whole files.
+const briefExcerptLines = 40
+
+var (
+	// parenNoteRe strips a parenthetical note from a Files: line BEFORE the line is
+	// split on commas, because such a note may itself contain commas.
+	parenNoteRe = regexp.MustCompile(`\([^)]*\)`)
+	// fieldLineRe recognizes the next "Key:" field so Files: continuation lines are
+	// gathered but the following Doc:/Accept:/... field is not swallowed.
+	fieldLineRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]*:`)
+)
+
+// workBrief precomputes a compact, deterministic task brief for a Work dispatch,
+// returned as a preamble fragment ("" when it cannot be assembled). It REUSES the
+// values the Work setup already resolved — the code worktree (wtAbs) on its
+// branch, and the submodule checkout wg already synced to the tracked tip — so
+// the agent never re-runs discovery git plumbing or reads the whole submodule
+// tree to get its bearings. It carries: the worktree path + branch, the base
+// commit the branch is cut from plus the tracked tip, the mandated change-doc
+// path and commit stamp (provided, not left for the agent to derive), the task's
+// own PLAN card, and excerpts of exactly the files the task's Files: line names
+// (scoping the working set to the task, not the tree). Best-effort throughout:
+// any unreadable piece is omitted rather than failing the run.
+func (r *Runner) workBrief(ctx context.Context, sel *selectt.Selection, wg *git.Repo, wtAbs, branch, absRoot string) string {
+	sm := sel.Submodule.Name
+	taskid := sel.Task.ID
+	// Repo-root-relative display paths (forward slashes), matching the existing
+	// preamble's "submodules/<sm>/..." framing regardless of whether Submodule.Path
+	// is absolute (tests) or relative (real runs).
+	wtRel := "submodules/" + sm + "/worktrees/" + branch
+	docRel := "submodules/" + sm + "/docs/" + branch + "-" + taskid + ".md"
+	stamp := "Beehive: " + taskid + " " + docRel
+
+	// Base commit the branch is cut from (wg HEAD, already synced to the tracked
+	// tip). Best-effort: an unresolved base simply omits that line.
+	base, _ := wg.RevParse(ctx, "HEAD")
+	trackedTip := base
+	if rem, err := wg.Remote(ctx); err == nil && rem != "" {
+		if rel, rerr := filepath.Rel(absRoot, sel.Submodule.RepoDir()); rerr == nil {
+			if tip, terr := wg.RevParse(ctx, rem+"/"+r.trackedBranch(ctx, rel)); terr == nil && tip != "" {
+				trackedTip = tip
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("# Task brief (precomputed by the runner — use these values; do not re-derive them)\n")
+	b.WriteString(fmt.Sprintf("Task %s in submodule %s. Branch (already created): %s\n", taskid, sm, branch))
+	b.WriteString(fmt.Sprintf("Code worktree (edit the submodule's code here; never write submodules/%s/repo): %s/\n", sm, wtRel))
+	if base != "" {
+		b.WriteString(fmt.Sprintf("Base commit (your branch is cut from here): %s\n", base))
+	}
+	if trackedTip != "" {
+		b.WriteString(fmt.Sprintf("Tracked tip (submodule tracked-branch tip; the base is synced to it): %s\n", trackedTip))
+	}
+	b.WriteString(fmt.Sprintf("Change doc — write it EXACTLY here (the completion check looks nowhere else): %s\n", docRel))
+	b.WriteString(fmt.Sprintf("Commit stamp — put this line verbatim in the code commit message: %s\n", stamp))
+
+	// The task's own PLAN card, so the agent has its full spec without reading PLAN.md.
+	if card := taskCard(sel.Task); card != "" {
+		b.WriteString("\n## Your PLAN card\n")
+		b.WriteString(card)
+	}
+
+	// Excerpts of exactly the files the task touches (from its Files: line), read
+	// from the just-created worktree — the precise code the agent edits. This
+	// scopes the working set to the task instead of the whole submodule tree.
+	if files := parseFilesLine(sel.Task.Body); len(files) > 0 {
+		b.WriteString("\n## Files this task touches (from the PLAN card's `Files:` line — your working set)\n")
+		for _, f := range files {
+			b.WriteString(fileExcerpt(wtAbs, f))
+		}
+	}
+	return b.String() + "\n"
+}
+
+// taskCard renders a task's PLAN card (header + body) from its exported fields,
+// omitting the volatile session/heartbeat claim stamp — that changes every turn
+// and the agent is told to read it live from PLAN.md, so a snapshot would mislead.
+func taskCard(t plan.Task) string {
+	meta := fmt.Sprintf("attempts=%d deps=%s", t.Attempts, strings.Join(t.Deps, ","))
+	if t.Weight > 1 {
+		meta += fmt.Sprintf(" weight=%d", t.Weight)
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("## %s [%s] <!-- %s -->\n", t.ID, t.Status, meta))
+	for _, line := range t.Body {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// parseFilesLine extracts the file/dir tokens a task declares on its PLAN card's
+// Files: line — the working set the task is scoped to. The value may wrap across
+// lines (gathered until a blank line or the next "Key:" field); parenthetical
+// notes are stripped BEFORE splitting on commas (a note may itself contain
+// commas); tokens are trimmed of surrounding punctuation; blanks and tokens
+// containing whitespace (prose, not paths) are dropped; the result is
+// de-duplicated in order.
+func parseFilesLine(body []string) []string {
+	var parts []string
+	collecting := false
+	for _, line := range body {
+		t := strings.TrimSpace(line)
+		if !collecting {
+			if rest, ok := strings.CutPrefix(t, "Files:"); ok {
+				parts = append(parts, rest)
+				collecting = true
+			}
+			continue
+		}
+		if t == "" || fieldLineRe.MatchString(t) {
+			break // Files: value ended at a blank line or the next field
+		}
+		parts = append(parts, t)
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	raw := parenNoteRe.ReplaceAllString(strings.Join(parts, " "), "")
+	seen := map[string]bool{}
+	var out []string
+	for _, tok := range strings.Split(raw, ",") {
+		tok = strings.Trim(strings.TrimSpace(tok), ".;")
+		tok = strings.TrimSpace(tok)
+		if tok == "" || strings.ContainsAny(tok, " \t") {
+			continue
+		}
+		if seen[tok] {
+			continue
+		}
+		seen[tok] = true
+		out = append(out, tok)
+	}
+	return out
+}
+
+// fileExcerpt renders a compact, self-contained excerpt for one task file, read
+// from the code worktree (base) so it reflects the exact code the agent edits. A
+// regular file yields its first briefExcerptLines lines (with a truncation note
+// when longer); a directory yields a one-level listing; a glob pattern is shown
+// as a spec to fill; a missing path is flagged as one to create. Best-effort: an
+// unreadable path degrades to a short note, never an error.
+func fileExcerpt(base, rel string) string {
+	if strings.ContainsAny(rel, "*?[") { // a glob is a spec, not a concrete file
+		return fmt.Sprintf("--- %s (pattern) ---\n", rel)
+	}
+	full := filepath.Join(base, filepath.FromSlash(rel))
+	info, err := os.Stat(full)
+	if err != nil {
+		return fmt.Sprintf("--- %s (not present — create it in the worktree) ---\n", rel)
+	}
+	if info.IsDir() {
+		ents, derr := os.ReadDir(full)
+		if derr != nil {
+			return fmt.Sprintf("--- %s/ (directory; unreadable: %v) ---\n", rel, derr)
+		}
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("--- %s/ (directory, %d entries) ---\n", rel, len(ents)))
+		const maxEntries = 50
+		for i, e := range ents {
+			if i >= maxEntries {
+				b.WriteString(fmt.Sprintf("… %d more\n", len(ents)-maxEntries))
+				break
+			}
+			name := e.Name()
+			if e.IsDir() {
+				name += "/"
+			}
+			b.WriteString(name + "\n")
+		}
+		return b.String()
+	}
+	data, rerr := os.ReadFile(full)
+	if rerr != nil {
+		return fmt.Sprintf("--- %s (unreadable: %v) ---\n", rel, rerr)
+	}
+	lines := strings.Split(string(data), "\n")
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1] // drop the empty tail a trailing newline produces
+	}
+	total := len(lines)
+	truncated := false
+	if len(lines) > briefExcerptLines {
+		lines = lines[:briefExcerptLines]
+		truncated = true
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("--- %s (%d lines) ---\n", rel, total))
+	for _, l := range lines {
+		b.WriteString(l + "\n")
+	}
+	if truncated {
+		b.WriteString(fmt.Sprintf("… (%d more lines; open the file for the rest)\n", total-briefExcerptLines))
+	}
+	return b.String()
 }
 
 // syncWorktreeBase brings the submodule checkout to the tracked-branch tip
