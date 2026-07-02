@@ -363,3 +363,98 @@ func TestReconcilePrefixStampNoDrift(t *testing.T) {
 		t.Fatalf("short prefix stamp must read as no-drift, got range %q", rng)
 	}
 }
+
+// clone makes a working clone of origin (with its "origin" remote wired up) and
+// gives it a commit identity, standing in for a honeybee's local checkout of the
+// hive whose local main can lag the upstream tip.
+func clone(t *testing.T, origin string) (string, *git.Repo) {
+	t.Helper()
+	ctx := context.Background()
+	dst := filepath.Join(t.TempDir(), "local")
+	if _, err := git.New(t.TempDir()).Run(ctx, "clone", "-q", origin, dst); err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	g := git.New(dst)
+	for _, a := range [][]string{{"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		g.Run(ctx, a...)
+	}
+	return dst, g
+}
+
+// TestSelectPullsTrackedTipBeforeReconcile closes the audited reconcile_loop at
+// its source: a peer has already folded the ROI drift and stamped PLAN.md on the
+// remote, but this checkout's local main is stale (the runner only Fetches, never
+// Pulls). Select must fast-forward the tracked tip first, observe the stamp now
+// prefixes the ROI head, and pick real work instead of re-emitting the reconcile.
+// A second cycle at the same stamped head must likewise not re-emit (single-flight).
+func TestSelectPullsTrackedTipBeforeReconcile(t *testing.T) {
+	ctx := context.Background()
+	_, og, origin := hive(t)
+	// Upstream starts DRIFTED: PLAN stamped to a dead sha while ROI is committed.
+	sub(origin, "a", map[string]string{"ROI.md": "x", "PLAN.md": "<!-- Beehive-ROI: dead -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	if err := og.Commit(ctx, "seed drifted"); err != nil {
+		t.Fatal(err)
+	}
+	// Local clone starts at that drifted state; its local main now lags upstream.
+	root, g := clone(t, origin)
+
+	// A peer folds the reconcile UPSTREAM: PLAN.md restamped to the real ROI head.
+	// Only PLAN.md changes, so the ROI head sha stays identical in both repos.
+	head, err := og.LastCommit(ctx, "submodules/a/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("origin ROI head: %q %v", head, err)
+	}
+	os.WriteFile(filepath.Join(origin, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	if err := og.Commit(ctx, "peer folded reconcile"); err != nil {
+		t.Fatal(err)
+	}
+
+	// On-disk local main is still stale (stamp=dead): the old Fetch-only path would
+	// emit a redundant Reconcile here. Select must pull origin/main first.
+	s, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if s == nil {
+		t.Fatal("select returned nothing after pulling the folded tip")
+	}
+	if s.Kind == Reconcile {
+		t.Fatalf("stale reconcile must be pulled away, got a Reconcile: %+v", s)
+	}
+	if s.Kind != Work || s.Task.ID != "T1" {
+		t.Fatalf("want Work/T1 after pull, got %+v", s)
+	}
+	// Single-flight: a second cycle at the same stamped head must not re-emit the
+	// reconcile (this is exactly the audited re-fold loop).
+	s2, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("select 2: %v", err)
+	}
+	if s2 == nil || s2.Kind == Reconcile {
+		t.Fatalf("second cycle re-emitted the reconcile: %+v", s2)
+	}
+}
+
+// TestSelectReconcilesWhenTrackedTipAlsoDrifted is the negative control: with a
+// remote present but the upstream tip ALSO genuinely drifted (no peer fold),
+// pulling changes nothing and a real reconcile must still be dispatched. The
+// dedup guard must never suppress a legitimately-needed reconcile.
+func TestSelectReconcilesWhenTrackedTipAlsoDrifted(t *testing.T) {
+	ctx := context.Background()
+	_, og, origin := hive(t)
+	sub(origin, "a", map[string]string{"ROI.md": "x", "PLAN.md": "<!-- Beehive-ROI: dead -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	if err := og.Commit(ctx, "seed drifted"); err != nil {
+		t.Fatal(err)
+	}
+	root, g := clone(t, origin)
+	// Upstream is left drifted. Pulling the tracked tip is a no-op, so the drift is
+	// real and a reconcile is still owed.
+	s, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if s == nil || s.Kind != Reconcile || s.DiffRange == "" {
+		t.Fatalf("genuine drift must still reconcile even with a remote, got %+v", s)
+	}
+}

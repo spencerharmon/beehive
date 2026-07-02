@@ -60,6 +60,13 @@ type Selector struct {
 // Select walks weighted-random submodules and returns the first workable item.
 // nil is returned only when no submodule has any workable task.
 func (s *Selector) Select(ctx context.Context) (*Selection, error) {
+	// Evaluate selection against the freshest main. main.go only Fetches the
+	// remote (never Pulls), so the primary seed selector otherwise reads a stale
+	// local main and re-emits a reconcile a peer already folded and stamped into
+	// PLAN.md — the audited reconcile_loop. Fast-forward the tracked tip first;
+	// best-effort, so no-remote / dirty / diverged / offline all fall back to the
+	// current checkout and selection proceeds against it.
+	s.pullMainTip(ctx)
 	subs, err := s.Repo.Submodules()
 	if err != nil {
 		return nil, err
@@ -154,6 +161,25 @@ func graphGate(sm repo.Submodule, cands []plan.Task, graph *Graph) []plan.Task {
 		out = append(out, t)
 	}
 	return out
+}
+
+// pullMainTip fast-forwards the repo's checkout to the tracked remote's main so
+// selection reads PLAN.md/ROI.md at the tip the swarm has actually converged to
+// rather than a stale local main. It is best-effort and never blocks selection:
+// a repo with no remote (local-only hives, tests), a non-fast-forward (local
+// commits on the branch), a dirty tree, or an offline/failed fetch all leave the
+// current checkout untouched and selection proceeds against it. Freshening the
+// read at its source is what turns an already-applied reconcile into a no-op
+// instead of a redundant, zero-progress pass.
+func (s *Selector) pullMainTip(ctx context.Context) {
+	if s.Git == nil {
+		return
+	}
+	remote, err := s.Git.Remote(ctx)
+	if err != nil || remote == "" {
+		return
+	}
+	_ = s.Git.Pull(ctx, remote, "main")
 }
 
 // reconcileRange returns "<stamp>..<roiHead>" when ROI.md drifted, else "".

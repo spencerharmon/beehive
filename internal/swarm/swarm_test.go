@@ -806,6 +806,98 @@ func TestReconciledPrefixMatch(t *testing.T) {
 	}
 }
 
+// TestRunReconcileSkipsWhenApplied proves the pre-dispatch dedup guard: a
+// reconcile whose ROI delta is already folded and stamped into PLAN.md completes
+// WITHOUT opening a session — no turns, no tokens. This is the deterministic
+// no-op that kills the audited reconcile_loop (redundant passes re-folding the
+// same, already-stamped delta).
+func TestRunReconcileSkipsWhenApplied(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	// PLAN.md already stamped at the ROI head: the reconcile is applied.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	mc := &mockClient{} // sess stays nil unless Open is actually called
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("an already-applied reconcile must be Skipped, got %+v", res)
+	}
+	if mc.sess != nil {
+		t.Fatal("an applied reconcile must NOT open a session (no turns, no tokens)")
+	}
+	if res.Turns != 0 {
+		t.Fatalf("an applied reconcile must not run a turn, got Turns=%d", res.Turns)
+	}
+	if !res.SessionPublished {
+		t.Fatalf("skip must mark SessionPublished so the caller reclaims the empty session stub branch, got %+v", res)
+	}
+	if res.Completed {
+		t.Fatalf("a no-op skip must not report Completed (no work ran), got %+v", res)
+	}
+}
+
+// TestRunReconcileDispatchesWhenDrifted is the negative control for the guard: a
+// genuinely-drifted ROI (PLAN.md stamped to a stale sha) must still open a session
+// and run — the guard must never suppress a legitimately-needed reconcile. The
+// agent folds the drift on turn 1 so the run completes the normal way.
+func TestRunReconcileDispatchesWhenDrifted(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "sessions"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	// PLAN.md stamped to a DEAD sha: genuine drift, a reconcile is owed.
+	os.WriteFile(planPath, []byte("<!-- Beehive-ROI: deadbeefcafe -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "drift")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	// The agent folds the drift on turn 1 by stamping PLAN.md at the ROI head, so
+	// the reconcile completes the normal way — proving the guard did NOT short-circuit.
+	mc := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if mc.sess.prompts < 1 {
+		t.Fatal("genuine drift must dispatch a session (at least one turn)")
+	}
+	if !res.Completed {
+		t.Fatalf("a drifted reconcile should complete after the fold, got %+v", res)
+	}
+}
+
 // TestRunPublishFailureBlocksCompletion guards correctness: a task that reaches
 // its terminal state LOCALLY but whose publish to main fails must NOT be reported
 // Completed (that would be a phantom DONE whose work never landed). Instead the

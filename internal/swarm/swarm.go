@@ -223,6 +223,12 @@ type Result struct {
 	// main. Callers may delete stream branch only when this is true; otherwise that
 	// branch is only remaining transcript source.
 	SessionPublished bool
+	// Skipped is true when a Reconcile selection was found already-applied at the
+	// freshest tip and short-circuited WITHOUT opening a session — the deterministic
+	// pre-dispatch dedup that keeps an already-folded ROI delta from ever spawning an
+	// agent pass (the audited reconcile_loop). SessionPublished is set alongside it so
+	// the caller reclaims the empty pre-created session branch instead of leaking it.
+	Skipped bool
 }
 
 // branchFor names the worktree branch and doc stem for a task selection.
@@ -244,6 +250,27 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	absRoot, err := filepath.Abs(r.Repo.Root)
 	if err != nil {
 		return res, err
+	}
+
+	// Pre-dispatch reconcile dedup: a reconcile whose ROI delta a peer already
+	// folded and stamped into PLAN.md is a no-op. Pull the freshest main and, reusing
+	// the reconcile prefix-match, short-circuit WITHOUT opening a session when the
+	// stamp already prefixes the ROI head — the backstop that kills the audited
+	// reconcile_loop (redundant passes burning turns/tokens re-folding the same
+	// delta). No session is opened and nothing is flipped; the skip marks
+	// SessionPublished so the caller reclaims the empty pre-created session branch
+	// instead of leaking it. Positive-only: any pull/check error or genuine drift
+	// falls through to a normal dispatch, so a legitimately-needed reconcile still runs.
+	if sel.Kind == selectt.Reconcile {
+		r.pullMainTip(ctx)
+		if done, derr := r.reconciled(sel); derr == nil && done {
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] reconcile for %s already applied at the freshest tip; skipping dispatch (no session)\n", sel.Submodule.Name)
+			}
+			res.Skipped = true
+			res.SessionPublished = true
+			return res, nil
+		}
 	}
 
 	// Only a main Work task edits the submodule repo and needs a worktree.
@@ -749,6 +776,21 @@ func (r *Runner) statusLeft(sel *selectt.Selection, from plan.Status) (bool, err
 		return false, nil
 	}
 	return t.Status != from, nil
+}
+
+// pullMainTip fast-forwards this honeybee's beehive worktree to the tracked
+// remote's main before the pre-dispatch reconcile check, so a fold a peer
+// merged and stamped after this pass started is observed and the pass is skipped
+// without spawning a session. Uses the runner's configured Remote ("" = a
+// local-only hive or a test, so there is nothing to pull). Best-effort: a
+// non-fast-forward (local commits on the branch) or any pull error leaves the
+// checkout as-is and the dedup check simply evaluates against it — the pull only
+// freshens, never blocks.
+func (r *Runner) pullMainTip(ctx context.Context) {
+	if r.Remote == "" || r.Git == nil {
+		return
+	}
+	_ = r.Git.Pull(ctx, r.Remote, "main")
 }
 
 func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
