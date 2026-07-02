@@ -173,6 +173,13 @@ func run() error {
 		SessionPublish: sessPublish, SessionPush: sessPush,
 		RestoreConfig: restoreRemotes,
 		TurnTimeout:   time.Duration(c.TurnTimeoutMinutes) * time.Minute,
+		// Model routing (honeybee-model-routing): the strong model plus the optional
+		// cheap model trivial kinds route to, and the no-forward-progress cap that
+		// kills an idle-churn pass early. All resolved from the layered config; a
+		// zero CheapModel / NoProgressTurns is inert (single-model, no early kill).
+		Model:         eff.Model,
+		CheapModel:    eff.CheapModel,
+		NoProgressCap: eff.NoProgressTurns,
 		// Opt-in per-pass injection trim. Deliberately an env flag rather than a
 		// config knob: the layered-config surface is owned by honeybee-model-routing,
 		// and gating here keeps the injected set byte-identical to the historical

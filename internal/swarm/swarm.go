@@ -34,9 +34,11 @@ type Session interface {
 
 // Client opens opencode sessions. Open creates a session at cwd with the given
 // system prompt but sends no message yet, so callers can start recording before
-// the (often long) first turn runs.
+// the (often long) first turn runs. model is the "provider/model" the session's
+// turns run on (the runner routes trivial kinds to a cheap model); "" lets the
+// client fall back to its configured default.
 type Client interface {
-	Open(ctx context.Context, cwd, system string) (Session, error)
+	Open(ctx context.Context, cwd, system, model string) (Session, error)
 }
 
 // Runner drives a single honeybee turn loop.
@@ -92,6 +94,23 @@ type Runner struct {
 	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
 	// backstop. 0 = no per-turn cap (tests).
 	TurnTimeout time.Duration
+
+	// Model is the strong (default) agent model "provider/model" for this pass,
+	// mirrored from the resolved config; it is passed to Client.Open. CheapModel,
+	// when set, is routed to instead for trivial near-deterministic kinds (see
+	// modelForKind) so the swarm doesn't pay top-tier cost for a status flip.
+	// CheapModel == "" (the inert default) keeps every kind on Model — a
+	// single-model host is byte-identical to before.
+	Model      string
+	CheapModel string
+
+	// NoProgressCap, when > 0, stops a pass early after this many CONSECUTIVE
+	// turns whose observable work fingerprint (progressKey: code worktree state +
+	// parsed PLAN task states + ROI stamp + docs listing) did not change — idle
+	// churn that would otherwise burn the whole turn/wall budget. The early stop
+	// is surfaced (GCMarked + Warning), never silent. 0 = disabled (inert
+	// default), so the historical MaxTurns/WallCap behavior is unchanged.
+	NoProgressCap int
 
 	// LeanInject trims the per-pass injected system prompt to only what this pass's
 	// kind acts on (trimProtocol) and defers the Work completion rule from the
@@ -237,6 +256,29 @@ func branchFor(sel *selectt.Selection) string {
 	}
 }
 
+// trivialKind reports whether a selection's kind is trivial and near-
+// deterministic enough to route to the cheap model. Only Reconcile qualifies: it
+// is a diff-scoped PLAN.md refresh that is frequently a no-op or a tiny
+// mechanical edit. Work (real code), Review/Arbitrate (judgment), and Bootstrap
+// (authoring the whole plan) stay on the strong model, so routing never
+// downgrades code or judgment work. (The redundant-reconcile case is suppressed
+// upstream by reconcile-dedup-guard; this only right-sizes a reconcile that IS
+// dispatched.)
+func trivialKind(k selectt.Kind) bool {
+	return k == selectt.Reconcile
+}
+
+// modelForKind picks the agent model for a selection: the cheap model for a
+// trivial kind when one is configured, else the strong Model. With no CheapModel
+// set (the inert default) it always returns Model, so a single-model host is
+// unchanged and no code/judgment work is ever silently downgraded.
+func (r *Runner) modelForKind(k selectt.Kind) string {
+	if r.CheapModel != "" && trivialKind(k) {
+		return r.CheapModel
+	}
+	return r.Model
+}
+
 // Run executes the loop for one selection. It claims work tasks, creates a
 // worktree (Work only), runs turns until completion or caps, and tidies up.
 func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first string) (Result, error) {
@@ -375,7 +417,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if r.LeanInject {
 		system = trimProtocol(system, sel.Kind)
 	}
-	sess, err := r.Client.Open(ctx, absRoot, system)
+	sess, err := r.Client.Open(ctx, absRoot, system, r.modelForKind(sel.Kind))
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
 	}
@@ -464,6 +506,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			_ = wg.WorktreeRemove(ctx, wtAbs)
 		}
 	}
+	// No-forward-progress tracking (see Runner.NoProgressCap). lastProgress holds
+	// the previous non-completing turn's work fingerprint; stalls counts how many
+	// consecutive turns have produced an identical fingerprint (idle churn).
+	var lastProgress string
+	stalls := 0
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
 		// Revert any change the agent made to the repo's git config (remotes) during
 		// the previous turn before doing more work. Honeybees publish via worktree
@@ -612,6 +659,35 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 			cleanup()
 			return res, nil
+		}
+		// No-forward-progress detector: after a turn that did NOT complete, compare
+		// this turn's observable work fingerprint (progressKey) to the previous
+		// turn's. NoProgressCap consecutive unchanged turns is idle churn — abandon
+		// the task for GC now instead of burning the full turn/wall budget. Bounded
+		// and surfaced (GCMarked + Warning), never a silent drop. Disabled when
+		// NoProgressCap == 0. A fingerprint error is non-fatal: skip this turn's
+		// check rather than fail an otherwise healthy run.
+		if r.NoProgressCap > 0 {
+			if key, kerr := r.progressKey(ctx, sel, wtAbs); kerr == nil {
+				if res.Turns > 1 && key == lastProgress {
+					stalls++
+					if stalls >= r.NoProgressCap {
+						res.GCMarked = true
+						res.Warning = fmt.Sprintf(
+							"no forward progress for %d consecutive turns (idle churn); abandoning task %s for GC at turn %d",
+							r.NoProgressCap, taskID(sel), res.Turns)
+						if ferr := finish(res.Warning); ferr != nil {
+							cleanup()
+							return res, ferr
+						}
+						cleanup()
+						return res, nil
+					}
+				} else {
+					stalls = 0
+				}
+				lastProgress = key
+			}
 		}
 		if r.now().After(deadline) {
 			break
@@ -816,6 +892,62 @@ func (r *Runner) docPresent(sel *selectt.Selection, branch string) (bool, error)
 
 func pathHasPrefix(name, stem string) bool {
 	return len(name) >= len(stem) && name[:len(stem)] == stem
+}
+
+// progressKey fingerprints the observable work state a turn can change, so the
+// no-forward-progress detector (Runner.NoProgressCap) can tell an idle-churn
+// turn from one that actually advanced the task. It deliberately EXCLUDES the
+// per-turn heartbeat: the runner re-stamps session=/heartbeat= on the task line
+// every turn for task-bearing kinds, so hashing raw PLAN.md would never look
+// idle. It captures only durable signals:
+//
+//   - the code worktree HEAD + `git status --porcelain` (Work only; wtAbs == ""
+//     for beehive-layer kinds), so a new commit or working-tree edit registers;
+//   - the parsed PLAN task id:status pairs (NOT raw bytes), which move only on a
+//     real state transition, plus the ROI stamp a reconcile advances;
+//   - the sorted submodule docs/ listing, so a new change/rejection doc counts.
+//
+// A read/parse error is returned so the caller SKIPS detection that turn rather
+// than mistaking a transient failure for "no progress".
+func (r *Runner) progressKey(ctx context.Context, sel *selectt.Selection, wtAbs string) (string, error) {
+	var parts []string
+	// Code worktree state (Work only). git.New(wtAbs) runs git rooted at the
+	// honeybee's code worktree, not the shared submodule checkout.
+	if wtAbs != "" {
+		cg := git.New(wtAbs)
+		head, err := cg.RevParse(ctx, "HEAD")
+		if err != nil {
+			return "", err
+		}
+		status, err := cg.Run(ctx, "status", "--porcelain")
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, "head="+head, "status="+strings.TrimSpace(status))
+	}
+	// PLAN task states + ROI stamp — durable content only, excluding the
+	// session/heartbeat metadata the heartbeat rewrites each turn.
+	if b, err := os.ReadFile(sel.Submodule.PlanPath()); err == nil {
+		p, perr := plan.Parse(string(b))
+		if perr != nil {
+			return "", perr
+		}
+		parts = append(parts, "roi="+p.ROI)
+		for _, t := range p.Tasks {
+			parts = append(parts, "task="+t.ID+":"+string(t.Status))
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	// Submodule docs listing (os.ReadDir returns entries sorted by name).
+	if ents, err := os.ReadDir(filepath.Join(sel.Submodule.Path, "docs")); err == nil {
+		for _, e := range ents {
+			parts = append(parts, "doc="+e.Name())
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	return strings.Join(parts, "\n"), nil
 }
 
 // taskID is the stable id used in the change-doc stem and Context preamble.

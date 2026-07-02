@@ -44,8 +44,9 @@ type Opencode struct {
 // opencode takes the cwd from the ?directory= query, not a body field) under the
 // given system prompt, WITHOUT sending a first message. The caller drives turns
 // via Session.Prompt, which lets a recorder start before the first (often long)
-// turn.
-func (o *Opencode) Open(ctx context.Context, dir, system string) (Session, error) {
+// turn. model is the "provider/model" this session's turns run on; "" falls back
+// to o.Model, so a caller that does not route per-session behaves as before.
+func (o *Opencode) Open(ctx context.Context, dir, system, model string) (Session, error) {
 	body := map[string]any{
 		"agent": "build", // primary agent that can edit/run, not read-only chat
 		// auto-approve all tool actions so the honeybee runs autonomously
@@ -60,14 +61,15 @@ func (o *Opencode) Open(ctx context.Context, dir, system string) (Session, error
 	if created.ID == "" {
 		return nil, fmt.Errorf("opencode: empty session id")
 	}
-	return &ocSession{oc: o, id: created.ID, dir: dir, system: system}, nil
+	return &ocSession{oc: o, id: created.ID, dir: dir, system: system, model: model}, nil
 }
 
 // NewSession creates a session and sends the first prompt, returning its reply.
 // Convenience for callers that don't record the first turn (e.g. the editor,
-// which reads the changed file from disk rather than the opencode transcript).
+// which reads the changed file from disk rather than the opencode transcript). It
+// runs on o.Model (no per-session routing).
 func (o *Opencode) NewSession(ctx context.Context, dir, system, first string) (Session, string, error) {
-	s, err := o.Open(ctx, dir, system)
+	s, err := o.Open(ctx, dir, system, o.Model)
 	if err != nil {
 		return nil, "", err
 	}
@@ -105,6 +107,7 @@ type ocSession struct {
 	id     string
 	dir    string
 	system string
+	model  string // per-session "provider/model"; "" falls back to oc.Model
 }
 
 // Messages returns the full ordered message history of the session, including
@@ -163,7 +166,13 @@ func (s *ocSession) Messages(ctx context.Context) ([]Message, error) {
 // per-turn timeout / WallCap) bounds the wait and poll errors are surfaced, never
 // swallowed.
 func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
-	prov, model, _ := strings.Cut(s.oc.Model, "/")
+	// Per-session model when the runner routed one (e.g. a cheap model for a
+	// trivial kind); otherwise the server's configured default o.Model.
+	full := s.model
+	if full == "" {
+		full = s.oc.Model
+	}
+	prov, model, _ := strings.Cut(full, "/")
 	body := map[string]any{
 		"agent":  "build",
 		"system": s.system,

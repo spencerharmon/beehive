@@ -3,6 +3,7 @@ package swarm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,11 +20,15 @@ import (
 type mockClient struct {
 	sess      *mockSession
 	gotSystem *string // when set, records the system prompt Open was given
+	gotModel  *string // when set, records the model Open was dispatched with
 }
 
-func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+func (m *mockClient) Open(ctx context.Context, cwd, system, model string) (Session, error) {
 	if m.gotSystem != nil {
 		*m.gotSystem = system
+	}
+	if m.gotModel != nil {
+		*m.gotModel = model
 	}
 	if m.sess == nil {
 		m.sess = &mockSession{}
@@ -255,7 +260,7 @@ type scriptClient struct {
 	calls    int
 }
 
-func (c *scriptClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+func (c *scriptClient) Open(ctx context.Context, cwd, system, model string) (Session, error) {
 	return &scriptSession{c: c}, nil
 }
 
@@ -611,7 +616,7 @@ func TestReviewCompletesOnStatusChange(t *testing.T) {
 // that contract at the runner level.
 type gateClient struct{ sess *gateSession }
 
-func (c *gateClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+func (c *gateClient) Open(ctx context.Context, cwd, system, model string) (Session, error) {
 	return c.sess, nil
 }
 
@@ -702,7 +707,7 @@ func TestCompletionWaitsForTurnIdle(t *testing.T) {
 // a stalled opencode call.
 type blockingClient struct{}
 
-func (blockingClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+func (blockingClient) Open(ctx context.Context, cwd, system, model string) (Session, error) {
 	return blockingSession{}, nil
 }
 
@@ -995,5 +1000,190 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// TestModelForKindRouting proves the model router: with a cheap model configured,
+// only the trivial kind (Reconcile) routes to it while every code/judgment/
+// bootstrap kind stays on the strong model; with no cheap model set (the inert
+// default) every kind stays on the strong model so a single-model host never
+// downgrades code or judgment work.
+func TestModelForKindRouting(t *testing.T) {
+	routed := &Runner{Model: "strong/model", CheapModel: "cheap/model"}
+	cases := []struct {
+		kind selectt.Kind
+		want string
+	}{
+		{selectt.Reconcile, "cheap/model"},  // trivial, near-deterministic -> cheap
+		{selectt.Work, "strong/model"},      // real code -> strong (never downgraded)
+		{selectt.Review, "strong/model"},    // judgment -> strong
+		{selectt.Arbitrate, "strong/model"}, // judgment -> strong
+		{selectt.Bootstrap, "strong/model"}, // authors the whole plan -> strong
+	}
+	for _, c := range cases {
+		if got := routed.modelForKind(c.kind); got != c.want {
+			t.Errorf("modelForKind(%s) = %q, want %q", c.kind, got, c.want)
+		}
+	}
+	// Inert default: no cheap model => every kind (even the trivial one) stays on
+	// the strong model, byte-identical to the pre-feature single-model host.
+	inert := &Runner{Model: "strong/model"}
+	for _, k := range []selectt.Kind{selectt.Reconcile, selectt.Work, selectt.Review, selectt.Arbitrate, selectt.Bootstrap} {
+		if got := inert.modelForKind(k); got != "strong/model" {
+			t.Errorf("inert modelForKind(%s) = %q, want strong/model (no cheap routing configured)", k, got)
+		}
+	}
+}
+
+// TestRunDispatchesStrongModelForWork proves the routed model actually reaches
+// Client.Open: a Work task (real code) opens its session on the STRONG model even
+// when a cheap model is configured, so code work is never downgraded.
+func TestRunDispatchesStrongModelForWork(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	var gotModel string
+	cl := &mockClient{gotModel: &gotModel, sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Model: "strong/model", CheapModel: "cheap/model"}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if gotModel != "strong/model" {
+		t.Fatalf("Work dispatched on %q, want strong/model (code work must not be downgraded)", gotModel)
+	}
+}
+
+// TestRunDispatchesCheapModelForReconcile proves a trivial-kind pass (Reconcile)
+// opens its session on the CHEAP model. The pass does not reach completion here
+// (no ROI stamp is written), so it runs its one turn and hits the cap — but the
+// model the session was opened with is the assertion.
+func TestRunDispatchesCheapModelForReconcile(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\nbuild it\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+
+	var gotModel string
+	cl := &mockClient{gotModel: &gotModel}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 1, WallCap: time.Hour, TTL: time.Hour,
+		Model: "strong/model", CheapModel: "cheap/model"}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if gotModel != "cheap/model" {
+		t.Fatalf("Reconcile dispatched on %q, want cheap/model (trivial kind routes cheap)", gotModel)
+	}
+}
+
+// TestNoForwardProgressKillsPassEarly proves the no-progress detector: a Work
+// pass whose agent does nothing (no code edit, no PLAN status change, no doc)
+// produces an identical work fingerprint every turn, so with NoProgressCap set the
+// run is abandoned for GC EARLY — well before MaxTurns — with a surfaced warning,
+// instead of burning the whole turn/wall budget. It also proves the per-turn
+// heartbeat churn (which rewrites session=/heartbeat= on the task line every turn)
+// is excluded from the fingerprint; otherwise the pass would never look idle.
+func TestNoForwardProgressKillsPassEarly(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.MkdirAll(filepath.Join(sm, "repo"), 0o755)
+	gitInit(t, filepath.Join(sm, "repo"))
+	os.WriteFile(filepath.Join(sm, "repo", "f"), []byte("x"), 0o644)
+	git.New(filepath.Join(sm, "repo")).Commit(context.Background(), "base")
+	os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	// A no-op agent: Prompt does nothing, so nothing observable changes turn to turn.
+	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 20, WallCap: time.Hour, TTL: time.Hour,
+		NoProgressCap: 2}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("a no-progress early stop must not be a fatal error, got: %v", err)
+	}
+	if !res.GCMarked {
+		t.Fatalf("a stalled pass must be GC-marked, got %+v", res)
+	}
+	if res.Turns >= 20 {
+		t.Fatalf("no-progress pass burned the full budget (turns=%d); it must stop early", res.Turns)
+	}
+	if !contains(res.Warning, "no forward progress") {
+		t.Fatalf("the early stop must be surfaced with a no-progress warning, got %q", res.Warning)
+	}
+}
+
+// TestNoForwardProgressAllowsProgressingPass guards the other side: a pass that
+// makes real progress every turn (a new doc each turn) must NEVER be falsely
+// killed by the detector — the stall counter resets on any observable change — so
+// the pass runs to a normal completion. This is the "never a silent drop of
+// in-flight work" caveat.
+func TestNoForwardProgressAllowsProgressingPass(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		// Distinct progress every turn (a new doc), so the fingerprint changes and
+		// the stall counter keeps resetting even with a tight NoProgressCap.
+		os.WriteFile(filepath.Join(sm, "docs", fmt.Sprintf("progress-%d.md", turn)), []byte("x"), 0o644)
+		if turn >= 3 { // then finish normally
+			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		}
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 10, WallCap: time.Hour, TTL: time.Hour,
+		NoProgressCap: 2}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed || res.GCMarked {
+		t.Fatalf("a progressing pass must complete, not be killed by the no-progress detector: %+v", res)
 	}
 }

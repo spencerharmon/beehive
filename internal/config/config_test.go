@@ -15,6 +15,11 @@ func TestDefaults(t *testing.T) {
 	if c.AgentCmd != "opencode" || c.TTLMinutes != 60 || c.MaxTurns != 15 || c.RejectLimit != 3 || c.TurnTimeoutMinutes != 60 {
 		t.Fatalf("bad defaults: %+v", c)
 	}
+	// Model-routing knobs are inert by default: no cheap-model routing and no
+	// no-progress cap, so a single-model host behaves exactly as before.
+	if c.CheapModel != "" || c.NoProgressTurns != 0 {
+		t.Fatalf("model-routing knobs must default to unset (inert), got CheapModel=%q NoProgressTurns=%d", c.CheapModel, c.NoProgressTurns)
+	}
 }
 
 func write(t *testing.T, path, body string) {
@@ -125,6 +130,47 @@ func TestResolveNoSubmoduleLayer(t *testing.T) {
 	}
 	if c2.Model != "global/model" {
 		t.Errorf("Model = %q, want global/model (missing submodule file is a no-op)", c2.Model)
+	}
+}
+
+// TestResolveModelRoutingLayering mirrors TestResolveLayering for the model-
+// routing knobs (cheap_model, no_progress_turns): each resolves with per-scope
+// precedence (submodule > global > host > default) INDEPENDENTLY and an unset
+// field falls through to the next-lower layer.
+func TestResolveModelRoutingLayering(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+
+	// Host sets both routing knobs.
+	write(t, filepath.Join(hostDir, "config.yaml"), "cheap_model: host/cheap\nno_progress_turns: 3\n")
+	// In-repo global overrides only cheap_model (no_progress_turns falls through).
+	write(t, filepath.Join(root, "config.yaml"), "cheap_model: global/cheap\n")
+	// Per-submodule x overrides only no_progress_turns (cheap_model falls through to global).
+	write(t, filepath.Join(root, "submodules", "x", "config.yaml"), "no_progress_turns: 9\n")
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CheapModel != "global/cheap" {
+		t.Errorf("CheapModel = %q, want global/cheap (global overrides host; submodule unset falls through)", c.CheapModel)
+	}
+	if c.NoProgressTurns != 9 {
+		t.Errorf("NoProgressTurns = %d, want 9 (submodule overrides host)", c.NoProgressTurns)
+	}
+
+	// A submodule with no override file: cheap_model still resolves to global, and
+	// no_progress_turns falls all the way through to the host layer.
+	c2, err := Resolve(root, "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.CheapModel != "global/cheap" {
+		t.Errorf("CheapModel = %q, want global/cheap (global wins, no submodule override)", c2.CheapModel)
+	}
+	if c2.NoProgressTurns != 3 {
+		t.Errorf("NoProgressTurns = %d, want 3 (host falls through; global+submodule unset)", c2.NoProgressTurns)
 	}
 }
 

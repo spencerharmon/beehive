@@ -47,22 +47,35 @@ const fileName = "config.yaml"
 // Config is the parsed beehive config. Zero-valued fields are treated as "unset"
 // when layering (see merge): a layer only overrides the fields it actually sets.
 type Config struct {
-	Dir          string  `yaml:"-"`
-	GPGHome      string  `yaml:"gpg_home"`      // dir containing the keyring
-	GPGRecipient string  `yaml:"gpg_recipient"` // recipient for SECRETS.yaml.gpg
-	AgentCmd     string  `yaml:"agent_cmd"`     // opencode binary
-	AgentURL     string  `yaml:"agent_url"`     // opencode server base URL
-	Model        string  `yaml:"model"`         // provider/model for opencode
-	Temperature  float64 `yaml:"temperature"`   // sampling temperature for the agent model
-	MaxTokens    int     `yaml:"max_tokens"`    // max output tokens per turn (0 = backend default)
-	TTLMinutes   int     `yaml:"ttl_minutes"`   // GC heartbeat TTL
-	MaxTurns     int     `yaml:"max_turns"`     // per-honeybee turn cap
-	RejectLimit  int     `yaml:"reject_limit"`  // rejections before NEEDS-HUMAN
+	Dir          string `yaml:"-"`
+	GPGHome      string `yaml:"gpg_home"`      // dir containing the keyring
+	GPGRecipient string `yaml:"gpg_recipient"` // recipient for SECRETS.yaml.gpg
+	AgentCmd     string `yaml:"agent_cmd"`     // opencode binary
+	AgentURL     string `yaml:"agent_url"`     // opencode server base URL
+	Model        string `yaml:"model"`         // provider/model for opencode (the strong/default model)
+	// CheapModel, when set, is the provider/model routed to for trivial,
+	// near-deterministic passes (reconcile no-ops / tiny mechanical edits) so the
+	// swarm doesn't pay top-tier cost for a status flip; the strong Model still
+	// runs real code/judgment work. Unset ("") keeps every kind on Model — an
+	// inert default that leaves a single-model host byte-identical to today.
+	CheapModel  string  `yaml:"cheap_model"`
+	Temperature float64 `yaml:"temperature"`  // sampling temperature for the agent model
+	MaxTokens   int     `yaml:"max_tokens"`   // max output tokens per turn (0 = backend default)
+	TTLMinutes  int     `yaml:"ttl_minutes"`  // GC heartbeat TTL
+	MaxTurns    int     `yaml:"max_turns"`    // per-honeybee turn cap
+	RejectLimit int     `yaml:"reject_limit"` // rejections before NEEDS-HUMAN
 	// TurnTimeoutMinutes bounds a single agent turn (one opencode call). A stalled
 	// session is canceled at this cap so the honeybee abandons the task for GC
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+	// NoProgressTurns, when > 0, stops a pass early after this many CONSECUTIVE
+	// turns that produce no observable forward progress (no change to the code
+	// worktree, the parsed PLAN task states, the ROI stamp, or the docs listing) —
+	// idle churn that would otherwise burn the whole turn/wall budget. The early
+	// stop is surfaced (a recorded warning + GC), never a silent drop. 0 =
+	// disabled (inert default; only MaxTurns/TurnTimeout/WallCap bound the run).
+	NoProgressTurns int `yaml:"no_progress_turns"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -125,6 +138,9 @@ func merge(base, over Config) Config {
 	if over.Model != "" {
 		out.Model = over.Model
 	}
+	if over.CheapModel != "" {
+		out.CheapModel = over.CheapModel
+	}
 	if over.Temperature != 0 {
 		out.Temperature = over.Temperature
 	}
@@ -142,6 +158,9 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	if over.NoProgressTurns != 0 {
+		out.NoProgressTurns = over.NoProgressTurns
 	}
 	return out
 }
