@@ -183,6 +183,12 @@ func run() error {
 		// rationale as LeanInject; off keeps the per-turn prompt byte-identical to the
 		// historical bare "continue"/lean-hint and skips the extra session poll.
 		LeanContext: os.Getenv("BEEHIVE_LEAN_CONTEXT") == "1",
+		// Opt-in precomputed task brief on a Work dispatch (resolved worktree/branch/
+		// pointer + deterministic doc-path/commit-stamp + the task card + head
+		// excerpts of the task's own files) so the agent skips discovery plumbing and
+		// a whole-tree scan. Same env-flag rationale as LeanInject; off keeps the
+		// injected preamble byte-identical to the historical path.
+		LeanBrief: os.Getenv("BEEHIVE_LEAN_BRIEF") == "1",
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {

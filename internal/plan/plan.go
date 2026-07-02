@@ -195,6 +195,22 @@ func (p *Plan) String() string {
 	return b.String()
 }
 
+// Card renders this task's PLAN.md card — its H2 header line plus its body —
+// exactly as Plan.String() emits it. The runner injects the card verbatim in the
+// precomputed honeybee brief so the agent gets its task definition without
+// re-reading and re-parsing PLAN.md. It reuses the canonical header serialization,
+// so there is one source of truth for the card format.
+func (t *Task) Card() string {
+	var b strings.Builder
+	b.WriteString(t.header())
+	b.WriteByte('\n')
+	if len(t.Body) > 0 {
+		b.WriteString(strings.Join(t.Body, "\n"))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 func (t *Task) header() string {
 	meta := fmt.Sprintf("attempts=%d deps=%s", t.Attempts, strings.Join(t.Deps, ","))
 	if t.Weight > 1 {

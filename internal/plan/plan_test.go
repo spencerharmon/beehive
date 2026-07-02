@@ -47,6 +47,32 @@ func TestParseRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCard proves Task.Card() renders a task's H2 header + body exactly as
+// Plan.String() emits that task (single source of truth for the card format the
+// runner injects in the honeybee brief).
+func TestCard(t *testing.T) {
+	p, err := Parse(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2 := p.Task("t2")
+	card := t2.Card()
+	if !strings.HasPrefix(card, "## t2 [TODO] <!--") {
+		t.Fatalf("card missing canonical header: %q", card)
+	}
+	// The card is exactly the slice Plan.String() emits for this task: its header
+	// line plus its body, each newline-terminated.
+	want := t2.header() + "\n" + strings.Join(t2.Body, "\n") + "\n"
+	if card != want {
+		t.Fatalf("card mismatch:\n%q\nvs\n%q", card, want)
+	}
+	// A body-less task renders just the header line.
+	bare := (&Task{ID: "z", Status: StatusDone}).Card()
+	if bare != "## z [DONE] <!-- attempts=0 deps= -->\n" {
+		t.Fatalf("bare card: %q", bare)
+	}
+}
+
 // TestLegacyInProgressNormalizes proves an old [IN-PROGRESS] header still loads,
 // mapped to TODO (in-progress is now session+heartbeat, not a status).
 func TestLegacyInProgressNormalizes(t *testing.T) {
