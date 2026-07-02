@@ -377,9 +377,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"operator input, run: beehive task human %[2]s %[3]s --reason \"<specific blocker and exact input needed>\". "+
 				"Use exact status NEEDS-HUMAN; never write HUMAN-NEEDED.\n\n",
 			r.Session, smName, sel.Task.ID)
-		// Told once: the mandated host build/test invocation (same map the runner
-		// exports into the agent's shell env), so the agent never re-derives the
-		// broken-linker / quota-tmp fix. Empty when unconfigured -> byte-identical.
+		// Told once: the mandated host build/test invocation, rendered from the SAME
+		// BuildEnv the runner exports, so the agent never re-derives the
+		// broken-linker / quota-tmp fix. The agent's shell is a sibling (opencode)
+		// process that does NOT inherit this process's env, so this preamble line —
+		// which instructs the agent to PREFIX its Go commands — is the lever that
+		// reaches it. Empty when unconfigured -> byte-identical.
 		preamble += buildEnvLine(r.BuildEnv)
 	}
 	first = preamble + first
@@ -394,9 +397,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if r.LeanInject {
 		system = trimProtocol(system, sel.Kind)
 	}
-	// Export the resolved host build/test env into this process so the tool
-	// subprocesses the agent's shell launches inherit the mandated invocation
-	// (same map stated once in the preamble above). No-op when unconfigured.
+	// Export the resolved host build/test env into THIS (honeybee) process so any
+	// build/test subprocess the honeybee itself spawns inherits the mandated
+	// invocation. opencode runs as a separate server, so its bash tool does NOT
+	// inherit this env — the told-once preamble line above is what reaches the
+	// agent's own commands. Rendered from the same map, so the two never drift.
+	// No-op when unconfigured.
 	if err := r.exportBuildEnv(); err != nil {
 		return res, err
 	}
@@ -707,22 +713,25 @@ func (r *Runner) exportBuildEnv() error {
 }
 
 // buildEnvLine renders the told-once build/test invocation from the resolved
-// build env for the injected preamble, so the agent is told the mandated env
-// ONCE rather than rediscovering the broken-linker / quota-tmp fix every session.
-// It is sourced from the SAME map exportBuildEnv exports, so the stated line and
-// the exported process env can never drift. An empty/nil map returns "" so the
-// preamble stays byte-identical to the historical path; keys are sorted so the
-// line is deterministic.
+// build env for the injected preamble: the agent is told the mandated env ONCE
+// (and instructed to PREFIX its Go commands with it) rather than rediscovering
+// the broken-linker / quota-tmp fix every session. Because the agent's shell is
+// a sibling (opencode) process that does not inherit the honeybee's exported
+// env, this line is the channel that reaches the agent's own commands; it is
+// rendered from the SAME map exportBuildEnv uses, so the stated and exported
+// values can never drift. An empty/nil map returns "" so the preamble stays
+// byte-identical to the historical path; keys are sorted so the line is
+// deterministic.
 func buildEnvLine(env map[string]string) string {
 	if len(env) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("Build/test env for this host is already exported into your shell — use it, do not re-derive or override it:")
+	b.WriteString("Build/test environment mandated for this host (static build + tmp/cache redirected off the broken linker) — do NOT re-derive it. Prefix every Go build/test command with:")
 	for _, k := range sortedKeys(env) {
 		fmt.Fprintf(&b, " %s=%s", k, env[k])
 	}
-	b.WriteString(". Prefix go build/test invocations with this environment.\n\n")
+	b.WriteString(" — e.g. prepend it to run go test ./... . Use these values verbatim; do not rediscover CGO/tmp/cache flags.\n\n")
 	return b.String()
 }
 
