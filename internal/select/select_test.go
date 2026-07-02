@@ -363,3 +363,141 @@ func TestReconcilePrefixStampNoDrift(t *testing.T) {
 		t.Fatalf("short prefix stamp must read as no-drift, got range %q", rng)
 	}
 }
+
+// submoduleNamed resolves a submodule by name from a fresh repo open (its ROIStamp
+// reads PLAN.md live, so callers see the current on-disk stamp).
+func submoduleNamed(t *testing.T, root, name string) repo.Submodule {
+	t.Helper()
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	for _, s := range subs {
+		if s.Name == name {
+			return s
+		}
+	}
+	t.Fatalf("submodule %q not found", name)
+	return repo.Submodule{}
+}
+
+// TestSelectPullsFreshMainSuppressesReconcile proves refreshMain fixes the audited
+// reconcile_loop: a peer folds+publishes the ROI delta, but this process's LOCAL
+// main still shows the drift (fetched but never fast-forwarded). Select must pull
+// the tracked tip FIRST, see the already-applied stamp, and proceed to Work
+// instead of re-dispatching the folded reconcile.
+func TestSelectPullsFreshMainSuppressesReconcile(t *testing.T) {
+	ctx := context.Background()
+	_, g, root := hive(t)
+	// C1: PLAN stamped at a dead sha -> drift.
+	sub(root, "a", map[string]string{
+		"ROI.md":  "x",
+		"PLAN.md": "<!-- Beehive-ROI: dead -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	g.Commit(ctx, "seed stale")
+	c1, err := g.Head(ctx)
+	if err != nil {
+		t.Fatalf("head c1: %v", err)
+	}
+	head, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+
+	// Bare origin; publish C1, then a peer's fold C2 (PLAN stamped at the ROI head).
+	origin := t.TempDir()
+	if _, err := git.New(origin).Run(ctx, "init", "--bare", "-b", "main", "."); err != nil {
+		t.Fatalf("bare origin: %v", err)
+	}
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatalf("remote add: %v", err)
+	}
+	if err := g.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push c1: %v", err)
+	}
+	os.WriteFile(filepath.Join(root, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "peer folds reconcile")
+	if err := g.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push c2: %v", err)
+	}
+	// Rewind local behind origin: the stale seed checkout that fetched but never FF'd.
+	if err := g.HardReset(ctx, c1); err != nil {
+		t.Fatalf("rewind: %v", err)
+	}
+
+	// Control: without pulling, the local checkout reports drift, so a Select that
+	// skipped the refresh would emit a redundant Reconcile.
+	rng, err := sel(root, g).reconcileRange(ctx, submoduleNamed(t, root, "a"))
+	if err != nil {
+		t.Fatalf("reconcileRange: %v", err)
+	}
+	if rng == "" {
+		t.Fatal("precondition: stale local checkout must show reconcile drift")
+	}
+
+	s, err := sel(root, g).Select(ctx)
+	if err != nil || s == nil {
+		t.Fatalf("sel %v %v", s, err)
+	}
+	if s.Kind != Work || s.Task.ID != "T1" {
+		t.Fatalf("pull should reveal the applied fold and select Work/T1, got %+v", s)
+	}
+}
+
+// TestSelectRefreshNonFatalBadRemote proves refreshMain is best-effort: a remote
+// that cannot be reached must not fail or block selection — Select falls through
+// to the current tree exactly as before.
+func TestSelectRefreshNonFatalBadRemote(t *testing.T) {
+	ctx := context.Background()
+	_, g, root := hive(t)
+	sub(root, "a", map[string]string{"ROI.md": "x", "PLAN.md": "placeholder\n"})
+	g.Commit(ctx, "seed")
+	head, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+	os.WriteFile(filepath.Join(root, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+	// A configured but unreachable remote: the pull errors and must be swallowed.
+	if _, err := g.Run(ctx, "remote", "add", "origin", filepath.Join(root, "does-not-exist.git")); err != nil {
+		t.Fatalf("remote add: %v", err)
+	}
+
+	s, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("unreachable remote must not fail selection: %v", err)
+	}
+	if s == nil || s.Kind != Work || s.Task.ID != "T1" {
+		t.Fatalf("want Work/T1 despite bad remote, got %+v", s)
+	}
+}
+
+// TestSelectReconcileFiresOnceNoReemit proves idempotency across two selection
+// cycles at the same stamped head (local-only, no remote): the first cycle emits
+// the Reconcile, and once the delta is folded (PLAN re-stamped at head) the second
+// cycle does NOT re-emit it — it advances to Work.
+func TestSelectReconcileFiresOnceNoReemit(t *testing.T) {
+	ctx := context.Background()
+	_, g, root := hive(t)
+	sub(root, "a", map[string]string{
+		"ROI.md":  "x",
+		"PLAN.md": "<!-- Beehive-ROI: dead -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	g.Commit(ctx, "seed stale")
+	head, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+
+	s, err := sel(root, g).Select(ctx)
+	if err != nil || s == nil {
+		t.Fatalf("cycle1 sel %v %v", s, err)
+	}
+	if s.Kind != Reconcile {
+		t.Fatalf("cycle1 must emit Reconcile for the drift, got %+v", s)
+	}
+
+	// Fold the delta: stamp PLAN.md at the ROI head, as a reconcile pass would.
+	os.WriteFile(filepath.Join(root, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "fold")
+
+	s2, err := sel(root, g).Select(ctx)
+	if err != nil || s2 == nil {
+		t.Fatalf("cycle2 sel %v %v", s2, err)
+	}
+	if s2.Kind != Work || s2.Task.ID != "T1" {
+		t.Fatalf("cycle2 must NOT re-emit Reconcile; want Work/T1, got %+v", s2)
+	}
+}

@@ -19,9 +19,11 @@ import (
 type mockClient struct {
 	sess      *mockSession
 	gotSystem *string // when set, records the system prompt Open was given
+	opened    int     // counts Open calls, so a test can assert no session spawned
 }
 
 func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	m.opened++
 	if m.gotSystem != nil {
 		*m.gotSystem = system
 	}
@@ -803,6 +805,165 @@ func TestReconciledPrefixMatch(t *testing.T) {
 				t.Fatalf("stamp %q: got reconciled=%v want %v (head %s)", c.stamp, got, c.want, head)
 			}
 		})
+	}
+}
+
+// TestRunReconcileSkipsWhenApplied proves the pre-dispatch guard: a reconcile
+// whose ROI delta is already folded into PLAN.md at the current head is a
+// deterministic no-op — Run reports Skipped, opens NO session, and surfaces the
+// reason — instead of spawning the audited zero-progress reconcile_loop.
+func TestRunReconcileSkipsWhenApplied(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	// PLAN stamped at the ROI head -> reconcile already applied.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("applied reconcile must be Skipped: %+v", res)
+	}
+	if res.Completed {
+		t.Fatalf("a skipped reconcile is a no-op, not a completion: %+v", res)
+	}
+	if mc.opened != 0 {
+		t.Fatalf("skipped reconcile must open no session, opened=%d", mc.opened)
+	}
+	if !strings.Contains(res.Warning, "already applied") {
+		t.Fatalf("skip reason should be surfaced: %q", res.Warning)
+	}
+}
+
+// TestRunReconcileDispatchesOnDrift proves the guard is scoped to genuine no-ops:
+// when PLAN.md is stamped behind the ROI head (real drift), Run DOES open a
+// session and drive the reconcile to completion.
+func TestRunReconcileDispatchesOnDrift(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	planPath := filepath.Join(sm, "PLAN.md")
+	// Stamped at a stale sha -> the reconcile is genuinely needed.
+	os.WriteFile(planPath, []byte("<!-- Beehive-ROI: deadbeefcafe -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed stale")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+
+	// The agent folds the delta: re-stamp PLAN.md at the ROI head so the reconcile
+	// completion check clears after the first turn.
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Skipped {
+		t.Fatalf("a drifted reconcile must NOT be skipped: %+v", res)
+	}
+	if !res.Completed {
+		t.Fatalf("drifted reconcile should dispatch and complete: %+v", res)
+	}
+	if cl.opened == 0 {
+		t.Fatalf("drifted reconcile must open a session")
+	}
+}
+
+// TestRunReconcilePullSuppresses proves the guard judges against the freshest
+// PUBLISHED tip, not the (stale) seed checkout selection ran on: a peer folds and
+// pushes the delta in the select->dispatch window, and Run's best-effort pull
+// reveals the applied stamp and skips — closing the race the select-side pull
+// alone can't (the seed was already chosen on a stale primary).
+func TestRunReconcilePullSuppresses(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	planPath := filepath.Join(sm, "PLAN.md")
+	// C1: stale stamp -> drift on the local seed checkout.
+	os.WriteFile(planPath, []byte("<!-- Beehive-ROI: deadbeefcafe -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed stale")
+	c1, err := g.Head(ctx)
+	if err != nil {
+		t.Fatalf("head c1: %v", err)
+	}
+	head, _ := g.LastCommit(ctx, "submodules/sm/ROI.md")
+
+	// Bare origin; publish C1, then a peer's fold C2 (PLAN stamped at the ROI head).
+	origin := t.TempDir()
+	if _, err := git.New(origin).Run(ctx, "init", "--bare", "-b", "main", "."); err != nil {
+		t.Fatalf("bare origin: %v", err)
+	}
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatalf("remote add: %v", err)
+	}
+	if err := g.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push c1: %v", err)
+	}
+	os.WriteFile(planPath, []byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "peer folds reconcile")
+	if err := g.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push c2: %v", err)
+	}
+	// Rewind local behind origin: local is the stale seed checkout, origin has the fold.
+	if err := g.HardReset(ctx, c1); err != nil {
+		t.Fatalf("rewind: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+
+	// Control: on the stale local checkout the reconcile reads as NOT applied, so a
+	// pass that skipped WITHOUT pulling would be a false negative.
+	if applied, err := (&Runner{Repo: rp, Git: g}).reconciled(sel); err != nil || applied {
+		t.Fatalf("precondition: stale local must show drift, applied=%v err=%v", applied, err)
+	}
+
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: g, Client: mc, Remote: "origin", MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("pull must reveal the peer's fold and skip: %+v", res)
+	}
+	if mc.opened != 0 {
+		t.Fatalf("skipped reconcile must open no session, opened=%d", mc.opened)
 	}
 }
 

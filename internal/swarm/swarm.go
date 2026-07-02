@@ -227,6 +227,12 @@ type Result struct {
 	Turns     int
 	GCMarked  bool
 	Lost      bool // lost the claim race; the caller should reselect another task
+	// Skipped is set when a reconcile was short-circuited pre-dispatch because its
+	// ROI delta is already folded into PLAN.md at the freshest published tip: no
+	// session was opened, nothing was written. Distinguishes a deterministic no-op
+	// (the audited reconcile_loop the runner should never have spawned) from a real
+	// completion or a GC abandonment.
+	Skipped   bool
 	Branch    string
 	SessionID string
 	Warning   string // non-empty when the run aborted (e.g. task removed on main)
@@ -252,6 +258,26 @@ func branchFor(sel *selectt.Selection) string {
 // worktree (Work only), runs turns until completion or caps, and tidies up.
 func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first string) (Result, error) {
 	res := Result{Branch: branchFor(sel)}
+
+	// Pre-dispatch reconcile idempotency guard. Selection ran on the seed process's
+	// (possibly stale) checkout; between that Select and this Run a peer can win the
+	// claim race and fold+publish the very ROI delta this reconcile targets. Re-judge
+	// against the freshest published tip HERE, right before spending a session: if
+	// PLAN.md is already stamped at (a prefix of) the current ROI head, this is the
+	// audited zero-progress reconcile_loop — report a deterministic skip and open no
+	// session. Guarded to Reconcile so Work/Bootstrap dispatch is untouched.
+	if sel.Kind == selectt.Reconcile {
+		applied, err := r.reconcileApplied(ctx, sel)
+		if err != nil {
+			return res, err
+		}
+		if applied {
+			res.Skipped = true
+			res.Warning = "reconcile already applied at published tip; skipping redundant pass"
+			return res, nil
+		}
+	}
+
 	absRoot, err := filepath.Abs(r.Repo.Root)
 	if err != nil {
 		return res, err
@@ -795,6 +821,27 @@ func (r *Runner) statusLeft(sel *selectt.Selection, from plan.Status) (bool, err
 		return false, nil
 	}
 	return t.Status != from, nil
+}
+
+// reconcileApplied reports whether this reconcile's ROI delta is already folded
+// into PLAN.md at the freshest published main. It first best-effort pulls the
+// tracked tip — selection may have run on a stale seed checkout, and a peer can
+// publish the fold in the select->dispatch window — then delegates to the same
+// prefix-stamp compare reconciled() uses at turn boundaries, so pre-dispatch and
+// mid-session agree on "done".
+//
+// The pull is non-fatal and deliberately best-effort: no remote (r.Remote == "",
+// single-host installs whose primary checkout publish already keeps current), a
+// branch diverged from origin/main, or a transient fetch failure all fall through
+// to judging the current tree — never worse than today's behavior, and --ff-only
+// can only reveal an already-applied stamp, never fabricate one. The reconciled
+// compare's own error IS surfaced, since misreading the stamp would wrongly
+// skip a needed reconcile.
+func (r *Runner) reconcileApplied(ctx context.Context, sel *selectt.Selection) (bool, error) {
+	if r.Remote != "" {
+		_ = r.Git.Pull(ctx, r.Remote, "main")
+	}
+	return r.reconciled(sel)
 }
 
 func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
