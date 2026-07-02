@@ -173,6 +173,11 @@ func run() error {
 		SessionPublish: sessPublish, SessionPush: sessPush,
 		RestoreConfig: restoreRemotes,
 		TurnTimeout:   time.Duration(c.TurnTimeoutMinutes) * time.Minute,
+		// Opt-in per-pass injection trim. Deliberately an env flag rather than a
+		// config knob: the layered-config surface is owned by honeybee-model-routing,
+		// and gating here keeps the injected set byte-identical to the historical
+		// path until a site sets BEEHIVE_LEAN_INJECT=1.
+		LeanInject: os.Getenv("BEEHIVE_LEAN_INJECT") == "1",
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {

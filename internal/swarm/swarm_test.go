@@ -17,10 +17,14 @@ import (
 
 // mockClient records prompts and lets the test drive the submodule to terminal.
 type mockClient struct {
-	sess *mockSession
+	sess      *mockSession
+	gotSystem *string // when set, records the system prompt Open was given
 }
 
 func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	if m.gotSystem != nil {
+		*m.gotSystem = system
+	}
 	if m.sess == nil {
 		m.sess = &mockSession{}
 	}
@@ -30,13 +34,17 @@ func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, err
 type mockSession struct {
 	prompts int
 	onTurn  func(turn int)
-	capture *string // when set, records the first prompt text
+	capture *string   // when set, records the first prompt text
+	all     *[]string // when set, records every prompt text in order
 }
 
 func (s *mockSession) Prompt(ctx context.Context, text string) (string, error) {
 	s.prompts++
 	if s.capture != nil && s.prompts == 1 {
 		*s.capture = text
+	}
+	if s.all != nil {
+		*s.all = append(*s.all, text)
 	}
 	if s.onTurn != nil {
 		s.onTurn(s.prompts)

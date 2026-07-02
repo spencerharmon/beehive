@@ -92,6 +92,14 @@ type Runner struct {
 	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
 	// backstop. 0 = no per-turn cap (tests).
 	TurnTimeout time.Duration
+
+	// LeanInject trims the per-pass injected system prompt to only what this pass's
+	// kind acts on (trimProtocol) and defers the Work completion rule from the
+	// up-front preamble to an at-decision-point "continue" hint (nextPrompt). Off
+	// by default so the injected set is byte-identical to the historical path; the
+	// runner flips it on from an env flag (see cmd/honeybee). The protocol is
+	// re-sent on every turn, so trimming compounds across a session.
+	LeanInject bool
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -312,19 +320,32 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"The run completes when the task leaves NEEDS-ARBITRATION. Act autonomously.\n\n",
 			smName, sel.Task.ID)
 	case selectt.Work:
+		// The completion rule (flip to NEEDS-REVIEW, commit+push with the Beehive
+		// stamp, bump the pointer) is a static "what to do at the end" dump. In lean
+		// mode it is dropped from the up-front preamble and fired instead as an
+		// at-decision-point hint on the "continue" turn where the change doc is still
+		// missing (nextPrompt); its authoritative copy still lives in the retained
+		// protocol step 4. Default (off): the full sentence stays in place, keeping
+		// the injected brief byte-identical to the historical path.
+		onComplete := ""
+		if !r.LeanInject {
+			onComplete = fmt.Sprintf(
+				"On completion of a Work task: PLAN.md -> NEEDS-REVIEW on main; commit the code on branch %[1]s "+
+					"with a `Beehive: %[2]s <doc-path>` stamp and ensure that commit is pushed to the submodule's origin; "+
+					"bump the submodule pointer.\n",
+				res.Branch, taskID(sel))
+		}
 		preamble = fmt.Sprintf(
 			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
 				"Coordination files (the beehive layer): submodules/%[1]s/ROI.md (read-only), "+
 				"submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/.\n"+
 				"Code worktree (already created and checked out for you): submodules/%[1]s/worktrees/%[2]s/ "+
 				"on branch %[2]s. Edit the submodule's CODE there; never write submodules/%[1]s/repo (the shared checkout).\n"+
-				"On completion of a Work task: PLAN.md -> NEEDS-REVIEW on main; commit the code on branch %[2]s "+
-				"with a `Beehive: %[3]s <doc-path>` stamp and ensure that commit is pushed to the submodule's origin; "+
-				"bump the submodule pointer.\n"+
+				"%[4]s"+
 				"REQUIRED change doc path: submodules/%[1]s/docs/%[2]s-%[3]s.md (the beehive layer — NOT inside the code "+
 				"worktree). The runner's completion check looks for it exactly there; a doc elsewhere reads as 'not done'.\n"+
 				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
-			smName, res.Branch, taskID(sel))
+			smName, res.Branch, taskID(sel), onComplete)
 	default: // Bootstrap, Reconcile: beehive-layer only, no code worktree.
 		preamble = fmt.Sprintf(
 			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
@@ -346,6 +367,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 
 	if r.Debug != nil {
 		fmt.Fprintf(r.Debug, "[honeybee] dir=%s submodule=%s kind=%s opening session...\n", absRoot, sel.Submodule.Name, sel.Kind)
+	}
+	// Lean mode: trim the injected protocol to only what this pass's kind acts on
+	// before opening the session. The system prompt is re-sent on EVERY turn, so
+	// trimming it once here compounds across the whole session. Off by default =
+	// the injected system is byte-identical to the historical full protocol.
+	if r.LeanInject {
+		system = trimProtocol(system, sel.Kind)
 	}
 	sess, err := r.Client.Open(ctx, absRoot, system)
 	if err != nil {
@@ -588,7 +616,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if r.now().After(deadline) {
 			break
 		}
-		prompt = "continue"
+		prompt = r.nextPrompt(sel, res.Branch)
 	}
 	// Turn/wall cap hit: the agent never reached completion. Mirror the DONE path
 	// and reclaim the orphaned code worktree (cleanup -> wg.WorktreeRemove) so
@@ -606,6 +634,27 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	cleanup()
 	return res, nil
+}
+
+// nextPrompt is the "keep going" prompt sent on every turn after the first.
+// Default: the bare "continue" (byte-identical to the historical loop). In lean
+// mode, for a Work task whose change doc is still absent, it fires the completion
+// rule as an at-decision-point hint — the turn where the agent is most likely
+// wrapping up — instead of front-loading that static rule in the system preamble.
+// Once the doc exists (the agent is effectively done) it reverts to "continue".
+func (r *Runner) nextPrompt(sel *selectt.Selection, branch string) string {
+	if !r.LeanInject || sel.Kind != selectt.Work {
+		return "continue"
+	}
+	if present, err := r.docPresent(sel, branch); err == nil && present {
+		return "continue"
+	}
+	return fmt.Sprintf(
+		"continue. When the code change is made and tested, complete the task: write the change doc at "+
+			"EXACTLY submodules/%[1]s/docs/%[2]s-%[3]s.md, commit the code on branch %[2]s with a "+
+			"`Beehive: %[3]s <doc-path>` stamp and push it to the submodule's origin, bump the submodule "+
+			"pointer, then flip the PLAN.md task to NEEDS-REVIEW on main.",
+		sel.Submodule.Name, branch, sel.Task.ID)
 }
 
 // taskRemoved checks whether the operator deleted the plan or removed this
