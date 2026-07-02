@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -987,5 +988,155 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// TestWorkBriefPrecomputed proves a Work dispatch injects the precomputed task
+// brief: the resolved code-worktree path, branch, and the submodule base the Work
+// setup produced; the deterministic protocol choices PROVIDED rather than left
+// for the agent to derive (exact change-doc path + fully-substituted commit
+// stamp); the task's own PLAN card; and excerpts of exactly the task's Files —
+// scoped to them (a committed file NOT in Files is not pulled into the brief).
+func TestWorkBriefPrecomputed(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	// alpha + beta are named in the task's Files:; gamma is committed too but is
+	// NOT — the brief must excerpt alpha+beta and must NOT pull gamma (scoping).
+	os.WriteFile(filepath.Join(repoDir, "alpha.go"), []byte("package widget\n// ALPHA_MARKER_a1b2\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "beta.go"), []byte("package widget\n// BETA_MARKER_c3d4\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "gamma.go"), []byte("package widget\n// GAMMA_MARKER_e5f6\n"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	ctx := context.Background()
+	wantBase, err := git.New(repoDir).RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	task := plan.Task{
+		ID:     "T1",
+		Status: plan.TODO,
+		Body: []string{
+			"PRIORITY_BODY_MARKER implement the widget.",
+			"Files: alpha.go, beta.go (the two touched files).",
+			"Doc: docs/tasks/T1.md",
+		},
+	}
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: task}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Resolved handoff reused from the Work setup, not re-derived by the agent:
+	// worktree path, branch, and the base commit the worktree is on.
+	for _, want := range []string{
+		"submodules/sm/worktrees/bee-T1",
+		"Branch: bee-T1",
+		"Submodule base: " + wantBase,
+	} {
+		if !contains(firstPrompt, want) {
+			t.Fatalf("brief missing %q; got:\n%s", want, firstPrompt)
+		}
+	}
+	// Deterministic protocol choices PROVIDED (not left for the agent to derive):
+	// exact change-doc path and the fully-substituted commit stamp.
+	if !contains(firstPrompt, "submodules/sm/docs/bee-T1-T1.md") {
+		t.Fatalf("brief missing change-doc path; got:\n%s", firstPrompt)
+	}
+	if !contains(firstPrompt, "Beehive: T1 submodules/sm/docs/bee-T1-T1.md") {
+		t.Fatalf("brief missing the provided commit stamp; got:\n%s", firstPrompt)
+	}
+	// Task card, rendered from the selection (no plan re-read needed to orient).
+	if !contains(firstPrompt, "PRIORITY_BODY_MARKER") {
+		t.Fatalf("brief missing task card body; got:\n%s", firstPrompt)
+	}
+	// Scoped file excerpts: alpha+beta appear; gamma (not in Files) must not.
+	if !contains(firstPrompt, "ALPHA_MARKER_a1b2") || !contains(firstPrompt, "BETA_MARKER_c3d4") {
+		t.Fatalf("brief missing task-file excerpts; got:\n%s", firstPrompt)
+	}
+	if contains(firstPrompt, "GAMMA_MARKER_e5f6") {
+		t.Fatalf("brief pulled in a file NOT in the task's Files: (not scoped to the task); got:\n%s", firstPrompt)
+	}
+}
+
+// TestTaskFilesParsing covers the Files: parser against the real annotations the
+// PLAN.md carries: trailing periods, parenthetical notes, comma-separation, a
+// leading "new " marker, globs, "or" alternatives, prose noise that is dropped,
+// and a line wrapped across a continuation that stops at the next field.
+func TestTaskFilesParsing(t *testing.T) {
+	cases := []struct {
+		name string
+		body []string
+		want []string
+	}{
+		{
+			"plain two files, trailing period",
+			[]string{"Files: internal/git/git.go, internal/git/git_test.go."},
+			[]string{"internal/git/git.go", "internal/git/git_test.go"},
+		},
+		{
+			"parenthetical annotation ignored",
+			[]string{"Files: internal/swarm/opencode.go, internal/swarm/swarm.go (Run loop), swarm_test.go."},
+			[]string{"internal/swarm/opencode.go", "internal/swarm/swarm.go", "swarm_test.go"},
+		},
+		{
+			"prose noise dropped, dir kept",
+			[]string{"Files: internal/select/select.go, internal/links/links.go, internal/plan, commit-path guard."},
+			[]string{"internal/select/select.go", "internal/links/links.go", "internal/plan"},
+		},
+		{
+			"glob kept",
+			[]string{"Files: internal/web/templates/*.html."},
+			[]string{"internal/web/templates/*.html"},
+		},
+		{
+			"new marker stripped",
+			[]string{"Files: new internal/artifacts/*, internal/web/web.go, internal/web/env.go."},
+			[]string{"internal/artifacts/*", "internal/web/web.go", "internal/web/env.go"},
+		},
+		{
+			"alternatives take leading token, bare word dropped",
+			[]string{"Files: internal/web or internal/swarm (session store + startup prune), internal/git, tests."},
+			[]string{"internal/web", "internal/git"},
+		},
+		{
+			"wrapped continuation joined, stops at next field",
+			[]string{
+				"Files: internal/swarm (brief assembly + injection; reuse the resolved worktree/branch/pointer the Work",
+				"setup already computes), swarm_test.go.",
+				"Doc: docs/tasks/honeybee-task-brief.md",
+			},
+			[]string{"internal/swarm", "swarm_test.go"},
+		},
+		{
+			"no files line",
+			[]string{"PRIORITY do a thing.", "Doc: docs/tasks/x.md"},
+			nil,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := taskFiles(c.body)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("taskFiles(%#v) = %#v, want %#v", c.body, got, c.want)
+			}
+		})
 	}
 }

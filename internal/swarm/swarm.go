@@ -325,6 +325,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"worktree). The runner's completion check looks for it exactly there; a doc elsewhere reads as 'not done'.\n"+
 				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
 			smName, res.Branch, taskID(sel))
+		// Precomputed brief: the resolved worktree/branch/base, the deterministic
+		// protocol choices (doc path + commit stamp), the task card, and excerpts of
+		// exactly the task's files — so the agent skips discovery plumbing and a tree
+		// scan. Reuses the worktree the Work setup just created (wtAbs/res.Branch).
+		preamble += r.workBrief(ctx, sel, wtAbs, res.Branch)
 	default: // Bootstrap, Reconcile: beehive-layer only, no code worktree.
 		preamble = fmt.Sprintf(
 			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
