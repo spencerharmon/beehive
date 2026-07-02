@@ -989,3 +989,107 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// TestWorkBriefPrecomputedAndScoped proves the runner injects a precomputed task
+// brief for a Work dispatch that (a) hands the agent the mechanics it would
+// otherwise re-derive — the resolved code-worktree path, branch, and the
+// submodule pointer + tracked tip the setup already resolved; (b) PROVIDES the
+// deterministic protocol values (the exact change-doc path and the verbatim
+// commit stamp) rather than leaving them for the agent to compute; (c) inlines
+// the task's own PLAN card; and (d) scopes the working-set excerpts to the files
+// the task's `Files:` line names — a file present in the worktree but NOT named
+// is deliberately excluded, proving the brief targets the task's files and not
+// the whole tree.
+func TestWorkBriefPrecomputedAndScoped(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	ctx := context.Background()
+
+	// A submodule with a real origin so the pointer + tracked tip render with a
+	// concrete sha. Two files land in the checkout: one the task names (in scope)
+	// and one it does not (out of scope) — each with a unique marker so we can
+	// prove exactly which one the brief injects.
+	origin := t.TempDir()
+	og := gitInit(t, origin)
+	os.WriteFile(filepath.Join(origin, "wanted.go"), []byte("package p\n// MARKER_WANTED orient here\n"), 0o644)
+	os.WriteFile(filepath.Join(origin, "unrelated.go"), []byte("package p\n// MARKER_UNRELATED must not be injected\n"), 0o644)
+	if err := og.Commit(ctx, "base"); err != nil {
+		t.Fatalf("origin base: %v", err)
+	}
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	originTip, err := og.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("origin tip: %v", err)
+	}
+
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	// The selection carries the task's real body, including the free-form `Files:`
+	// line (parenthetical note included, to prove it is stripped) that scopes the
+	// working set. `swarm_test.go` is named but absent from this checkout, proving
+	// a named-but-missing file degrades gracefully rather than injecting anything.
+	task := plan.Task{
+		ID: "T1", Status: plan.TODO, Weight: 128,
+		Body: []string{
+			"Do the thing.",
+			"Files: wanted.go (the file to change), swarm_test.go.",
+			"Doc: docs/tasks/x.md",
+		},
+	}
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: task}
+
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	cl.sess.capture = &firstPrompt
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// (a) The runner-resolved mechanics: worktree path, branch, and the pointer +
+	// tracked-tip lines (both carrying the concrete origin sha).
+	for _, want := range []string{
+		"submodules/sm/worktrees/bee-T1",            // resolved code worktree
+		"Branch: bee-T1",                            // branch name
+		"Submodule pointer / worktree base commit:", // pointer line label
+		"Tracked-branch tip (submodule origin):",    // tracked-tip line label
+		originTip,                                   // the concrete pointer/tip sha
+	} {
+		if !contains(firstPrompt, want) {
+			t.Fatalf("brief missing %q; got:\n%s", want, firstPrompt)
+		}
+	}
+	// (b) The deterministic protocol values are PROVIDED, not left to derive.
+	if !contains(firstPrompt, "submodules/sm/docs/bee-T1-T1.md") {
+		t.Fatalf("brief missing the mandated change-doc path; got:\n%s", firstPrompt)
+	}
+	if !contains(firstPrompt, "Beehive: T1 submodules/sm/docs/bee-T1-T1.md") {
+		t.Fatalf("brief missing the verbatim commit stamp; got:\n%s", firstPrompt)
+	}
+	// (c) The task's own PLAN card is inlined (so the agent need not reopen PLAN.md).
+	if !contains(firstPrompt, "## T1 [TODO]") || !contains(firstPrompt, "weight=128") {
+		t.Fatalf("brief missing the task card; got:\n%s", firstPrompt)
+	}
+	// (d) Scoped working set: the named file's excerpt is injected…
+	if !contains(firstPrompt, "MARKER_WANTED") {
+		t.Fatalf("brief missing the in-scope task-file excerpt; got:\n%s", firstPrompt)
+	}
+	// …while a file that exists in the worktree but is NOT named is excluded —
+	// the brief targets the task's Files, not the whole tree.
+	if contains(firstPrompt, "MARKER_UNRELATED") {
+		t.Fatalf("brief leaked a non-task file into the working set; got:\n%s", firstPrompt)
+	}
+}

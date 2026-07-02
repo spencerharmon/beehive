@@ -242,6 +242,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
 	var wg *git.Repo
 	var wtAbs string
+	// Resolved once by the Work setup and reused verbatim in the injected task
+	// brief so the agent never re-derives them: the worktree's base commit (the
+	// submodule pointer this pass branched from) and the tracked-branch tip the
+	// checkout was synced to ("" when there is no submodule remote).
+	var basePointer, trackedTip string
 	if sel.Kind == selectt.Work {
 		// Absolute paths rooted at THIS honeybee's worktree (absRoot). A fresh
 		// `git worktree add` of the beehive repo does NOT populate submodules, so
@@ -271,11 +276,18 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// recorded pointer. Advancing the beehive pointer to the synced tip is
 		// automatic (no review). A no-remote install (and most tests) keeps the
 		// recorded pointer and branches off HEAD as before.
-		if err := r.syncWorktreeBase(ctx, wg, sel.Submodule, absRoot); err != nil {
+		tip, err := r.syncWorktreeBase(ctx, wg, sel.Submodule, absRoot)
+		if err != nil {
 			return res, err
 		}
+		trackedTip = tip
 		if err := wg.WorktreeAdd(ctx, wtAbs, res.Branch, "HEAD"); err != nil {
 			return res, fmt.Errorf("worktree add: %w", err)
+		}
+		// The commit the worktree branches from — the submodule pointer for this
+		// pass. Best-effort: an unresolved base only leaves that brief line blank.
+		if p, perr := wg.RevParse(ctx, "HEAD"); perr == nil {
+			basePointer = p
 		}
 	}
 
@@ -341,6 +353,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"operator input, run: beehive task human %[2]s %[3]s --reason \"<specific blocker and exact input needed>\". "+
 				"Use exact status NEEDS-HUMAN; never write HUMAN-NEEDED.\n\n",
 			r.Session, smName, sel.Task.ID)
+	}
+	// Precompute the Work task brief and inject it: the resolved worktree/branch/
+	// pointer/tip the setup already computed, the mandated doc path + commit stamp
+	// (answers, not formulas), the task's own PLAN card, and bounded excerpts of
+	// exactly the files the task touches — so the agent skips discovery plumbing
+	// and a whole-tree read to get its bearings. Reuses the values resolved above
+	// (no divergent re-derivation); additive to correctness (the agent may read
+	// more). Only Work carries a code worktree; other kinds get no brief.
+	if sel.Kind == selectt.Work {
+		preamble += buildWorkBrief(sel, wtAbs, res.Branch, basePointer, trackedTip).render()
 	}
 	first = preamble + first
 
@@ -801,37 +823,41 @@ func hasTask(sel *selectt.Selection) bool {
 // submodule's origin, so the bumped pointer never dangles. A no-remote checkout
 // (single-host install, most tests) is a no-op: the recorded pointer stands and
 // the worktree branches off HEAD as before.
-func (r *Runner) syncWorktreeBase(ctx context.Context, wg *git.Repo, sub repo.Submodule, absRoot string) error {
+//
+// It returns the tracked-branch tip SHA it synced to (for the injected task
+// brief), or "" when there is no remote (nothing to sync; the recorded pointer
+// stands).
+func (r *Runner) syncWorktreeBase(ctx context.Context, wg *git.Repo, sub repo.Submodule, absRoot string) (string, error) {
 	rem, err := wg.Remote(ctx)
 	if err != nil {
-		return fmt.Errorf("submodule %s remote: %w", sub.Name, err)
+		return "", fmt.Errorf("submodule %s remote: %w", sub.Name, err)
 	}
 	if rem == "" {
-		return nil // no remote: nothing to sync, keep the recorded pointer
+		return "", nil // no remote: nothing to sync, keep the recorded pointer
 	}
 	rel, err := filepath.Rel(absRoot, sub.RepoDir())
 	if err != nil {
-		return fmt.Errorf("resolve submodule %s path: %w", sub.Name, err)
+		return "", fmt.Errorf("resolve submodule %s path: %w", sub.Name, err)
 	}
 	branch := r.trackedBranch(ctx, rel)
 	if err := wg.Fetch(ctx, rem, branch); err != nil {
-		return fmt.Errorf("fetch submodule %s %s/%s: %w", sub.Name, rem, branch, err)
+		return "", fmt.Errorf("fetch submodule %s %s/%s: %w", sub.Name, rem, branch, err)
 	}
 	if err := wg.HardReset(ctx, rem+"/"+branch); err != nil {
-		return fmt.Errorf("sync submodule %s to %s/%s: %w", sub.Name, rem, branch, err)
+		return "", fmt.Errorf("sync submodule %s to %s/%s: %w", sub.Name, rem, branch, err)
 	}
 	// Advance the beehive pointer to the synced tip (no review). Commit only the
 	// gitlink path so unrelated working-tree state is untouched; ErrNothing means
 	// the recorded pointer already matched the tip (no move to commit).
 	tip, err := wg.RevParse(ctx, "HEAD")
 	if err != nil {
-		return fmt.Errorf("resolve synced %s tip: %w", sub.Name, err)
+		return "", fmt.Errorf("resolve synced %s tip: %w", sub.Name, err)
 	}
 	msg := fmt.Sprintf("beehive: sync %s worktree base to tracked tip %s", sub.Name, tip)
 	if err := r.Git.CommitPaths(ctx, msg, rel); err != nil && !errors.Is(err, git.ErrNothing) {
-		return fmt.Errorf("commit synced %s pointer: %w", sub.Name, err)
+		return "", fmt.Errorf("commit synced %s pointer: %w", sub.Name, err)
 	}
-	return nil
+	return tip, nil
 }
 
 // trackedBranch returns the submodule's tracked branch from .gitmodules
