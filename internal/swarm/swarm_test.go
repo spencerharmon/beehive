@@ -989,3 +989,115 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// originBootstrapEnv builds a beehive checkout wired to a bare origin so
+// origin/main is a real remote-tracking ref the advance-guard can fetch, laid
+// out for a Bootstrap run. The agent is expected to write+commit PLAN.md; whether
+// that reaches origin depends on the Publish closure the test installs. Returns
+// the checkout repo, repo handle, bootstrap selection, and the PLAN.md path.
+func originBootstrapEnv(t *testing.T) (*git.Repo, *repo.Repo, *selectt.Selection, string) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\nbuild it\n"), 0o644)
+	g.Commit(ctx, "seed roi")
+	// A bare origin the checkout pushes to, seeded with base main so origin/main
+	// exists as a remote-tracking ref for the guard to compare against.
+	origin := t.TempDir()
+	if _, err := git.New(origin).Run(ctx, "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("bare origin: %v", err)
+	}
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatalf("add origin: %v", err)
+	}
+	if _, err := g.Run(ctx, "push", "-q", "origin", "main"); err != nil {
+		t.Fatalf("seed origin main: %v", err)
+	}
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+	return g, rp, sel, subs[0].PlanPath()
+}
+
+// TestRunGuardsMainDidNotAdvance proves guard (2): a run whose completion check
+// passes LOCALLY and whose publish REPORTS success but does NOT actually advance
+// origin main (a local-only commit whose push never landed) must NOT report
+// Completed. Guard 1 (a returned publish error) cannot catch a nil-returning
+// no-op publish — only independently verifying that origin main carries this
+// honeybee's HEAD can. The task is left GC-marked for retry, never a phantom DONE.
+func TestRunGuardsMainDidNotAdvance(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sel, planPath := originBootstrapEnv(t)
+
+	cl := &scriptClient{}
+	cl.onPrompt = func() {
+		// Bootstrap + COMMIT the plan locally: HEAD moves ahead of origin main,
+		// exactly the local-only commit whose push may never land.
+		os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		_ = g.CommitPaths(ctx, "plan: bootstrap", "submodules/sm/PLAN.md")
+	}
+	// Publish reports success but never pushes: origin main stays at base.
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Remote:  "origin",
+		Publish: func(ctx context.Context) error { return nil },
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("main never advanced — must NOT report Completed (phantom DONE): %+v", res)
+	}
+	if !res.GCMarked {
+		t.Fatalf("unadvanced main — run must mark GC so the work is re-driven: %+v", res)
+	}
+	if !contains(res.Warning, "did not advance") {
+		t.Fatalf("warning should explain main did not advance: %+v", res)
+	}
+}
+
+// TestRunCompletesWhenOriginActuallyAdvances is the positive control for guard
+// (2): the SAME setup as the negative case, but the publish actually pushes to
+// origin. Once origin main carries the honeybee's HEAD the advance-guard passes
+// and the run reports Completed exactly once — proving the guard gates on the
+// published origin stamp, not merely on the local commit.
+func TestRunCompletesWhenOriginActuallyAdvances(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sel, planPath := originBootstrapEnv(t)
+
+	cl := &scriptClient{}
+	cl.onPrompt = func() {
+		os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		_ = g.CommitPaths(ctx, "plan: bootstrap", "submodules/sm/PLAN.md")
+	}
+	// A real publish that pushes HEAD to origin main.
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Remote:  "origin",
+		Publish: func(ctx context.Context) error { return g.PublishToMain(ctx, "origin") },
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed || res.GCMarked {
+		t.Fatalf("origin advanced — run must report Completed: %+v", res)
+	}
+	// Origin main must actually carry the honeybee's committed HEAD.
+	head, err := g.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	originMain, err := g.RevParse(ctx, "origin/main")
+	if err != nil {
+		t.Fatalf("origin/main: %v", err)
+	}
+	if head != originMain {
+		t.Fatalf("origin main %s did not advance to HEAD %s", originMain, head)
+	}
+}

@@ -255,6 +255,27 @@ func (r *Repo) SharesHistory(ctx context.Context, a, b string) (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// IsAncestor reports whether commit ancestor is contained in the history of
+// commit descendant (the test `git merge-base --is-ancestor`). It is how the
+// runner confirms a publish ACTUALLY reached the shared main: the local commit
+// the completion check validated must be an ancestor of the fetched origin main,
+// so a local-only commit whose push never landed is provably not on main. A
+// commit is its own ancestor, so an exact match yields true. git exits 0 for
+// true and a documented 1 for false; only 1 maps to (false, nil), while any
+// other failure (e.g. an unresolvable ref, exit 128) surfaces as an error rather
+// than a silent false.
+func (r *Repo) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	_, err := r.Run(ctx, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
 // DiffPaths reports whether path changed between commits a and b.
 func (r *Repo) DiffPaths(ctx context.Context, a, b, path string) (bool, error) {
 	out, err := r.Run(ctx, "diff", "--name-only", a, b, "--", path)

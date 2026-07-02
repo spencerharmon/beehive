@@ -195,6 +195,39 @@ func (r *Runner) publish(ctx context.Context) error {
 	return r.Publish(ctx)
 }
 
+// mainAdvanced verifies this honeybee's just-published work ACTUALLY reached the
+// shared main rather than trusting that publish returned nil. The per-turn
+// completion check only inspects local state, so a commit whose push to main was
+// rejected (or a publish that no-ops) still passes it; completion is only real
+// once main carries the change. It re-confirms structurally: the runner's HEAD
+// (the commit the completion check validated) must be an ancestor of the
+// published main — which strictly implies main carries every stamp/status/doc
+// that HEAD does. With a remote it fetches origin main and checks against that;
+// a local-only install (no remote) has no separate origin ref to diverge, so it
+// checks local main (PublishToMain advances it via updateInstead or errors,
+// surfaced separately). A local-only commit ahead of an unadvanced main is not
+// its ancestor, so completion fails and the task is left claimed for GC/retry
+// instead of read as a phantom DONE. Any error resolving/fetching the refs is
+// surfaced (treated as not-advanced), never swallowed into a false completion.
+func (r *Runner) mainAdvanced(ctx context.Context) (bool, error) {
+	head, err := r.Git.RevParse(ctx, "HEAD")
+	if err != nil {
+		return false, err
+	}
+	ref := "main"
+	if r.Remote != "" {
+		if err := r.Git.Fetch(ctx, r.Remote, "main"); err != nil {
+			return false, err
+		}
+		ref = r.Remote + "/main"
+	}
+	target, err := r.Git.RevParse(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	return r.Git.IsAncestor(ctx, head, target)
+}
+
 func (r *Runner) now() time.Time {
 	if r.Now != nil {
 		return r.Now().UTC()
@@ -436,6 +469,54 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			_ = wg.WorktreeRemove(ctx, wtAbs)
 		}
 	}
+	// completeOnPublished finalizes a turn whose per-turn completion check passed.
+	// Completion is only real once the work is VERIFIABLY on the shared main, so it
+	// gates on BOTH publish guards: finish() publishes and returns the publish
+	// error (a rejected publish -> GC, never DONE), and even on a nil publish
+	// mainAdvanced re-confirms origin main actually carries this honeybee's HEAD.
+	// A local-only commit whose push never landed is left claimed (stale -> GC ->
+	// retry), never reported as a phantom DONE. warning is any pre-existing turn
+	// warning to carry into the final transcript.
+	completeOnPublished := func(warning string) (Result, error) {
+		if ferr := finish(warning); ferr != nil {
+			cleanup()
+			if isSessionTranscriptError(ferr) {
+				return res, ferr
+			}
+			res.GCMarked = true
+			res.Warning = fmt.Sprintf(
+				"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
+				taskID(sel), ferr)
+			return res, nil
+		}
+		// Publish reported success — VERIFY main actually advanced rather than trust
+		// it. If origin main does not carry our HEAD, the change never really landed;
+		// leave the task claimed for GC/retry instead of a phantom DONE.
+		advanced, aerr := r.mainAdvanced(ctx)
+		if aerr != nil || !advanced {
+			cleanup()
+			res.GCMarked = true
+			if aerr != nil {
+				res.Warning = fmt.Sprintf(
+					"task %s reached completion locally but verifying main advanced failed: %v; left unreleased for retry",
+					taskID(sel), aerr)
+			} else {
+				res.Warning = fmt.Sprintf(
+					"task %s reached completion locally but main did not advance to carry the published change; left unreleased for retry",
+					taskID(sel))
+			}
+			return res, nil
+		}
+		res.Completed = true
+		if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
+			res.Warning = w
+		}
+		if hasTask(sel) {
+			_ = cl.Release(ctx, sel.Task.ID)
+		}
+		cleanup()
+		return res, nil
+	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
 		// Revert any change the agent made to the repo's git config (remotes) during
 		// the previous turn before doing more work. Honeybees publish via worktree
@@ -475,25 +556,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					return res, derr
 				}
 				if done {
-					// Publish first; only release + report complete if main advanced.
-					if ferr := finish(""); ferr != nil {
-						cleanup()
-						if isSessionTranscriptError(ferr) {
-							return res, ferr
-						}
-						res.GCMarked = true
-						res.Warning = fmt.Sprintf(
-							"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
-							sel.Task.ID, ferr)
-						return res, nil
-					}
-					res.Completed = true
-					if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
-						res.Warning = w
-					}
-					_ = cl.Release(ctx, sel.Task.ID)
-					cleanup()
-					return res, nil
+					// Publish first; only release + report complete once main
+					// verifiably carries the change (see completeOnPublished).
+					return completeOnPublished("")
 				}
 				res.Warning = fmt.Sprintf(
 					"task %s left %s but the completion check failed — left for review",
@@ -560,30 +625,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			return res, err
 		}
 		if done {
-			// Completion is only real once the work lands on main. Publish first; if it
-			// fails, do NOT release the claim or report Completed — leave the task
-			// claimed (stale -> GC -> retry) so the work is re-driven, never silently
-			// dropped as a phantom DONE.
-			if ferr := finish(res.Warning); ferr != nil {
-				cleanup()
-				if isSessionTranscriptError(ferr) {
-					return res, ferr
-				}
-				res.GCMarked = true
-				res.Warning = fmt.Sprintf(
-					"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
-					sel.Task.ID, ferr)
-				return res, nil
-			}
-			res.Completed = true
-			if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
-				res.Warning = w
-			}
-			if hasTask(sel) {
-				_ = cl.Release(ctx, sel.Task.ID)
-			}
-			cleanup()
-			return res, nil
+			// Completion is only real once the work verifiably lands on main.
+			// Publish first; if the publish fails OR main does not actually advance
+			// to carry it, do NOT release the claim or report Completed — leave the
+			// task claimed (stale -> GC -> retry) so the work is re-driven, never
+			// silently dropped as a phantom DONE (see completeOnPublished).
+			return completeOnPublished(res.Warning)
 		}
 		if r.now().After(deadline) {
 			break

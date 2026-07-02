@@ -427,3 +427,32 @@ func TestExistsAtRef(t *testing.T) {
 		t.Fatal("empty tracked file should count as present")
 	}
 }
+
+// TestIsAncestor locks the merge-base --is-ancestor wrapper the runner uses to
+// verify a publish reached main: an older commit is an ancestor of a newer one
+// (and of itself), the reverse is not, and an unresolvable ref surfaces an error
+// rather than a silent false.
+func TestIsAncestor(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	base := commitFile(t, r, "f", "base\n", "base")
+	next := commitFile(t, r, "f", "next\n", "next")
+
+	// base -> next: base is an ancestor of next.
+	if ok, err := r.IsAncestor(ctx, base, next); err != nil || !ok {
+		t.Fatalf("base ancestor of next: ok=%v err=%v", ok, err)
+	}
+	// A commit is its own ancestor (reflexive) — an exact match must be true, so a
+	// published head equal to origin main reads as advanced.
+	if ok, err := r.IsAncestor(ctx, next, next); err != nil || !ok {
+		t.Fatalf("commit should be its own ancestor: ok=%v err=%v", ok, err)
+	}
+	// next is NOT an ancestor of base: a local-only commit ahead of main fails.
+	if ok, err := r.IsAncestor(ctx, next, base); err != nil || ok {
+		t.Fatalf("next must not be ancestor of base: ok=%v err=%v", ok, err)
+	}
+	// An unresolvable ref is a real error (exit 128), never a silent (false, nil).
+	if _, err := r.IsAncestor(ctx, base, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"); err == nil {
+		t.Fatal("absent descendant ref must surface an error, not a silent false")
+	}
+}
