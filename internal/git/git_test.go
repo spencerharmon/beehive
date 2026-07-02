@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -425,5 +426,98 @@ func TestExistsAtRef(t *testing.T) {
 	commitFile(t, r, "empty.md", "", "empty")
 	if !r.Exists(ctx, "main", "empty.md") {
 		t.Fatal("empty tracked file should count as present")
+	}
+}
+
+// TestOrphanWorktreeGitlinks locks the classifier that decides what the GC sweep
+// is allowed to remove. It seeds the four index shapes side by side and asserts
+// the method returns EXACTLY the leaked code-worktree gitlink. The undeclared
+// submodules/<sm>/repo case is the load-bearing safety check: a real submodule
+// checkout whose .gitmodules entry has not landed yet (e.g. mid-bootstrap) is a
+// 160000 entry with no declaration, and it must NEVER be classified as an orphan
+// worktree — only the submodules/<sm>/worktrees/<...> shape may be.
+func TestOrphanWorktreeGitlinks(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+
+	// A DECLARED submodule: a .gitmodules entry plus a gitlink at its path.
+	gm := "[submodule \"dep\"]\n\tpath = submodules/dep/repo\n\turl = ../dep.git\n"
+	if err := os.WriteFile(filepath.Join(r.Dir, ".gitmodules"), []byte(gm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 40)
+	for _, p := range []string{
+		"submodules/dep/repo",           // declared submodule    -> excluded (declaredSet)
+		"submodules/sm/repo",            // UNDECLARED repo checkout -> excluded (path guard)
+		"submodules/sm/worktrees/bee-x", // leaked code worktree  -> the ONLY orphan
+	} {
+		if _, err := r.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+sha+","+p); err != nil {
+			t.Fatalf("seed gitlink %s: %v", p, err)
+		}
+	}
+	// A plain blob at a submodules/ path must never be mistaken for a gitlink.
+	if err := os.MkdirAll(filepath.Join(r.Dir, "submodules", "sm"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, r, "submodules/sm/PLAN.md", "plan\n")
+	if _, err := r.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add blob: %v", err)
+	}
+
+	got, err := r.OrphanWorktreeGitlinks(ctx)
+	if err != nil {
+		t.Fatalf("OrphanWorktreeGitlinks: %v", err)
+	}
+	if len(got) != 1 || got[0] != "submodules/sm/worktrees/bee-x" {
+		t.Fatalf("orphans = %v, want exactly [submodules/sm/worktrees/bee-x]", got)
+	}
+}
+
+// TestRemoveCachedAndCommitStaged locks the two primitives the orphan sweep is
+// built from. RemoveCached must drop a path from the index WITHOUT touching the
+// working tree (so a live nested checkout survives), and CommitStaged must record
+// exactly the staged index — no add, no pathspec — returning ErrNothing when the
+// index matches HEAD so an empty sweep never manufactures a commit.
+func TestRemoveCachedAndCommitStaged(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+
+	// A clean index is a no-op sentinel, never an empty commit.
+	if err := r.CommitStaged(ctx, "nothing"); err != ErrNothing {
+		t.Fatalf("CommitStaged on clean index: want ErrNothing, got %v", err)
+	}
+	// Empty path list is a no-op (and must not error).
+	if err := r.RemoveCached(ctx); err != nil {
+		t.Fatalf("RemoveCached(no paths): %v", err)
+	}
+
+	commitFile(t, r, "keep", "v\n", "base")
+	writeFile(t, r, "gone", "body\n")
+	if _, err := r.Run(ctx, "add", "gone"); err != nil {
+		t.Fatalf("add gone: %v", err)
+	}
+	if err := r.CommitStaged(ctx, "track gone"); err != nil {
+		t.Fatalf("CommitStaged(track): %v", err)
+	}
+
+	// RemoveCached un-tracks it but must leave the file on disk.
+	if err := r.RemoveCached(ctx, "gone"); err != nil {
+		t.Fatalf("RemoveCached: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.Dir, "gone")); err != nil {
+		t.Fatalf("RemoveCached deleted the working-tree file: %v", err)
+	}
+	if staged, _ := r.Run(ctx, "diff", "--cached", "--name-only"); strings.TrimSpace(staged) != "gone" {
+		t.Fatalf("expected only 'gone' staged for removal, got %q", staged)
+	}
+	// CommitStaged records only the removal; it must not re-add the on-disk file.
+	if err := r.CommitStaged(ctx, "drop gone"); err != nil {
+		t.Fatalf("CommitStaged(removal): %v", err)
+	}
+	if r.Exists(ctx, "HEAD", "gone") {
+		t.Fatal("CommitStaged did not record the removal (gone still tracked at HEAD)")
+	}
+	if !r.Exists(ctx, "HEAD", "keep") {
+		t.Fatal("CommitStaged disturbed an unrelated tracked file")
 	}
 }

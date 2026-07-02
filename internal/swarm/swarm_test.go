@@ -997,3 +997,186 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// worktreeGitlinksInIndex returns every tracked gitlink (mode 160000) under a
+// submodules/<sm>/worktrees/ path in g's index. It parses raw `git ls-files -s`
+// independently of the production classifier so the assertions below are a true
+// check, not a tautology against the code under test.
+func worktreeGitlinksInIndex(t *testing.T, g *git.Repo, ctx context.Context) []string {
+	t.Helper()
+	out, err := g.Run(ctx, "ls-files", "-s")
+	if err != nil {
+		t.Fatalf("ls-files: %v", err)
+	}
+	var found []string
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "160000 ") {
+			continue
+		}
+		tab := strings.IndexByte(line, '\t')
+		if tab < 0 {
+			continue
+		}
+		p := line[tab+1:]
+		parts := strings.Split(p, "/")
+		if len(parts) >= 4 && parts[0] == "submodules" && parts[2] == "worktrees" {
+			found = append(found, p)
+		}
+	}
+	return found
+}
+
+// TestWorkCommitPathNeverStagesWorktreeGitlink is the producer-side guard: a Work
+// run creates its code worktree at submodules/<sm>/worktrees/<branch> (itself a
+// checkout) INSIDE the beehive worktree, and the per-turn claim/heartbeat commits
+// run while it exists. Those commits must scope to PLAN.md (never `git add -A`),
+// so the beehive index must hold NO gitlink under submodules/*/worktrees/* after
+// the run. With the old add-all commit this test fails (the worktree leaks in as
+// an orphan gitlink); with scoped commits the index stays clean.
+func TestWorkCommitPathNeverStagesWorktreeGitlink(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(ctx, "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	var wtExisted bool
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		// The code worktree must physically exist while the heartbeat commits run,
+		// so a clean index afterward is a real "never staged", not "never created".
+		if fi, err := os.Stat(wtDir); err == nil && fi.IsDir() {
+			wtExisted = true
+		}
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Session: "bee-A"}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !wtExisted {
+		t.Fatal("code worktree was never created during the run; the test cannot prove the commit path avoided staging it")
+	}
+	if leaked := worktreeGitlinksInIndex(t, g, ctx); len(leaked) != 0 {
+		t.Fatalf("Work commit path leaked worktree gitlink(s) into the beehive index: %v", leaked)
+	}
+}
+
+// TestSweepRemovesOrphanWorktreeGitlink is the GC-sweep acceptance: a real
+// registered submodule plus a leaked orphan gitlink under worktrees/. The orphan
+// wedges `git submodule update` (fatal: no .gitmodules URL). After the sweep the
+// orphan is gone, the registered submodule gitlink is untouched, and
+// `git submodule update` succeeds.
+func TestSweepRemovesOrphanWorktreeGitlink(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file") // permit the local-path submodule clone offline
+	ctx := context.Background()
+
+	// A source repo to register as a REAL (declared) submodule.
+	src := t.TempDir()
+	sg := gitInit(t, src)
+	os.WriteFile(filepath.Join(src, "s.txt"), []byte("sub\n"), 0o644)
+	if err := sg.Commit(ctx, "sub init"); err != nil {
+		t.Fatalf("seed src: %v", err)
+	}
+
+	root := t.TempDir()
+	g := gitInit(t, root)
+	os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0o644)
+	if err := g.Commit(ctx, "init"); err != nil {
+		t.Fatalf("seed root: %v", err)
+	}
+	if _, err := g.Run(ctx, "-c", "protocol.file.allow=always", "submodule", "add", src, "submodules/sm/repo"); err != nil {
+		t.Fatalf("submodule add: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "add submodule"); err != nil {
+		t.Fatalf("commit submodule: %v", err)
+	}
+	// Seed an ORPHAN gitlink: a 160000 index entry under worktrees/ with NO
+	// .gitmodules URL — exactly what a leaked honeybee code-worktree looks like.
+	orphanPath := "submodules/sm/worktrees/bee-x"
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+strings.Repeat("3", 40)+","+orphanPath); err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "leak orphan"); err != nil {
+		t.Fatalf("commit orphan: %v", err)
+	}
+
+	// Precondition: the orphan wedges `git submodule update`.
+	if _, err := g.Run(ctx, "submodule", "update", "--init"); err == nil {
+		t.Fatal("precondition failed: expected `git submodule update` to fatal on the orphan gitlink")
+	}
+
+	r := &Runner{Git: g, TTL: time.Hour}
+	if err := r.sweepOrphanWorktreeGitlinks(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	// 1) The orphan is gone from the index.
+	if got := worktreeGitlinksInIndex(t, g, ctx); len(got) != 0 {
+		t.Fatalf("sweep left orphan worktree gitlink(s) in the index: %v", got)
+	}
+	// 2) The registered submodule gitlink is untouched.
+	ls, err := g.Run(ctx, "ls-files", "-s", "--", "submodules/sm/repo")
+	if err != nil || !strings.HasPrefix(ls, "160000 ") || !strings.Contains(ls, "submodules/sm/repo") {
+		t.Fatalf("sweep disturbed the registered submodule gitlink (ls=%q err=%v)", ls, err)
+	}
+	// 3) `git submodule update` now succeeds — the wedge is cleared.
+	if out, err := g.Run(ctx, "submodule", "update", "--init"); err != nil {
+		t.Fatalf("submodule update still fails after sweep: %v\n%s", err, out)
+	}
+}
+
+// TestSweepLeavesLiveWorktreeCheckoutOnDisk proves the sweep only drops the stray
+// INDEX entry: when the leaked path is a live nested checkout (a code worktree a
+// peer may still be using), its on-disk files are left intact and the gitlink
+// does not reappear (the removal is committed via the staged index, never a
+// pathspec add that would re-stage the live checkout).
+func TestSweepLeavesLiveWorktreeCheckoutOnDisk(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0o644)
+	if err := g.Commit(ctx, "init"); err != nil {
+		t.Fatalf("seed root: %v", err)
+	}
+	// A live nested checkout at the worktree path, staged (leaked) as a gitlink.
+	wtRel := filepath.Join("submodules", "sm", "worktrees", "bee-live")
+	wtAbs := filepath.Join(root, wtRel)
+	os.MkdirAll(wtAbs, 0o755)
+	gitInit(t, wtAbs)
+	codeFile := filepath.Join(wtAbs, "code")
+	os.WriteFile(codeFile, []byte("live work\n"), 0o644)
+	git.New(wtAbs).Commit(ctx, "code")
+	if _, err := g.Run(ctx, "add", wtRel); err != nil {
+		t.Fatalf("stage worktree: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "leak live worktree"); err != nil {
+		t.Fatalf("commit leak: %v", err)
+	}
+
+	r := &Runner{Git: g, TTL: time.Hour}
+	if err := r.sweepOrphanWorktreeGitlinks(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if got := worktreeGitlinksInIndex(t, g, ctx); len(got) != 0 {
+		t.Fatalf("sweep did not remove the live-checkout gitlink from the index: %v", got)
+	}
+	// The peer's on-disk worktree files must be untouched.
+	if b, err := os.ReadFile(codeFile); err != nil || string(b) != "live work\n" {
+		t.Fatalf("sweep destroyed the live worktree checkout on disk (err=%v content=%q)", err, string(b))
+	}
+}

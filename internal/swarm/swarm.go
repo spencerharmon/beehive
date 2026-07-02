@@ -203,6 +203,39 @@ func (r *Runner) publish(ctx context.Context) error {
 	return r.Publish(ctx)
 }
 
+// sweepOrphanWorktreeGitlinks removes any orphan gitlink that a prior pass leaked
+// under submodules/<sm>/worktrees/ from this honeybee's beehive index and
+// publishes the removal to main, so a committed code-worktree (a gitlink with no
+// .gitmodules entry that wedges `git submodule update`) self-heals on the next
+// pass instead of festering until an operator runs cleanup. It is a strict
+// superset-safe GC: it only ever drops a stray *worktree* gitlink (never a
+// declared submodule) and only from the index — the live worktree files on disk
+// are untouched, so a peer actively using that worktree is unaffected. A no-op
+// (no orphans) costs a single `git ls-files`. Failures are surfaced to the caller,
+// which treats them as non-fatal (a transient publish race must not kill a
+// healthy honeybee; the next pass re-sweeps).
+func (r *Runner) sweepOrphanWorktreeGitlinks(ctx context.Context) error {
+	orphans, err := r.Git.OrphanWorktreeGitlinks(ctx)
+	if err != nil {
+		return err
+	}
+	if len(orphans) == 0 {
+		return nil
+	}
+	if err := r.Git.RemoveCached(ctx, orphans...); err != nil {
+		return err
+	}
+	msg := "beehive: drop orphan worktree gitlink(s) " + strings.Join(orphans, ", ") +
+		"\n\nBeehive: gc orphan-worktree-gitlink"
+	if err := r.Git.CommitStaged(ctx, msg); err != nil {
+		if errors.Is(err, git.ErrNothing) {
+			return nil
+		}
+		return err
+	}
+	return r.publish(ctx)
+}
+
 func (r *Runner) now() time.Time {
 	if r.Now != nil {
 		return r.Now().UTC()
@@ -244,6 +277,17 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	absRoot, err := filepath.Abs(r.Repo.Root)
 	if err != nil {
 		return res, err
+	}
+
+	// Self-heal before doing anything else: drop any orphan code-worktree gitlink a
+	// prior pass leaked into the beehive index (a committed submodules/<sm>/
+	// worktrees/<branch> gitlink with no .gitmodules entry wedges `git submodule
+	// update`). This runs before this pass creates its OWN code worktree, so the
+	// index is a clean projection of main and the removal commit records nothing
+	// but the orphan drop. Non-fatal: a transient failure must not kill a healthy
+	// honeybee — the next pass re-sweeps — so it is logged, not returned.
+	if err := r.sweepOrphanWorktreeGitlinks(ctx); err != nil && r.Debug != nil {
+		fmt.Fprintf(r.Debug, "[honeybee] orphan-worktree-gitlink sweep: %v\n", err)
 	}
 
 	// Only a main Work task edits the submodule repo and needs a worktree.
