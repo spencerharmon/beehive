@@ -111,6 +111,18 @@ type Runner struct {
 	// A compression of the working context only — the authoritative transcript still
 	// streams verbatim to the session branch.
 	LeanContext bool
+
+	// LeanBrief injects a runner-precomputed task brief on a Work dispatch (ROI
+	// Priority 1 — "Precompute in the runner: resolve the worktree, branch, and
+	// pointers; hand the agent the file excerpts it needs; make the deterministic
+	// choices for it"). The brief carries the resolved worktree/branch, the
+	// submodule pointer + tracked tip, the task's own PLAN card, the mandated
+	// change-doc path and commit stamp, and head excerpts of the task's own files,
+	// so the agent does not re-run discovery git plumbing or scan the whole
+	// submodule tree to orient. Off by default so the injected preamble stays
+	// byte-identical to the historical path; the runner flips it on from an env
+	// flag (see cmd/honeybee). Additive — the floor, not a cage.
+	LeanBrief bool
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -373,6 +385,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"operator input, run: beehive task human %[2]s %[3]s --reason \"<specific blocker and exact input needed>\". "+
 				"Use exact status NEEDS-HUMAN; never write HUMAN-NEEDED.\n\n",
 			r.Session, smName, sel.Task.ID)
+	}
+	// Precomputed task brief (Work only): hand the agent the worktree/branch/pointer
+	// the setup already resolved, the deterministic doc-path/commit-stamp, its PLAN
+	// card, and head excerpts of its own files — so it skips discovery plumbing and
+	// a whole-tree scan. Inert by default (LeanBrief off) so the injected preamble
+	// is byte-identical to the historical path.
+	if r.LeanBrief && sel.Kind == selectt.Work {
+		preamble += r.buildTaskBrief(ctx, sel, wg, wtAbs, absRoot, res.Branch).render()
 	}
 	first = preamble + first
 
