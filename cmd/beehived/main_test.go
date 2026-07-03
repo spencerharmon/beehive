@@ -1,72 +1,78 @@
 package main
 
 import (
-	"reflect"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spencerharmon/beehive/internal/config"
+	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/web"
 )
 
-// TestServeTargetSingleEntryByteIdentical confirms the single-repo bridge: the
-// active entry of a synthesized one-entry registry projects to today's resolved
-// config exactly, and serves the same root. This is the back-compat guarantee —
-// an unconfigured host is unchanged by the registry indirection.
-func TestServeTargetSingleEntryByteIdentical(t *testing.T) {
-	hostDir := t.TempDir()
+// TestDaemonServesResolvedRegistry exercises the daemon's real serving path end
+// to end for the bare single-host install: config.ResolveRegistry synthesizes a
+// one-entry registry from --repo, web.NewMulti builds the server, and Routes
+// serves the dashboard. It replaces the old serveTarget bridge tests — routing is
+// now web.Multi's job (see internal/web/web_test.go) and the daemon just hands it
+// the resolved registry. It also locks the back-compat guarantee: a single
+// registered repo keeps today's flat routes with NO /repo/ switcher, so an
+// unconfigured host is unchanged by the registry indirection.
+func TestDaemonServesResolvedRegistry(t *testing.T) {
+	// No repos.yaml under the host config dir: a bare single-repo install.
+	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
 	root := t.TempDir()
-	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+	if err := repo.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	// The read-only dashboard/hygiene views run git on the root.
+	for _, a := range [][]string{{"init"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		c := exec.Command("git", a...)
+		c.Dir = root
+		if err := c.Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	sm := filepath.Join(root, "submodules", "alpha")
+	if err := os.MkdirAll(sm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(sm, repo.ROIFile), []byte("# alpha\n"), 0o644)
+	os.WriteFile(filepath.Join(sm, repo.PlanFile), []byte(
+		"<!-- Beehive-ROI: abc -->\n# Plan\n\n"+
+			"## t1 [TODO] <!-- attempts=0 deps= -->\ndo it\nDoc: d.md\n"), 0o644)
 
-	cfg, err := config.Resolve(root, "")
+	reg, err := config.ResolveRegistry(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg := config.SingleEntryRegistry(cfg, root)
-
-	entry, served, err := serveTarget(reg)
+	if got := len(reg.Repos); got != 1 {
+		t.Fatalf("bare install should synthesize a one-entry registry, got %d", got)
+	}
+	s, err := web.NewMulti(reg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if entry.Root != root {
-		t.Errorf("served root = %q, want %q", entry.Root, root)
-	}
-	if !reflect.DeepEqual(served, cfg) {
-		t.Fatalf("served config not byte-identical to single config:\n got %+v\nwant %+v", served, cfg)
-	}
-}
+	h := s.Routes()
 
-// TestServeTargetMultiPicksSortedFirstOwnKeyring confirms a multi-repo registry
-// serves the first repo by sorted name, projected onto ITS OWN keyring (never
-// another repo's) — the per-repo isolation the daemon must preserve.
-func TestServeTargetMultiPicksSortedFirstOwnKeyring(t *testing.T) {
-	hostDir := t.TempDir()
-	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
-	alphaRoot := t.TempDir()
-	zetaRoot := t.TempDir()
-	reg := config.Registry{Repos: []config.RepoEntry{
-		{Name: "zeta", Root: zetaRoot, GPGHome: "/srv/zeta/gnupg", GPGRecipient: "zeta@example.com"},
-		{Name: "alpha", Root: alphaRoot, GPGHome: "/srv/alpha/gnupg", GPGRecipient: "alpha@example.com"},
-	}}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("dashboard = %d: %s", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), "alpha") {
+		t.Fatalf("dashboard should list the submodule; body=%s", w.Body)
+	}
 
-	entry, served, err := serveTarget(reg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if entry.Name != "alpha" {
-		t.Fatalf("active entry = %q, want alpha (first by sorted name)", entry.Name)
-	}
-	if served.GPGHome != "/srv/alpha/gnupg" || served.GPGRecipient != "alpha@example.com" {
-		t.Fatalf("served keyring = %q/%q, want alpha's own /srv/alpha/gnupg + alpha@example.com", served.GPGHome, served.GPGRecipient)
-	}
-	// Strict isolation: the served config never leaks the other repo's keyring.
-	if served.GPGHome == "/srv/zeta/gnupg" || served.GPGRecipient == "zeta@example.com" {
-		t.Fatalf("served config leaked zeta's keyring: %q/%q", served.GPGHome, served.GPGRecipient)
-	}
-}
-
-// TestServeTargetEmptyErrors confirms an empty registry (no repos) is a startup
-// error rather than a nil-deref or silent no-op.
-func TestServeTargetEmptyErrors(t *testing.T) {
-	if _, _, err := serveTarget(config.Registry{}); err == nil {
-		t.Fatal("serveTarget(empty) should error, got nil")
+	// Single-repo mode keeps flat routes: the multi-repo /repo/ switch endpoint
+	// is not exposed, so a switch attempt 404s.
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, httptest.NewRequest("POST", "/repo/alpha", nil))
+	if w2.Code != http.StatusNotFound {
+		t.Fatalf("single-repo mode must not expose the /repo/ switch, got %d", w2.Code)
 	}
 }

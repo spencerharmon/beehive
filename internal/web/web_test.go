@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1989,4 +1990,276 @@ func TestViewerFollowsOffBoxSessions(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, ".git", "MERGE_HEAD")); !os.IsNotExist(err) {
 		t.Fatalf("ff-only pull must never start a merge (MERGE_HEAD present): err=%v", err)
 	}
+}
+
+// --- multi-repo routing (Multi) ---
+
+// mkRepoRoot builds a minimal beehive repo at a fresh temp dir with exactly one
+// submodule (sub), mirroring setup()'s layout, and returns its root. It is the
+// building block for the multi-repo routing tests: two such roots with DISTINCT
+// submodule names let a test prove a request is scoped to the selected repo's own
+// tree (only that repo's submodule is visible/reachable — no cross-repo crawl).
+func mkRepoRoot(t *testing.T, sub string) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := repo.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range [][]string{{"init"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		c := exec.Command("git", a...)
+		c.Dir = root
+		if err := c.Run(); err != nil {
+			t.Fatalf("git %v: %v", a, err)
+		}
+	}
+	sm := filepath.Join(root, "submodules", sub)
+	if err := os.MkdirAll(sm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(sm, repo.ROIFile), []byte("# "+sub+"\n"), 0o644)
+	os.WriteFile(filepath.Join(sm, repo.PlanFile), []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## t1 [TODO] <!-- attempts=0 deps= weight=16 -->\ndo "+sub+"\nDoc: d.md\n"), 0o644)
+	return root
+}
+
+// twoRepoServer builds a 2-repo Multi over two distinct beehive repos (entry
+// "one" -> submodule "alpha", entry "two" -> submodule "bravo") and returns it
+// with the two roots. BEEHIVE_CONFIG_DIR is redirected to an empty temp dir so
+// config.Resolve reads pure Defaults (no host /etc/beehive bleed). Each entry
+// carries its OWN distinct keyring, matching the registry isolation invariant.
+// The slice is deliberately out of sorted order to prove the default active repo
+// is the sorted-first name ("one"), not the file order.
+func twoRepoServer(t *testing.T) (*Multi, string, string) {
+	t.Helper()
+	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
+	aRoot := mkRepoRoot(t, "alpha")
+	bRoot := mkRepoRoot(t, "bravo")
+	reg := config.Registry{Repos: []config.RepoEntry{
+		{Name: "two", Root: bRoot, GPGHome: filepath.Join(t.TempDir(), "two-gnupg"), GPGRecipient: "two@example.com"},
+		{Name: "one", Root: aRoot, GPGHome: filepath.Join(t.TempDir(), "one-gnupg"), GPGRecipient: "one@example.com"},
+	}}
+	m, err := NewMulti(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m, aRoot, bRoot
+}
+
+// getReq drives one request through h with an optional active-repo cookie (empty
+// = no cookie) and returns the recorder.
+func getReq(t *testing.T, h http.Handler, method, path, cookieVal string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	if cookieVal != "" {
+		req.AddCookie(&http.Cookie{Name: repoCookie, Value: cookieVal})
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// TestMultiRoutesToSelectedRepo proves a 2-repo registry routes reads to the
+// cookie-selected repo (default = sorted-first), scopes them to that repo's tree
+// (no cross-repo crawl), and rejects an unknown switch handle — the task's core
+// acceptance. The needles are the per-repo dashboard card links
+// (/submodule/alpha vs /submodule/bravo) so the assertion is unambiguous.
+func TestMultiRoutesToSelectedRepo(t *testing.T) {
+	m, _, _ := twoRepoServer(t)
+	h := m.Routes()
+
+	// Default (no cookie) serves the sorted-first repo "one" -> submodule alpha.
+	def := getReq(t, h, "GET", "/", "")
+	if def.Code != 200 {
+		t.Fatalf("dashboard (default) = %d: %s", def.Code, def.Body)
+	}
+	if b := def.Body.String(); !strings.Contains(b, "/submodule/alpha") || strings.Contains(b, "/submodule/bravo") {
+		t.Fatalf("default must serve repo one (alpha), not two (bravo):\n%s", b)
+	}
+
+	// Cookie selects repo "two" -> submodule bravo.
+	if b := getReq(t, h, "GET", "/", "two").Body.String(); !strings.Contains(b, "/submodule/bravo") || strings.Contains(b, "/submodule/alpha") {
+		t.Fatalf("cookie two must serve repo two (bravo), not one (alpha):\n%s", b)
+	}
+
+	// Reads are scoped to the selected repo's TREE: alpha's plan is reachable
+	// under repo one but NOT under repo two, and vice-versa — no cross-repo crawl.
+	if w := getReq(t, h, "GET", "/submodule/alpha/plan", "one"); w.Code != 200 {
+		t.Fatalf("alpha/plan under repo one = %d, want 200", w.Code)
+	}
+	if w := getReq(t, h, "GET", "/submodule/alpha/plan", "two"); w.Code != http.StatusNotFound {
+		t.Fatalf("alpha/plan under repo two = %d, want 404 (no cross-repo crawl)", w.Code)
+	}
+	if w := getReq(t, h, "GET", "/submodule/bravo/plan", "two"); w.Code != 200 {
+		t.Fatalf("bravo/plan under repo two = %d, want 200", w.Code)
+	}
+	if w := getReq(t, h, "GET", "/submodule/bravo/plan", "one"); w.Code != http.StatusNotFound {
+		t.Fatalf("bravo/plan under repo one = %d, want 404 (no cross-repo crawl)", w.Code)
+	}
+
+	// A stale/unknown cookie falls back to the default repo (page still works)...
+	if w := getReq(t, h, "GET", "/", "ghost"); w.Code != 200 || !strings.Contains(w.Body.String(), "/submodule/alpha") {
+		t.Fatalf("unknown cookie should fall back to default repo one; code=%d body=%s", w.Code, w.Body)
+	}
+	// ...but an explicit switch to an unknown repo is REJECTED.
+	if w := getReq(t, h, "POST", "/repo/ghost", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("switch to unknown repo = %d, want 404", w.Code)
+	}
+}
+
+// TestMultiSwitchSetsCookieAndChangesRepo proves POST /repo/{name} sets the
+// active-repo cookie and that following that cookie changes which repo is served.
+func TestMultiSwitchSetsCookieAndChangesRepo(t *testing.T) {
+	m, _, _ := twoRepoServer(t)
+	h := m.Routes()
+
+	sw := getReq(t, h, "POST", "/repo/two", "")
+	if sw.Code != http.StatusSeeOther {
+		t.Fatalf("switch = %d, want 303", sw.Code)
+	}
+	var set *http.Cookie
+	for _, c := range sw.Result().Cookies() {
+		if c.Name == repoCookie {
+			set = c
+		}
+	}
+	if set == nil || set.Value != "two" {
+		t.Fatalf("switch must set %s=two, got %+v", repoCookie, set)
+	}
+	// Following the just-set cookie now serves repo two (bravo).
+	if b := getReq(t, h, "GET", "/", set.Value).Body.String(); !strings.Contains(b, "/submodule/bravo") {
+		t.Fatalf("after switch the dashboard must serve bravo:\n%s", b)
+	}
+}
+
+// TestMultiWritesRouteToSelectedRepo proves a WRITE (ROI edit + commit) lands in
+// the cookie-selected repo's tree only — the write half of "routes reads/writes
+// to the selected repo".
+func TestMultiWritesRouteToSelectedRepo(t *testing.T) {
+	m, aRoot, bRoot := twoRepoServer(t)
+	h := m.Routes()
+
+	form := url.Values{"body": {"# edited alpha intent\n"}}
+	req := httptest.NewRequest("POST", "/roi/alpha", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: repoCookie, Value: "one"})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("roi post under repo one = %d: %s", w.Code, w.Body)
+	}
+	// The edit landed in repo one's alpha ROI...
+	got, _ := os.ReadFile(filepath.Join(aRoot, "submodules", "alpha", repo.ROIFile))
+	if string(got) != "# edited alpha intent\n" {
+		t.Fatalf("write did not land in repo one's alpha ROI: %q", got)
+	}
+	// ...and repo two (which has no alpha submodule) never gained one.
+	if _, err := os.Stat(filepath.Join(bRoot, "submodules", "alpha")); !os.IsNotExist(err) {
+		t.Fatalf("repo two must not have gained an alpha submodule: err=%v", err)
+	}
+	// A write to a submodule ABSENT from the selected repo is rejected (scoped
+	// routing): editing alpha while repo two is selected 404s.
+	req2 := httptest.NewRequest("POST", "/roi/alpha", strings.NewReader(form.Encode()))
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req2.AddCookie(&http.Cookie{Name: repoCookie, Value: "two"})
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusNotFound {
+		t.Fatalf("roi post for alpha under repo two = %d, want 404", w2.Code)
+	}
+}
+
+// TestMultiSingleEntryFlatRoutesUnchanged proves the empty/legacy path is a
+// regression-free flat single-repo server: a one-entry registry (the synthesized
+// bare-install entry) serves today's routes and does NOT expose the /repo/
+// switcher.
+func TestMultiSingleEntryFlatRoutesUnchanged(t *testing.T) {
+	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
+	root := mkRepoRoot(t, "alpha")
+	cfg, err := config.Resolve(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewMulti(config.SingleEntryRegistry(cfg, root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := m.Routes()
+
+	if w := getReq(t, h, "GET", "/", ""); w.Code != 200 || !strings.Contains(w.Body.String(), "/submodule/alpha") {
+		t.Fatalf("single-repo dashboard code=%d body=%s", w.Code, w.Body)
+	}
+	if w := getReq(t, h, "GET", "/submodule/alpha/plan", ""); w.Code != 200 {
+		t.Fatalf("single-repo plan = %d, want 200", w.Code)
+	}
+	// No switcher in single-repo mode: flat routes only, so /repo/ 404s.
+	if w := getReq(t, h, "POST", "/repo/alpha", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("single-repo mode must not expose the /repo/ switch, got %d", w.Code)
+	}
+}
+
+// TestMultiPerRepoKeyringIsolation proves each per-repo Server is scoped to its
+// OWN keyring — never another repo's — at construction. This is the foundation
+// the secrets-isolation subtask threads through (no shared gpg home, no key
+// reuse), and it re-homes the isolation guarantee the removed serveTarget test
+// held.
+func TestMultiPerRepoKeyringIsolation(t *testing.T) {
+	m, _, _ := twoRepoServer(t)
+	one, two := m.servers["one"], m.servers["two"]
+	if one == nil || two == nil {
+		t.Fatalf("both repos must be built: one=%v two=%v", one, two)
+	}
+	if !strings.HasSuffix(one.cfg.GPGHome, "one-gnupg") || one.cfg.GPGRecipient != "one@example.com" {
+		t.Fatalf("repo one keyring = %q/%q, want its own one-gnupg + one@example.com", one.cfg.GPGHome, one.cfg.GPGRecipient)
+	}
+	if !strings.HasSuffix(two.cfg.GPGHome, "two-gnupg") || two.cfg.GPGRecipient != "two@example.com" {
+		t.Fatalf("repo two keyring = %q/%q, want its own two-gnupg + two@example.com", two.cfg.GPGHome, two.cfg.GPGRecipient)
+	}
+	// Strict isolation: neither server ever carries the other's keyring.
+	if one.cfg.GPGHome == two.cfg.GPGHome || one.cfg.GPGRecipient == two.cfg.GPGRecipient {
+		t.Fatalf("keyrings leaked across repos: one=%q/%q two=%q/%q",
+			one.cfg.GPGHome, one.cfg.GPGRecipient, two.cfg.GPGHome, two.cfg.GPGRecipient)
+	}
+}
+
+// TestNewMultiEmptyRegistryErrors proves an empty registry is a build error (the
+// daemon always resolves at least a synthesized entry), re-homing the removed
+// serveTarget empty-registry guarantee.
+func TestNewMultiEmptyRegistryErrors(t *testing.T) {
+	if _, err := NewMulti(config.Registry{}); err == nil {
+		t.Fatal("NewMulti(empty) should error, got nil")
+	}
+}
+
+// TestMultiConcurrentSelectionNoLeak fires many concurrent requests that each
+// carry a DIFFERENT active-repo cookie and asserts every response is scoped to
+// its own cookie's repo. Because selection lives in the per-request cookie (never
+// a shared mutable Server/Multi field), no request can flip another's active
+// repo. Under -race this also catches any accidental shared-state write.
+func TestMultiConcurrentSelectionNoLeak(t *testing.T) {
+	m, _, _ := twoRepoServer(t)
+	h := m.Routes()
+
+	const n = 60
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			want, cookie := "/submodule/alpha", "one"
+			other := "/submodule/bravo"
+			if i%2 == 1 {
+				want, cookie, other = "/submodule/bravo", "two", "/submodule/alpha"
+			}
+			w := getReq(t, h, "GET", "/", cookie)
+			if w.Code != 200 {
+				t.Errorf("i=%d code=%d", i, w.Code)
+				return
+			}
+			if b := w.Body.String(); !strings.Contains(b, want) || strings.Contains(b, other) {
+				t.Errorf("i=%d cookie=%s: served the wrong repo (want %s, not %s)", i, cookie, want, other)
+			}
+		}(i)
+	}
+	wg.Wait()
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"embed"
 	"errors"
+	"fmt"
 	"html/template"
 	"net/http"
 	"os"
@@ -92,6 +93,156 @@ func pullInterval(cfg config.Config) time.Duration {
 // non-fatal — so a recovery hiccup never blocks the frontend from starting.
 func (s *Server) RecoverEditors(ctx context.Context) error {
 	return s.editors.Reload(ctx)
+}
+
+// repoCookie is the client-scoped active-repo selector for the multi-repo
+// frontend. The selection lives in this cookie — a per-REQUEST value — never in a
+// mutable Server/Multi field, so a concurrent request can never flip another
+// request's active repo (the "selection must not leak across repos" invariant).
+// An absent, or stale/unknown, cookie falls back to the default repo (the
+// sorted-first registered name).
+const repoCookie = "beehive_repo"
+
+// Multi is the multi-repo frontend: it serves several registered beehive repos
+// from one daemon, each under its OWN set of routes. It holds the config.Registry
+// and one fully-resolved, IMMUTABLE *Server per RepoEntry (built once in NewMulti
+// from repo.Open(entry.Root) for the layout and entry.Config(config.Resolve(
+// entry.Root, "")) for the per-repo keyring). A request's active repo is read
+// from the repoCookie and dispatched to that repo's pre-built handler, so there
+// is no shared mutable selection state a concurrent request could race, and every
+// read/write and secret stays scoped to its repo's own tree + keyring (no
+// cross-repo crawl). A single-entry registry (a bare install's synthesized entry,
+// or a one-repo repos.yaml) is served by that one Server's flat routes verbatim,
+// so legacy single-repo installs are byte-identical.
+type Multi struct {
+	reg      config.Registry
+	names    []string                // registered repo names, sorted; names[0] is the default
+	servers  map[string]*Server      // name -> immutable per-repo server (own repo/cfg/git/editors/cache)
+	handlers map[string]http.Handler // name -> that server's routes, built once
+}
+
+// NewMulti builds the multi-repo frontend from a resolved registry (typically
+// config.ResolveRegistry, which Validates a real repos.yaml and synthesizes a
+// one-entry registry for a bare install). Every entry becomes one immutable
+// *Server over repo.Open(entry.Root) and the entry's own keyring-scoped config
+// (entry.Config(config.Resolve(entry.Root, ""))), so each repo is served under
+// its own routes with its own secrets keyring. The registry is assumed already
+// Validated (cross-repo keyring isolation is enforced by config.Registry.Validate
+// at load); NewMulti deliberately does NOT re-Validate, because the synthesized
+// single-entry registry for a bare install legitimately carries no GPGRecipient.
+// An empty registry is an error — the daemon always resolves at least the
+// synthesized entry, so an empty one signals a caller bug rather than a bare
+// install.
+func NewMulti(reg config.Registry) (*Multi, error) {
+	names := reg.Names()
+	if len(names) == 0 {
+		return nil, errors.New("web: empty registry (no repo to serve)")
+	}
+	m := &Multi{
+		reg:      reg,
+		names:    names,
+		servers:  make(map[string]*Server, len(names)),
+		handlers: make(map[string]http.Handler, len(names)),
+	}
+	for _, name := range names {
+		entry, ok := reg.Repo(name)
+		if !ok {
+			// Names() is derived from reg, so a missing entry is impossible; fail
+			// loudly rather than silently skip a repo if that ever changes.
+			return nil, fmt.Errorf("web: registry missing repo %q", name)
+		}
+		base, err := config.Resolve(entry.Root, "")
+		if err != nil {
+			return nil, fmt.Errorf("web: resolve config for repo %q: %w", name, err)
+		}
+		r, err := repo.Open(entry.Root)
+		if err != nil {
+			return nil, fmt.Errorf("web: open repo %q at %s: %w", name, entry.Root, err)
+		}
+		srv, err := New(r, entry.Config(base))
+		if err != nil {
+			return nil, fmt.Errorf("web: build server for repo %q: %w", name, err)
+		}
+		m.servers[name] = srv
+		m.handlers[name] = srv.Routes()
+	}
+	return m, nil
+}
+
+// RecoverEditors runs each per-repo Server's startup editor recovery (re-register
+// in-flight edit sessions, prune stale edit worktrees). It is best-effort startup
+// housekeeping — the daemon logs a failure and keeps serving — so a hiccup
+// recovering one repo's editors never blocks another's: every repo is attempted
+// and the errors are joined.
+func (m *Multi) RecoverEditors(ctx context.Context) error {
+	var errs []error
+	for _, name := range m.names {
+		if err := m.servers[name].RecoverEditors(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("repo %q: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Routes returns the handler the daemon serves. A single registered repo (a bare
+// install or a one-repo repos.yaml) gets that repo's flat routes verbatim — no
+// switcher, no /repo/ endpoint — so legacy behavior is byte-identical. Two or
+// more repos get a thin router: POST /repo/{name} switches the active repo (sets
+// the repoCookie, rejects an unknown handle) and every other request is
+// dispatched to the cookie-selected repo's own routes. Paths stay flat in both
+// modes; selection rides the cookie, not the URL, so the embedded templates and
+// asset wiring are untouched.
+func (m *Multi) Routes() http.Handler {
+	if len(m.names) == 1 {
+		return m.handlers[m.names[0]]
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /repo/{name}", m.switchRepo)
+	mux.HandleFunc("/", m.dispatch)
+	return mux
+}
+
+// switchRepo selects the active repo for this client by setting the repoCookie,
+// then redirects to the dashboard (now scoped to the chosen repo). An unknown
+// handle is rejected with 404 rather than silently selecting nothing — the caller
+// asked to switch to a repo that is not registered.
+func (m *Multi) switchRepo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, ok := m.handlers[name]; !ok {
+		http.NotFound(w, r)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     repoCookie,
+		Value:    name,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// dispatch routes a request to the active repo's own handler set. The active repo
+// is resolved per-request from the repoCookie (defaulting to the sorted-first
+// name), so concurrent requests carrying different cookies are served by
+// different, immutable Servers with no shared selection state to race.
+func (m *Multi) dispatch(w http.ResponseWriter, r *http.Request) {
+	m.activeHandler(r).ServeHTTP(w, r)
+}
+
+// activeHandler returns the routes for the repo this request selected via the
+// repoCookie, or the default (sorted-first) repo when the cookie is absent or
+// names a repo that is not (or no longer) registered. Falling back to the default
+// for a stale cookie keeps every page working after a repo is removed, while an
+// explicit switch to an unknown repo is still rejected in switchRepo.
+func (m *Multi) activeHandler(r *http.Request) http.Handler {
+	name := m.names[0]
+	if c, err := r.Cookie(repoCookie); err == nil {
+		if _, ok := m.handlers[c.Value]; ok {
+			name = c.Value
+		}
+	}
+	return m.handlers[name]
 }
 
 // Routes returns the mux wired to all handlers.
