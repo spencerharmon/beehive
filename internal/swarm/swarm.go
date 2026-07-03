@@ -39,6 +39,16 @@ type Client interface {
 	Open(ctx context.Context, cwd, system string) (Session, error)
 }
 
+// ModelClient is a Client that can additionally pin a session to a specific
+// model, letting the runner route a pass to a per-kind model (a cheap model for
+// trivial passes, the strong model for real code Work). A Client that does NOT
+// implement it (e.g. a test stub, or a future single-model backend) simply falls
+// back to Open, so model routing is inert rather than a hard dependency.
+type ModelClient interface {
+	Client
+	OpenModel(ctx context.Context, cwd, system, model string) (Session, error)
+}
+
 // Runner drives a single honeybee turn loop.
 type Runner struct {
 	Repo     *repo.Repo
@@ -49,6 +59,21 @@ type Runner struct {
 	TTL      time.Duration
 	Now      func() time.Time
 	Debug    io.Writer // non-nil: stream session activity live
+
+	// ModelByKind routes a pass to a per-kind model, keyed by the selection kind
+	// string ("reconcile"/"bootstrap"/"work"/"review"/"arbitrate"). It tiers cost:
+	// a cheap model for trivial, near-deterministic passes, the strong model for
+	// real code Work. A kind with no entry (or a Client that is not a ModelClient)
+	// falls back to the client's single configured model, so a single-model host is
+	// unaffected. Nil = no routing. Resolved from the layered config (see cmd/honeybee).
+	ModelByKind map[string]string
+
+	// MaxIdleTurns bounds consecutive turns that make NO forward progress (see
+	// progressSig): no change to the code worktree, the change docs, or — for a
+	// claim-free bootstrap/reconcile pass — the beehive layer. A pass that churns
+	// without advancing is abandoned for GC with a warning, tightening the raw
+	// turn/wall cap into a progress detector. 0 = off (only the turn/wall caps apply).
+	MaxIdleTurns int
 	// Session is this honeybee's unique claim token, stamped on the task it works
 	// so peers can tell a task is actively held (session + fresh heartbeat) versus
 	// free. Must match the token main used for the initial Claim.
@@ -406,7 +431,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if r.LeanInject {
 		system = trimProtocol(system, sel.Kind)
 	}
-	sess, err := r.Client.Open(ctx, absRoot, system)
+	sess, err := r.openSession(ctx, absRoot, system, sel)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
 	}
@@ -501,6 +526,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if wg != nil {
 			_ = wg.WorktreeRemove(ctx, wtAbs)
 		}
+	}
+	// No-forward-progress detection: track a fingerprint of this pass's real
+	// artifacts (progressSig) and abandon the pass for GC once it repeats for
+	// MaxIdleTurns consecutive turns. lastSig is seeded with the pre-first-turn
+	// state so a turn 1 that does nothing already counts as idle. Inert when
+	// MaxIdleTurns == 0 (no extra git/fs reads, byte-identical to the old loop).
+	var idleTurns int
+	var lastSig string
+	if r.MaxIdleTurns > 0 {
+		lastSig = r.progressSig(ctx, sel, wtAbs)
 	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
 		// Revert any change the agent made to the repo's git config (remotes) during
@@ -650,6 +685,32 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 			cleanup()
 			return res, nil
+		}
+		// No-forward-progress cap: the turn did real work but produced nothing this
+		// pass acts on (no code-worktree/docs/beehive change). Count consecutive idle
+		// turns and abandon for GC once they reach MaxIdleTurns, exactly like the
+		// turn/wall cap below — status and the (now-staling) claim are left intact so
+		// stale-claim GC reclaims and re-drives the task. Skipped when disabled.
+		if r.MaxIdleTurns > 0 {
+			sig := r.progressSig(ctx, sel, wtAbs)
+			if sig == lastSig {
+				idleTurns++
+			} else {
+				idleTurns = 0
+				lastSig = sig
+			}
+			if idleTurns >= r.MaxIdleTurns {
+				res.GCMarked = true
+				res.Warning = fmt.Sprintf(
+					"no forward progress for %d consecutive turns on %s; abandoning for GC (turn cap tightened to a progress detector)",
+					idleTurns, progressLabel(sel))
+				if ferr := finish(res.Warning); ferr != nil {
+					cleanup()
+					return res, ferr
+				}
+				cleanup()
+				return res, nil
+			}
 		}
 		if r.now().After(deadline) {
 			break
@@ -904,6 +965,106 @@ func hasTask(sel *selectt.Selection) bool {
 	default:
 		return false
 	}
+}
+
+// openSession opens the agent session for this pass, routing to a per-kind model
+// when one is configured AND the client can honor it (ModelClient). Otherwise it
+// opens on the client's single configured model, so a single-model host — or any
+// Client that is not a ModelClient (test stubs) — behaves exactly as before.
+func (r *Runner) openSession(ctx context.Context, dir, system string, sel *selectt.Selection) (Session, error) {
+	if model := r.modelForKind(sel.Kind); model != "" {
+		if mc, ok := r.Client.(ModelClient); ok {
+			return mc.OpenModel(ctx, dir, system, model)
+		}
+	}
+	return r.Client.Open(ctx, dir, system)
+}
+
+// modelForKind returns the configured model override for a selection kind, or ""
+// when none is set (fall back to the client's default model).
+func (r *Runner) modelForKind(kind selectt.Kind) string {
+	if r.ModelByKind == nil {
+		return ""
+	}
+	return r.ModelByKind[string(kind)]
+}
+
+// progressSig fingerprints this pass's real artifacts so the loop can detect a
+// pass that burns turns without advancing. It deliberately reads ONLY surfaces
+// the agent itself moves, never anything the per-turn heartbeat rewrites:
+//
+//   - the change-docs directory (filesystem name:size:modtime) — every kind. The
+//     heartbeat's `git add -A` commits these files but never mutates them, so the
+//     on-disk listing changes only when the agent writes a doc.
+//   - the code worktree HEAD + porcelain status — Work only. It is a SEPARATE git
+//     repo (the submodule checkout) the beehive heartbeat never touches.
+//   - the beehive worktree HEAD + porcelain status — ONLY for the claim-free kinds
+//     (Bootstrap/Reconcile). They hold no task, so nothing re-stamps the beehive
+//     layer each turn and its movement is genuine progress. For a task-bearing kind
+//     the heartbeat commits to this worktree every turn, so it is excluded.
+//
+// A read error degrades to a stable marker rather than failing the turn: idle
+// detection is a bounded safety net, never a correctness dependency.
+func (r *Runner) progressSig(ctx context.Context, sel *selectt.Selection, wtAbs string) string {
+	var b strings.Builder
+	b.WriteString("docs:")
+	b.WriteString(dirSig(filepath.Join(sel.Submodule.Path, "docs")))
+	if wtAbs != "" {
+		b.WriteString("|code:")
+		b.WriteString(repoSig(ctx, git.New(wtAbs)))
+	}
+	if !hasTask(sel) {
+		b.WriteString("|hive:")
+		b.WriteString(repoSig(ctx, r.Git))
+	}
+	return b.String()
+}
+
+// repoSig is a git working-tree fingerprint: committed HEAD plus the porcelain
+// status of uncommitted changes, so both a commit and an in-progress edit register
+// as forward progress. Unreadable git state degrades to a stable "?" marker.
+func repoSig(ctx context.Context, g *git.Repo) string {
+	head, err := g.RevParse(ctx, "HEAD")
+	if err != nil {
+		head = "?"
+	}
+	st, err := g.Run(ctx, "status", "--porcelain")
+	if err != nil {
+		st = "?"
+	}
+	return head + ";" + st
+}
+
+// dirSig fingerprints a directory's regular files by name, size, and modtime so a
+// new or grown file registers as progress. A missing/unreadable dir is a stable
+// "?" (so "no docs yet" stays constant across idle turns).
+func dirSig(dir string) string {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return "?"
+	}
+	var b strings.Builder
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			b.WriteString(e.Name() + ":?;")
+			continue
+		}
+		fmt.Fprintf(&b, "%s:%d:%d;", e.Name(), info.Size(), info.ModTime().UnixNano())
+	}
+	return b.String()
+}
+
+// progressLabel names the pass for an idle-cap warning: "<submodule> <taskid>" for
+// a task-bearing kind, else "<submodule> <kind>".
+func progressLabel(sel *selectt.Selection) string {
+	if hasTask(sel) {
+		return sel.Submodule.Name + " " + sel.Task.ID
+	}
+	return sel.Submodule.Name + " " + string(sel.Kind)
 }
 
 // syncWorktreeBase brings the submodule checkout to the tracked-branch tip

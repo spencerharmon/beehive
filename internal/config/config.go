@@ -47,22 +47,36 @@ const fileName = "config.yaml"
 // Config is the parsed beehive config. Zero-valued fields are treated as "unset"
 // when layering (see merge): a layer only overrides the fields it actually sets.
 type Config struct {
-	Dir          string  `yaml:"-"`
-	GPGHome      string  `yaml:"gpg_home"`      // dir containing the keyring
-	GPGRecipient string  `yaml:"gpg_recipient"` // recipient for SECRETS.yaml.gpg
-	AgentCmd     string  `yaml:"agent_cmd"`     // opencode binary
-	AgentURL     string  `yaml:"agent_url"`     // opencode server base URL
-	Model        string  `yaml:"model"`         // provider/model for opencode
-	Temperature  float64 `yaml:"temperature"`   // sampling temperature for the agent model
-	MaxTokens    int     `yaml:"max_tokens"`    // max output tokens per turn (0 = backend default)
-	TTLMinutes   int     `yaml:"ttl_minutes"`   // GC heartbeat TTL
-	MaxTurns     int     `yaml:"max_turns"`     // per-honeybee turn cap
-	RejectLimit  int     `yaml:"reject_limit"`  // rejections before NEEDS-HUMAN
+	Dir          string `yaml:"-"`
+	GPGHome      string `yaml:"gpg_home"`      // dir containing the keyring
+	GPGRecipient string `yaml:"gpg_recipient"` // recipient for SECRETS.yaml.gpg
+	AgentCmd     string `yaml:"agent_cmd"`     // opencode binary
+	AgentURL     string `yaml:"agent_url"`     // opencode server base URL
+	Model        string `yaml:"model"`         // provider/model for opencode (the default when no per-kind route applies)
+	// Models routes a pass to a per-kind model (keyed by the selection kind:
+	// "reconcile", "bootstrap", "work", "review", "arbitrate"). It tiers cost:
+	// a CHEAP model for trivial, near-deterministic passes (reconcile no-ops,
+	// pointer bumps, pure status flips) and the strong Model for real code Work.
+	// A kind with no entry falls through to Model (see ModelForKind), so a single-
+	// model host that never sets `models:` is unaffected. Layered per-key: a more
+	// specific scope overrides only the kinds it names (see merge).
+	Models      map[string]string `yaml:"models"`
+	Temperature float64           `yaml:"temperature"`  // sampling temperature for the agent model
+	MaxTokens   int               `yaml:"max_tokens"`   // max output tokens per turn (0 = backend default)
+	TTLMinutes  int               `yaml:"ttl_minutes"`  // GC heartbeat TTL
+	MaxTurns    int               `yaml:"max_turns"`    // per-honeybee turn cap
+	RejectLimit int               `yaml:"reject_limit"` // rejections before NEEDS-HUMAN
 	// TurnTimeoutMinutes bounds a single agent turn (one opencode call). A stalled
 	// session is canceled at this cap so the honeybee abandons the task for GC
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+	// MaxIdleTurns bounds consecutive agent turns that make NO forward progress
+	// (no change to the code worktree, the change docs, or — for a claim-free
+	// bootstrap/reconcile pass — the beehive layer). A pass that churns turns
+	// without advancing is abandoned for GC, tightening the raw turn/wall cap into
+	// a progress detector. 0 = off (only the turn/wall caps apply).
+	MaxIdleTurns int `yaml:"max_idle_turns"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -85,6 +99,19 @@ func resolveDir() string {
 		return d
 	}
 	return DefaultDir
+}
+
+// ModelForKind returns the model the given selection kind should run on: the
+// per-kind override from Models when set, else the default Model. kind is the
+// selection kind string ("reconcile"/"bootstrap"/"work"/"review"/"arbitrate").
+// An empty result (no route and no default Model) tells the caller to use the
+// agent client's own configured model, so routing stays inert on a single-model
+// host.
+func (c Config) ModelForKind(kind string) string {
+	if m := c.Models[kind]; m != "" {
+		return m
+	}
+	return c.Model
 }
 
 // loadFile reads one config layer from path. A missing file is not an error: it
@@ -125,6 +152,21 @@ func merge(base, over Config) Config {
 	if over.Model != "" {
 		out.Model = over.Model
 	}
+	// Per-kind model routes layer per KEY, not wholesale: a more specific scope
+	// overrides only the kinds it names and inherits the rest. Clone-on-write so a
+	// merge never mutates the base layer's map (Config values share it by copy).
+	if len(over.Models) > 0 {
+		m := make(map[string]string, len(out.Models)+len(over.Models))
+		for k, v := range out.Models {
+			m[k] = v
+		}
+		for k, v := range over.Models {
+			if v != "" {
+				m[k] = v
+			}
+		}
+		out.Models = m
+	}
 	if over.Temperature != 0 {
 		out.Temperature = over.Temperature
 	}
@@ -142,6 +184,9 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	if over.MaxIdleTurns != 0 {
+		out.MaxIdleTurns = over.MaxIdleTurns
 	}
 	return out
 }

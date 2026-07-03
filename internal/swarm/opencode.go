@@ -44,8 +44,21 @@ type Opencode struct {
 // opencode takes the cwd from the ?directory= query, not a body field) under the
 // given system prompt, WITHOUT sending a first message. The caller drives turns
 // via Session.Prompt, which lets a recorder start before the first (often long)
-// turn.
+// turn. The session runs on the client's configured Model.
 func (o *Opencode) Open(ctx context.Context, dir, system string) (Session, error) {
+	return o.open(ctx, dir, system, "")
+}
+
+// OpenModel is Open with a per-session model override (empty = the client's
+// configured Model). It lets the runner route one pass to a per-kind model —
+// e.g. a cheap model for a trivial reconcile, the strong model for real code
+// Work — without mutating the shared client. The override applies to every turn
+// of the returned session (see ocSession.Prompt).
+func (o *Opencode) OpenModel(ctx context.Context, dir, system, model string) (Session, error) {
+	return o.open(ctx, dir, system, model)
+}
+
+func (o *Opencode) open(ctx context.Context, dir, system, model string) (Session, error) {
 	body := map[string]any{
 		"agent": "build", // primary agent that can edit/run, not read-only chat
 		// auto-approve all tool actions so the honeybee runs autonomously
@@ -60,7 +73,7 @@ func (o *Opencode) Open(ctx context.Context, dir, system string) (Session, error
 	if created.ID == "" {
 		return nil, fmt.Errorf("opencode: empty session id")
 	}
-	return &ocSession{oc: o, id: created.ID, dir: dir, system: system}, nil
+	return &ocSession{oc: o, id: created.ID, dir: dir, system: system, model: model}, nil
 }
 
 // NewSession creates a session and sends the first prompt, returning its reply.
@@ -105,6 +118,9 @@ type ocSession struct {
 	id     string
 	dir    string
 	system string
+	// model is the per-session model override ("provider/model"); "" means use the
+	// client's configured Opencode.Model. Set by OpenModel for per-kind routing.
+	model string
 }
 
 // Messages returns the full ordered message history of the session, including
@@ -163,11 +179,18 @@ func (s *ocSession) Messages(ctx context.Context) ([]Message, error) {
 // per-turn timeout / WallCap) bounds the wait and poll errors are surfaced, never
 // swallowed.
 func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
-	prov, model, _ := strings.Cut(s.oc.Model, "/")
+	// This session's model: the per-session override when set (per-kind routing),
+	// else the client's configured default. Split provider/model at send time so a
+	// routed session and a default session share one code path.
+	model := s.model
+	if model == "" {
+		model = s.oc.Model
+	}
+	prov, modelID, _ := strings.Cut(model, "/")
 	body := map[string]any{
 		"agent":  "build",
 		"system": s.system,
-		"model":  map[string]any{"providerID": prov, "modelID": model},
+		"model":  map[string]any{"providerID": prov, "modelID": modelID},
 		"parts":  []map[string]any{{"type": "text", "text": text}},
 	}
 	// Model knobs from the resolved (layered) config. Only sent when explicitly

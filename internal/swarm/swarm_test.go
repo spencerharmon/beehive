@@ -3,6 +3,7 @@ package swarm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -995,5 +996,218 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	}
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
+	}
+}
+
+// modelClient implements ModelClient, recording which open path each pass took:
+// the per-kind OpenModel (capturing the model string) or the plain default Open.
+// It lets the routing tests prove a pass is dispatched to the configured per-kind
+// model, and falls back to the client default when a kind has no route.
+type modelClient struct {
+	sess         *mockSession
+	openModels   []string // model arg of each OpenModel (per-kind route) call
+	defaultOpens int      // count of plain Open (client-default) calls
+}
+
+var _ ModelClient = (*modelClient)(nil)
+
+func (m *modelClient) session() *mockSession {
+	if m.sess == nil {
+		m.sess = &mockSession{}
+	}
+	return m.sess
+}
+
+func (m *modelClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	m.defaultOpens++
+	return m.session(), nil
+}
+
+func (m *modelClient) OpenModel(ctx context.Context, cwd, system, model string) (Session, error) {
+	m.openModels = append(m.openModels, model)
+	return m.session(), nil
+}
+
+// seedWorkTask stands up a beehive repo with one submodule 'sm', a committed code
+// checkout, and a claimable Work task T1 (seeded [IN-PROGRESS], which parses to
+// TODO). It mirrors the inline fixture the other Work tests use, factored out for
+// the routing/idle tests, and returns the runner-facing handles plus the submodule
+// dir and PLAN.md path.
+func seedWorkTask(t *testing.T) (*repo.Repo, *git.Repo, *selectt.Selection, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+	return rp, g, sel, sm, planPath
+}
+
+// completeOnTurn drives the standard Work task T1 to DONE with its expected change
+// doc, so a pass completes on the turn it runs.
+func completeOnTurn(sm, planPath string) func(int) {
+	return func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}
+}
+
+// TestRunRoutesModelByKind proves a pass whose kind has a configured model is
+// dispatched to that model via the ModelClient path — the per-kind routing that
+// sends a cheap model to trivial passes and reserves the strong model for real
+// Work.
+func TestRunRoutesModelByKind(t *testing.T) {
+	rp, g, sel, sm, planPath := seedWorkTask(t)
+	mc := &modelClient{sess: &mockSession{onTurn: completeOnTurn(sm, planPath)}}
+	r := &Runner{
+		Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		ModelByKind: map[string]string{"work": "cheap/x"},
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("want completed, got %+v", res)
+	}
+	if len(mc.openModels) != 1 || mc.openModels[0] != "cheap/x" {
+		t.Fatalf("want one OpenModel(cheap/x), got openModels=%v defaultOpens=%d", mc.openModels, mc.defaultOpens)
+	}
+	if mc.defaultOpens != 0 {
+		t.Fatalf("a routed kind must not open on the default model, defaultOpens=%d", mc.defaultOpens)
+	}
+}
+
+// TestRunNoModelRouteUsesDefault proves a kind with NO configured model opens on
+// the client's default model (plain Open) even when other kinds are routed — so a
+// single-model host, or any unrouted kind, is unaffected.
+func TestRunNoModelRouteUsesDefault(t *testing.T) {
+	rp, g, sel, sm, planPath := seedWorkTask(t)
+	mc := &modelClient{sess: &mockSession{onTurn: completeOnTurn(sm, planPath)}}
+	r := &Runner{
+		Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		ModelByKind: map[string]string{"reconcile": "cheap/x"}, // no "work" route
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("want completed, got %+v", res)
+	}
+	if mc.defaultOpens != 1 || len(mc.openModels) != 0 {
+		t.Fatalf("an unrouted kind must open on the default model, got defaultOpens=%d openModels=%v", mc.defaultOpens, mc.openModels)
+	}
+}
+
+// TestModelRouteInertWithoutModelClient proves model routing is inert when the
+// Client cannot honor it: a plain Client (not a ModelClient) with ModelByKind set
+// still runs the pass on its single model rather than failing — routing is an
+// optional capability, never a hard dependency.
+func TestModelRouteInertWithoutModelClient(t *testing.T) {
+	rp, g, sel, sm, planPath := seedWorkTask(t)
+	cl := &mockClient{sess: &mockSession{onTurn: completeOnTurn(sm, planPath)}}
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		ModelByKind: map[string]string{"work": "cheap/x"}, // set, but cl cannot honor it
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("routing must be inert (fall back to Open) for a non-ModelClient, got %+v", res)
+	}
+}
+
+// TestRunStopsOnNoForwardProgress proves the no-forward-progress cap: a pass that
+// keeps running turns without changing any artifact it acts on (no code-worktree
+// or change-doc movement) is abandoned for GC once it repeats MaxIdleTurns times —
+// well before the raw turn cap — with a warning naming the stuck pass.
+func TestRunStopsOnNoForwardProgress(t *testing.T) {
+	rp, g, sel, _, _ := seedWorkTask(t)
+	// The agent does nothing each turn (no onTurn): every turn is idle.
+	r := &Runner{
+		Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 20, WallCap: time.Hour, TTL: time.Hour,
+		MaxIdleTurns: 2,
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("an idle pass must not report completion, got %+v", res)
+	}
+	if !res.GCMarked {
+		t.Fatalf("want GCMarked on a no-progress pass, got %+v", res)
+	}
+	if res.Turns != 2 {
+		t.Fatalf("idle cap must fire at MaxIdleTurns (2), not the turn cap; got Turns=%d", res.Turns)
+	}
+	if !contains(res.Warning, "no forward progress") {
+		t.Fatalf("warning should name the stalled progress, got %q", res.Warning)
+	}
+}
+
+// TestRunNoIdleCapWhenDisabled proves MaxIdleTurns==0 disables the detector
+// entirely: an idle pass runs all the way to the raw turn cap (Turns==MaxTurns+1)
+// exactly as before, and no idle warning is produced — the feature is opt-in.
+func TestRunNoIdleCapWhenDisabled(t *testing.T) {
+	rp, g, sel, _, _ := seedWorkTask(t)
+	r := &Runner{
+		Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		MaxIdleTurns: 0,
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.GCMarked || res.Turns != 4 {
+		t.Fatalf("disabled idle cap must run to the turn cap (Turns=4, GCMarked), got %+v", res)
+	}
+	if contains(res.Warning, "no forward progress") {
+		t.Fatalf("no idle warning must appear when the cap is disabled, got %q", res.Warning)
+	}
+}
+
+// TestRunIdleResetsOnProgress proves a pass that makes real progress every turn (a
+// new change doc each turn) never trips the idle cap: the consecutive-idle counter
+// resets on each change, so the run continues to the turn cap rather than being
+// abandoned mid-flight.
+func TestRunIdleResetsOnProgress(t *testing.T) {
+	rp, g, sel, sm, _ := seedWorkTask(t)
+	// Each turn writes a NEW doc (never the completion stem; status stays TODO) so
+	// progressSig advances every turn while the task never completes.
+	sess := &mockSession{}
+	sess.onTurn = func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", fmt.Sprintf("progress-%d.md", turn)), []byte("x"), 0o644)
+	}
+	r := &Runner{
+		Repo: rp, Git: g, Client: &mockClient{sess: sess}, MaxTurns: 4, WallCap: time.Hour, TTL: time.Hour,
+		MaxIdleTurns: 2,
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Turns != 5 {
+		t.Fatalf("progress every turn must reset the idle counter and reach the turn cap (Turns=5), got %d", res.Turns)
+	}
+	if contains(res.Warning, "no forward progress") {
+		t.Fatalf("a progressing pass must not trip the idle cap, got %q", res.Warning)
+	}
+	if !res.GCMarked {
+		t.Fatalf("want GCMarked at the turn cap, got %+v", res)
 	}
 }

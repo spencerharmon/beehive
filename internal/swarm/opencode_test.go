@@ -82,6 +82,87 @@ func TestPromptOmitsUnsetKnobs(t *testing.T) {
 	}
 }
 
+// TestPromptUsesSessionModelOverride proves a session carrying a per-session model
+// override (set by OpenModel for per-kind routing) sends THAT model in its turn
+// request — split into providerID/modelID — instead of the client's configured
+// default Model. This is the opencode-layer half of model routing: the runner
+// picks the model, the session pins it for every turn without mutating the shared
+// client.
+func TestPromptUsesSessionModelOverride(t *testing.T) {
+	var body map[string]any
+	srv := captureBody(t, &body)
+	defer srv.Close()
+
+	oc := &Opencode{Base: srv.URL, Model: "strong/big", HTTP: srv.Client()}
+	// model set as OpenModel would, overriding the client default strong/big.
+	s := &ocSession{oc: oc, id: "sess1", dir: "/wt", system: "sys", model: "cheap/small"}
+
+	if _, err := s.Prompt(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	model, _ := body["model"].(map[string]any)
+	if model["providerID"] != "cheap" || model["modelID"] != "small" {
+		t.Fatalf("body model = %v, want the per-session override cheap/small (not the client default strong/big)", body["model"])
+	}
+}
+
+// TestOpenModelRoutesModelEndToEnd proves the OpenModel constructor yields a
+// session that routes to the override model end-to-end (session create + turn),
+// while a plain Open session on the same client still uses the client default —
+// so a routed pass and a default pass share one client without cross-talk.
+func TestOpenModelRoutesModelEndToEnd(t *testing.T) {
+	var mu sync.Mutex
+	var lastModel map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/session" { // session create
+			_, _ = w.Write([]byte(`{"id":"sess1"}`))
+			return
+		}
+		// turn message POST: record the model split, reply already completed.
+		b, _ := io.ReadAll(r.Body)
+		m := map[string]any{}
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Errorf("bad json body: %v", err)
+		}
+		mu.Lock()
+		lastModel, _ = m["model"].(map[string]any)
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"info":{"id":"a1","time":{"completed":1700000000000}},"parts":[{"type":"text","text":"ok"}]}`))
+	}))
+	defer srv.Close()
+
+	oc := &Opencode{Base: srv.URL, Model: "strong/big", HTTP: srv.Client()}
+
+	routed, err := oc.OpenModel(context.Background(), "/wt", "sys", "cheap/small")
+	if err != nil {
+		t.Fatalf("OpenModel: %v", err)
+	}
+	if _, err := routed.Prompt(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := lastModel
+	mu.Unlock()
+	if got["providerID"] != "cheap" || got["modelID"] != "small" {
+		t.Fatalf("OpenModel turn model = %v, want cheap/small override", got)
+	}
+
+	def, err := oc.Open(context.Background(), "/wt", "sys")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := def.Prompt(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got = lastModel
+	mu.Unlock()
+	if got["providerID"] != "strong" || got["modelID"] != "big" {
+		t.Fatalf("default Open turn model = %v, want the client default strong/big (override must not leak)", got)
+	}
+}
+
 // TestPromptWaitsForTurnIdle proves the turn-idle poll: opencode's POST accepts a
 // turn WITHOUT finishing it (the reply has no info.time.completed), so Prompt must
 // poll GET /session/<id>/message until the assistant message reports completed and

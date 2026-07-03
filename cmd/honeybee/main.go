@@ -173,6 +173,14 @@ func run() error {
 		SessionPublish: sessPublish, SessionPush: sessPush,
 		RestoreConfig: restoreRemotes,
 		TurnTimeout:   time.Duration(c.TurnTimeoutMinutes) * time.Minute,
+		// Per-kind model routing + no-forward-progress cap from the LAYERED config
+		// (honeybee-model-routing): a cheap model for trivial passes, the strong
+		// model for real code Work, and a bounded idle detector that abandons a
+		// churning pass for GC. Both are inert by default — ModelByKind empty (or a
+		// non-ModelClient client) uses the single configured model, MaxIdleTurns 0
+		// leaves only the turn/wall caps — so a single-model host is unchanged.
+		ModelByKind:  eff.Models,
+		MaxIdleTurns: eff.MaxIdleTurns,
 		// Opt-in per-pass injection trim. Deliberately an env flag rather than a
 		// config knob: the layered-config surface is owned by honeybee-model-routing,
 		// and gating here keeps the injected set byte-identical to the historical
