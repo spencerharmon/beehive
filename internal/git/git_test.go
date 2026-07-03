@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -564,5 +565,33 @@ func TestEnsureCleanCheckout(t *testing.T) {
 	healed, err = r2.EnsureCleanCheckout(ctx)
 	if !healed || err == nil {
 		t.Fatalf("un-resettable drift: want (true,err), got (%v,%v)", healed, err)
+	}
+}
+
+// TestConflictErrNamesPaths verifies the publish-conflict instrumentation: the
+// error returned when a merge conflicts still satisfies errors.Is(ErrConflict)
+// (so every existing consumer keeps working) AND names the conflicted path so the
+// log says WHAT clashed instead of a bare "merge conflict".
+func TestConflictErrNamesPaths(t *testing.T) {
+	r := initRepo(t)
+	ctx := context.Background()
+	os.WriteFile(filepath.Join(r.Dir, "f"), []byte("base\n"), 0o644)
+	r.Commit(ctx, "base")
+	r.Run(ctx, "checkout", "-q", "-b", "x")
+	os.WriteFile(filepath.Join(r.Dir, "f"), []byte("x\n"), 0o644)
+	r.Commit(ctx, "x")
+	r.Run(ctx, "checkout", "-q", "main")
+	os.WriteFile(filepath.Join(r.Dir, "f"), []byte("main\n"), 0o644)
+	r.Commit(ctx, "main")
+	// Merge x into main -> conflicts on f, leaving unmerged state.
+	if _, err := r.Run(ctx, "merge", "--no-edit", "x"); err == nil {
+		t.Fatal("expected merge to conflict")
+	}
+	err := r.conflictErr(ctx)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("wrapped error must match ErrConflict, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "conflicted:") || !strings.Contains(err.Error(), "f") {
+		t.Fatalf("error must name the conflicted path, got %q", err.Error())
 	}
 }

@@ -348,6 +348,23 @@ func (r *Repo) DiffPaths(ctx context.Context, a, b, path string) (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// conflictErr wraps ErrConflict with the currently-conflicted (unmerged) paths, so
+// a publish failure names WHAT clashed (the submodule gitlink, PLAN.md, a session
+// transcript, ...) in the log instead of a bare "merge conflict". Capture it BEFORE
+// `git merge --abort`, which clears the conflict state. Kept
+// errors.Is(err, ErrConflict)-compatible via %w.
+func (r *Repo) conflictErr(ctx context.Context) error {
+	paths := "unknown"
+	if out, err := r.Run(ctx, "diff", "--name-only", "--diff-filter=U"); err == nil {
+		if f := strings.Fields(out); len(f) > 0 {
+			paths = strings.Join(f, ",")
+		} else {
+			paths = "none"
+		}
+	}
+	return fmt.Errorf("%w (conflicted: %s)", ErrConflict, paths)
+}
+
 // PublishToMain advances main to the current worktree branch's tip and pushes,
 // the conflict-free way honeybees converge. It merges the latest main into the
 // branch first (distinct session/plan files auto-merge), then updates main. With
@@ -371,8 +388,9 @@ func (r *Repo) PublishToMain(ctx context.Context, remote string) error {
 				return err
 			}
 			if _, err := r.Run(ctx, "merge", "--no-edit", "FETCH_HEAD"); err != nil {
+				cerr := r.conflictErr(ctx)
 				_, _ = r.Run(ctx, "merge", "--abort")
-				return ErrConflict
+				return cerr
 			}
 		}
 		_, err := r.Run(ctx, "push", target, "HEAD:refs/heads/main")
@@ -386,8 +404,9 @@ func (r *Repo) PublishToMain(ctx context.Context, remote string) error {
 				ref = remote + "/main"
 			}
 			if _, merr := r.Run(ctx, "merge", "--no-edit", ref); merr != nil {
+				cerr := r.conflictErr(ctx)
 				_, _ = r.Run(ctx, "merge", "--abort")
-				return ErrConflict
+				return cerr
 			}
 			continue
 		}
@@ -596,8 +615,9 @@ func (r *Repo) UpdateLocalMain(ctx context.Context) error {
 		}
 		if isNonFastForward(err) {
 			if _, merr := r.Run(ctx, "merge", "--no-edit", "main"); merr != nil {
+				cerr := r.conflictErr(ctx)
 				_, _ = r.Run(ctx, "merge", "--abort")
-				return ErrConflict
+				return cerr
 			}
 			continue
 		}
