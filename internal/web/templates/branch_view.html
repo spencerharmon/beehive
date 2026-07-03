@@ -1,5 +1,18 @@
 {{template "header"}}
 <h1>{{.Name}} commits</h1>
+<section class="card merge-inline">
+<h2>Merge a branch</h2>
+<p class="muted">Merge a branch into this submodule's tracked branch, push it to origin, and advance the beehive pointer. Destructive — you'll be asked to confirm.</p>
+<form method="post" action="/merge"
+      hx-post="/merge" hx-target="#branch-merge-result" hx-select="#merge-panel" hx-swap="innerHTML"
+      hx-indicator="#htmx-progress"
+      hx-confirm="Merge this branch into the tracked branch? This runs a real git merge, pushes origin, and advances the pointer — it cannot be undone here.">
+  <input type="hidden" name="name" value="{{.Name}}">
+  <input name="branch" placeholder="branch to merge">
+  <button class="merge">merge &amp; publish</button>
+</form>
+<div id="branch-merge-result"></div>
+</section>
 {{range .Sections}}
 <section class="card">
 <h2>{{.Date}}</h2>

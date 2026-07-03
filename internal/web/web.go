@@ -485,10 +485,33 @@ func (s *Server) secretsPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) mergeGet(w http.ResponseWriter, r *http.Request) {
-	subs, _ := s.repo.Submodules()
-	s.render(w, "merge_panel.html", map[string]interface{}{"Subs": subs})
+	s.renderMerge(w, nil)
 }
 
+// renderMerge renders the merge panel fragment, always injecting the live
+// submodule list and a (possibly empty) Selected name so the template's
+// preselect comparison is type-safe. Extra keys (Merged/Branch/Tracked) drive
+// the post-merge success banner.
+func (s *Server) renderMerge(w http.ResponseWriter, data map[string]interface{}) {
+	if data == nil {
+		data = map[string]interface{}{}
+	}
+	if _, ok := data["Selected"]; !ok {
+		data["Selected"] = ""
+	}
+	subs, _ := s.repo.Submodules()
+	data["Subs"] = subs
+	s.render(w, "merge_panel.html", data)
+}
+
+// mergePost publishes a merge end-to-end rather than merging locally and
+// stopping. It merges the chosen branch into the submodule's tracked branch
+// (resolved from .gitmodules, never a hardcoded "main"), pushes that branch to
+// the submodule's origin, then advances + commits the beehive pointer and
+// publishes the beehive root through the same shared write path the other
+// mutating handlers use (commit -> publishMain). A conflict is aborted cleanly
+// (origin and pointer untouched) and returns 409; an already-merged branch moves
+// nothing and is still a success (idempotent).
 func (s *Server) mergePost(w http.ResponseWriter, r *http.Request) {
 	name, branch := r.FormValue("name"), r.FormValue("branch")
 	if name == "" || branch == "" {
@@ -500,20 +523,69 @@ func (s *Server) mergePost(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	ctx := r.Context()
+	tracked := s.trackedBranch(ctx, sm)
 	g := git.New(sm.RepoDir())
-	if err := g.Merge(r.Context(), branch); err != nil {
+	// Merge INTO the tracked branch: check it out first so the merge advances that
+	// branch ref itself (submodule checkouts are frequently left detached), which
+	// is exactly what the subsequent push publishes.
+	if _, err := g.Run(ctx, "checkout", tracked); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if err := g.Merge(ctx, branch); err != nil {
 		if errors.Is(err, git.ErrConflict) {
+			// Abort the conflicted merge so the checkout (and origin) are left
+			// exactly as found — no partial publish.
+			_, _ = g.Run(ctx, "merge", "--abort")
 			http.Error(w, "merge conflict", http.StatusConflict)
 			return
 		}
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := s.commit(r.Context(), "frontend: merge "+branch+" in "+name); err != nil && !errors.Is(err, git.ErrNothing) {
+	// Publish the merged tracked branch to the submodule's origin (branch-tracking
+	// model) so other clones and the recorded pointer agree. No remote => a
+	// single-host target with nothing to push. A failed push stops here, BEFORE
+	// the pointer is advanced, so the recorded pointer never points past origin.
+	remote, err := g.Remote(ctx)
+	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.mergeGet(w, r)
+	if remote != "" {
+		if err := g.Push(ctx, remote, tracked); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	}
+	// Advance + commit the beehive pointer (stages the submodule gitlink) and
+	// publish the beehive root, reusing the same path planDelete/roiPost use. An
+	// already-merged branch stages nothing (ErrNothing) and is still a success.
+	if err := s.commit(ctx, "frontend: merge "+branch+" into "+tracked+" ("+name+")\n\nBeehive: frontend-merge "+name); err != nil && !errors.Is(err, git.ErrNothing) {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if err := s.publishMain(ctx); err != nil {
+		http.Error(w, "merged locally but publish to remote failed: "+err.Error(), 500)
+		return
+	}
+	s.renderMerge(w, map[string]interface{}{
+		"Selected": name, "Merged": true, "Branch": branch, "Tracked": tracked,
+	})
+}
+
+// trackedBranch resolves the submodule's tracked branch from .gitmodules
+// (submodule.<path>.branch) — the branch the beehive pointer follows, the same
+// lookup `beehive submodule sync` uses. It defaults to "main" only when the entry
+// is unset, so the merge target is never hardcoded.
+func (s *Server) trackedBranch(ctx context.Context, sm repo.Submodule) string {
+	rel := filepath.Join("submodules", sm.Name, "repo")
+	branch, err := s.git.Run(ctx, "config", "-f", ".gitmodules", "submodule."+rel+".branch")
+	if err != nil || branch == "" {
+		return "main"
+	}
+	return branch
 }
 
 // submoduleAdd registers a target repo as a real tracked git submodule through

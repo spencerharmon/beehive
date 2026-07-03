@@ -1651,3 +1651,213 @@ func TestComputeStats(t *testing.T) {
 		t.Fatalf("GET /stats: code=%d, m/🐝 present=%v", w.Code, strings.Contains(w.Body.String(), "m/🐝"))
 	}
 }
+
+// seedTrackedSubmodule stands up a bare origin seeded with a single base commit
+// on the given tracked branch, clones it into submodules/<name>/repo, and
+// registers the gitlink + a .gitmodules entry (branch=tracked) in the beehive
+// root with an initial pointer commit. It returns the bare origin path, the
+// submodule checkout dir, and the base commit SHA — the realistic branch-tracking
+// setup the merge publish path operates on. Callers add feature/conflict branches
+// on top. A non-"main" tracked branch also proves the tracked branch is read from
+// .gitmodules, never hardcoded.
+func seedTrackedSubmodule(t *testing.T, root, name, tracked string) (origin, repoDir, base string) {
+	t.Helper()
+	origin = filepath.Join(t.TempDir(), name+"-origin.git")
+	hygGit(t, root, "init", "--bare", "-b", tracked, origin)
+
+	seed := filepath.Join(t.TempDir(), name+"-seed")
+	hygGit(t, root, "init", "-q", "-b", tracked, seed)
+	hygGit(t, seed, "config", "user.email", "t@t")
+	hygGit(t, seed, "config", "user.name", "t")
+	os.WriteFile(filepath.Join(seed, "base.txt"), []byte("base\n"), 0o644)
+	hygGit(t, seed, "add", "-A")
+	hygGit(t, seed, "commit", "-q", "-m", "base")
+	hygGit(t, seed, "remote", "add", "origin", origin)
+	hygGit(t, seed, "push", "-q", "-u", "origin", tracked)
+
+	repoDir = filepath.Join(root, "submodules", name, "repo")
+	if err := os.MkdirAll(filepath.Dir(repoDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hygGit(t, root, "clone", "-q", "-b", tracked, origin, repoDir)
+	hygGit(t, repoDir, "config", "user.email", "t@t")
+	hygGit(t, repoDir, "config", "user.name", "t")
+	base = hygGit(t, repoDir, "rev-parse", "HEAD")
+
+	rel := filepath.Join("submodules", name, "repo")
+	os.WriteFile(filepath.Join(root, ".gitmodules"),
+		[]byte("[submodule \""+rel+"\"]\n\tpath = "+rel+"\n\turl = "+origin+"\n\tbranch = "+tracked+"\n"), 0o644)
+	// Stage the gitlink at the checkout's real HEAD and the .gitmodules entry, then
+	// commit ONLY those so the baseline pointer records the submodule at base.
+	hygGit(t, root, "update-index", "--add", "--cacheinfo", "160000,"+base+","+rel)
+	hygGit(t, root, "add", ".gitmodules")
+	hygGit(t, root, "commit", "-q", "-m", "register "+name)
+	return origin, repoDir, base
+}
+
+// TestMergePublishes is the core of merge-button-wire: POST /merge fast-forwards
+// the submodule's tracked branch, PUSHES it to origin, and ADVANCES + commits the
+// beehive pointer — the three steps the old local-only merge skipped. The tracked
+// branch is "trunk" (not "main") to prove it is read from .gitmodules. A second
+// identical POST is a no-op success (idempotent): no spurious pointer commit, no
+// origin movement.
+func TestMergePublishes(t *testing.T) {
+	s, root := setup(t)
+	name, tracked := "merger", "trunk"
+	origin, repoDir, _ := seedTrackedSubmodule(t, root, name, tracked)
+
+	// A fast-forwardable feature branch: base + one commit, local and on origin.
+	hygGit(t, repoDir, "checkout", "-q", "-b", "feature")
+	os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("feat\n"), 0o644)
+	hygGit(t, repoDir, "add", "-A")
+	hygGit(t, repoDir, "commit", "-q", "-m", "feature work")
+	featTip := hygGit(t, repoDir, "rev-parse", "HEAD")
+	hygGit(t, repoDir, "push", "-q", "origin", "feature")
+	hygGit(t, repoDir, "checkout", "-q", tracked)
+
+	rel := filepath.Join("submodules", name, "repo")
+	rootBefore := hygGit(t, root, "rev-parse", "HEAD")
+
+	w := postForm(t, s, "/merge", url.Values{"name": {name}, "branch": {"feature"}})
+	if w.Code != 200 {
+		t.Fatalf("merge %d: %s", w.Code, w.Body)
+	}
+
+	// (a) tracked branch fast-forwarded to the feature tip in the local checkout.
+	if got := hygGit(t, repoDir, "rev-parse", tracked); got != featTip {
+		t.Fatalf("tracked branch not fast-forwarded: got %s want %s", got, featTip)
+	}
+	// (b) the merge was PUSHED: origin's tracked branch advanced to the feature tip.
+	if got := hygGit(t, origin, "rev-parse", tracked); got != featTip {
+		t.Fatalf("origin %s not advanced (merge not published): got %s want %s", tracked, got, featTip)
+	}
+	// (c) the beehive pointer advanced: a new root commit records the new gitlink.
+	if got := hygGit(t, root, "rev-parse", "HEAD"); got == rootBefore {
+		t.Fatalf("beehive pointer commit not created (root HEAD unchanged)")
+	}
+	if got := hygGit(t, root, "rev-parse", "HEAD:"+rel); got != featTip {
+		t.Fatalf("pointer gitlink = %s, want feature tip %s", got, featTip)
+	}
+
+	// Idempotent: a second identical merge is a no-op success — no new pointer
+	// commit and origin unmoved.
+	rootAfter := hygGit(t, root, "rev-parse", "HEAD")
+	w2 := postForm(t, s, "/merge", url.Values{"name": {name}, "branch": {"feature"}})
+	if w2.Code != 200 {
+		t.Fatalf("idempotent merge %d: %s", w2.Code, w2.Body)
+	}
+	if got := hygGit(t, root, "rev-parse", "HEAD"); got != rootAfter {
+		t.Fatalf("idempotent merge created a spurious pointer commit: %s -> %s", rootAfter, got)
+	}
+	if got := hygGit(t, origin, "rev-parse", tracked); got != featTip {
+		t.Fatalf("idempotent merge moved origin: got %s", got)
+	}
+}
+
+// TestMergeConflict proves the destructive path is safe: a branch that conflicts
+// with the tracked branch returns 409, the merge is ABORTED (the checkout is left
+// clean on the tracked tip), and NOTHING is published — origin and the beehive
+// pointer are untouched (no partial publish).
+func TestMergeConflict(t *testing.T) {
+	s, root := setup(t)
+	name, tracked := "conf", "trunk"
+	origin, repoDir, _ := seedTrackedSubmodule(t, root, name, tracked)
+
+	// A conflict branch edits the same file the tracked branch will also edit, so
+	// the merge can neither fast-forward nor auto-merge.
+	hygGit(t, repoDir, "checkout", "-q", "-b", "conflict")
+	os.WriteFile(filepath.Join(repoDir, "base.txt"), []byte("theirs\n"), 0o644)
+	hygGit(t, repoDir, "add", "-A")
+	hygGit(t, repoDir, "commit", "-q", "-m", "their edit")
+	hygGit(t, repoDir, "push", "-q", "origin", "conflict")
+	hygGit(t, repoDir, "checkout", "-q", tracked)
+	os.WriteFile(filepath.Join(repoDir, "base.txt"), []byte("ours\n"), 0o644)
+	hygGit(t, repoDir, "add", "-A")
+	hygGit(t, repoDir, "commit", "-q", "-m", "our edit")
+	hygGit(t, repoDir, "push", "-q", "origin", tracked)
+	trackedTip := hygGit(t, repoDir, "rev-parse", tracked)
+	originBefore := hygGit(t, origin, "rev-parse", tracked)
+	rootBefore := hygGit(t, root, "rev-parse", "HEAD")
+
+	w := postForm(t, s, "/merge", url.Values{"name": {name}, "branch": {"conflict"}})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("merge conflict: got %d, want 409: %s", w.Code, w.Body)
+	}
+	// Merge aborted: the checkout is clean and still on the tracked tip.
+	if out := hygGit(t, repoDir, "status", "--porcelain"); out != "" {
+		t.Fatalf("submodule left mid-conflict (dirty): %q", out)
+	}
+	if got := hygGit(t, repoDir, "rev-parse", "HEAD"); got != trackedTip {
+		t.Fatalf("tracked HEAD moved on a conflict: got %s want %s", got, trackedTip)
+	}
+	// Origin untouched — the failed merge published nothing.
+	if got := hygGit(t, origin, "rev-parse", tracked); got != originBefore {
+		t.Fatalf("origin advanced on a conflict: got %s want %s", got, originBefore)
+	}
+	// Beehive pointer untouched.
+	if got := hygGit(t, root, "rev-parse", "HEAD"); got != rootBefore {
+		t.Fatalf("beehive pointer commit created on a conflict")
+	}
+}
+
+// TestTrackedBranchDefault locks the "read the tracked branch from .gitmodules,
+// never hardcode main" contract directly: absent config falls back to main, and
+// an explicit submodule.<path>.branch entry is honored.
+func TestTrackedBranchDefault(t *testing.T) {
+	s, root := setup(t)
+	sm := repo.Submodule{Name: "alpha", Path: filepath.Join(root, "submodules", "alpha")}
+	if got := s.trackedBranch(context.Background(), sm); got != "main" {
+		t.Fatalf("no .gitmodules: tracked = %q, want main (default)", got)
+	}
+	rel := filepath.Join("submodules", "alpha", "repo")
+	os.WriteFile(filepath.Join(root, ".gitmodules"),
+		[]byte("[submodule \""+rel+"\"]\n\tpath = "+rel+"\n\turl = ./x\n\tbranch = release\n"), 0o644)
+	if got := s.trackedBranch(context.Background(), sm); got != "release" {
+		t.Fatalf("explicit branch: tracked = %q, want release (from .gitmodules)", got)
+	}
+}
+
+// TestMergePanelSuccessAndPreselect locks the post-merge UI: the success banner
+// names the merged branch and tracked branch, and the submodule dropdown
+// preselects the one just merged (so the panel reflects what happened).
+func TestMergePanelSuccessAndPreselect(t *testing.T) {
+	s, _ := setup(t)
+	out := renderTmpl(t, s, "merge_panel.html", map[string]interface{}{
+		"Subs":     []repo.Submodule{{Name: "alpha"}, {Name: "beta"}},
+		"Merged":   true,
+		"Branch":   "bee-x",
+		"Tracked":  "trunk",
+		"Selected": "beta",
+	})
+	for _, want := range []string{`id="merge-panel"`, "bee-x", "trunk", `<option selected>beta</option>`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("merge success panel missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `<option selected>alpha</option>`) {
+		t.Fatalf("wrong submodule preselected (alpha, not beta):\n%s", out)
+	}
+}
+
+// TestBranchViewMergeControl proves the once-inert branch view now carries a live,
+// submodule-scoped publish control: a form that POSTs /merge with the submodule
+// name fixed, a destructive confirm, a loading indicator, and an inline result
+// target for the htmx swap.
+func TestBranchViewMergeControl(t *testing.T) {
+	s, _ := setup(t)
+	out := renderTmpl(t, s, "branch_view.html", map[string]interface{}{
+		"Name": "alpha", "Sections": nil, "HasPrev": false, "HasNext": false,
+	})
+	for _, want := range []string{
+		`hx-post="/merge"`,              // wired to the publish endpoint
+		`name="name" value="alpha"`,     // scoped to THIS submodule
+		`id="branch-merge-result"`,      // inline success/failure target
+		"hx-confirm=",                   // destructive-action confirm
+		`hx-indicator="#htmx-progress"`, // loading state on the swap
+		`hx-target="#branch-merge-result"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("branch view merge control missing %q:\n%s", want, out)
+		}
+	}
+}

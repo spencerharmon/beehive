@@ -1,12 +1,13 @@
 {{template "header"}}
 <div id="merge-panel">
 <h1>Merge to main</h1>
-<p class="muted">Runs a real <code>git merge</code> of the chosen branch into the submodule's main. Destructive — you'll be asked to confirm.</p>
+{{if .Merged}}<p class="banner ok">Merged <code>{{.Branch}}</code> into <code>{{.Tracked}}</code> for {{.Selected}} — pushed to origin and advanced the beehive pointer.</p>{{end}}
+<p class="muted">Runs a real <code>git merge</code> of the chosen branch into the submodule's tracked branch, pushes it to origin, and advances the beehive pointer. Destructive — you'll be asked to confirm.</p>
 <form method="post" action="/merge"
       hx-post="/merge" hx-target="#merge-panel" hx-select="#merge-panel" hx-swap="outerHTML"
       hx-indicator="#htmx-progress"
-      hx-confirm="Merge this branch into main? This runs a real git merge and cannot be undone here.">
-  <select name="name">{{range .Subs}}<option>{{.Name}}</option>{{end}}</select>
+      hx-confirm="Merge this branch into the tracked branch? This runs a real git merge, pushes origin, and advances the pointer — it cannot be undone here.">
+  <select name="name">{{range .Subs}}<option{{if eq .Name $.Selected}} selected{{end}}>{{.Name}}</option>{{end}}</select>
   <input name="branch" placeholder="branch">
   <button class="merge">merge</button>
 </form>
