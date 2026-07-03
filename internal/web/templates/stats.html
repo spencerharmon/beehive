@@ -1,27 +1,26 @@
 {{template "header"}}
-<h1>honeybee performance <span class="badge">m/🐝</span></h1>
+<h1>honeybee performance <span class="badge">✅/🐝</span></h1>
 <p class="muted">Derived on read from git — nothing stored, nothing to drift.
-<b>delivered</b> = PLAN <code>[DONE]</code> · <b>sessions</b> = one honeybee pass ·
-<b>sessions/task</b> = retry pressure · <b>stranded</b> = finished work whose merge
-never landed (wedge indicator) · <b>m/🐝</b> = delivered ÷ sessions.
-See <code>docs/conflict-resolution.md</code>.</p>
+<b>delivered tasks (✅)</b> = tasks marked <code>[DONE]</code> (a task can take more
+than one merge, so we count the task) · <b>honeybees (🐝)</b> = one honeybee pass ·
+<b>✅/🐝</b> = delivered tasks per honeybee · <b>stranded</b> = tasks with finished
+work on a pushed branch that never merged (recoverable — GC never drops an unmerged
+branch). See <code>docs/conflict-resolution.md</code>.</p>
 <table>
-<tr><th>submodule</th><th>delivered</th><th>sessions</th><th>sessions/task</th><th>stranded</th><th>m/🐝</th></tr>
+<tr><th>submodule</th><th>delivered tasks ✅</th><th>honeybees 🐝</th><th>✅/🐝</th><th>stranded</th></tr>
 {{range .Subs}}<tr>
   <td><a href="/submodule/{{.Name}}/plan">{{.Name}}</a></td>
-  <td>{{.Delivered}}</td>
-  <td>{{.Sessions}}</td>
-  <td>{{printf "%.1f" .SessionsPerTask}}</td>
+  <td>{{.DeliveredTasks}}</td>
+  <td>{{.Honeybees}}</td>
+  <td>{{printf "%.1f%%" .DeliveredPerBeePct}}</td>
   <td>{{if .Stranded}}<span class="state danger">{{.Stranded}}</span>{{else}}0{{end}}</td>
-  <td>{{printf "%.1f%%" .MergesPerBeePct}}</td>
-</tr>{{else}}<tr><td colspan=6 class="muted">no submodules</td></tr>{{end}}
+</tr>{{else}}<tr><td colspan=5 class="muted">no submodules</td></tr>{{end}}
 <tr class="total">
   <td><b>total</b></td>
-  <td><b>{{.Total.Delivered}}</b></td>
-  <td><b>{{.Total.Sessions}}</b></td>
-  <td><b>{{printf "%.1f" .Total.SessionsPerTask}}</b></td>
+  <td><b>{{.Total.DeliveredTasks}}</b></td>
+  <td><b>{{.Total.Honeybees}}</b></td>
+  <td><b>{{printf "%.1f%%" .Total.DeliveredPerBeePct}}</b></td>
   <td><b>{{.Total.Stranded}}</b></td>
-  <td><b>{{printf "%.1f%%" .Total.MergesPerBeePct}}</b></td>
 </tr>
 </table>
 {{template "footer"}}

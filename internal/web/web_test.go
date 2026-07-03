@@ -1629,26 +1629,20 @@ func TestComputeStats(t *testing.T) {
 		t.Fatalf("want 1 submodule, got %d", len(subs))
 	}
 	a := subs[0]
-	if a.Delivered != 1 { // only t3 is DONE
-		t.Errorf("delivered=%d, want 1", a.Delivered)
+	if a.DeliveredTasks != 1 { // only t3 is DONE
+		t.Errorf("deliveredTasks=%d, want 1", a.DeliveredTasks)
 	}
-	if a.Sessions != 3 { // the 3 bee-*.md, not the non-session file
-		t.Errorf("sessions=%d, want 3", a.Sessions)
+	if a.Honeybees != 3 { // the 3 bee-*.md, not the non-session file
+		t.Errorf("honeybees=%d, want 3", a.Honeybees)
 	}
-	if a.DistinctTasks != 2 { // t1, t3
-		t.Errorf("distinctTasks=%d, want 2", a.DistinctTasks)
+	if want := 100.0 / 3.0; a.DeliveredPerBeePct < want-0.01 || a.DeliveredPerBeePct > want+0.01 {
+		t.Errorf("delivered/bee=%v, want ~%v", a.DeliveredPerBeePct, want)
 	}
-	if a.SessionsPerTask != 1.5 {
-		t.Errorf("sessions/task=%v, want 1.5", a.SessionsPerTask)
+	if total.DeliveredTasks != 1 || total.Honeybees != 3 {
+		t.Errorf("total=%+v, want delivered 1 honeybees 3", total)
 	}
-	if want := 100.0 / 3.0; a.MergesPerBeePct < want-0.01 || a.MergesPerBeePct > want+0.01 {
-		t.Errorf("m/bee=%v, want ~%v", a.MergesPerBeePct, want)
-	}
-	if total.Delivered != 1 || total.Sessions != 3 {
-		t.Errorf("total=%+v, want delivered 1 sessions 3", total)
-	}
-	if w := get(t, s, "/stats"); w.Code != 200 || !strings.Contains(w.Body.String(), "m/🐝") {
-		t.Fatalf("GET /stats: code=%d, m/🐝 present=%v", w.Code, strings.Contains(w.Body.String(), "m/🐝"))
+	if w := get(t, s, "/stats"); w.Code != 200 || !strings.Contains(w.Body.String(), "✅/🐝") {
+		t.Fatalf("GET /stats: code=%d, ✅/🐝 present=%v", w.Code, strings.Contains(w.Body.String(), "✅/🐝"))
 	}
 }
 

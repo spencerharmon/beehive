@@ -15,30 +15,26 @@ import (
 // from git — never stored, so they can't drift from reality (the same signals as
 // skills/bin/beehive-stats.sh; see docs/conflict-resolution.md).
 //
-//	Delivered = tasks at PLAN [DONE] (merged + reviewed + live)
-//	Sessions  = session transcript files (one per honeybee pass / one "bee")
-//	Stranded  = stamped bee-branches ahead of main whose task isn't DONE
-//	            (finished work whose merge never landed — the wedge indicator)
-//	MergesPerBeePct = 100 * Delivered / Sessions   (the m/🐝 yield)
-//	SessionsPerTask = Sessions / distinct tasks worked (retry pressure)
+//	DeliveredTasks (✅) = tasks at PLAN [DONE] — a task can take more than one
+//	                     merge, so we count the task, not merges.
+//	Honeybees      (🐝) = session transcript files (one per honeybee pass).
+//	Stranded            = tasks with a stamped bee-<task> branch ahead of main that
+//	                     never merged (finished work whose merge didn't land — the
+//	                     wedge indicator; not lost, GC never drops an unmerged branch).
+//	DeliveredPerBeePct  = 100 * DeliveredTasks / Honeybees   (the ✅/🐝 yield)
 type subStat struct {
-	Name            string
-	Delivered       int
-	Sessions        int
-	DistinctTasks   int
-	Stranded        int
-	SessionsPerTask float64
-	MergesPerBeePct float64
+	Name               string
+	DeliveredTasks     int
+	Honeybees          int
+	Stranded           int
+	DeliveredPerBeePct float64
 }
 
 var sessionNameRE = regexp.MustCompile(`^bee-(.+)-\d+-\d+$`)
 
 func (st *subStat) derive() {
-	if st.DistinctTasks > 0 {
-		st.SessionsPerTask = float64(st.Sessions) / float64(st.DistinctTasks)
-	}
-	if st.Sessions > 0 {
-		st.MergesPerBeePct = 100 * float64(st.Delivered) / float64(st.Sessions)
+	if st.Honeybees > 0 {
+		st.DeliveredPerBeePct = 100 * float64(st.DeliveredTasks) / float64(st.Honeybees)
 	}
 }
 
@@ -57,33 +53,26 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 				for _, t := range p.Tasks {
 					if t.Status == plan.StatusDone {
 						done[t.ID] = true
-						st.Delivered++
+						st.DeliveredTasks++
 					}
 				}
 			}
 		}
-		tasks := map[string]bool{}
 		if ents, rerr := os.ReadDir(sm.SessionsDir()); rerr == nil {
 			for _, e := range ents {
-				name := e.Name()
-				if !strings.HasSuffix(name, ".md") {
+				if !strings.HasSuffix(e.Name(), ".md") {
 					continue
 				}
-				m := sessionNameRE.FindStringSubmatch(strings.TrimSuffix(name, ".md"))
-				if m == nil {
-					continue
+				if sessionNameRE.MatchString(strings.TrimSuffix(e.Name(), ".md")) {
+					st.Honeybees++
 				}
-				st.Sessions++
-				tasks[m[1]] = true
 			}
 		}
-		st.DistinctTasks = len(tasks)
 		st.Stranded = strandedCount(ctx, git.New(sm.RepoDir()), done)
 		st.derive()
 		subs = append(subs, st)
-		total.Delivered += st.Delivered
-		total.Sessions += st.Sessions
-		total.DistinctTasks += st.DistinctTasks
+		total.DeliveredTasks += st.DeliveredTasks
+		total.Honeybees += st.Honeybees
 		total.Stranded += st.Stranded
 	}
 	total.derive()
