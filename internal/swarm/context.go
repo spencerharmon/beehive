@@ -166,11 +166,18 @@ func reinjectAll(transcript string, current map[string]string) string {
 }
 
 // latestFileContents extracts, from a session transcript, the most recent full
-// content the agent has for each file it read or wrote: a completed read tool's
-// output, or a write tool's input content. Later turns overwrite earlier ones so
-// the map holds each file's latest seen state. edit/patch tools carry only a
-// fragment (old/new strings), not the whole file, so they are not a content
-// source here — the diff feed works from the full snapshots reads/writes give.
+// content the agent has for each file it read, wrote, or EDITED. A completed
+// read's output and a write's input content are full snapshots taken directly.
+// An edit carries only an (oldString -> newString) fragment, not the whole file,
+// so a COMPLETED edit is APPLIED (applyEdit) to the running snapshot the map
+// already holds for that path — edits are the dominant way a honeybee mutates a
+// file across turns, so ignoring them left a just-edited file mis-reported as
+// "unchanged" by the diff feed (the file changed but no read/write re-snapshotted
+// it). Parts are processed in order so sequential edits compose and a later
+// read/write overrides. An edit to a path with no prior snapshot is skipped: a
+// fragment alone cannot reconstruct the whole file. (The multi-hunk `patch` tool
+// is still not folded — its unified-diff payload needs a full applier; a
+// subsequent read re-snapshots such files.)
 func latestFileContents(msgs []Message) map[string]string {
 	out := map[string]string{}
 	for _, m := range msgs {
@@ -191,10 +198,40 @@ func latestFileContents(msgs []Message) map[string]string {
 				if c := inputString(p.Input, "content"); c != "" {
 					out[path] = c
 				}
+			case "edit":
+				// Only a completed edit actually mutated the file; a
+				// pending/errored one (e.g. oldString absent or ambiguous)
+				// left it unchanged. Need a prior full snapshot to apply to.
+				if p.Status != "completed" {
+					continue
+				}
+				if base, ok := out[path]; ok {
+					out[path] = applyEdit(base, p.Input)
+				}
 			}
 		}
 	}
 	return out
+}
+
+// applyEdit folds a completed edit tool's (oldString -> newString) fragment into
+// the content the runner already tracks for that file, mirroring the editor's own
+// single-occurrence (or replaceAll) substitution so the diff feed reflects an
+// in-place edit instead of reporting the file unchanged. Best-effort: an empty or
+// absent oldString, or one not present in base (a stale snapshot), leaves base
+// untouched — the runner never re-reads to reconcile and the authoritative file
+// still streams verbatim to the session branch. replaceAll replaces every
+// occurrence; otherwise only the first (the single unique match a plain edit made).
+func applyEdit(base string, in map[string]any) string {
+	oldS := inputString(in, "oldString")
+	if oldS == "" || !strings.Contains(base, oldS) {
+		return base
+	}
+	newS := inputString(in, "newString")
+	if all, ok := in["replaceAll"].(bool); ok && all {
+		return strings.ReplaceAll(base, oldS, newS)
+	}
+	return strings.Replace(base, oldS, newS, 1)
 }
 
 // transcriptText renders the transcript to plain text (assistant/user text,

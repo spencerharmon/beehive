@@ -166,6 +166,79 @@ func TestLatestFileContentsReadWriteLatestWins(t *testing.T) {
 	}
 }
 
+// TestLatestFileContentsAppliesEdits proves a completed edit is folded into the
+// running snapshot (edits are the dominant cross-turn mutation, so a fragment must
+// advance the tracked content), an errored edit does NOT mutate it, and an edit to a
+// path with no prior snapshot is skipped (a fragment cannot rebuild the whole file).
+func TestLatestFileContentsAppliesEdits(t *testing.T) {
+	msgs := []Message{
+		{Role: "assistant", Parts: []Part{
+			{Type: "tool", Tool: "read", Status: "completed", Input: map[string]any{"filePath": "a.go"}, Output: "alpha\nbeta\ngamma\n"},
+		}},
+		{Role: "assistant", Parts: []Part{
+			{Type: "tool", Tool: "edit", Status: "completed", Input: map[string]any{"filePath": "a.go", "oldString": "beta", "newString": "BETA"}},
+			// An errored edit (e.g. ambiguous/absent oldString) did not change the file.
+			{Type: "tool", Tool: "edit", Status: "error", Input: map[string]any{"filePath": "a.go", "oldString": "gamma", "newString": "NOPE"}},
+			// An edit to a never-snapshotted file cannot be reconstructed from a fragment.
+			{Type: "tool", Tool: "edit", Status: "completed", Input: map[string]any{"filePath": "b.go", "oldString": "x", "newString": "y"}},
+		}},
+	}
+	got := latestFileContents(msgs)
+	if got["a.go"] != "alpha\nBETA\ngamma\n" {
+		t.Errorf("a completed edit must fold into the snapshot (and an errored edit must not); got %q", got["a.go"])
+	}
+	if _, ok := got["b.go"]; ok {
+		t.Errorf("an edit to a never-snapshotted file must be skipped; got %q", got["b.go"])
+	}
+}
+
+// TestLatestFileContentsEditReplaceAll proves replaceAll rewrites every occurrence
+// while the default single edit rewrites only the first.
+func TestLatestFileContentsEditReplaceAll(t *testing.T) {
+	base := "x x x\n"
+	all := []Message{{Role: "assistant", Parts: []Part{
+		{Type: "tool", Tool: "write", Input: map[string]any{"filePath": "a.go", "content": base}},
+		{Type: "tool", Tool: "edit", Status: "completed", Input: map[string]any{"filePath": "a.go", "oldString": "x", "newString": "y", "replaceAll": true}},
+	}}}
+	if got := latestFileContents(all)["a.go"]; got != "y y y\n" {
+		t.Errorf("replaceAll must rewrite every occurrence; got %q", got)
+	}
+	one := []Message{{Role: "assistant", Parts: []Part{
+		{Type: "tool", Tool: "write", Input: map[string]any{"filePath": "a.go", "content": base}},
+		{Type: "tool", Tool: "edit", Status: "completed", Input: map[string]any{"filePath": "a.go", "oldString": "x", "newString": "y"}},
+	}}}
+	if got := latestFileContents(one)["a.go"]; got != "y x x\n" {
+		t.Errorf("a default edit must rewrite only the first occurrence; got %q", got)
+	}
+}
+
+// TestEditedFileFeedsDiffNotUnchanged is the end-to-end guard for the edit gap: a
+// file read on an earlier turn and then mutated by `edit` (no re-read) must surface
+// as a DIFF on the next turn, not be mis-reported "unchanged". Without edit tracking
+// latestFileContents returned the stale read snapshot == the pin, so the feed said
+// "unchanged" for a file the agent had just changed.
+func TestEditedFileFeedsDiffNotUnchanged(t *testing.T) {
+	tc := newTurnCompactor()
+	turn1 := []Message{{Role: "assistant", Parts: []Part{
+		{Type: "tool", Tool: "read", Status: "completed", Input: map[string]any{"filePath": "a.go"}, Output: "one\ntwo\nthree\n"},
+	}}}
+	tc.fileFeed(latestFileContents(turn1)) // earlier turn pinned the read content silently
+
+	turn2 := []Message{
+		turn1[0],
+		{Role: "assistant", Parts: []Part{
+			{Type: "tool", Tool: "edit", Status: "completed", Input: map[string]any{"filePath": "a.go", "oldString": "two", "newString": "TWO"}},
+		}},
+	}
+	out := tc.fileFeed(latestFileContents(turn2))
+	if !strings.Contains(out, "@@") || !strings.Contains(out, "-two") || !strings.Contains(out, "+TWO") {
+		t.Fatalf("an edited file must surface as a diff on the next turn, got:\n%s", out)
+	}
+	if strings.Contains(out, "unchanged since last turn") {
+		t.Fatalf("an edited file must not be reported unchanged, got:\n%s", out)
+	}
+}
+
 // TestTranscriptTextRendersTextAndTools proves the digest source captures
 // assistant text, reasoning, and tool commands + output.
 func TestTranscriptTextRendersTextAndTools(t *testing.T) {
