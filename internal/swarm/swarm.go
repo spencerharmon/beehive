@@ -610,19 +610,26 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				fmt.Fprintf(r.Debug, "\n⚠️  %s\n", warning)
 			}
 		}
-		if err := r.streamSession(ctx, sessionRel); err != nil { // commit final transcript (incl. warning) to the branch
+		if err := r.streamSession(ctx, sessionRel); err != nil { // durable final transcript on the session branch (beehived's live source)
 			return sessionTranscriptError{err: fmt.Errorf("stream final session transcript: %w", err)}
 		}
-		if err := r.finalizeSession(ctx, sid, sessionRel, stubCommit); err != nil {
-			return sessionTranscriptError{err: err}
-		}
-		res.SessionPublished = true
-		// Publish the work to main and RETURN the result. A failure means the change
-		// never landed on main; callers that treat the task as complete MUST gate on
-		// this so a rejected publish can never read as DONE. Always surfaced to the log.
+		// Publish the WORK first and let its result gate completion. The work is what
+		// the task exists to produce; a convenience artifact must never block it.
 		ferr := r.publish(ctx)
 		if ferr != nil && r.Debug != nil {
 			fmt.Fprintf(r.Debug, "\n⚠️  publish to main failed: %v\n", ferr)
+		}
+		// Promote the transcript to main best-effort. It already lives on the session
+		// branch (beehived reads that for the live view), so failing to reach main is a
+		// WARNING, never a task failure — decoupling it is what stops a cosmetic
+		// transcript merge-conflict from blocking real work. Leave SessionPublished
+		// false on failure so the stream branch is kept as the transcript source. The
+		// warning goes to stderr (not r.Debug) so it reaches the journal even with
+		// --debug off, carrying the conflicted paths for the log-review audit.
+		if terr := r.finalizeSession(ctx, sid, sessionRel, stubCommit); terr != nil {
+			fmt.Fprintf(os.Stderr, "honeybee: WARNING session transcript publish to main failed (non-fatal; transcript kept on branch %s): %v\n", r.SessionBranch, terr)
+		} else {
+			res.SessionPublished = true
 		}
 		return ferr
 	}

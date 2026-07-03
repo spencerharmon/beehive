@@ -342,7 +342,7 @@ func TestRunPublishesSessionToMain(t *testing.T) {
 	}
 }
 
-func TestRunKeepsSessionUnpublishedWhenFinalPublishFails(t *testing.T) {
+func TestRunTranscriptPublishFailureDoesNotBlockWork(t *testing.T) {
 	root := t.TempDir()
 	g := gitInit(t, root)
 	repo.Init(root)
@@ -385,11 +385,19 @@ func TestRunKeepsSessionUnpublishedWhenFinalPublishFails(t *testing.T) {
 		},
 	}
 	res, err := r.Run(ctx, sel, "sys", "first")
-	if err == nil || !strings.Contains(err.Error(), "final session publish failed") {
-		t.Fatalf("run error = %v, want final publish error", err)
+	// The transcript publish to main is a convenience decoupled from the work: its
+	// failure must NOT fail the run nor block completion (the work — here the
+	// bootstrap PLAN.md — still lands on main).
+	if err != nil {
+		t.Fatalf("run error = %v, want nil (transcript publish failure is non-fatal)", err)
 	}
-	if res.Completed || res.SessionPublished {
-		t.Fatalf("final session publish failure must block completion and branch deletion, got %+v", res)
+	if !res.Completed {
+		t.Fatalf("work must still complete despite transcript publish failure, got %+v", res)
+	}
+	// But SessionPublished stays false so the stream branch is KEPT as the
+	// transcript source, and main keeps the live stub.
+	if res.SessionPublished {
+		t.Fatalf("SessionPublished must be false when the transcript publish failed, got %+v", res)
 	}
 	if publishCalls != 2 {
 		t.Fatalf("SessionPublish calls = %d, want start + final", publishCalls)
@@ -468,10 +476,17 @@ func TestSessionAndPlanOnSeparateBranches(t *testing.T) {
 	if !has(g, "bee-2-session", sessRel) {
 		t.Error("session branch missing the session file")
 	}
-	// The session branch published before the agent's plan reached main, so it
-	// never merged the plan: proof the two are authored independently.
-	if has(g, "bee-2-session", "submodules/sm/PLAN.md") {
-		t.Error("session branch unexpectedly has PLAN.md (indexes intermingled)")
+	// Work now publishes before the transcript, so the transcript publish merges
+	// main (which already carries the plan) into the session branch via an
+	// index-aware git-merge — not an out-of-band commit. The session branch thus
+	// legitimately gains PLAN.md while its transcript survives intact (the real
+	// anti-clobber invariant: separate authorship, nothing overwritten).
+	if !has(g, "bee-2-session", "submodules/sm/PLAN.md") {
+		t.Error("session branch should carry PLAN.md via the index-aware merge from main")
+	}
+	sbody, err := g.Show(ctx, "bee-2-session", sessRel)
+	if err != nil || !strings.Contains(sbody, "# session "+res.SessionID) {
+		t.Errorf("session branch transcript clobbered by the merge: err=%v body=%q", err, sbody)
 	}
 	// main: both, neither clobbered.
 	if !has(g, "main", "submodules/sm/PLAN.md") || !has(g, "main", sessRel) {
