@@ -997,3 +997,198 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// TestMainAdvancedComparesPublishedStamp is the unit proof of the second
+// publish-tree guard (Runner.mainAdvanced): it evaluates the bootstrap/reconcile
+// completion predicate against the PUBLISHED main (origin/main when a remote is
+// set, else local main) rather than the working tree. The decisive contrast is
+// case (2): a matching ROI stamp written ONLY to the working tree — exactly what
+// reconciled() reads and clears on — must read as NOT advanced here, because it
+// was never committed/published. The remote section proves it reads origin/main
+// and not a locally-regressed main. Every git failure is surfaced, never a false
+// "advanced".
+func TestMainAdvancedComparesPublishedStamp(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	planPath := filepath.Join(sm, "PLAN.md")
+	recSel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	bootSel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	// Non-nil Publish so the guard actually evaluates (nil short-circuits to true
+	// for the local, no-convergence mode). Remote "" => the published ref is local
+	// main, matching the harness the other publish tests use.
+	r := &Runner{Repo: rp, Git: g, Publish: func(context.Context) error { return nil }}
+
+	// 1) Nothing on main yet: neither kind has advanced.
+	if adv, err := r.mainAdvanced(ctx, recSel); err != nil || adv {
+		t.Fatalf("reconcile: no PLAN on main must be not-advanced, got adv=%v err=%v", adv, err)
+	}
+	if adv, err := r.mainAdvanced(ctx, bootSel); err != nil || adv {
+		t.Fatalf("bootstrap: no PLAN on main must be not-advanced, got adv=%v err=%v", adv, err)
+	}
+
+	// 2) A matching stamp written ONLY to the working tree (never committed) must
+	// NOT count as advanced — the guard reads the PUBLISHED main. Prove the
+	// contrast: reconciled() (the local trigger) DOES clear on that same stamp.
+	wtBody := "<!-- Beehive-ROI: " + head[:12] + " -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"
+	if err := os.WriteFile(planPath, []byte(wtBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if adv, err := r.mainAdvanced(ctx, recSel); err != nil || adv {
+		t.Fatalf("reconcile: an uncommitted working-tree stamp must be not-advanced, got adv=%v err=%v", adv, err)
+	}
+	if wtSees, err := r.reconciled(recSel); err != nil || !wtSees {
+		t.Fatalf("sanity: reconciled() must clear on the working-tree stamp (got %v err=%v)", wtSees, err)
+	}
+
+	// 3) Commit that PLAN.md to main: now bootstrap (PLAN exists) and reconcile
+	// (stamp prefixes the ROI head) both see main as advanced.
+	if err := g.CommitPaths(ctx, "plan: reconcile", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("commit plan: %v", err)
+	}
+	if adv, err := r.mainAdvanced(ctx, recSel); err != nil || !adv {
+		t.Fatalf("reconcile: a committed matching stamp on main must be advanced, got adv=%v err=%v", adv, err)
+	}
+	if adv, err := r.mainAdvanced(ctx, bootSel); err != nil || !adv {
+		t.Fatalf("bootstrap: a committed PLAN.md on main must be advanced, got adv=%v err=%v", adv, err)
+	}
+
+	// 4) A committed PLAN whose stamp does NOT prefix the ROI head fails the
+	// reconcile predicate, even though the file exists (bootstrap needs only
+	// existence, so it stays advanced).
+	bad := "<!-- Beehive-ROI: deadbeefcafe -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"
+	if err := os.WriteFile(planPath, []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.CommitPaths(ctx, "plan: wrong stamp", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("commit bad plan: %v", err)
+	}
+	if adv, err := r.mainAdvanced(ctx, recSel); err != nil || adv {
+		t.Fatalf("reconcile: a non-prefix stamp on main must be not-advanced, got adv=%v err=%v", adv, err)
+	}
+	if adv, err := r.mainAdvanced(ctx, bootSel); err != nil || !adv {
+		t.Fatalf("bootstrap: existence-only must stay advanced, got adv=%v err=%v", adv, err)
+	}
+
+	// 5) Publish == nil (local no-convergence mode) short-circuits to advanced,
+	// even though main currently holds the non-matching stamp from case (4).
+	rNil := &Runner{Repo: rp, Git: g}
+	if adv, err := rNil.mainAdvanced(ctx, recSel); err != nil || !adv {
+		t.Fatalf("nil Publish must short-circuit to advanced, got adv=%v err=%v", adv, err)
+	}
+
+	// 6) Remote mode reads origin/main, not local main. Push a good matching stamp
+	// to a bare origin, then REGRESS local main (without pushing): the remote guard
+	// must still see origin/main as advanced, proving it reads the published ref;
+	// the local guard sees the regressed local main as not advanced.
+	origin := t.TempDir()
+	ob := git.New(origin)
+	if _, err := ob.Run(ctx, "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("bare origin init: %v", err)
+	}
+	if _, err := g.Run(ctx, "remote", "add", "origin", origin); err != nil {
+		t.Fatalf("remote add: %v", err)
+	}
+	good := "<!-- Beehive-ROI: " + head[:12] + " -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"
+	if err := os.WriteFile(planPath, []byte(good), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.CommitPaths(ctx, "plan: good, pushed", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("commit good plan: %v", err)
+	}
+	if err := g.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push origin main: %v", err)
+	}
+	// Regress local main only (not pushed): origin/main keeps the good stamp.
+	if err := os.WriteFile(planPath, []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.CommitPaths(ctx, "plan: local regress, unpushed", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("commit regress: %v", err)
+	}
+	rRemote := &Runner{Repo: rp, Git: g, Remote: "origin", Publish: func(context.Context) error { return nil }}
+	if adv, err := rRemote.mainAdvanced(ctx, recSel); err != nil || !adv {
+		t.Fatalf("remote: origin/main holds the good stamp, must be advanced (reads origin, not regressed local), got adv=%v err=%v", adv, err)
+	}
+	if adv, err := r.mainAdvanced(ctx, recSel); err != nil || adv {
+		t.Fatalf("local: regressed local main must be not-advanced, got adv=%v err=%v", adv, err)
+	}
+}
+
+// TestRunBootstrapGatesOnUnpublishedPlan is the second publish-tree guard's
+// end-to-end regression: a bootstrap agent writes PLAN.md into its worktree but
+// never COMMITS it, so the local completion check passes yet the publish is a
+// no-op (the branch merge to main carries nothing). The run must NOT report
+// Completed — main never gained PLAN.md — and must mark the task for GC so the
+// bootstrap is re-driven. It is the negative twin of TestRunPublishesSessionToMain
+// (which DOES commit and stays Completed), differing ONLY in the missing commit.
+func TestRunBootstrapGatesOnUnpublishedPlan(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\nbuild it\n"), 0o644)
+	g.Commit(context.Background(), "seed roi")
+
+	ctx := context.Background()
+	wtPath := filepath.Join(root, ".worktrees", "bee-x")
+	if err := g.WorktreeAdd(ctx, wtPath, "bee-x", "main"); err != nil {
+		t.Fatal(err)
+	}
+	sessPath := filepath.Join(root, ".worktrees", "bee-x-session")
+	if err := g.WorktreeAdd(ctx, sessPath, "bee-x-session", "main"); err != nil {
+		t.Fatal(err)
+	}
+	wrp, _ := repo.Open(wtPath)
+	wg := git.New(wtPath)
+	sessGit := git.New(sessPath)
+	subs, _ := wrp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	cl := &scriptClient{}
+	cl.onPrompt = func() {
+		// Write PLAN.md into the agent worktree but DELIBERATELY never commit it:
+		// the on-disk existence check passes, but the branch has no new commit, so
+		// the publish merges nothing to main (the exact phantom-DONE gap).
+		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}
+	r := &Runner{
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Publish:        func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
+		SessionGit:     sessGit,
+		SessionRoot:    sessPath,
+		SessionBranch:  "bee-x-session",
+		SessionPublish: func(ctx context.Context) error { return sessGit.PublishToMain(ctx, "") },
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run must not error (the work is merely re-driven): %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("uncommitted PLAN never reached main; must NOT report Completed (phantom DONE): %+v", res)
+	}
+	if !res.GCMarked {
+		t.Fatalf("must mark GC so the bootstrap is re-driven: %+v", res)
+	}
+	if !contains(res.Warning, "did not advance") {
+		t.Fatalf("warning should name the no-op publish, got %q", res.Warning)
+	}
+	// main must NOT carry PLAN.md — the guard's whole point.
+	if _, err := g.Show(ctx, "main", "submodules/sm/PLAN.md"); err == nil {
+		t.Fatal("PLAN.md unexpectedly reached main despite never being committed")
+	}
+}
