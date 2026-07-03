@@ -154,6 +154,21 @@ type Runner struct {
 	// agent's code worktree HEAD + porcelain status. Only consulted when
 	// StallTurns > 0.
 	Progress func(context.Context) string
+
+	// BuildEnv is the resolved host build/test environment (e.g. CGO_ENABLED=0 +
+	// root-fs GOTMPDIR/TMPDIR/GOCACHE) the runner OWNS so no honeybee re-derives it
+	// (audit session-audit-001 F1: ~150-190 turns/window of pure env rediscovery).
+	// It is (a) EXPORTED into the honeybee process env at agent spawn so build/test
+	// subprocesses the honeybee itself spawns inherit it, and (b) STATED once in the
+	// injected preamble as the mandated Go invocation for task-bearing kinds. Both
+	// levers read this one map (see buildenv.go) so the export and the stated line
+	// never drift. Sourced from config.Config.BuildEnv (see cmd/honeybee). Empty
+	// (the default) = inert: no export, byte-identical preamble.
+	BuildEnv map[string]string
+	// ExportEnv applies BuildEnv to the process environment at agent spawn. The
+	// injectable seam: nil runs the real os.Setenv loop; tests set it to capture the
+	// exported map without mutating the real process env.
+	ExportEnv func(map[string]string)
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -461,6 +476,15 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"Use exact status NEEDS-HUMAN; never write HUMAN-NEEDED.\n\n",
 			r.Session, smName, sel.Task.ID)
 	}
+	// Told-once build/test environment: task-bearing kinds (Work/Review/Arbitrate)
+	// all build/test the submodule's code, so state the host-mandated Go invocation
+	// the runner owns (config BuildEnv) once, up front, instead of paying ~150-190
+	// turns/window for every honeybee to re-derive it (audit F1). Bootstrap/Reconcile
+	// touch only PLAN.md and never carry it. Inert (empty BuildEnv ⇒ "") so the
+	// injected preamble is byte-identical to the historical path when unconfigured.
+	if hasTask(sel) {
+		preamble += buildEnvPreamble(r.BuildEnv)
+	}
 	// Precomputed task brief (Work only): hand the agent the worktree/branch/pointer
 	// the setup already resolved, the deterministic doc-path/commit-stamp, its PLAN
 	// card, and head excerpts of its own files — so it skips discovery plumbing and
@@ -495,6 +519,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 		}
 	}
+	// Export the host build/test env into this honeybee's process at agent spawn,
+	// so any build/test subprocess the honeybee itself spawns inherits it (the
+	// stated preamble line, above, is the lever for opencode's sibling bash tool —
+	// see buildenv.go). No-op when BuildEnv is empty.
+	r.exportBuildEnv()
 	sess, err := r.Client.Open(ctx, absRoot, system)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
