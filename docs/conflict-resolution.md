@@ -13,10 +13,11 @@ Every component authors in a **private worktree/branch** and lands work by:
 2. **fast-forward/merge the branch onto main** (an atomic ref update).
 
 `main` is never edited in place. On a race (main moved under us, no conflict) the
-publisher re-merges and re-pushes — an 8-attempt loop. On a **conflict**, it
-`git merge --abort`s (which touches only the *branch* worktree; main is left
-untouched — the anti-wedge guarantee) and stops. Aborting main-side is correct and
-transient; the *task* is what must eventually resolve and retry.
+publisher re-merges and re-pushes — an 8-attempt loop. On a **conflict**, git's
+`merge --abort` keeps main untouched (the anti-wedge guarantee), and then the
+conflict is **resolved and the publish retried** (see "The complete publish flow"
+and "Status") rather than simply abandoned. Only when it genuinely cannot be
+resolved does the publisher stop — cleanly, for a later pass to resume.
 
 The plan is meant to keep this rare: tasks are sized/separated so two in-flight
 honeybees are unlikely to touch the same code or plan region. Conflicts are the
@@ -37,6 +38,38 @@ landing and interfering past N, **give up cleanly** — leave the task unfinishe
 stopped**, e.g. once the human/non-honeybee agent has finished their edits. Nothing
 wedges, nothing is silently dropped, and no tokens are spent once the state is
 (for now) unrecoverable.
+
+## The complete publish flow
+
+When a honeybee finishes a task, `finish()` converges in this exact order:
+
+1. **Stream the final transcript** to the session branch (durable; beehived's live
+   source).
+2. **Publish the WORK** (`publishWithResolution`) — its success alone gates
+   completion:
+   1. `PublishToMain`: fetch main, merge it into the work branch, push. A
+      non-conflicting race retries internally (up to 8×). Clean → done.
+   2. On a **merge conflict**, reproduce the merge in the work worktree and act by
+      conflicted path:
+      - **submodule gitlink** → *defer* (needs a submodule merge — not yet built);
+      - **text** (`PLAN.md`/docs/code) → hand the named paths to the **agent** to
+        resolve (keep both sides), stage only those paths, refuse to commit if
+        anything is still unmerged or marker-laden, then commit the merge;
+      - **race cleared** (clean re-merge) → no agent needed.
+   3. **Retry** the publish. Repeat resolve→retry up to `merge_retries` (default 8).
+   4. If new changes keep interfering past the bound, or a conflict can't be
+      resolved → **give up cleanly**: a classified, path-named error; the task is
+      left unfinished (not DONE), its claim goes stale and GCs, and a **later
+      honeybee resumes** where this one stopped.
+3. **Promote the transcript** to main, best-effort — a failure is a WARNING, never
+   a task failure (it stays on the session branch).
+4. Completion is recorded **only if the work publish succeeded**
+   (`publish-advance-guard` re-verifies main actually advanced); otherwise the task
+   is marked for GC and re-driven.
+
+Same loop for every conflict source — concurrent honeybee work or an external/
+non-honeybee writer. The abort/defer paths guarantee it never wedges and never
+spends tokens on an unrecoverable state.
 
 ## Three conflict regimes
 

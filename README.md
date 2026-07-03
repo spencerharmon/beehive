@@ -189,6 +189,7 @@ the pull target is unreachable. See `docs/sharing-modes.md`.
 - `docs/repo-layout.md` — beehive repo layout.
 - `docs/honeybee.md` — honeybee runner loop.
 - `docs/sharing-modes.md` — local vs remote sharing modes and the startup preflight guard.
+- `docs/conflict-resolution.md` — how publishes converge and how merge conflicts are resolved.
 - `docs/orchestration.md` — scheduling passes with systemd.
 - `docs/opencode.md` — agent backend setup.
 - `docs/secrets.md` — gpg secrets workflow.

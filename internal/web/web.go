@@ -69,6 +69,7 @@ func (s *Server) RecoverEditors(ctx context.Context) error {
 func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.dashboard)
+	mux.HandleFunc("GET /stats", s.stats)
 	mux.HandleFunc("GET /submodule/{name}", s.explorer)
 	mux.HandleFunc("GET /submodule/{name}/branches", s.branches)
 	mux.HandleFunc("GET /submodule/{name}/doc/{file}", s.doc)

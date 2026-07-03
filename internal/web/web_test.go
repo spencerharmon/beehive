@@ -1610,3 +1610,44 @@ func TestHygieneCleanAndWidget(t *testing.T) {
 		t.Fatalf("dashboard does not embed the hygiene widget:\n%s", dash.Body)
 	}
 }
+
+// TestComputeStats checks the git-derived honeybee-performance figures behind the
+// /stats view: delivered = PLAN [DONE], sessions = transcript files, distinct
+// tasks and the derived ratios — all read live, nothing stored.
+func TestComputeStats(t *testing.T) {
+	s, root := setup(t)
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	os.MkdirAll(sessDir, 0o755)
+	for _, n := range []string{"bee-t1-100-1.md", "bee-t1-200-2.md", "bee-t3-300-3.md", "not-a-session.md"} {
+		os.WriteFile(filepath.Join(sessDir, n), []byte("x"), 0o644)
+	}
+	subs, total, err := s.computeStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subs) != 1 {
+		t.Fatalf("want 1 submodule, got %d", len(subs))
+	}
+	a := subs[0]
+	if a.Delivered != 1 { // only t3 is DONE
+		t.Errorf("delivered=%d, want 1", a.Delivered)
+	}
+	if a.Sessions != 3 { // the 3 bee-*.md, not the non-session file
+		t.Errorf("sessions=%d, want 3", a.Sessions)
+	}
+	if a.DistinctTasks != 2 { // t1, t3
+		t.Errorf("distinctTasks=%d, want 2", a.DistinctTasks)
+	}
+	if a.SessionsPerTask != 1.5 {
+		t.Errorf("sessions/task=%v, want 1.5", a.SessionsPerTask)
+	}
+	if want := 100.0 / 3.0; a.MergesPerBeePct < want-0.01 || a.MergesPerBeePct > want+0.01 {
+		t.Errorf("m/bee=%v, want ~%v", a.MergesPerBeePct, want)
+	}
+	if total.Delivered != 1 || total.Sessions != 3 {
+		t.Errorf("total=%+v, want delivered 1 sessions 3", total)
+	}
+	if w := get(t, s, "/stats"); w.Code != 200 || !strings.Contains(w.Body.String(), "m/🐝") {
+		t.Fatalf("GET /stats: code=%d, m/🐝 present=%v", w.Code, strings.Contains(w.Body.String(), "m/🐝"))
+	}
+}
