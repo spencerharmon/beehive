@@ -39,6 +39,7 @@ type Server struct {
 	git     *git.Repo
 	tmpl    *template.Template
 	editors *editor.Manager
+	cache   *viewCache
 }
 
 // New builds a Server over the beehive repo at root.
@@ -51,7 +52,8 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{repo: r, cfg: cfg, git: git.New(r.Root), tmpl: t, editors: em}, nil
+	g := git.New(r.Root)
+	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache()}, nil
 }
 
 // RecoverEditors runs the editor's startup recovery: it re-registers persisted
@@ -158,8 +160,22 @@ func (v subView) EnvClass() string {
 	}
 }
 
+// headSHA resolves the beehive repo HEAD short SHA used to key the parse cache,
+// returning "" when HEAD is unresolvable (a repo with no commits yet) so callers
+// read through uncached rather than failing. Resolve it ONCE per request and
+// share it across every submodule's cached read: a multi-submodule dashboard
+// then pays a single `git rev-parse`, not one per submodule, and every card in
+// that render sees a coherent commit snapshot.
+func (s *Server) headSHA(ctx context.Context) string {
+	h, err := s.git.Head(ctx)
+	if err != nil {
+		return ""
+	}
+	return h
+}
+
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
-	views, err := s.subViews(time.Now(), s.ttl())
+	views, err := s.subViews(r.Context(), time.Now(), s.ttl())
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -175,20 +191,29 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg})
 }
 
-// subViews builds the dashboard card data for every submodule, derived live from
-// files (no cache) so the swarm status is always current: State
+// subViews builds the dashboard card data for every submodule: State
 // (active/dormant/bootstrap), the ROI Stamp, the Pending/Human task counts from
-// the unified parser (internal/plan via parsePlan — the same code the
+// the unified parser (internal/plan via planView — the same parse the
 // runner/selector use), the active blue/green Env from the submodule's own
 // INFRASTRUCTURE.md via the typed artifacts model, and Working (a task carrying a
 // fresh session+heartbeat claim). now/ttl are passed in so the claim-freshness
 // derivation is deterministically testable; the handler supplies time.Now() and
 // the resolved TTL.
-func (s *Server) subViews(now time.Time, ttl time.Duration) ([]subView, error) {
+//
+// The PLAN.md read+parse is memoized per repo HEAD via planView, but the swarm
+// status stays current: the counts and Working flag are re-projected against
+// now/ttl every call (so a claim still goes stale on TTL expiry with no new
+// commit), and any file change advances HEAD and drops the cache. ctx carries
+// the request's cancellation/deadline into the HEAD lookup.
+func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration) ([]subView, error) {
 	subs, err := s.repo.Submodules()
 	if err != nil {
 		return nil, err
 	}
+	// Resolve HEAD once for the whole render: every submodule's cached parse is
+	// keyed by this one generation, so the dashboard pays a single rev-parse and
+	// all cards reflect the same commit.
+	head := s.headSHA(ctx)
 	var views []subView
 	for _, sm := range subs {
 		v := subView{Name: sm.Name, State: "active"}
@@ -198,15 +223,19 @@ func (s *Server) subViews(now time.Time, ttl time.Duration) ([]subView, error) {
 		case sm.NeedsBootstrap():
 			v.State = "bootstrap"
 		}
-		v.Stamp, _ = sm.ROIStamp()
-		// Counts come from the unified parser: Pending = every task not DONE,
-		// Human = NEEDS-HUMAN only. A NEEDS-HUMAN task is BOTH pending and human —
-		// the two counters legitimately overlap, but each task increments each
-		// counter at most once (never double-counted within a counter). Working =
-		// any task with a fresh claim (session+heartbeat within the TTL). A parse
-		// error leaves this submodule's counts at zero rather than failing the
-		// whole dashboard (mirrors the pre-existing per-submodule resilience).
-		if p, err := parsePlan(sm.PlanPath(), now, ttl); err == nil {
+		// The ROI stamp and the task counts both come from the SAME cached
+		// PLAN.md parse (p.ROIStamp is plan.Parse().ROI — the exact value
+		// Submodule.ROIStamp scans PLAN.md for), so the dashboard reads each
+		// PLAN.md once per generation instead of twice. Counts: Pending = every
+		// task not DONE, Human = NEEDS-HUMAN only. A NEEDS-HUMAN task is BOTH
+		// pending and human — the two counters legitimately overlap, but each task
+		// increments each counter at most once (never double-counted within a
+		// counter). Working = any task with a fresh claim (session+heartbeat within
+		// the TTL). A parse error leaves this submodule's stamp/counts empty rather
+		// than failing the whole dashboard (mirrors the pre-existing per-submodule
+		// resilience).
+		if p, err := s.planView(head, sm.PlanPath(), now, ttl); err == nil {
+			v.Stamp = p.ROIStamp
 			for _, it := range p.Items {
 				if it.Status != StatusDone {
 					v.Pending++
@@ -324,7 +353,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	p, err := parsePlan(sm.PlanPath(), time.Now(), s.ttl())
+	p, err := s.planView(s.headSHA(r.Context()), sm.PlanPath(), time.Now(), s.ttl())
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -566,8 +595,9 @@ func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 		Item PlanItem
 	}
 	var rows []row
+	head := s.headSHA(r.Context())
 	for _, sm := range subs {
-		p, _ := parsePlan(sm.PlanPath(), time.Now(), s.ttl())
+		p, _ := s.planView(head, sm.PlanPath(), time.Now(), s.ttl())
 		for _, it := range p.Items {
 			if it.Status == StatusHuman {
 				rows = append(rows, row{Sub: sm.Name, Item: it})

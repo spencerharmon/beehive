@@ -111,25 +111,73 @@ type Plan struct {
 // file is an empty plan. Each task's active/stale claim state is derived against
 // now and ttl. now/ttl are passed in so the projection is deterministically
 // testable; handlers supply time.Now() and the resolved TTL.
+//
+// This is the UNCACHED baseline (read + parse + project every call); the
+// server's planView memoizes the read+parse half through viewCache. The two must
+// stay equivalent — the cache test asserts planView == parsePlan.
 func parsePlan(path string, now time.Time, ttl time.Duration) (Plan, error) {
-	var p Plan
+	parsed, err := readParsePlan(path)
+	if err != nil {
+		return Plan{}, err
+	}
+	return projectPlan(parsed, now, ttl), nil
+}
+
+// planView is the cached equivalent of parsePlan: it memoizes the expensive,
+// time-independent read+parse (readParsePlan) through the HEAD-keyed viewCache
+// and recomputes the cheap, time-dependent projection (projectPlan) fresh every
+// call. For any single HEAD generation planView(head, path, now, ttl) equals
+// parsePlan(path, now, ttl) — the cache changes only WHEN the read+parse runs,
+// never WHAT the view contains (the cache test asserts this equivalence, and
+// that a claim still goes stale on TTL expiry with no intervening commit because
+// the projection is never cached).
+//
+// head is the beehive repo HEAD short SHA, resolved once per request by the
+// caller (Server.headSHA) and shared across every submodule read; the cache key
+// is the PLAN.md path (unique per submodule), so a commit to any tracked file
+// (which advances head) re-parses on next access.
+func (s *Server) planView(head, path string, now time.Time, ttl time.Duration) (Plan, error) {
+	parsed, err := cachedView(head, s.cache, path, func() (*plan.Plan, error) {
+		return readParsePlan(path)
+	})
+	if err != nil {
+		return Plan{}, err
+	}
+	return projectPlan(parsed, now, ttl), nil
+}
+
+// readParsePlan reads a PLAN.md and returns the raw internal/plan model. This is
+// the expensive, TIME-INDEPENDENT half of parsePlan (disk read + parse) — the
+// exact work viewCache memoizes per HEAD generation. A missing file is an empty
+// plan (never an error): a freshly-added, pre-bootstrap submodule. The result is
+// treated as read-only by callers (projectPlan only reads it), so a cached
+// *plan.Plan is safe to share across concurrent requests.
+func readParsePlan(path string) (*plan.Plan, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return p, nil
+			return &plan.Plan{}, nil
 		}
-		return p, err
+		return nil, err
 	}
-	parsed, err := plan.Parse(string(b))
-	if err != nil {
-		return p, err
+	return plan.Parse(string(b))
+}
+
+// projectPlan derives the view Plan from a raw parsed plan, computing each task's
+// active/stale claim state against now/ttl. This is the cheap, TIME-DEPENDENT
+// half — it is recomputed every request (never cached) so a claim goes stale on
+// TTL expiry even when no new commit advanced HEAD.
+func projectPlan(parsed *plan.Plan, now time.Time, ttl time.Duration) Plan {
+	var p Plan
+	if parsed == nil {
+		return p
 	}
 	p.ROIStamp = parsed.ROI
 	for _, t := range parsed.Tasks {
 		p.Items = append(p.Items, projectTask(t, now, ttl))
 	}
 	resolveDeps(p.Items)
-	return p, nil
+	return p
 }
 
 // resolveDeps fills each item's DepStates, marking which of its deps are DONE in
