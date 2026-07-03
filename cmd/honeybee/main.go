@@ -90,7 +90,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	sel0, err := (&selectt.Selector{Repo: rp0, Git: primary, Rand: rnd, TTL: ttl}).Select(ctx)
+	sel0er := &selectt.Selector{Repo: rp0, Git: primary, Rand: rnd, TTL: ttl}
+	if debug {
+		sel0er.Debug = os.Stderr
+	}
+	sel0, err := sel0er.Select(ctx)
 	if err != nil {
 		return err
 	}
@@ -156,6 +160,9 @@ func run() error {
 	}
 
 	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl}
+	if debug {
+		selector.Debug = os.Stderr
+	}
 	// Rebind the primary selection onto the worktree repo so attempt 0 works the
 	// exact submodule the worktrees are named after.
 	seed, err := rebindSelection(rp, sel0)
@@ -265,7 +272,11 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		sessionBranchDisposable = res.SessionPublished
+		// SessionPublished => a real transcript merged to main; the stream branch is
+		// safe to drop. A reconcile the dedup guard found already-applied returns
+		// Completed with no SessionID: its stream branch is a bare stub (no transcript
+		// ever recorded or pushed), so dispose it too rather than leaking a local ref.
+		sessionBranchDisposable = res.SessionPublished || (res.Completed && res.SessionID == "")
 		if res.Lost {
 			tried[key] = true
 			if res.Warning != "" {

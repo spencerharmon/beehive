@@ -997,3 +997,97 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// TestRunReconcileAlreadyAppliedSkipsSession proves the reconcile dedup guard: a
+// Reconcile selection whose PLAN.md stamp already prefixes the current ROI head is
+// reported Completed WITHOUT opening a session or spending a turn. This is the
+// exact zero-progress pass the session audit flagged (a reconcile re-folding an
+// already-stamped ROI delta). The mock client's session stays nil unless Open is
+// called, so mc.sess == nil is proof no agent session was ever spawned.
+func TestRunReconcileAlreadyAppliedSkipsSession(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	// PLAN already stamped to the live ROI head: the reconcile delta is applied.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+
+	var gotSys string
+	mc := &mockClient{gotSystem: &gotSys} // sess nil; Open would set gotSys + sess
+	// No Remote => refreshMain is a no-op; the guard judges the local (stamped) tree.
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("already-applied reconcile must report Completed, got %+v", res)
+	}
+	if res.Turns != 0 {
+		t.Fatalf("already-applied reconcile must spend zero turns, got %d", res.Turns)
+	}
+	if mc.sess != nil || gotSys != "" {
+		t.Fatalf("already-applied reconcile must not open a session (sess=%v system=%q)", mc.sess, gotSys)
+	}
+}
+
+// TestRunReconcileDriftedRunsSession is the converse: a genuinely drifted Reconcile
+// (PLAN stamped to a dead sha) must NOT be short-circuited — it opens a session and
+// runs. The mock folds the delta on turn 1 (stamps PLAN to the live head) so the
+// per-turn completion check clears and the run finishes normally.
+func TestRunReconcileDriftedRunsSession(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	// Stamped to a dead sha: genuine drift, the reconcile must run.
+	os.WriteFile(planPath, []byte("<!-- Beehive-ROI: deadbeef0000 -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed plan")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+
+	var gotSys string
+	mc := &mockClient{gotSystem: &gotSys, sess: &mockSession{onTurn: func(turn int) {
+		// The agent folds the ROI delta: stamp PLAN to the live head so reconciled() clears.
+		os.WriteFile(planPath, []byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("drifted reconcile should complete after folding, got %+v", res)
+	}
+	if res.Turns < 1 {
+		t.Fatalf("drifted reconcile must run at least one turn, got %d", res.Turns)
+	}
+	if gotSys != "sys" || mc.sess.prompts < 1 {
+		t.Fatalf("drifted reconcile must open a session and prompt (system=%q prompts=%d)", gotSys, mc.sess.prompts)
+	}
+}
