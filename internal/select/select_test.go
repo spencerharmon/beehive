@@ -363,3 +363,124 @@ func TestReconcilePrefixStampNoDrift(t *testing.T) {
 		t.Fatalf("short prefix stamp must read as no-drift, got range %q", rng)
 	}
 }
+
+// TestSelectAppliedReconcileNoReEmit proves the dedup guard's back-to-back case:
+// with PLAN.md stamped at the current ROI head, TWO consecutive selection cycles
+// both yield the Work task and never re-emit a (redundant) Reconcile — the audited
+// loop where the same already-applied head is re-picked cycle after cycle.
+func TestSelectAppliedReconcileNoReEmit(t *testing.T) {
+	_, g, root := hive(t)
+	ctx := context.Background()
+	sub(root, "a", map[string]string{"ROI.md": "x", "PLAN.md": "placeholder\n"})
+	g.Commit(ctx, "seed")
+	head, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+	os.WriteFile(filepath.Join(root, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	s := sel(root, g)
+	for i := 0; i < 2; i++ {
+		got, err := s.Select(ctx)
+		if err != nil {
+			t.Fatalf("cycle %d: %v", i, err)
+		}
+		if got == nil || got.Kind != Work || got.Task.ID != "T1" {
+			t.Fatalf("cycle %d: a stamped head must select Work/T1, never re-emit Reconcile: got %+v", i, got)
+		}
+	}
+}
+
+// TestSelectRefreshMainSuppressesReconcile proves Select fast-forwards the tracked
+// tip BEFORE evaluating drift: the checkout carries a stale local stamp (a no-pull
+// selection sees drift — the negative control below), but a peer has already
+// pushed the applied reconcile to origin. With Remote set, refreshMain pulls the
+// peer's stamp and the same head no longer reads as drift, so no Reconcile is
+// selected.
+func TestSelectRefreshMainSuppressesReconcile(t *testing.T) {
+	ctx := context.Background()
+	origin := bareInit(t)
+
+	// seed checkout carries a stale stamp (local drift) and seeds origin.
+	seed := cloneBeehive(t, origin, "seed")
+	repo.Init(seed.Dir)
+	sub(seed.Dir, "a", map[string]string{
+		"ROI.md":  "x",
+		"PLAN.md": "<!-- Beehive-ROI: deadbeefcafe -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	if err := seed.Commit(ctx, "seed drift"); err != nil {
+		t.Fatalf("seed commit: %v", err)
+	}
+	if err := seed.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("seed push: %v", err)
+	}
+	head, err := seed.LastCommit(ctx, "submodules/a/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+
+	// A peer stamps PLAN.md at the ROI head (leaving ROI.md untouched so the head
+	// does not move) and pushes: origin/main now carries the applied reconcile.
+	peer := cloneBeehive(t, origin, "peer")
+	os.WriteFile(filepath.Join(peer.Dir, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	if err := peer.Commit(ctx, "peer stamp"); err != nil {
+		t.Fatalf("peer commit: %v", err)
+	}
+	if err := peer.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("peer push: %v", err)
+	}
+
+	rp, _ := repo.Open(seed.Dir)
+
+	// Negative control: WITHOUT a remote, Select never pulls, so the stale local
+	// stamp still reads as drift and a (redundant) Reconcile is emitted.
+	noRemote := &Selector{Repo: rp, Git: seed, Rand: rand.New(rand.NewSource(1)), TTL: time.Hour}
+	got, err := noRemote.Select(ctx)
+	if err != nil {
+		t.Fatalf("select (no remote): %v", err)
+	}
+	if got == nil || got.Kind != Reconcile {
+		t.Fatalf("no-remote select must still see the stale local stamp as drift (Reconcile): got %+v", got)
+	}
+
+	// With Remote set, Select first ff-pulls origin/main (the peer's applied
+	// stamp), so the same head no longer reads as drift: Work, not Reconcile.
+	withRemote := &Selector{Repo: rp, Git: seed, Rand: rand.New(rand.NewSource(1)), TTL: time.Hour, Remote: "origin"}
+	got, err = withRemote.Select(ctx)
+	if err != nil {
+		t.Fatalf("select (remote): %v", err)
+	}
+	if got == nil || got.Kind != Work || got.Task.ID != "T1" {
+		t.Fatalf("ff-pull must suppress the reconcile (peer already stamped): got %+v", got)
+	}
+}
+
+// bareInit creates an empty bare repo (default branch main) to act as a shared
+// beehive origin that clones push to and pull from.
+func bareInit(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if _, err := git.New(dir).Run(context.Background(), "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("bare init: %v", err)
+	}
+	return dir
+}
+
+// cloneBeehive clones origin into a fresh temp dir named name, with a committer
+// identity configured so commits succeed.
+func cloneBeehive(t *testing.T, origin, name string) *git.Repo {
+	t.Helper()
+	ctx := context.Background()
+	parent := t.TempDir()
+	dir := filepath.Join(parent, name)
+	if _, err := git.New(parent).Run(ctx, "clone", "-q", origin, dir); err != nil {
+		t.Fatalf("clone %s: %v", name, err)
+	}
+	r := git.New(dir)
+	for _, a := range [][]string{{"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		if _, err := r.Run(ctx, a...); err != nil {
+			t.Fatalf("config %v: %v", a, err)
+		}
+	}
+	return r
+}

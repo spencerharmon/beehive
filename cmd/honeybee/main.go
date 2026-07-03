@@ -155,7 +155,12 @@ func run() error {
 		sessPush = func(ctx context.Context) error { return sessGit.Push(ctx, remote, sessBranch) }
 	}
 
-	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl}
+	// The worktree selector carries Remote so that on a reselect it first
+	// fast-forwards its (throwaway) main to the tracked tip: a reconcile whose
+	// delta a peer already stamped is then never re-emitted. The primary sel0
+	// selector above deliberately omits Remote — it must not advance the shared
+	// checkout's main (the runner's pre-dispatch guard catches any stale seed).
+	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl, Remote: remote}
 	// Rebind the primary selection onto the worktree repo so attempt 0 works the
 	// exact submodule the worktrees are named after.
 	seed, err := rebindSelection(rp, sel0)
@@ -272,6 +277,13 @@ func run() error {
 				fmt.Fprintf(os.Stderr, "honeybee: %s\n", res.Warning)
 			}
 			continue
+		}
+		if res.Skipped {
+			// The reconcile was already applied (PLAN.md stamp already covers the ROI
+			// head): the runner short-circuited before opening a session. Exit cleanly
+			// having spawned no agent turns — the whole point of the dedup guard.
+			fmt.Printf("honeybee: kind=%s already applied; no session dispatched\n", sel.Kind)
+			return nil
 		}
 		if res.Warning != "" {
 			fmt.Fprintf(os.Stderr, "honeybee: WARNING %s\n", res.Warning)

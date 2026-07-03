@@ -55,11 +55,21 @@ type Selector struct {
 	Git  *git.Repo // beehive repo root, for ROI commit lookup
 	Rand *rand.Rand
 	TTL  time.Duration
+	// Remote, when set, is the beehive repo's tracked remote. Select first
+	// fast-forwards this checkout's main to <Remote>/main (git.Pull --ff-only,
+	// best-effort) so reconcile drift is judged against the freshest tip a peer
+	// may have just published rather than a stale local view — the audited case
+	// where a second pass re-picks an ROI head a peer already stamped into PLAN.md.
+	// Empty ("" — the primary pre-selection and every local-only install) skips the
+	// pull: only the isolated worktree selector (whose branch is a throwaway) may
+	// move its own main; a shared checkout's main must never be advanced here.
+	Remote string
 }
 
 // Select walks weighted-random submodules and returns the first workable item.
 // nil is returned only when no submodule has any workable task.
 func (s *Selector) Select(ctx context.Context) (*Selection, error) {
+	s.refreshMain(ctx)
 	subs, err := s.Repo.Submodules()
 	if err != nil {
 		return nil, err
@@ -80,6 +90,22 @@ func (s *Selector) Select(ctx context.Context) (*Selection, error) {
 		}
 	}
 	return nil, nil
+}
+
+// refreshMain fast-forwards this checkout's main to the tracked remote tip
+// (git.Pull --ff-only) before selection, so reconcile drift is judged against
+// what peers have already published instead of a stale local main — closing the
+// window where a reconcile is re-selected for an ROI head a peer just stamped.
+// Best-effort and gated on Remote: a pull failure (a diverged throwaway branch,
+// offline) is discarded so selection proceeds on local state exactly as before —
+// the freshness is an optimization, and the runner's own pre-dispatch guard
+// (Runner.reconcileAlreadyApplied) remains the authoritative short-circuit. No
+// remote configured => a no-op (a shared checkout's main is never moved).
+func (s *Selector) refreshMain(ctx context.Context) {
+	if s.Remote == "" {
+		return
+	}
+	_ = s.Git.Pull(ctx, s.Remote, "main")
 }
 
 func (s *Selector) fromSubmodule(ctx context.Context, sm repo.Submodule, now time.Time, graph *Graph) (*Selection, error) {

@@ -19,9 +19,11 @@ import (
 type mockClient struct {
 	sess      *mockSession
 	gotSystem *string // when set, records the system prompt Open was given
+	opens     int     // number of times Open was called (0 proves no session spawned)
 }
 
 func (m *mockClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	m.opens++
 	if m.gotSystem != nil {
 		*m.gotSystem = system
 	}
@@ -996,4 +998,174 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 	if ptr != subTip {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
+}
+
+// TestRunSkipsAppliedReconcile proves the reconcile-dedup guard: when PLAN.md's
+// ROI stamp already covers the current ROI head, Run short-circuits to a no-op
+// (res.Skipped) BEFORE opening any session — the whole point is to spend zero
+// agent turns on a reconcile that has nothing to fold (the audited reconcile_loop
+// re-folding an already-stamped delta). No remote here, so the guard evaluates the
+// local state directly.
+func TestRunSkipsAppliedReconcile(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	ctx := context.Background()
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	g.Commit(ctx, "seed roi")
+	head, err := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+	// PLAN.md already stamped at the ROI head: the reconcile has nothing to do.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("stamp already covers ROI head — reconcile must be skipped: %+v", res)
+	}
+	if mc.opens != 0 {
+		t.Fatalf("a skipped reconcile must open NO session, opened %d", mc.opens)
+	}
+	if res.Completed || res.GCMarked {
+		t.Fatalf("a skip is neither completion nor GC: %+v", res)
+	}
+}
+
+// TestRunReconcileDriftRunsSession is the negative control: a genuine ROI drift
+// (PLAN.md stamped at a stale sha that does NOT prefix the head) is NOT skipped —
+// the guard lets the pass open exactly one session to do the real reconcile work.
+func TestRunReconcileDriftRunsSession(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	ctx := context.Background()
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	// Stamped at a dead sha: the head will not prefix it, so drift is real.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: deadbeefcafe -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 1, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Skipped {
+		t.Fatalf("genuine drift must NOT be skipped: %+v", res)
+	}
+	if mc.opens != 1 {
+		t.Fatalf("a drifted reconcile must open exactly one session, opened %d", mc.opens)
+	}
+}
+
+// TestRunReconcileFFPullSuppresses proves the pre-check pulls the tracked tip
+// FIRST: the runner's checkout still carries a stale local stamp (a local-only
+// check would see drift and dispatch), but a peer has already pushed the applied
+// reconcile to origin. The guard's ff-only pull surfaces the peer's stamp and the
+// pass skips without opening a session — the distributed half of the dedup guard.
+func TestRunReconcileFFPullSuppresses(t *testing.T) {
+	ctx := context.Background()
+	origin := bareInit(t)
+
+	// The runner's beehive checkout (seed) seeds origin with a STALE stamp, so a
+	// purely-local reconcile check would still see drift.
+	seed := cloneBeehive(t, origin, "seed")
+	repo.Init(seed.Dir)
+	sm := filepath.Join(seed.Dir, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: deadbeefcafe -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	if err := seed.Commit(ctx, "seed drift"); err != nil {
+		t.Fatalf("seed commit: %v", err)
+	}
+	if err := seed.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("seed push: %v", err)
+	}
+	head, err := seed.LastCommit(ctx, "submodules/sm/ROI.md")
+	if err != nil || head == "" {
+		t.Fatalf("ROI head: %q %v", head, err)
+	}
+
+	// A peer stamps PLAN.md at the ROI head (leaving ROI.md untouched, so the head
+	// does not move) and pushes: origin/main now carries the applied reconcile the
+	// seed checkout has not pulled yet.
+	peer := cloneBeehive(t, origin, "peer")
+	os.WriteFile(filepath.Join(peer.Dir, "submodules", "sm", "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	if err := peer.Commit(ctx, "peer stamp"); err != nil {
+		t.Fatalf("peer commit: %v", err)
+	}
+	if err := peer.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("peer push: %v", err)
+	}
+
+	rp, _ := repo.Open(seed.Dir)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	mc := &mockClient{}
+	r := &Runner{Repo: rp, Git: seed, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Remote: "origin"}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Skipped {
+		t.Fatalf("ff-pull should surface the peer's applied stamp and skip: %+v", res)
+	}
+	if mc.opens != 0 {
+		t.Fatalf("a suppressed reconcile must open NO session, opened %d", mc.opens)
+	}
+	// Sanity: the pre-check actually fast-forwarded the checkout to the peer's tip.
+	if b, _ := os.ReadFile(filepath.Join(sm, "PLAN.md")); !strings.Contains(string(b), head) {
+		t.Fatalf("pre-check did not ff-pull the peer stamp into the checkout: %q", b)
+	}
+}
+
+// bareInit creates an empty bare repo (default branch main) to act as a shared
+// beehive origin that clones push to and pull from.
+func bareInit(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if _, err := git.New(dir).Run(context.Background(), "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("bare init: %v", err)
+	}
+	return dir
+}
+
+// cloneBeehive clones origin into a fresh temp dir named name, with a committer
+// identity configured so commits succeed.
+func cloneBeehive(t *testing.T, origin, name string) *git.Repo {
+	t.Helper()
+	ctx := context.Background()
+	parent := t.TempDir()
+	dir := filepath.Join(parent, name)
+	if _, err := git.New(parent).Run(ctx, "clone", "-q", origin, dir); err != nil {
+		t.Fatalf("clone %s: %v", name, err)
+	}
+	r := git.New(dir)
+	for _, a := range [][]string{{"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		if _, err := r.Run(ctx, a...); err != nil {
+			t.Fatalf("config %v: %v", a, err)
+		}
+	}
+	return r
 }
