@@ -199,6 +199,17 @@ func run() error {
 		SessionPublish: sessPublish, SessionPush: sessPush,
 		RestoreConfig: restoreRemotes,
 		TurnTimeout:   time.Duration(c.TurnTimeoutMinutes) * time.Minute,
+		// Per-kind model routing from the layered config (honeybee-model-routing):
+		// a near-deterministic kind can run on a cheap model while code Work runs on
+		// the strong one. eff.ModelFor falls through to the single Model when a kind
+		// has no override, and returns "" when nothing is configured, so a single-
+		// model host routes to the same model it already used (inert). oc.Model below
+		// stays the fallback the client is built with.
+		ModelFor: eff.ModelFor,
+		// Idle-churn cap from the layered config: abandon a Work pass that makes no
+		// code-worktree progress for StallTurns consecutive turns. 0 (the default)
+		// leaves the pass bounded only by the turn/wall caps, exactly as before.
+		StallTurns: eff.StallTurns,
 		// Opt-in per-pass injection trim. Deliberately an env flag rather than a
 		// config knob: the layered-config surface is owned by honeybee-model-routing,
 		// and gating here keeps the injected set byte-identical to the historical
