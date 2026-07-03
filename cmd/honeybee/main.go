@@ -69,10 +69,36 @@ func run() error {
 	}
 	restoreRemotes := func(c context.Context) { _ = primary.RestoreRemotes(c, remoteSnap) }
 	defer restoreRemotes(context.Background())
+
+	// Preflight guard: never start the (token-costly) agent on a checkout that
+	// cannot reach a clean, publishable state. Two sharing modes, detected from the
+	// repo alone with NO configuration:
+	//   - LOCAL sharing  (no remote configured): components may share this same
+	//     filesystem/checkout; convergence relies on main staying a clean
+	//     projection of committed history.
+	//   - REMOTE sharing (a remote configured): a private checkout that converges by
+	//     pull/push. A hybrid swarm mixes both; each component decides per-repo.
+	// A dirty checkout is reset to HEAD (always safe) but that is WARNED, because it
+	// is never normal: it signals a bug in the honeybee protocol/process, in
+	// beehived, or a rogue model writing outside its worktree. If it cannot be made
+	// clean, abort here — before any LLM tokens are spent — rather than do work that
+	// can only fail to publish (exactly the wedge that spun the swarm for two days).
+	mode := "local-sharing"
+	if remote != "" {
+		mode = "remote-sharing"
+	}
+	if healed, herr := primary.EnsureCleanCheckout(ctx); herr != nil {
+		return fmt.Errorf("preflight: %s checkout at %s is dirty and cannot be reset to a clean projection of HEAD (%w); aborting before starting the agent — investigate the honeybee/beehived process or protocol", mode, primaryRoot, herr)
+	} else if healed {
+		fmt.Fprintf(os.Stderr, "honeybee: WARNING preflight reset a dirty %s checkout at %s to HEAD before starting; a dirty live checkout is not normal and signals a honeybee/beehived protocol or process bug (or a rogue model writing outside its worktree)\n", mode, primaryRoot)
+	}
+
 	base := "main"
 	if remote != "" {
 		if err := primary.Fetch(ctx, remote, "main"); err != nil {
-			return fmt.Errorf("fetch %s main: %w", remote, err)
+			// Remote-sharing pull failure: work done without being able to catch up is
+			// invalid, so this is fatal at startup (no LLM is started).
+			return fmt.Errorf("preflight: %s cannot pull %s main (%w); aborting before starting the agent", mode, remote, err)
 		}
 		base = remote + "/main"
 	}

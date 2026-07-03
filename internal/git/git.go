@@ -464,6 +464,45 @@ func (r *Repo) healLocalMain(ctx context.Context) error {
 	return nil
 }
 
+// Status returns `git status --porcelain` (trimmed; empty string == clean tree).
+func (r *Repo) Status(ctx context.Context) (string, error) {
+	out, err := r.Run(ctx, "status", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// EnsureCleanCheckout makes this checkout a clean projection of committed HEAD so
+// a honeybee never starts a token-costly LLM turn on top of drift that can only
+// fail to publish at the very end (the failure mode that let a wedged checkout
+// spin the swarm for two days with no progress and no cheap signal).
+//
+// It returns healed=true when the tree WAS dirty and had to be reset. The caller
+// MUST surface that as a WARNING: a dirty live checkout is not normal operation —
+// the tree is a pure projection of committed history, so any drift signals a bug
+// in the honeybee protocol (agent instructions), the honeybee or beehived
+// process, or a rogue model writing outside its worktree. Reset is always safe,
+// but it always means something upstream misbehaved.
+//
+// When the tree cannot be made clean — a filesystem error, or drift that survives
+// a reset (e.g. an orphan gitlink that wedges `git submodule update`, or stray
+// untracked files) — it returns a non-nil error so the caller aborts BEFORE
+// spending any tokens. A clean tree is the cheap path: one `git status`.
+func (r *Repo) EnsureCleanCheckout(ctx context.Context) (healed bool, err error) {
+	st, err := r.Status(ctx)
+	if err != nil {
+		return false, err
+	}
+	if st == "" {
+		return false, nil
+	}
+	if herr := r.healLocalMain(ctx); herr != nil {
+		return true, herr
+	}
+	return true, nil
+}
+
 // mainWorktreeDir returns the path of the worktree that has main checked out
 // (the target updateInstead pushes into), found from `git worktree list`.
 func (r *Repo) mainWorktreeDir(ctx context.Context) (string, error) {

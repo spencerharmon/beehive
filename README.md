@@ -139,12 +139,29 @@ max_turns: 15
 reject_limit: 3
 ```
 
+## Sharing modes
+
+Components converge through git in one of two modes, **detected at runtime from
+the repo's remotes with no configuration**:
+
+- **Local sharing** (no remote): components may share one checkout on one
+  filesystem; convergence relies on `main` staying a clean projection of history.
+- **Remote sharing** (remotes configured): private checkout, converge by
+  pull/push; push/pull failures are fatal (work that can't catch up or land is
+  invalid). A swarm may be hybrid.
+
+Before starting its agent, a honeybee runs a **preflight**: it resets a dirty
+checkout to `HEAD` (always safe, but **warned** — drift signals a protocol/process
+bug) and **aborts before spending tokens** if the checkout can't be made clean or
+the pull target is unreachable. See `docs/sharing-modes.md`.
+
 ## Documentation
 
 - `docs/install.md` — install, packaging, config, release verification.
 - `docs/cli.md` — CLI reference.
 - `docs/repo-layout.md` — beehive repo layout.
 - `docs/honeybee.md` — honeybee runner loop.
+- `docs/sharing-modes.md` — local vs remote sharing modes and the startup preflight guard.
 - `docs/orchestration.md` — scheduling passes with systemd.
 - `docs/opencode.md` — agent backend setup.
 - `docs/secrets.md` — gpg secrets workflow.

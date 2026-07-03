@@ -556,7 +556,22 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		// Guard: an operator may have deleted the plan or removed this task on main
 		// after we started. Detect it and exit rather than work a task nobody wants.
-		if removed, warning, err := r.taskRemoved(ctx, sel); err == nil && removed {
+		removed, warning, terr := r.taskRemoved(ctx, sel)
+		if terr != nil {
+			// A fetch/pull failure means we can no longer trust that main hasn't
+			// moved out from under us. Per the remote-sharing contract, work done
+			// blind (unable to catch up) is invalid, so end the run rather than
+			// keep spending tokens on a task whose status we cannot verify. (In
+			// local-sharing/no-remote mode taskRemoved does no fetch and cannot
+			// return this error, so healthy single-host runs are unaffected.)
+			if ferr := finish(""); ferr != nil {
+				cleanup()
+				return res, errors.Join(fmt.Errorf("turn %d: cannot reach main to verify task status: %w", res.Turns, terr), ferr)
+			}
+			cleanup()
+			return res, fmt.Errorf("turn %d: cannot reach main to verify task status: %w", res.Turns, terr)
+		}
+		if removed {
 			res.Warning = warning
 			if ferr := finish(warning); ferr != nil {
 				cleanup()

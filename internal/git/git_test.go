@@ -521,3 +521,48 @@ func TestRemoveCachedAndCommitStaged(t *testing.T) {
 		t.Fatal("CommitStaged disturbed an unrelated tracked file")
 	}
 }
+
+// TestEnsureCleanCheckout covers the honeybee startup preflight guard: a clean
+// tree is a cheap no-op (healed=false); tracked drift is reset to HEAD and
+// reported as healed=true so the caller can WARN; drift that survives a reset
+// (here an untracked file, standing in for any un-resettable state such as an
+// orphan gitlink) returns healed=true AND a non-nil error so the caller aborts
+// before starting the agent.
+func TestEnsureCleanCheckout(t *testing.T) {
+	ctx := context.Background()
+
+	// (1) clean tree -> no-op
+	r := initRepo(t)
+	os.WriteFile(filepath.Join(r.Dir, "f"), []byte("base\n"), 0o644)
+	if err := r.Commit(ctx, "base"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if healed, err := r.EnsureCleanCheckout(ctx); healed || err != nil {
+		t.Fatalf("clean tree: want (false,nil), got (%v,%v)", healed, err)
+	}
+
+	// (2) tracked-file drift -> reset, healed=true, clean afterward
+	os.WriteFile(filepath.Join(r.Dir, "f"), []byte("DRIFT\n"), 0o644)
+	healed, err := r.EnsureCleanCheckout(ctx)
+	if !healed || err != nil {
+		t.Fatalf("tracked drift: want (true,nil), got (%v,%v)", healed, err)
+	}
+	if st, _ := r.Status(ctx); st != "" {
+		t.Fatalf("tree not clean after heal: %q", st)
+	}
+	if b, _ := os.ReadFile(filepath.Join(r.Dir, "f")); string(b) != "base\n" {
+		t.Fatalf("reset did not restore committed content: %q", b)
+	}
+
+	// (3) un-resettable drift (untracked file survives reset) -> healed=true, error
+	r2 := initRepo(t)
+	os.WriteFile(filepath.Join(r2.Dir, "f"), []byte("x\n"), 0o644)
+	if err := r2.Commit(ctx, "base"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	os.WriteFile(filepath.Join(r2.Dir, "stray"), []byte("untracked\n"), 0o644)
+	healed, err = r2.EnsureCleanCheckout(ctx)
+	if !healed || err == nil {
+		t.Fatalf("un-resettable drift: want (true,err), got (%v,%v)", healed, err)
+	}
+}
