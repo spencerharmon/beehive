@@ -40,6 +40,18 @@ type Opencode struct {
 	pollMax time.Duration
 }
 
+// SelectModel sets the "provider/model" used for subsequent turns on sessions
+// this client opens, implementing swarm.ModelRouter so the runner can route a
+// pass to a cheaper model by task kind. An empty model is ignored (keeps the
+// configured default), so an unset per-kind route is a no-op. Each honeybee
+// process owns its own Opencode and runs one Run at a time, so mutating the field
+// here is not shared across concurrent sessions.
+func (o *Opencode) SelectModel(model string) {
+	if model != "" {
+		o.Model = model
+	}
+}
+
 // Open creates a server session for the working directory dir (an absolute path;
 // opencode takes the cwd from the ?directory= query, not a body field) under the
 // given system prompt, WITHOUT sending a first message. The caller drives turns

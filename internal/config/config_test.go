@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -96,6 +97,87 @@ max_tokens: 500
 	}
 }
 
+// TestResolveModelByKindLayering checks the per-kind model routing knob layers
+// PER KEY with the same most-specific-wins precedence + fall-through as scalar
+// fields, and that MaxIdleTurns layers like the other int caps. A trivial kind
+// set only in a lower layer is inherited; a kind re-set in a more specific layer
+// wins; a kind set nowhere falls through to the strong Model at dispatch (not
+// stored in the map).
+func TestResolveModelByKindLayering(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+
+	// Host: strong default model + cheap routes for reconcile and review, plus an
+	// idle cap that a more specific layer overrides.
+	write(t, filepath.Join(hostDir, "config.yaml"), `
+model: strong/model
+max_idle_turns: 9
+model_by_kind:
+  reconcile: cheap/host
+  review: cheap/host
+`)
+	// Global: re-routes reconcile (wins over host) and adds bootstrap; leaves
+	// review to fall through from host.
+	write(t, filepath.Join(root, "config.yaml"), `
+model_by_kind:
+  reconcile: cheap/global
+  bootstrap: cheap/global
+`)
+	// Submodule (most specific): re-routes bootstrap and adds arbitrate; tightens
+	// the idle cap.
+	write(t, filepath.Join(root, "submodules", "x", "config.yaml"), `
+max_idle_turns: 3
+model_by_kind:
+  bootstrap: cheap/sub
+  arbitrate: cheap/sub
+`)
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Model != "strong/model" {
+		t.Errorf("Model = %q, want strong/model (host, never routed away)", c.Model)
+	}
+	// per-key precedence: submodule > global > host, unset keys inherited.
+	want := map[string]string{
+		"reconcile": "cheap/global", // global overrode host
+		"review":    "cheap/host",   // only host set it; inherited through
+		"bootstrap": "cheap/sub",    // submodule overrode global
+		"arbitrate": "cheap/sub",    // only submodule set it
+	}
+	if !reflect.DeepEqual(c.ModelByKind, want) {
+		t.Errorf("ModelByKind = %v, want %v", c.ModelByKind, want)
+	}
+	// "work" is set nowhere -> absent from the map -> falls through to Model at dispatch.
+	if _, ok := c.ModelByKind["work"]; ok {
+		t.Errorf("ModelByKind must not contain 'work' (unset kind falls through to Model)")
+	}
+	if c.MaxIdleTurns != 3 {
+		t.Errorf("MaxIdleTurns = %d, want 3 (submodule wins over host)", c.MaxIdleTurns)
+	}
+}
+
+// TestMergeDoesNotMutateLowerLayer confirms the per-key ModelByKind overlay is
+// copy-on-write: overlaying a more specific layer must not mutate the map handed
+// in as the base (maps are references; a naive overlay would corrupt a shared
+// lower layer for later resolves).
+func TestMergeDoesNotMutateLowerLayer(t *testing.T) {
+	base := Config{ModelByKind: map[string]string{"reconcile": "cheap/base"}}
+	over := Config{ModelByKind: map[string]string{"reconcile": "cheap/over", "review": "cheap/over"}}
+	out := merge(base, over)
+	if base.ModelByKind["reconcile"] != "cheap/base" {
+		t.Errorf("merge mutated base ModelByKind: reconcile = %q, want cheap/base", base.ModelByKind["reconcile"])
+	}
+	if _, ok := base.ModelByKind["review"]; ok {
+		t.Errorf("merge leaked 'review' into base ModelByKind")
+	}
+	if out.ModelByKind["reconcile"] != "cheap/over" || out.ModelByKind["review"] != "cheap/over" {
+		t.Errorf("merge output wrong: %v", out.ModelByKind)
+	}
+}
+
 // TestResolveNoSubmoduleLayer confirms submodule="" resolves only host+global,
 // and that an absent submodule file is a skipped layer (global stays most
 // specific) rather than an error.
@@ -140,7 +222,7 @@ func TestResolveBareInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Defaults(hostDir)
-	if c != want {
+	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("bare Resolve = %+v, want Defaults %+v", c, want)
 	}
 }

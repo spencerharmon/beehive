@@ -997,3 +997,223 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// workFixture builds a minimal beehive repo with one submodule holding a single
+// TODO Work task and a checked-out code repo, returning the pieces a Run test
+// needs (rp, beehive git, submodule dir, PLAN.md path, the Work selection).
+func workFixture(t *testing.T) (*repo.Repo, *git.Repo, string, string, *selectt.Selection) {
+	t.Helper()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+	return rp, g, sm, planPath, sel
+}
+
+// routingClient is a Client that ALSO implements ModelRouter, recording every
+// model the runner selects at dispatch. Its session drives the task terminal on
+// turn 1 via onTurn so Run returns immediately.
+type routingClient struct {
+	selected []string
+	onTurn   func(turn int)
+}
+
+func (c *routingClient) SelectModel(m string) { c.selected = append(c.selected, m) }
+
+func (c *routingClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	return &mockSession{onTurn: c.onTurn}, nil
+}
+
+// TestModelFor verifies per-kind model routing resolution: an overridden kind
+// takes the Models entry, every other kind falls through to the strong default
+// Model, an empty override is treated as unset, and an all-zero Runner yields ""
+// (dispatch then leaves the client's configured model untouched).
+func TestModelFor(t *testing.T) {
+	r := &Runner{
+		Model:  "strong/opus",
+		Models: map[string]string{"reconcile": "cheap/haiku", "review": "cheap/haiku"},
+	}
+	cases := []struct {
+		kind selectt.Kind
+		want string
+	}{
+		{selectt.Work, "strong/opus"},      // no override -> strong
+		{selectt.Arbitrate, "strong/opus"}, // no override -> strong
+		{selectt.Bootstrap, "strong/opus"}, // no override -> strong
+		{selectt.Reconcile, "cheap/haiku"}, // overridden -> cheap
+		{selectt.Review, "cheap/haiku"},    // overridden -> cheap
+	}
+	for _, c := range cases {
+		if got := r.modelFor(c.kind); got != c.want {
+			t.Errorf("modelFor(%s) = %q, want %q", c.kind, got, c.want)
+		}
+	}
+	// An empty override string is unset -> falls through to Model, never selecting "".
+	r2 := &Runner{Model: "strong/opus", Models: map[string]string{"work": ""}}
+	if got := r2.modelFor(selectt.Work); got != "strong/opus" {
+		t.Errorf("empty override should fall through to Model, got %q", got)
+	}
+	// All-zero: no Model, no Models -> "" so dispatch leaves the client alone.
+	var r3 Runner
+	if got := r3.modelFor(selectt.Work); got != "" {
+		t.Errorf("zero Runner modelFor = %q, want empty", got)
+	}
+}
+
+// TestRunRoutesModelByKind proves the runner applies the kind-routed model at
+// dispatch (before opening the session) through the optional ModelRouter client
+// capability: an overridden kind selects the cheap model, and with no override
+// for the dispatched kind the strong default is selected.
+func TestRunRoutesModelByKind(t *testing.T) {
+	drive := func(sm, planPath string) func(int) {
+		return func(int) {
+			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		}
+	}
+
+	// Overridden kind (work) -> the cheap model reaches SelectModel.
+	rp, g, sm, planPath, sel := workFixture(t)
+	rc := &routingClient{onTurn: drive(sm, planPath)}
+	r := &Runner{
+		Repo: rp, Git: g, Client: rc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Model: "strong/opus", Models: map[string]string{"work": "cheap/haiku"},
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("res %+v", res)
+	}
+	if len(rc.selected) != 1 || rc.selected[0] != "cheap/haiku" {
+		t.Fatalf("overridden work kind: selected=%v, want [cheap/haiku]", rc.selected)
+	}
+
+	// No override for the dispatched kind -> the strong default is selected.
+	rp2, g2, sm2, planPath2, sel2 := workFixture(t)
+	rc2 := &routingClient{onTurn: drive(sm2, planPath2)}
+	r2 := &Runner{
+		Repo: rp2, Git: g2, Client: rc2, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Model: "strong/opus", Models: map[string]string{"review": "cheap/haiku"},
+	}
+	if _, err := r2.Run(context.Background(), sel2, "sys", "first"); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	if len(rc2.selected) != 1 || rc2.selected[0] != "strong/opus" {
+		t.Fatalf("unrouted work kind: selected=%v, want [strong/opus]", rc2.selected)
+	}
+}
+
+// TestRunModelRoutingInertWithoutRouter proves a Client that does NOT implement
+// ModelRouter is simply not routed: dispatch resolves a model but the type
+// assertion fails, so the run proceeds on the client's single configured model
+// with no error or panic — model routing degrades, never breaks.
+func TestRunModelRoutingInertWithoutRouter(t *testing.T) {
+	rp, g, sm, planPath, sel := workFixture(t)
+	cl := &mockClient{sess: &mockSession{onTurn: func(int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Model: "strong/opus", Models: map[string]string{"work": "cheap/haiku"},
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed || res.GCMarked {
+		t.Fatalf("res %+v", res)
+	}
+}
+
+// TestRunNoProgressCapStopsEarly proves the MaxIdleTurns no-forward-progress cap
+// stops a churning pass early — GC-marked and warned — long before the turn/wall
+// budget. The agent does nothing (no code, no doc, no plan edit). Critically, the
+// runner re-stamps the task heartbeat every turn with an ADVANCING clock, so
+// PLAN.md's raw bytes DO change turn to turn; the cap must still fire, proving
+// progressFingerprint hashes only substantive state and not the volatile claim
+// churn (a raw-bytes digest would reset idle every turn and never trip the cap).
+func TestRunNoProgressCapStopsEarly(t *testing.T) {
+	rp, g, _, _, sel := workFixture(t)
+	// Advancing clock: each call is a later second, so the per-turn heartbeat
+	// re-stamp genuinely changes PLAN.md's raw bytes turn to turn.
+	base := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
+	tick := 0
+	now := func() time.Time {
+		tick++
+		return base.Add(time.Duration(tick) * time.Second)
+	}
+	cl := &mockClient{sess: &mockSession{}} // a no-op agent: never changes anything
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 10, WallCap: time.Hour, TTL: time.Hour,
+		Session: "S1", MaxIdleTurns: 2, Now: now,
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.GCMarked || res.Completed {
+		t.Fatalf("want GC-marked incomplete, got %+v", res)
+	}
+	if !strings.Contains(res.Warning, "no forward progress") {
+		t.Fatalf("want a no-forward-progress warning, got %q", res.Warning)
+	}
+	if res.Turns != r.MaxIdleTurns {
+		t.Fatalf("want early stop at MaxIdleTurns=%d, got Turns=%d", r.MaxIdleTurns, res.Turns)
+	}
+	if res.Turns >= r.MaxTurns {
+		t.Fatalf("cap did not stop early: Turns=%d MaxTurns=%d", res.Turns, r.MaxTurns)
+	}
+}
+
+// TestProgressFingerprintIgnoresClaimChurn pins the fingerprint invariant the
+// no-progress cap relies on: the runner-bumped session+heartbeat (re-stamped
+// every turn) must NOT change the digest, while any substantive change (status,
+// body, attempts) MUST. Without stripping the claim, the idle cap could never
+// fire for task-bearing kinds.
+func TestProgressFingerprintIgnoresClaimChurn(t *testing.T) {
+	rp, g, _, planPath, sel := workFixture(t)
+	r := &Runner{Repo: rp, Git: g}
+	ctx := context.Background()
+	write := func(s string) { os.WriteFile(planPath, []byte(s), 0o644) }
+
+	write("## T1 [TODO] <!-- attempts=0 deps= session=S1 heartbeat=2026-06-29T10:00:00Z -->\ngo\n")
+	fp1 := r.progressFingerprint(ctx, sel, nil)
+	if fp1 == "" {
+		t.Fatal("empty fingerprint for a present PLAN.md")
+	}
+	// Only the volatile claim (session + heartbeat) differs -> digest unchanged.
+	write("## T1 [TODO] <!-- attempts=0 deps= session=S2 heartbeat=2026-06-29T11:22:33Z -->\ngo\n")
+	if fp := r.progressFingerprint(ctx, sel, nil); fp != fp1 {
+		t.Fatalf("claim churn changed the fingerprint (%s -> %s); the idle cap would never fire", fp1, fp)
+	}
+	// A real status transition MUST change it.
+	write("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= session=S2 heartbeat=2026-06-29T11:22:33Z -->\ngo\n")
+	if fp := r.progressFingerprint(ctx, sel, nil); fp == fp1 {
+		t.Fatal("status transition did not change the fingerprint")
+	}
+	// A body edit (e.g. a Review note / Human-needed reason) MUST change it.
+	write("## T1 [TODO] <!-- attempts=0 deps= session=S1 heartbeat=2026-06-29T10:00:00Z -->\ngo further\n")
+	if fp := r.progressFingerprint(ctx, sel, nil); fp == fp1 {
+		t.Fatal("body edit did not change the fingerprint")
+	}
+	// An attempts bump (reject counter) MUST change it.
+	write("## T1 [TODO] <!-- attempts=1 deps= session=S1 heartbeat=2026-06-29T10:00:00Z -->\ngo\n")
+	if fp := r.progressFingerprint(ctx, sel, nil); fp == fp1 {
+		t.Fatal("attempts bump did not change the fingerprint")
+	}
+}

@@ -189,6 +189,17 @@ func run() error {
 		// a whole-tree scan. Same env-flag rationale as LeanInject; off keeps the
 		// injected preamble byte-identical to the historical path.
 		LeanBrief: os.Getenv("BEEHIVE_LEAN_BRIEF") == "1",
+		// Per-kind model routing: the strong default plus the resolved per-kind
+		// overrides (Defaults->host->global->submodule). Empty Models routes every
+		// kind to Model, so a single-model host is unchanged; a site routes trivial
+		// kinds (reconcile/bootstrap/review/arbitrate) to a cheap model via
+		// model_by_kind in config. Applied at dispatch through the ModelRouter
+		// capability the Opencode client implements.
+		Model:  eff.Model,
+		Models: eff.ModelByKind,
+		// No-forward-progress cap (config max_idle_turns; 0 = off): stop a churning
+		// pass early instead of burning the full turn/wall budget.
+		MaxIdleTurns: eff.MaxIdleTurns,
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {

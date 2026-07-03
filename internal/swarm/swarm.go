@@ -7,6 +7,8 @@ package swarm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +39,16 @@ type Session interface {
 // the (often long) first turn runs.
 type Client interface {
 	Open(ctx context.Context, cwd, system string) (Session, error)
+}
+
+// ModelRouter is an OPTIONAL Client capability: SelectModel picks the model used
+// for the session(s) the client opens next. The runner calls it once per Run with
+// the kind-routed model (see Runner.modelFor) so a trivial, near-deterministic
+// pass can use a CHEAP model while real code work keeps the strong one. A Client
+// that does NOT implement it (e.g. test mocks) is simply not routed — model
+// routing degrades to the single configured model, never an error.
+type ModelRouter interface {
+	SelectModel(model string)
 }
 
 // Runner drives a single honeybee turn loop.
@@ -123,6 +135,24 @@ type Runner struct {
 	// byte-identical to the historical path; the runner flips it on from an env
 	// flag (see cmd/honeybee). Additive — the floor, not a cage.
 	LeanBrief bool
+
+	// Model is the strong (default) "provider/model" — the one used for real code
+	// work and for any kind Models does not route. Models optionally overrides it
+	// PER task kind (keys "work"/"review"/"arbitrate"/"bootstrap"/"reconcile") so
+	// trivial, near-deterministic passes can run on a CHEAP model (ROI Priority 1 —
+	// "routing / caps"). Both come from the resolved layered config. Empty Models
+	// (the default) routes every kind to Model, so a single-model host is unchanged.
+	// Applied at dispatch via the optional ModelRouter client capability; a client
+	// without it is simply not routed.
+	Model  string
+	Models map[string]string
+
+	// MaxIdleTurns caps a pass on NO FORWARD PROGRESS: when the observable work
+	// state (progressFingerprint) is unchanged for this many consecutive turns, the
+	// runner stops the pass early — GC-marked and surfaced as a warning — instead of
+	// churning to the MaxTurns/WallCap budget. 0 = OFF (only the turn/wall caps
+	// apply, byte-identical to today). Comes from the resolved layered config.
+	MaxIdleTurns int
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -406,6 +436,19 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if r.LeanInject {
 		system = trimProtocol(system, sel.Kind)
 	}
+	// Route the model by task kind BEFORE opening the session: a trivial,
+	// near-deterministic pass (reconcile/bootstrap/review/arbitrate, per the site's
+	// Models config) runs on a CHEAP model while real code work keeps the strong
+	// one. Inert unless the client implements ModelRouter and Models routes this
+	// kind — an unrouted kind (or a mock client) leaves the configured model as-is.
+	if m := r.modelFor(sel.Kind); m != "" {
+		if mr, ok := r.Client.(ModelRouter); ok {
+			mr.SelectModel(m)
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] routed kind=%s to model=%q\n", sel.Kind, m)
+			}
+		}
+	}
 	sess, err := r.Client.Open(ctx, absRoot, system)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
@@ -462,6 +505,15 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	var tc *turnCompactor
 	if r.LeanContext && sel.Kind == selectt.Work {
 		tc = newTurnCompactor()
+	}
+	// No-forward-progress cap state. lastProgress is the observable-work digest at
+	// the last turn that MADE progress; idle counts consecutive turns since then
+	// whose digest is unchanged. Seed it with the pre-work fingerprint so a pass
+	// that never moves is caught from turn 1. Inert when MaxIdleTurns == 0.
+	var lastProgress string
+	idle := 0
+	if r.MaxIdleTurns > 0 {
+		lastProgress = r.progressFingerprint(ctx, sel, wg)
 	}
 	// finish stops the recorder, optionally records an abort warning to the
 	// transcript (so it shows in the UI), commits the final transcript to the
@@ -650,6 +702,34 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 			cleanup()
 			return res, nil
+		}
+		// No-forward-progress cap: if the observable work state has not advanced for
+		// MaxIdleTurns consecutive turns, the pass is churning (idle-loop / stuck) —
+		// stop early instead of burning the whole turn/wall budget. Bounded and
+		// SURFACED (GC-marked + a warning recorded to the transcript), never a silent
+		// drop: like the turn/wall cap it leaves status + the going-stale claim for
+		// stale-claim GC to reclaim/re-TODO. An empty digest ("" — nothing readable)
+		// is treated as a change so a transient read miss never counts as a stall.
+		if r.MaxIdleTurns > 0 {
+			fp := r.progressFingerprint(ctx, sel, wg)
+			if fp != "" && fp == lastProgress {
+				idle++
+				if idle >= r.MaxIdleTurns {
+					res.GCMarked = true
+					res.Warning = fmt.Sprintf(
+						"no forward progress for %d consecutive turns (stalled/idle-churn); stopping pass early for GC",
+						idle)
+					if ferr := finish(res.Warning); ferr != nil {
+						cleanup()
+						return res, ferr
+					}
+					cleanup()
+					return res, nil
+				}
+			} else {
+				idle = 0
+				lastProgress = fp
+			}
 		}
 		if r.now().After(deadline) {
 			break
@@ -904,6 +984,88 @@ func hasTask(sel *selectt.Selection) bool {
 	default:
 		return false
 	}
+}
+
+// modelFor resolves the model to dispatch this pass's kind on: the per-kind
+// override in Models when a site set one, else the strong default Model. Returns
+// "" only when neither is set (e.g. tests that leave both zero), which the
+// dispatch guard treats as "leave the client's configured model alone".
+func (r *Runner) modelFor(kind selectt.Kind) string {
+	if m := r.Models[string(kind)]; m != "" {
+		return m
+	}
+	return r.Model
+}
+
+// progressFingerprint is a cheap, deterministic digest of this honeybee's
+// OBSERVABLE forward progress, used by the MaxIdleTurns no-forward-progress cap.
+// It hashes the beehive-layer outputs every task-bearing pass writes (PLAN.md
+// substantive state — status flips/attempts/plan-body edits — and the docs/
+// listing with sizes — change docs) and, for a Work pass, the code worktree's
+// HEAD plus its porcelain status and tracked diff (commits + uncommitted edits).
+// A turn that advances any of these changes the digest; a pass that churns
+// without touching anything leaves it constant, which is exactly the "no forward
+// progress" signal. Best-effort: a read/git/parse error contributes nothing
+// rather than failing the turn, and an empty digest (nothing readable) is treated
+// by the caller as "no signal" (never a stall). It must NOT depend on wall-clock
+// or agent text so a working pass is never mistaken for idle and vice versa.
+//
+// CRITICAL: the runner re-stamps the task's session+heartbeat into PLAN.md every
+// turn (claim.Heartbeat), so hashing raw PLAN.md bytes would change the digest
+// each turn on pure claim churn and the idle cap would never fire for the exact
+// task-bearing kinds (Work/Review/Arbitrate) it must protect. So we parse PLAN.md
+// and zero the volatile claim metadata before serializing via the canonical
+// plan.String(), hashing only substantive plan state.
+func (r *Runner) progressFingerprint(ctx context.Context, sel *selectt.Selection, wg *git.Repo) string {
+	h := sha256.New()
+	wrote := false
+	// Beehive layer: PLAN.md substantive content (status transitions, attempts,
+	// plan-body authoring) with the runner-bumped session+heartbeat stripped, so
+	// per-turn claim churn is NOT mistaken for progress. A parse error contributes
+	// nothing (never the raw churning bytes) so it can't defeat the cap.
+	if b, err := os.ReadFile(sel.Submodule.PlanPath()); err == nil {
+		if p, perr := plan.Parse(string(b)); perr == nil {
+			for _, t := range p.Tasks {
+				t.Session = ""
+				t.Heartbeat = time.Time{}
+			}
+			norm := p.String()
+			fmt.Fprintf(h, "plan:%d:", len(norm))
+			io.WriteString(h, norm)
+			wrote = true
+		}
+	}
+	// docs/: entry names + sizes catch a new/growing change doc or rejection doc.
+	if ents, err := os.ReadDir(filepath.Join(sel.Submodule.Path, "docs")); err == nil {
+		for _, e := range ents {
+			io.WriteString(h, "\x00doc:"+e.Name())
+			if info, err := e.Info(); err == nil {
+				fmt.Fprintf(h, ":%d", info.Size())
+			}
+		}
+		wrote = true
+	}
+	// Work worktree: committed history + uncommitted edits (the code changing).
+	if wg != nil {
+		if head, err := wg.RevParse(ctx, "HEAD"); err == nil {
+			io.WriteString(h, "\x00head:"+head)
+			wrote = true
+		}
+		if st, err := wg.Run(ctx, "status", "--porcelain"); err == nil {
+			io.WriteString(h, "\x00st:"+st)
+			wrote = true
+		}
+		if d, err := wg.Run(ctx, "diff", "HEAD"); err == nil {
+			io.WriteString(h, "\x00diff:"+d)
+			wrote = true
+		}
+	}
+	// Nothing readable this turn: return "no signal" so the idle cap never trips on
+	// the constant empty-input digest.
+	if !wrote {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // syncWorktreeBase brings the submodule checkout to the tracked-branch tip
