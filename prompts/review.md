@@ -1,8 +1,8 @@
 # Review Prompt (task is NEEDS-REVIEW)
 
 An implementer finished this task and set it NEEDS-REVIEW. You are the REVIEWER. Your job is to
-JUDGE the existing work against the task and ROI — **do NOT reimplement it. There is no IN-PROGRESS
-status.** The status you were given is real; treat it as a review, not fresh work.
+JUDGE the existing work against the task and ROI — **do NOT reimplement it.** The status you
+were given is real; treat it as a review, not fresh work.
 
 What to read (all read-only):
 - The task body in submodules/<sm>/PLAN.md, including its `Review:` note (implementer branch,

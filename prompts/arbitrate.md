@@ -1,8 +1,7 @@
 # Arbitration Prompt (task is NEEDS-ARBITRATION)
 
 A reviewer rejected an implementation and the task is NEEDS-ARBITRATION. You are the ARBITER:
-settle the dispute between the implementer and the reviewer. **Do NOT reimplement the task. There is
-no IN-PROGRESS status.**
+settle the dispute between the implementer and the reviewer. **Do NOT reimplement the task.**
 
 What to read (all read-only):
 - The task body in submodules/<sm>/PLAN.md (its `Review:` note and any rejection notes).

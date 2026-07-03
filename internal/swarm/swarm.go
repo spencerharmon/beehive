@@ -550,7 +550,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	switch sel.Kind {
 	case selectt.Review:
 		preamble = fmt.Sprintf(
-			"# Context (REVIEW — judge existing work, do NOT reimplement, do NOT set IN-PROGRESS)\n"+
+			"# Context (REVIEW — judge existing work, do NOT reimplement)\n"+
 				"cwd is the beehive repo root. Submodule: %[1]s. Task under review: %[2]s.\n"+
 				"Beehive layer (read/write on main): submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/. ROI.md is read-only.\n"+
 				"Implementer's work is on branch bee-%[2]s in submodules/%[1]s/repo — inspect read-only via git "+
@@ -562,7 +562,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			smName, sel.Task.ID)
 	case selectt.Arbitrate:
 		preamble = fmt.Sprintf(
-			"# Context (ARBITRATION — settle the dispute, do NOT reimplement, do NOT set IN-PROGRESS)\n"+
+			"# Context (ARBITRATION — settle the dispute, do NOT reimplement)\n"+
 				"cwd is the beehive repo root. Submodule: %[1]s. Task in arbitration: %[2]s.\n"+
 				"Beehive layer (read/write on main): submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/. ROI.md is read-only.\n"+
 				"Implementer branch bee-%[2]s in submodules/%[1]s/repo; change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
@@ -578,7 +578,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// mode it is dropped from the up-front preamble and fired instead as an
 		// at-decision-point hint on the "continue" turn where the change doc is still
 		// missing (nextPrompt); its authoritative copy still lives in the retained
-		// protocol step 4. Default (off): the full sentence stays in place, keeping
+		// Work task section. Default (off): the full sentence stays in place, keeping
 		// the injected brief byte-identical to the historical path.
 		onComplete := ""
 		if !r.LeanInject {

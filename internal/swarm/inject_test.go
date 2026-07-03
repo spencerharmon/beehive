@@ -36,7 +36,7 @@ func TestTrimProtocolWorkDropsBoilerplateKeepsRules(t *testing.T) {
 		"## Claim model",
 		"## Tooling",
 		"## Turn loop",
-		"**Main task last.**", // its own Work step
+		"## Work task", // its own role section
 	} {
 		if !strings.Contains(lean, must) {
 			t.Errorf("lean Work protocol dropped required content %q", must)
@@ -46,10 +46,10 @@ func TestTrimProtocolWorkDropsBoilerplateKeepsRules(t *testing.T) {
 	for _, gone := range []string{
 		"## Topology",
 		"## You were started",
-		"This file is the authoritative honeybee protocol", // intro governance paragraph
-		"**ROI reconcile",        // reconcile step
-		"**Arbitration first.**", // arbitration step
-		"**Review next.**",       // review step
+		"authoritative for protocol", // intro governance paragraph
+		"## Reconcile task",          // reconcile role section
+		"## Arbitration task",        // arbitration role section
+		"## Review task",             // review role section
 	} {
 		if strings.Contains(lean, gone) {
 			t.Errorf("lean Work protocol still carries boilerplate/other-kind text %q", gone)
@@ -68,10 +68,10 @@ func TestTrimProtocolKeepsOwnKindStepDropsOthers(t *testing.T) {
 		keep  string
 		drops []string
 	}{
-		{selectt.Work, "**Main task last.**", []string{"**Review next.**", "**Arbitration first.**", "**ROI reconcile"}},
-		{selectt.Review, "**Review next.**", []string{"**Main task last.**", "**Arbitration first.**", "**ROI reconcile"}},
-		{selectt.Arbitrate, "**Arbitration first.**", []string{"**Main task last.**", "**Review next.**", "**ROI reconcile"}},
-		{selectt.Reconcile, "**ROI reconcile", []string{"**Main task last.**", "**Review next.**", "**Arbitration first.**"}},
+		{selectt.Work, "## Work task", []string{"## Review task", "## Arbitration task", "## Reconcile task"}},
+		{selectt.Review, "## Review task", []string{"## Work task", "## Arbitration task", "## Reconcile task"}},
+		{selectt.Arbitrate, "## Arbitration task", []string{"## Work task", "## Review task", "## Reconcile task"}},
+		{selectt.Reconcile, "## Reconcile task", []string{"## Work task", "## Review task", "## Arbitration task"}},
 	}
 	for _, c := range cases {
 		t.Run(string(c.kind), func(t *testing.T) {
@@ -181,7 +181,7 @@ func TestLeanInjectTrimsSystemAndFiresInlineHint(t *testing.T) {
 	if len(gotSystem) >= len(prompts.Honeybee) {
 		t.Fatalf("lean mode did not shrink the injected system (%d vs full %d)", len(gotSystem), len(prompts.Honeybee))
 	}
-	if strings.Contains(gotSystem, "## Topology") || strings.Contains(gotSystem, "**Review next.**") {
+	if strings.Contains(gotSystem, "## Topology") || strings.Contains(gotSystem, "## Review task") {
 		t.Errorf("lean system still carries boilerplate/other-kind prose:\n%s", gotSystem)
 	}
 	if !strings.Contains(gotSystem, "NEVER edit `ROI.md`") {

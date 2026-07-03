@@ -10,18 +10,19 @@ import (
 // EVERY turn (see ocSession.Prompt), so anything an agent never acts on is paid
 // for on every turn of every pass. trimProtocol derives the LEAN per-pass system
 // prompt from the full HONEYBEE.md: it keeps exactly what a pass of `kind` needs
-// — the absolute rules, the claim model, the tooling + turn-loop notes, and the
-// protocol steps that kind acts on — and drops managed boilerplate (the
-// file-governance intro paragraphs, the "read once" topology, the dispatch
-// framing) plus the protocol steps OWNED by other kinds (a Work pass never
-// carries review/arbitration/reconcile prose, and vice-versa).
+// — the absolute rules, the claim model, the status transitions, the shared
+// steps, and the tooling + turn-loop notes — plus the ONE role section that kind
+// acts on, and drops managed boilerplate (the file-governance intro paragraph,
+// the "read once" topology) plus the role sections OWNED by other kinds (a Work
+// pass never carries the Review/Arbitration/Reconcile task sections, and
+// vice-versa).
 //
 // SAFETY: trimming is anchored on the "## Absolute rules" heading. A protocol
 // that lacks it (an operator rewrote the file past recognition) is returned
 // UNCHANGED, so a rule we cannot account for is never silently dropped. Only
-// positively-identified boilerplate sections are removed; any section we do not
-// recognize is kept, and every shared (unmarked) protocol step is kept for all
-// kinds — so no cross-cutting rule is lost.
+// positively-identified boilerplate and other-kind role sections are removed;
+// any section we do not recognize is kept for every kind — so no cross-cutting
+// rule is lost.
 func trimProtocol(protocol string, kind selectt.Kind) string {
 	if !hasAbsoluteRules(protocol) {
 		return protocol
@@ -35,13 +36,38 @@ func trimProtocol(protocol string, kind selectt.Kind) string {
 			}
 		case dropSection(s.title):
 			// managed boilerplate the agent never acts on: drop it
-		case strings.HasPrefix(s.title, "Protocol"):
-			kept = append(kept, filterProtocolSteps(s.text, kind))
 		default:
+			if owner, isRole := roleOwner(s.title); isRole && owner != kind {
+				continue // a role section owned by a different kind
+			}
 			kept = append(kept, s.text)
 		}
 	}
 	return strings.Join(kept, "\n\n") + "\n"
+}
+
+// roleSections maps an H2 role-section title prefix to the single kind that acts
+// on it. A section whose title matches none of these is shared and kept for every
+// kind; a section owned by one kind is dropped for all others.
+var roleSections = []struct {
+	prefix string
+	kind   selectt.Kind
+}{
+	{"Reconcile task", selectt.Reconcile},
+	{"Work task", selectt.Work},
+	{"Review task", selectt.Review},
+	{"Arbitration task", selectt.Arbitrate},
+}
+
+// roleOwner reports the kind that owns a role section, or ok=false when the title
+// is not a recognized per-kind role section (a shared section, kept for all).
+func roleOwner(title string) (selectt.Kind, bool) {
+	for _, r := range roleSections {
+		if strings.HasPrefix(title, r.prefix) {
+			return r.kind, true
+		}
+	}
+	return "", false
 }
 
 // hasAbsoluteRules is the recognition anchor: we only trim a protocol that still
@@ -96,72 +122,13 @@ func dropSection(title string) bool {
 }
 
 // trimIntro keeps the H1 and the first framing paragraph and drops the
-// file-governance paragraphs that follow (how the file is managed/refreshed — an
-// agent never acts on it). Paragraphs are blank-line separated.
+// file-governance paragraph(s) that follow (how the file is managed/refreshed and
+// how the runner dispatches kinds — an agent never acts on it). Paragraphs are
+// blank-line separated.
 func trimIntro(intro string) string {
 	paras := strings.Split(intro, "\n\n")
 	if len(paras) > 2 {
 		paras = paras[:2]
 	}
 	return strings.TrimRight(strings.Join(paras, "\n\n"), "\n")
-}
-
-// stepOwner maps a numbered protocol step to the single kind that acts on it, by
-// a leading bold marker. A step with no recognized marker is shared and kept for
-// every kind.
-var stepOwners = []struct {
-	marker string
-	kind   selectt.Kind
-}{
-	{"**ROI reconcile", selectt.Reconcile},
-	{"**Arbitration first", selectt.Arbitrate},
-	{"**Review next", selectt.Review},
-	{"**Main task last", selectt.Work},
-}
-
-// filterProtocolSteps keeps the "## Protocol" heading and every step EXCEPT those
-// a different kind owns: a Work pass drops the reconcile/arbitration/review steps,
-// a Review pass keeps only its review step, etc. Shared (unmarked) steps — the
-// claim check, human escalation, DONE-unlock, the docs requirement, the ROI ban —
-// are kept for every kind, so no cross-cutting rule is lost.
-func filterProtocolSteps(section string, kind selectt.Kind) string {
-	lines := strings.Split(section, "\n")
-	var out []string
-	keep := true // the heading + any lead-in before the first numbered step
-	for _, ln := range lines {
-		if isStepStart(ln) {
-			keep = keepStep(ln, kind)
-		}
-		if keep {
-			out = append(out, ln)
-		}
-	}
-	return strings.Join(out, "\n")
-}
-
-// isStepStart reports whether a line begins a top-level numbered protocol step
-// ("0. ", "1. ", ...). Indented continuation and sub-items ("   a. ") never match
-// because the leading digit test fails on a leading space.
-func isStepStart(line string) bool {
-	i := 0
-	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
-		i++
-	}
-	return i > 0 && i+1 < len(line) && line[i] == '.' && line[i+1] == ' '
-}
-
-// keepStep decides whether a numbered step belongs in a pass of `kind`. A step
-// marked as owned by one kind is kept only for that kind; an unmarked (shared)
-// step is always kept.
-func keepStep(stepLine string, kind selectt.Kind) bool {
-	body := stepLine
-	if i := strings.IndexByte(body, ' '); i >= 0 {
-		body = body[i+1:] // strip the "N. " label
-	}
-	for _, o := range stepOwners {
-		if strings.HasPrefix(body, o.marker) {
-			return o.kind == kind
-		}
-	}
-	return true
 }
