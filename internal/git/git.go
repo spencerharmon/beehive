@@ -91,6 +91,90 @@ func (r *Repo) CommitPaths(ctx context.Context, msg string, paths ...string) err
 	return err
 }
 
+// CommitStaged commits whatever is already staged in the index with msg, WITHOUT
+// re-reading the working tree (no `add`, no pathspec). It is the safe way to
+// record a `git rm --cached` removal of a path whose working-tree directory is
+// still a live nested checkout (a code worktree): staging that path by pathspec
+// (`git add -- <path>`, as CommitPaths does) would re-add the live checkout as a
+// gitlink and undo the removal. Committing the staged index directly records only
+// the removal. ErrNothing when the index matches HEAD (nothing staged).
+func (r *Repo) CommitStaged(ctx context.Context, msg string) error {
+	staged, err := r.Run(ctx, "diff", "--cached", "--name-only")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(staged) == "" {
+		return ErrNothing
+	}
+	_, err = r.Run(ctx, "commit", "-m", msg)
+	return err
+}
+
+// RemoveCached drops paths from the index without touching the working tree
+// (`git rm --cached`). --ignore-unmatch keeps it a no-op for an already-absent
+// path and -q suppresses the per-file listing. The working-tree directory (which
+// for an orphan worktree gitlink is a live nested checkout) is left untouched;
+// only the tracked index entry is removed. A no-op for an empty path list.
+func (r *Repo) RemoveCached(ctx context.Context, paths ...string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	args := append([]string{"rm", "--cached", "-q", "--ignore-unmatch", "--"}, paths...)
+	_, err := r.Run(ctx, args...)
+	return err
+}
+
+// OrphanWorktreeGitlinks returns the tracked gitlink paths (index mode 160000)
+// that live under submodules/<sm>/worktrees/ and are NOT declared submodules in
+// .gitmodules — i.e. honeybee code-worktrees that leaked into the beehive index
+// as orphan gitlinks. Such an entry has no submodule URL and wedges
+// `git submodule update`, so the runner sweeps it. Declared submodules (real
+// gitlinks) and any gitlink outside a worktrees/ path are deliberately excluded,
+// so the sweep can only ever remove a leaked worktree, never a real submodule.
+func (r *Repo) OrphanWorktreeGitlinks(ctx context.Context) ([]string, error) {
+	out, err := r.Run(ctx, "ls-files", "-s")
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(out) == "" {
+		return nil, nil
+	}
+	declared, err := r.declaredSubmodulePaths(ctx)
+	if err != nil {
+		return nil, err
+	}
+	declaredSet := make(map[string]bool, len(declared))
+	for _, d := range declared {
+		declaredSet[d] = true
+	}
+	var orphans []string
+	for _, line := range strings.Split(out, "\n") {
+		// "<mode> <sha> <stage>\t<path>"; gitlinks are mode 160000.
+		if !strings.HasPrefix(line, "160000 ") {
+			continue
+		}
+		tab := strings.IndexByte(line, '\t')
+		if tab < 0 {
+			continue
+		}
+		path := line[tab+1:]
+		if declaredSet[path] || !isWorktreeGitlinkPath(path) {
+			continue
+		}
+		orphans = append(orphans, path)
+	}
+	return orphans, nil
+}
+
+// isWorktreeGitlinkPath reports whether p is a per-task code-worktree path of the
+// form submodules/<sm>/worktrees/<...> — the only shape the orphan-gitlink sweep
+// will remove. It intentionally does NOT match submodules/<sm>/repo (a real
+// submodule checkout) or any other layout.
+func isWorktreeGitlinkPath(p string) bool {
+	parts := strings.Split(p, "/")
+	return len(parts) >= 4 && parts[0] == "submodules" && parts[2] == "worktrees"
+}
+
 // Remote returns the name of the repo's default push remote ("origin" if
 // present, else the first configured remote), or "" when the repo has none.
 func (r *Repo) Remote(ctx context.Context) (string, error) {
