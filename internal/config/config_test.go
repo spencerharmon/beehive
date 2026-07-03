@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -140,8 +141,13 @@ func TestResolveBareInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Defaults(hostDir)
-	if c != want {
+	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("bare Resolve = %+v, want Defaults %+v", c, want)
+	}
+	// The inert default: no build_env anywhere ⇒ BuildEnv stays nil, so a normal
+	// host is unaffected (no export, byte-identical preamble).
+	if c.BuildEnv != nil {
+		t.Fatalf("bare Resolve BuildEnv = %v, want nil (inert default)", c.BuildEnv)
 	}
 }
 
@@ -155,5 +161,79 @@ func TestResolveMalformedErrors(t *testing.T) {
 
 	if _, err := Resolve(root, ""); err == nil {
 		t.Fatal("expected error for malformed config layer, got nil")
+	}
+}
+
+// TestResolveBuildEnvLayering checks the build_env map layers per KEY (not
+// whole-map): a key set in a more specific layer wins, a key set only in a lower
+// layer falls through, and a submodule with NO build_env inherits the accumulated
+// map unchanged (fall-through, not wiped). This is the runner-owned host build
+// env (CGO_ENABLED=0 + redirected tmp/cache) the honeybee must stop re-deriving.
+func TestResolveBuildEnvLayering(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+
+	// Host: sets the base host env (the LOCALS.md-documented static+root-fs fix).
+	write(t, filepath.Join(hostDir, "config.yaml"), `
+build_env:
+  CGO_ENABLED: "0"
+  GOTMPDIR: /host/tmp
+  TMPDIR: /host/tmp
+  GOCACHE: /host/cache
+`)
+	// Global: overrides one key (GOCACHE) and adds one (GOFLAGS); leaves the rest.
+	write(t, filepath.Join(root, "config.yaml"), `
+build_env:
+  GOCACHE: /global/cache
+  GOFLAGS: -mod=vendor
+`)
+	// Submodule: overrides one key (GOTMPDIR); everything else falls through.
+	write(t, filepath.Join(root, "submodules", "x", "config.yaml"), `
+build_env:
+  GOTMPDIR: /sub/tmp
+`)
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"CGO_ENABLED": "0",             // host only, falls through both layers
+		"TMPDIR":      "/host/tmp",     // host only, falls through
+		"GOCACHE":     "/global/cache", // global overrides host
+		"GOFLAGS":     "-mod=vendor",   // added by global
+		"GOTMPDIR":    "/sub/tmp",      // submodule overrides host
+	}
+	if !reflect.DeepEqual(c.BuildEnv, want) {
+		t.Fatalf("BuildEnv = %#v, want %#v", c.BuildEnv, want)
+	}
+
+	// A submodule with NO build_env inherits host+global unchanged (fall-through,
+	// not wiped) — the map must survive a layer that sets nothing.
+	c2, err := Resolve(root, "missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want2 := map[string]string{
+		"CGO_ENABLED": "0",
+		"GOTMPDIR":    "/host/tmp",
+		"TMPDIR":      "/host/tmp",
+		"GOCACHE":     "/global/cache",
+		"GOFLAGS":     "-mod=vendor",
+	}
+	if !reflect.DeepEqual(c2.BuildEnv, want2) {
+		t.Fatalf("fall-through BuildEnv = %#v, want %#v", c2.BuildEnv, want2)
+	}
+
+	// Layering must not mutate a lower layer's map: re-resolving the host-only
+	// scope still yields exactly the host keys (submodule/global edits built fresh
+	// maps, never aliased the host's).
+	hostOnly, err := Resolve(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := hostOnly.BuildEnv["GOTMPDIR"]; v != "/host/tmp" {
+		t.Fatalf("host-scope GOTMPDIR = %q, want /host/tmp (a more specific layer mutated the host map)", v)
 	}
 }

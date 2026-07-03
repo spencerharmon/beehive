@@ -255,7 +255,7 @@ func TestSingleEntryRegistryRoundTrip(t *testing.T) {
 	}
 	// Inverse of RepoEntry.Config: projecting the entry back over the same base
 	// config reproduces it field-for-field.
-	if got := e.Config(cfg); got != cfg {
+	if got := e.Config(cfg); !reflect.DeepEqual(got, cfg) {
 		t.Fatalf("Config round-trip not byte-identical:\n got %+v\nwant %+v", got, cfg)
 	}
 }
@@ -297,7 +297,7 @@ func TestResolveRegistryBareSynthesizes(t *testing.T) {
 	if e.GPGHome != cfg.GPGHome || e.GPGRecipient != cfg.GPGRecipient {
 		t.Errorf("legacy keyring not preserved: entry %q/%q, cfg %q/%q", e.GPGHome, e.GPGRecipient, cfg.GPGHome, cfg.GPGRecipient)
 	}
-	if got := e.Config(cfg); got != cfg {
+	if got := e.Config(cfg); !reflect.DeepEqual(got, cfg) {
 		t.Fatalf("synthesized entry not byte-identical:\n got %+v\nwant %+v", got, cfg)
 	}
 }

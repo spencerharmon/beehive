@@ -63,6 +63,19 @@ type Config struct {
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
 	// cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+
+	// BuildEnv is the host-specific Go build/test environment the runner OWNS so no
+	// honeybee re-derives it (audit session-audit-001 F1: e.g. a broken host cgo
+	// linker forces CGO_ENABLED=0, a quota-limited /tmp forces a root-fs GOTMPDIR/
+	// GOCACHE). It is EXPORTED into the honeybee process env at agent spawn (so
+	// build/test subprocesses the honeybee itself spawns inherit it) AND stated
+	// once in the injected prompt preamble as the mandated invocation — both
+	// sourced from this one map so they never drift. Layered per KEY (see merge): a
+	// more specific layer overrides individual keys; unset keys fall through; an
+	// empty value is unset. Inert (nil) by default so a normal host is unaffected;
+	// LOCALS.md is the human record of what to put here. Adding a map field makes
+	// Config non-comparable with ==; callers/tests use reflect.DeepEqual.
+	BuildEnv map[string]string `yaml:"build_env"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -143,7 +156,31 @@ func merge(base, over Config) Config {
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
 	}
+	out.BuildEnv = mergeEnv(base.BuildEnv, over.BuildEnv)
 	return out
+}
+
+// mergeEnv layers build_env per KEY (not whole-map): over's non-empty keys win,
+// base keys fall through, and an empty value is treated as unset (never overrides
+// a lower layer), mirroring the "zero == unset" rule used for every scalar field.
+// When over contributes it returns a FRESH map, so a lower layer's map is never
+// mutated; when over sets nothing it returns base unchanged (fall-through). So a
+// submodule can retune one var without restating the whole host map.
+func mergeEnv(base, over map[string]string) map[string]string {
+	if len(over) == 0 {
+		return base
+	}
+	merged := make(map[string]string, len(base)+len(over))
+	for k, v := range base {
+		merged[k] = v
+	}
+	for k, v := range over {
+		if v == "" {
+			continue // zero == unset: don't override a lower layer with a blank
+		}
+		merged[k] = v
+	}
+	return merged
 }
 
 // layerPaths returns the ordered config files (lowest precedence first, excluding
