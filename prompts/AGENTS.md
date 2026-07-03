@@ -38,8 +38,12 @@ Repo root (beehive-managed defaults unless noted):
 
 Per submodule (`submodules/<name>/`):
 
-- `ROI.md` — the human-owned record of intent for this target. **Never edited by an
-  agent** (a pre-commit hook blocks honeybee edits). Drives bootstrap/reconcile.
+- `ROI.md` — the human-owned record of intent for this target. **Never edited by a
+  honeybee** — a pre-commit hook blocks commits touching it under the honeybee
+  identity (`BEEHIVE_HONEYBEE=1`), and a server pre-receive mirrors that for pushes.
+  Operator-*directed* edits ARE allowed and expected: an agent acting on the hive
+  repo when an operator tells it to, or the beehived ROI/generic editor. Drives
+  bootstrap/reconcile.
 - `PLAN.md` — the honeybee-owned task list derived from `ROI.md`, carrying an ROI
   stamp `<!-- Beehive-ROI: <sha> -->`. Written by bootstrap/reconcile passes; do
   not hand-edit (it races the reconcile pass).
@@ -77,7 +81,10 @@ add a local skill so agents can discover it.
 
 ## Absolute rules (apply to every agent)
 
-- NEVER edit any `ROI.md` as an agent — it is the human record of intent.
+- NEVER edit any `ROI.md` **as a honeybee** (an autonomous pass) — it is the human
+  record of intent, hook-protected against the honeybee identity. Operator-directed
+  edits are allowed: a hive agent acting on an operator's instruction, or the
+  beehived ROI/generic editor.
 - NEVER hand-edit a `PLAN.md` — reconcile/bootstrap own it.
 - Do not stop, kill, or restart running passes/processes without explicit operator
   approval; see `LOCALS.md` for the local safety rule and how work is scheduled.

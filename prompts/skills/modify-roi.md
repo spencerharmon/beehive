@@ -4,8 +4,10 @@
 > work for `submodules/<name>/`.
 
 `ROI.md` is the human/operator-owned record of intent. It is hook-protected: a
-honeybee that tries to commit an edit to any `ROI.md` is blocked. Only the operator
-(directly or via the UI editor) changes it.
+**honeybee** (autonomous pass, `BEEHIVE_HONEYBEE=1`) that tries to commit an edit to
+any `ROI.md` is blocked. Operator-directed edits ARE allowed — the operator
+directly, the beehived ROI/generic editor, or an agent acting on the hive repo when
+the operator directs it.
 
 ## Procedure
 
@@ -21,5 +23,7 @@ honeybee that tries to commit an edit to any `ROI.md` is blocked. Only the opera
 
 ## Rules
 
-- Never edit an `ROI.md` as an autonomous agent.
+- Never edit an `ROI.md` **as a honeybee** (an autonomous pass — the hook blocks it).
+  Operator-directed edits are allowed: a hive agent acting on operator instruction,
+  or the beehived editor.
 - Never hand-edit `PLAN.md` — reconcile owns it.
