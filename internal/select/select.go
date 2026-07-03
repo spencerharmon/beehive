@@ -55,11 +55,32 @@ type Selector struct {
 	Git  *git.Repo // beehive repo root, for ROI commit lookup
 	Rand *rand.Rand
 	TTL  time.Duration
+	// Remote, when non-empty, is the push remote whose main is best-effort pulled
+	// (--ff-only) once at the top of Select so reconcile drift is evaluated against
+	// the freshest PUBLISHED tip rather than a merely-fetched (stale-working-tree)
+	// checkout. A not-yet-pulled tree makes the selector re-emit a reconcile whose
+	// ROI delta a peer already folded and stamped into PLAN.md — the audited
+	// reconcile_loop. Left "" for the shared primary checkout (which must never be
+	// written) and for local-only hives; set only on the isolated per-honeybee
+	// worktree selector, where a working-tree pull is safe.
+	Remote string
 }
 
 // Select walks weighted-random submodules and returns the first workable item.
 // nil is returned only when no submodule has any workable task.
 func (s *Selector) Select(ctx context.Context) (*Selection, error) {
+	// Freshen against the published tip BEFORE evaluating reconcile drift. A merely
+	// fetched-but-not-pulled tree makes the selector re-emit a reconcile whose ROI
+	// delta a peer already folded and stamped into PLAN.md (the audited
+	// reconcile_loop that spent whole passes re-applying an already-stamped delta).
+	// One pull covers every submodule — all PLAN.md/ROI.md live in this beehive
+	// repo. Best-effort --ff-only: a divergent/offline pull leaves the local tree
+	// untouched and selection falls through to local evaluation. Gated on Remote so
+	// the shared primary checkout (Remote unset) is never written; only the isolated
+	// worktree selector pulls.
+	if s.Remote != "" {
+		_ = s.Git.Pull(ctx, s.Remote, "main")
+	}
 	subs, err := s.Repo.Submodules()
 	if err != nil {
 		return nil, err

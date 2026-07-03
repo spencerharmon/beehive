@@ -269,6 +269,35 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		return res, err
 	}
 
+	// Reconcile single-flight: an already-applied reconcile must be a deterministic
+	// pre-dispatch no-op, never a spawned session. Selection and dispatch are
+	// separate cycles, and a peer may have published the same ROI fold in between
+	// (the audited reconcile_loop: repeated zero-progress passes re-folding one
+	// delta already stamped in PLAN.md). Best-effort re-pull main --ff-only so the
+	// working tree reflects the freshest PUBLISHED tip, then reuse the prefix
+	// compare (reconciled): if PLAN.md's Beehive-ROI stamp already prefixes the
+	// current ROI head, return WITHOUT opening a session. Best-effort — a
+	// divergent/offline pull falls back to local evaluation (ClaimLock already
+	// fetched+merged main, so the tree is fresh), and this keys only off
+	// stamp-prefixes-head, so a genuinely-advanced ROI still dispatches exactly one
+	// reconcile.
+	if sel.Kind == selectt.Reconcile {
+		if r.Remote != "" {
+			_ = r.Git.Pull(ctx, r.Remote, "main")
+		}
+		applied, err := r.reconciled(sel)
+		if err != nil {
+			return res, err
+		}
+		if applied {
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] reconcile already applied for %s; no session dispatched\n", sel.Submodule.Name)
+			}
+			res.Completed = true
+			return res, nil
+		}
+	}
+
 	// Only a main Work task edits the submodule repo and needs a worktree.
 	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
 	var wg *git.Repo

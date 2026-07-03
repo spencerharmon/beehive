@@ -997,3 +997,138 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		t.Fatalf("no-remote run moved the submodule pointer (%s != recorded %s)", ptr, subTip)
 	}
 }
+
+// openCounter is a swarm Client that counts how many sessions were opened, so a
+// test can assert the pre-dispatch reconcile guard spawned NO session (opens==0).
+type openCounter struct {
+	opens int
+	sess  *mockSession
+}
+
+func (o *openCounter) Open(ctx context.Context, cwd, system string) (Session, error) {
+	o.opens++
+	if o.sess == nil {
+		o.sess = &mockSession{}
+	}
+	return o.sess, nil
+}
+
+// TestRunReconcileAlreadyAppliedNoSession proves the pre-dispatch reconcile guard
+// is a deterministic no-op: when PLAN.md's Beehive-ROI stamp already prefixes the
+// current ROI head, Run returns Completed in zero turns WITHOUT opening a session —
+// the audited zero-progress reconcile pass is never spawned.
+func TestRunReconcileAlreadyAppliedNoSession(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	g.Commit(ctx, "seed roi")
+	head, _ := g.LastCommit(ctx, "submodules/sm/ROI.md")
+	// PLAN.md already stamped at the ROI head => reconcile is applied.
+	os.WriteFile(filepath.Join(sm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	oc := &openCounter{}
+	r := &Runner{Repo: rp, Git: g, Client: oc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if oc.opens != 0 {
+		t.Fatalf("already-applied reconcile opened %d sessions; want 0 (no dispatch)", oc.opens)
+	}
+	if !res.Completed || res.Turns != 0 {
+		t.Fatalf("want Completed with 0 turns, got %+v", res)
+	}
+}
+
+// TestRunReconcileAdvancedOpensSession is the counterpart guarding against
+// over-suppression: when ROI.md has advanced past the PLAN.md stamp (a genuine
+// drift), the guard does NOT short-circuit — exactly one reconcile session is
+// dispatched and drives the fold to completion.
+func TestRunReconcileAdvancedOpensSession(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	planPath := filepath.Join(sm, "PLAN.md")
+	// Stamp points at a stale sha => ROI drifted past it.
+	os.WriteFile(planPath, []byte("<!-- Beehive-ROI: deadbeefcafe -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed drift")
+	head, _ := g.LastCommit(ctx, "submodules/sm/ROI.md")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	// The reconcile agent folds the delta and stamps PLAN.md at the ROI head on its
+	// first turn, so the completion check (reconciled) clears after one turn.
+	oc := &openCounter{sess: &mockSession{onTurn: func(int) {
+		os.WriteFile(planPath, []byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: oc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if oc.opens != 1 {
+		t.Fatalf("advanced-ROI reconcile opened %d sessions; want exactly 1", oc.opens)
+	}
+	if !res.Completed || res.Turns != 1 {
+		t.Fatalf("want Completed in 1 turn, got %+v", res)
+	}
+}
+
+// TestRunReconcilePullSuppressesFromOrigin proves the guard PULLS the tracked tip
+// before deciding (Accept: "the pre-check pulls the tracked tip first"). The local
+// worktree is stale (PLAN.md unstamped => it would drift), but a peer's stamp has
+// already landed on origin/main. With Remote set, the guard ff-pulls origin, sees
+// the stamp, and dispatches NO session. A silently-failed pull would leave the
+// stale tree and open a session, so opens==0 is a real assertion of the pull.
+func TestRunReconcilePullSuppressesFromOrigin(t *testing.T) {
+	ctx := context.Background()
+	origin := t.TempDir()
+	og := gitInit(t, origin)
+	repo.Init(origin)
+	osm := filepath.Join(origin, "submodules", "sm")
+	os.MkdirAll(osm, 0o755)
+	os.WriteFile(filepath.Join(osm, "ROI.md"), []byte("intent\n"), 0o644)
+	os.WriteFile(filepath.Join(osm, "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	og.Commit(ctx, "seed")
+	head, _ := og.LastCommit(ctx, "submodules/sm/ROI.md")
+
+	// Clone the stale seed (PLAN.md unstamped) into the honeybee worktree.
+	wt := t.TempDir()
+	if _, err := git.New(wt).Run(ctx, "clone", origin, "."); err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	// A peer folds the delta and stamps PLAN.md at the ROI head on origin/main.
+	os.WriteFile(filepath.Join(osm, "PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	og.Commit(ctx, "peer: stamp ROI head")
+
+	rp, _ := repo.Open(wt)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	oc := &openCounter{}
+	r := &Runner{Repo: rp, Git: git.New(wt), Client: oc, Remote: "origin", MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if oc.opens != 0 {
+		t.Fatalf("origin stamp must suppress dispatch after the guard's pull; opened %d sessions", oc.opens)
+	}
+	if !res.Completed || res.Turns != 0 {
+		t.Fatalf("want Completed with 0 turns, got %+v", res)
+	}
+}

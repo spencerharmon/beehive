@@ -85,6 +85,10 @@ func run() error {
 	// the worktrees can be named <submodule>-<epoch> and are easy for an operator
 	// to find. The real selection/claim happens below in the isolated worktree:
 	// this seeds attempt 0; a lost-claim reselect picks a fresh task there.
+	// NOTE: no Remote here on purpose — primary is the SHARED checkout and must
+	// never be written (Selector.Remote would trigger a working-tree pull). Its
+	// possibly-stale reconcile seed is backstopped by the worktree selector's pull
+	// (below) and the runner's pre-dispatch reconcile guard.
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 	rp0, err := repo.Open(primaryRoot)
 	if err != nil {
@@ -155,7 +159,7 @@ func run() error {
 		sessPush = func(ctx context.Context) error { return sessGit.Push(ctx, remote, sessBranch) }
 	}
 
-	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl}
+	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl, Remote: remote}
 	// Rebind the primary selection onto the worktree repo so attempt 0 works the
 	// exact submodule the worktrees are named after.
 	seed, err := rebindSelection(rp, sel0)

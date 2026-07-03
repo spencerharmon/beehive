@@ -363,3 +363,102 @@ func TestReconcilePrefixStampNoDrift(t *testing.T) {
 		t.Fatalf("short prefix stamp must read as no-drift, got range %q", rng)
 	}
 }
+
+// TestSelectReconcileBackToBack reproduces the audited reconcile_loop at the
+// selection layer: once a reconcile has folded the delta and stamped the current
+// ROI head into PLAN.md, a SECOND selection cycle at that same head must NOT
+// re-emit a reconcile. The prefix-stamp gate makes the second cycle fall through
+// to the real Work task instead of dispatching another zero-progress reconcile.
+func TestSelectReconcileBackToBack(t *testing.T) {
+	_, g, root := hive(t)
+	ctx := context.Background()
+	// Unstamped PLAN.md vs a committed ROI.md => reconcile drift on cycle 1.
+	sub(root, "a", map[string]string{"ROI.md": "x", "PLAN.md": "## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	g.Commit(ctx, "seed")
+	head, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+
+	s1, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("cycle 1: %v", err)
+	}
+	if s1 == nil || s1.Kind != Reconcile {
+		t.Fatalf("cycle 1 want reconcile, got %+v", s1)
+	}
+	// The reconcile pass folds the delta and stamps PLAN.md at the ROI head.
+	os.WriteFile(filepath.Join(root, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "reconcile: stamp ROI head")
+
+	s2, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("cycle 2: %v", err)
+	}
+	if s2 == nil || s2.Kind == Reconcile {
+		t.Fatalf("cycle 2 must not re-emit reconcile at the stamped head, got %+v", s2)
+	}
+	if s2.Kind != Work || s2.Task.ID != "T1" {
+		t.Fatalf("cycle 2 want Work T1, got %+v", s2)
+	}
+}
+
+// cloneHive clones an existing beehive checkout into a fresh empty temp dir and
+// returns its path; the clone carries an "origin" remote pointing back at src, so
+// a Selector with Remote:"origin" can ff-pull src's main.
+func cloneHive(t *testing.T, src string) string {
+	t.Helper()
+	dst := t.TempDir() // empty; `git clone src .` populates it in place
+	if _, err := git.New(dst).Run(context.Background(), "clone", src, "."); err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	return dst
+}
+
+// TestSelectPullFreshensFromOrigin proves the pre-selection ff-pull (gated on
+// Selector.Remote) evaluates reconcile drift against the PUBLISHED tip, not a
+// stale local working tree: a peer's stamp that landed on origin/main is pulled
+// in and suppresses a local re-reconcile. Without Remote (the shared primary
+// checkout, which must never be written) no pull happens and the stale tree still
+// drifts — proving the pull is real and correctly gated.
+func TestSelectPullFreshensFromOrigin(t *testing.T) {
+	ctx := context.Background()
+	_, og, origin := hive(t)
+	// Seed: committed ROI.md, PLAN.md NOT yet stamped => reconcile drift locally.
+	sub(origin, "a", map[string]string{"ROI.md": "x", "PLAN.md": "## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	og.Commit(ctx, "seed")
+	head, _ := og.LastCommit(ctx, "submodules/a/ROI.md")
+
+	// Two independent clones of the seed (both stale: PLAN.md unstamped), taken
+	// BEFORE the peer publishes the stamp.
+	pulled := cloneHive(t, origin)
+	stale := cloneHive(t, origin)
+
+	// A peer folds the delta and stamps PLAN.md at the ROI head on origin/main.
+	os.WriteFile(filepath.Join(origin, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	og.Commit(ctx, "peer: stamp ROI head")
+
+	// Remote set: Select ff-pulls origin/main first, sees the stamp, no reconcile.
+	rp, _ := repo.Open(pulled)
+	sPull := &Selector{Repo: rp, Git: git.New(pulled), Rand: rand.New(rand.NewSource(1)), TTL: time.Hour, Remote: "origin"}
+	got, err := sPull.Select(ctx)
+	if err != nil {
+		t.Fatalf("pulled Select: %v", err)
+	}
+	if got == nil || got.Kind == Reconcile {
+		t.Fatalf("origin stamp must suppress reconcile after pull, got %+v", got)
+	}
+	if got.Kind != Work || got.Task.ID != "T1" {
+		t.Fatalf("pulled Select want Work T1, got %+v", got)
+	}
+
+	// Remote unset (shared-checkout safety): no pull, so the stale tree still drifts.
+	rp2, _ := repo.Open(stale)
+	sStale := &Selector{Repo: rp2, Git: git.New(stale), Rand: rand.New(rand.NewSource(1)), TTL: time.Hour}
+	got2, err := sStale.Select(ctx)
+	if err != nil {
+		t.Fatalf("stale Select: %v", err)
+	}
+	if got2 == nil || got2.Kind != Reconcile {
+		t.Fatalf("without Remote the stale tree must still drift to reconcile, got %+v", got2)
+	}
+}
