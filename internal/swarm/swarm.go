@@ -54,10 +54,14 @@ type Runner struct {
 	Git      *git.Repo // beehive worktree (this honeybee's isolated checkout)
 	Client   Client
 	MaxTurns int
-	WallCap  time.Duration
-	TTL      time.Duration
-	Now      func() time.Time
-	Debug    io.Writer // non-nil: stream session activity live
+	// MergeRetries bounds publish conflict resolution: on a merge conflict the
+	// runner has the agent resolve it, then retries the publish, up to this many
+	// attempts before deferring the task to a later honeybee. 0 -> default 8.
+	MergeRetries int
+	WallCap      time.Duration
+	TTL          time.Duration
+	Now          func() time.Time
+	Debug        io.Writer // non-nil: stream session activity live
 	// Session is this honeybee's unique claim token, stamped on the task it works
 	// so peers can tell a task is actively held (session + fresh heartbeat) versus
 	// free. Must match the token main used for the initial Claim.
@@ -270,6 +274,115 @@ func (r *Runner) publish(ctx context.Context) error {
 		return nil
 	}
 	return r.Publish(ctx)
+}
+
+// publishWithResolution lands the work on main, using the agent to resolve merge
+// conflicts git cannot (concurrent honeybee work, or an external/non-honeybee
+// commit to the submodule or hive that no lock can prevent). Deterministic first:
+// r.publish merges + pushes and auto-resolves non-conflicting races itself. On a
+// real conflict it reproduces the merge in the work worktree, hands the conflicted
+// paths to the agent, commits the resolution, and retries — bounded by
+// MergeRetries (default 8). If new changes keep interfering past the bound it gives
+// up CLEANLY: the task is left unfinished (not marked done; the stale claim GCs) so
+// a LATER honeybee resumes where this one stopped, e.g. once a human or non-honeybee
+// agent has finished editing. Never a wedge, never silent, no tokens spent on an
+// unrecoverable state. A nil session (tests/no agent) or a non-conflict failure
+// falls through to the deterministic result unchanged.
+func (r *Runner) publishWithResolution(ctx context.Context, sess Session) error {
+	n := r.MergeRetries
+	if n <= 0 {
+		n = 8
+	}
+	for attempt := 0; attempt < n; attempt++ {
+		err := r.publish(ctx)
+		if err == nil {
+			return nil
+		}
+		if sess == nil || !errors.Is(err, git.ErrConflict) {
+			return err // no agent, or a non-conflict failure: defer as before
+		}
+		if rerr := r.resolveConflict(ctx, sess); rerr != nil {
+			// Not resolvable this pass (agent failed, left markers, or a gitlink
+			// conflict needing a submodule merge): defer cleanly for a later pass.
+			return errors.Join(err, rerr)
+		}
+		// Resolved and committed on the branch; loop and retry the publish.
+	}
+	return fmt.Errorf("publish did not converge after %d attempts (concurrent/external changes still interfering); left for a later honeybee to finish: %w", n, git.ErrConflict)
+}
+
+// resolveConflict reproduces the publish merge in the work worktree and drives the
+// agent to resolve it, committing a clean merge. Returns nil once resolved (or the
+// race cleared with no conflict); returns an error when it is not resolvable this
+// pass. A submodule-gitlink conflict is a deferred submodule merge (see
+// docs/conflict-resolution.md), not a text resolution, so it is not attempted here.
+func (r *Runner) resolveConflict(ctx context.Context, sess Session) error {
+	ref := "main"
+	if r.Remote != "" {
+		if err := r.Git.Fetch(ctx, r.Remote, "main"); err != nil {
+			return err
+		}
+		ref = r.Remote + "/main"
+	}
+	switch err := r.Git.Merge(ctx, ref); {
+	case err == nil:
+		return nil // race cleared; caller retries the push
+	case !errors.Is(err, git.ErrConflict):
+		return err
+	}
+	// A submodule-gitlink conflict (index mode 160000) cannot be resolved by editing
+	// text; it needs a merge inside the submodule. Out of scope here — defer.
+	if raw, _ := r.Git.Run(ctx, "ls-files", "-u"); strings.Contains(raw, "160000 ") {
+		_ = r.Git.AbortMerge(ctx)
+		return fmt.Errorf("submodule-gitlink conflict needs a submodule merge (deferred; see docs/conflict-resolution.md)")
+	}
+	conflicts, err := r.Git.UnmergedPaths(ctx)
+	if err != nil {
+		_ = r.Git.AbortMerge(ctx)
+		return err
+	}
+	turnCtx := ctx
+	if r.TurnTimeout > 0 {
+		var cancel context.CancelFunc
+		turnCtx, cancel = context.WithTimeout(ctx, r.TurnTimeout)
+		defer cancel()
+	}
+	if _, perr := sess.Prompt(turnCtx, conflictResolutionPrompt(conflicts)); perr != nil {
+		_ = r.Git.AbortMerge(ctx)
+		return fmt.Errorf("agent conflict-resolution turn failed: %w", perr)
+	}
+	// Stage ONLY the conflicted paths (scope the merge commit to the resolution),
+	// then refuse to commit if anything is still unmerged or still marker-laden.
+	if _, err := r.Git.Run(ctx, append([]string{"add", "--"}, conflicts...)...); err != nil {
+		_ = r.Git.AbortMerge(ctx)
+		return err
+	}
+	if rem, _ := r.Git.UnmergedPaths(ctx); len(rem) > 0 {
+		_ = r.Git.AbortMerge(ctx)
+		return fmt.Errorf("agent left %s unresolved", strings.Join(rem, ","))
+	}
+	if marked, _ := r.Git.HasConflictMarkers(ctx, conflicts); marked {
+		_ = r.Git.AbortMerge(ctx)
+		return fmt.Errorf("agent left conflict markers in %s", strings.Join(conflicts, ","))
+	}
+	if _, err := r.Git.Run(ctx, "commit", "--no-edit"); err != nil {
+		_ = r.Git.AbortMerge(ctx)
+		return err
+	}
+	return nil
+}
+
+// conflictResolutionPrompt tells the agent to resolve an in-progress merge on its
+// branch. The runner — not the agent — commits and publishes, so the agent only
+// rewrites the conflicted files to a correct combined merge.
+func conflictResolutionPrompt(conflicts []string) string {
+	return "STOP the current task. A concurrent change landed on main and conflicts with your branch. " +
+		"A merge of main into your working branch is IN PROGRESS with git conflict markers in: " +
+		strings.Join(conflicts, ", ") + ". " +
+		"Resolve every conflict so each file is the correct combination of BOTH changes — keep the other " +
+		"change's work, never delete it just to clear the conflict. Remove all conflict markers " +
+		"(<<<<<<<, =======, >>>>>>>). Do NOT commit, push, or run git merge/reset/abort — the runner commits " +
+		"and publishes. When every listed file is a clean, correct merge, end your turn."
 }
 
 // sweepOrphanWorktreeGitlinks removes any orphan gitlink that a prior pass leaked
@@ -615,7 +728,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		// Publish the WORK first and let its result gate completion. The work is what
 		// the task exists to produce; a convenience artifact must never block it.
-		ferr := r.publish(ctx)
+		ferr := r.publishWithResolution(ctx, sess)
 		if ferr != nil && r.Debug != nil {
 			fmt.Fprintf(r.Debug, "\n⚠️  publish to main failed: %v\n", ferr)
 		}

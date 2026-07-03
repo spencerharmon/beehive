@@ -193,7 +193,7 @@ func run() error {
 	session := wtBranch
 
 	runner := &swarm.Runner{
-		Repo: rp, Git: gitRepo, MaxTurns: eff.MaxTurns, WallCap: ttl, TTL: ttl, Publish: publish,
+		Repo: rp, Git: gitRepo, MaxTurns: eff.MaxTurns, MergeRetries: eff.MergeRetries, WallCap: ttl, TTL: ttl, Publish: publish,
 		Remote: remote, BaseMain: baseMain, Session: session,
 		SessionGit: sessGit, SessionRoot: sessPath, SessionBranch: sessBranch,
 		SessionPublish: sessPublish, SessionPush: sessPush,

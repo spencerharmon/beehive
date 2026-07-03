@@ -60,12 +60,13 @@ type Config struct {
 	// key-by-key across layers, so a submodule can override a single kind. Unset =
 	// no routing: every kind resolves to Model, byte-identical to the single-model
 	// path.
-	Models      map[string]string `yaml:"models"`
-	Temperature float64           `yaml:"temperature"`  // sampling temperature for the agent model
-	MaxTokens   int               `yaml:"max_tokens"`   // max output tokens per turn (0 = backend default)
-	TTLMinutes  int               `yaml:"ttl_minutes"`  // GC heartbeat TTL
-	MaxTurns    int               `yaml:"max_turns"`    // per-honeybee turn cap
-	RejectLimit int               `yaml:"reject_limit"` // rejections before NEEDS-HUMAN
+	Models       map[string]string `yaml:"models"`
+	Temperature  float64           `yaml:"temperature"`   // sampling temperature for the agent model
+	MaxTokens    int               `yaml:"max_tokens"`    // max output tokens per turn (0 = backend default)
+	TTLMinutes   int               `yaml:"ttl_minutes"`   // GC heartbeat TTL
+	MaxTurns     int               `yaml:"max_turns"`     // per-honeybee turn cap
+	MergeRetries int               `yaml:"merge_retries"` // publish conflict-resolution attempts before deferring (default 8)
+	RejectLimit  int               `yaml:"reject_limit"`  // rejections before NEEDS-HUMAN
 	// StallTurns bounds idle churn: if a Work pass produces an identical code-
 	// worktree fingerprint for this many consecutive turns without reaching
 	// completion, the runner abandons it for GC instead of burning the whole
@@ -101,6 +102,7 @@ func Defaults(dir string) Config {
 		AgentURL:           "http://127.0.0.1:4096",
 		TTLMinutes:         60,
 		MaxTurns:           15,
+		MergeRetries:       8,
 		RejectLimit:        3,
 		TurnTimeoutMinutes: 60,
 	}
@@ -179,6 +181,9 @@ func merge(base, over Config) Config {
 	}
 	if over.MaxTurns != 0 {
 		out.MaxTurns = over.MaxTurns
+	}
+	if over.MergeRetries != 0 {
+		out.MergeRetries = over.MergeRetries
 	}
 	if over.RejectLimit != 0 {
 		out.RejectLimit = over.RejectLimit

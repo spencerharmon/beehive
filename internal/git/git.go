@@ -653,6 +653,40 @@ func (r *Repo) Clean(ctx context.Context) (bool, error) {
 	return out == "", nil
 }
 
+// UnmergedPaths lists the paths currently in a conflicted/unmerged index state
+// (`git diff --name-only --diff-filter=U`) — empty once every conflict, including
+// a submodule gitlink, has been resolved and staged.
+func (r *Repo) UnmergedPaths(ctx context.Context) ([]string, error) {
+	out, err := r.Run(ctx, "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(out), nil
+}
+
+// AbortMerge unwinds an in-progress merge, restoring the pre-merge branch state.
+func (r *Repo) AbortMerge(ctx context.Context) error {
+	_, err := r.Run(ctx, "merge", "--abort")
+	return err
+}
+
+// HasConflictMarkers reports whether any of paths still contains a git conflict
+// marker (`<<<<<<< `) — the safety net that stops a half-resolved file from being
+// committed. Non-regular paths (a submodule gitlink has no file) and unreadable
+// paths are skipped; the caller's UnmergedPaths check covers those.
+func (r *Repo) HasConflictMarkers(ctx context.Context, paths []string) (bool, error) {
+	for _, p := range paths {
+		b, err := os.ReadFile(filepath.Join(r.Dir, p))
+		if err != nil {
+			continue
+		}
+		if bytes.HasPrefix(b, []byte("<<<<<<< ")) || bytes.Contains(b, []byte("\n<<<<<<< ")) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Merge merges ref into the current branch. Returns ErrConflict on conflict.
 func (r *Repo) Merge(ctx context.Context, ref string) error {
 	if _, err := r.Run(ctx, "merge", "--no-edit", ref); err != nil {

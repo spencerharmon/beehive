@@ -1390,3 +1390,71 @@ func TestRunBootstrapGatesOnUnpublishedPlan(t *testing.T) {
 		t.Fatal("PLAN.md unexpectedly reached main despite never being committed")
 	}
 }
+
+// setupPublishConflict builds a hive repo where the work branch and main both
+// edited the same file, so the next publish conflicts. Returns the primary repo,
+// the work-worktree repo, and the conflicted path.
+func setupPublishConflict(t *testing.T) (g, wg *git.Repo, wtPath string) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	g = gitInit(t, root)
+	os.WriteFile(filepath.Join(root, "shared"), []byte("base\n"), 0o644)
+	g.Commit(ctx, "base")
+	wtPath = filepath.Join(root, ".worktrees", "bee-x")
+	if err := g.WorktreeAdd(ctx, wtPath, "bee-x", "main"); err != nil {
+		t.Fatal(err)
+	}
+	wg = git.New(wtPath)
+	os.WriteFile(filepath.Join(wtPath, "shared"), []byte("branch change\n"), 0o644)
+	if err := wg.CommitPaths(ctx, "branch edit", "shared"); err != nil {
+		t.Fatal(err)
+	}
+	// main advances with a conflicting edit.
+	os.WriteFile(filepath.Join(root, "shared"), []byte("main change\n"), 0o644)
+	g.Commit(ctx, "main edit")
+	return g, wg, wtPath
+}
+
+// TestPublishWithResolutionResolvesConflict: a publish conflict is handed to the
+// agent, which rewrites the file to a clean merge; the runner commits it and the
+// retry publish lands the work on main.
+func TestPublishWithResolutionResolvesConflict(t *testing.T) {
+	ctx := context.Background()
+	g, wg, wtPath := setupPublishConflict(t)
+	sess := &mockSession{onTurn: func(int) {
+		os.WriteFile(filepath.Join(wtPath, "shared"), []byte("merged both changes\n"), 0o644)
+	}}
+	r := &Runner{Git: wg, MergeRetries: 8, Publish: func(ctx context.Context) error { return wg.PublishToMain(ctx, "") }}
+	if err := r.publishWithResolution(ctx, sess); err != nil {
+		t.Fatalf("publishWithResolution: %v", err)
+	}
+	if sess.prompts != 1 {
+		t.Fatalf("agent prompts = %d, want exactly 1 resolution turn", sess.prompts)
+	}
+	body, err := g.Show(ctx, "main", "shared")
+	if err != nil || !strings.Contains(body, "merged both changes") {
+		t.Fatalf("main should carry the resolved merge, got %q (err %v)", body, err)
+	}
+}
+
+// TestPublishWithResolutionDefersWhenUnresolved: if the agent does NOT clear the
+// conflict, the runner must abort the merge (clean worktree), NOT land the work,
+// and return a deferred ErrConflict for a later honeybee — never a wedge.
+func TestPublishWithResolutionDefersWhenUnresolved(t *testing.T) {
+	ctx := context.Background()
+	g, wg, _ := setupPublishConflict(t)
+	sess := &mockSession{onTurn: func(int) { /* leave the conflict markers in place */ }}
+	r := &Runner{Git: wg, MergeRetries: 3, Publish: func(ctx context.Context) error { return wg.PublishToMain(ctx, "") }}
+	err := r.publishWithResolution(ctx, sess)
+	if err == nil || !errors.Is(err, git.ErrConflict) {
+		t.Fatalf("want a deferred ErrConflict, got %v", err)
+	}
+	if st, _ := wg.Status(ctx); st != "" {
+		t.Fatalf("work worktree must be clean after a deferred conflict, got %q", st)
+	}
+	body, _ := g.Show(ctx, "main", "shared")
+	if strings.Contains(body, "branch change") {
+		t.Fatalf("work must NOT have landed on main after a deferred conflict, got %q", body)
+	}
+}

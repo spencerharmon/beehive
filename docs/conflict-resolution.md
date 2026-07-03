@@ -24,6 +24,20 @@ exception, and the exception must be **recoverable, not fatal**. Almost no state
 should be unrecoverable by a honeybee; when one genuinely is, abort **without
 spending tokens**.
 
+### External (non-honeybee) writers
+
+A lock only serializes participants that honor it. A **human or a non-honeybee
+agent** committing directly to a submodule (or hive) does not — so their edits can
+collide with in-flight honeybee work in ways no lock prevents. The convergence
+protocol must tolerate this without special-casing it: **attempt the deterministic
+merge; on conflict, hand it to the agent (LLM) to resolve; commit and retry, up to
+N times** (`merge_retries`, default 8). If *new* external/concurrent changes keep
+landing and interfering past N, **give up cleanly** — leave the task unfinished
+(not marked done; the stale claim GCs) so a **later honeybee resumes where this one
+stopped**, e.g. once the human/non-honeybee agent has finished their edits. Nothing
+wedges, nothing is silently dropped, and no tokens are spent once the state is
+(for now) unrecoverable.
+
 ## Three conflict regimes
 
 A publish conflict is one of three things. The instrumentation names the
@@ -92,16 +106,26 @@ the *resolution* so two honeybees don't thrash the same merge:
 
 ## Status
 
-- **Implemented:** conflicted paths are named in every publish conflict error
-  (`git.conflictErr`); the **session-transcript publish is decoupled from the work
-  publish** — the work lands first and its success alone gates completion; a
-  transcript-publish failure is a logged WARNING that never blocks the task
-  (leaving the transcript on the session branch). This removes the coupling that
-  let a cosmetic transcript merge-conflict stall delivery.
-- **Pending log confirmation:** which regime actually dominates the conflict logs
-  (gitlink vs `PLAN.md` vs transcript). The named-path instrumentation feeds the
-  standing **log-review** plan item; the resolution work below is prioritized off
-  that data rather than a guess.
-- **Specified, not yet built:** LLM-in-the-loop resolution (re-enter an agent turn
-  on a resolvable conflict, resolve, retry); deterministic gitlink submodule-merge;
-  the conflict-serialization lock.
+- **Implemented:**
+  - Conflicted paths are named in every publish conflict error (`git.conflictErr`).
+  - The **session-transcript publish is decoupled from the work publish** — the
+    work lands first and its success alone gates completion; a transcript-publish
+    failure is a logged WARNING that never blocks the task (transcript stays on the
+    session branch). Removes the coupling that let a cosmetic transcript conflict
+    stall delivery.
+  - **LLM-in-the-loop resolution for text conflicts** (`Runner.publishWithResolution`
+    / `resolveConflict`): on a publish conflict the runner reproduces the merge in
+    the work worktree, hands the conflicted paths to the agent to resolve (keep
+    BOTH sides), stages **only** those paths, refuses to commit if anything is
+    still unmerged or marker-laden, commits, and retries — bounded by
+    `merge_retries` (default 8, configurable), then defers cleanly for a later
+    honeybee. Deterministic fast-path: if the race cleared, it re-publishes without
+    waking the agent. Falls through to the prior clean-defer when there is no agent.
+- **Pending log confirmation:** which regime dominates the conflict logs (gitlink
+  vs `PLAN.md` vs transcript). The named-path instrumentation feeds the standing
+  **log-review** plan item.
+- **Specified, not yet built:** the **gitlink / submodule-merge** resolution (a
+  gitlink conflict is detected and *deferred* today, not resolved — it needs a
+  merge inside the submodule and a merged-SHA pointer); the
+  **conflict-serialization lock** (hybrid: optimistic in the common case, lock only
+  to serialize resolution).
