@@ -20,6 +20,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spencerharmon/beehive/internal/submod"
+	"github.com/spencerharmon/beehive/internal/swarm"
 )
 
 //go:embed templates/*.html
@@ -41,6 +42,11 @@ type Server struct {
 	tmpl    *template.Template
 	editors *editor.Manager
 	cache   *viewCache
+
+	// chat is the generic chat-diff editor over ANY repo file: a per-edit ROOT
+	// worktree + opencode session that proposes a full-file change rendered as a
+	// unified diff, applied+committed only on human approval (chat-diff-editor-core).
+	chat *chatManager
 
 	// gitMu serializes operations that mutate the primary beehive checkout (where
 	// main is checked out): the viewer's periodic `git pull --ff-only main` that
@@ -71,7 +77,11 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 		return nil, err
 	}
 	g := git.New(r.Root)
-	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg)}, nil
+	// The chat-diff editor drives its own opencode client (same server/model as
+	// the single-file editor); it opens a per-edit ROOT worktree and awaits each
+	// turn (opencode-turn-poll) before rendering the proposed diff.
+	oc := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}}
+	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: newChatManager(r.Root, oc)}, nil
 }
 
 // pullInterval is the resolved follow-the-remote coalescing window (config
@@ -121,7 +131,13 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /human", s.human)
 	mux.HandleFunc("GET /hygiene", s.hygiene)
 	// AI editor chat (browser): one worktree branch per session.
-	mux.HandleFunc("GET /edit", s.editNew)
+	mux.HandleFunc("GET /edit", s.editEntry)
+	mux.HandleFunc("POST /edit", s.chatOpen)
+	mux.HandleFunc("GET /edit/{id}", s.chatPage)
+	mux.HandleFunc("GET /edit/{id}/panel", s.chatPanel)
+	mux.HandleFunc("POST /edit/{id}/message", s.chatMessage)
+	mux.HandleFunc("POST /edit/{id}/approve", s.chatApprove)
+	mux.HandleFunc("POST /edit/{id}/reject", s.chatReject)
 	mux.HandleFunc("GET /editor/{id}", s.editorPage)
 	mux.HandleFunc("GET /editor/{id}/panel", s.editorPanel)
 	mux.HandleFunc("POST /editor/{id}/chat", s.editorChat)

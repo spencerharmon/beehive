@@ -1,0 +1,17 @@
+<div class="editor-grid">
+  <div class="chat" id="chatedit-chat" data-scroll-preserve data-scroll-pin>
+    {{range .Log}}<div class="msg {{.Role}}"><span class="who">{{.Role}}</span> {{.Text}}</div>{{else}}<p class="muted">Say what you'd like to change in {{.Path}}.</p>{{end}}
+    {{if .Busy}}<div class="msg agent busy"><span class="who">agent</span> <span class="spinner">thinking…</span></div>{{end}}
+    {{if .Error}}<div class="msg err">⚠️ {{.Error}}</div>{{end}}
+  </div>
+  <div class="diffpane">
+    <div class="statusbar">
+      {{if .HasProposal}}<span class="state dirty">Proposed change — review the diff</span>
+      <button class="merge" hx-post="/edit/{{.ID}}/approve" hx-target="#chatedit" hx-swap="innerHTML" hx-confirm="Apply and commit this change in the edit worktree?">Approve</button>
+      <button class="merge danger" hx-post="/edit/{{.ID}}/reject" hx-target="#chatedit" hx-swap="innerHTML">Reject</button>
+      {{else}}<span class="state live">No pending proposal</span>{{end}}
+    </div>
+    <pre class="diff" id="chatedit-diff" data-scroll-preserve>{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
+{{else}}<span class="muted">no changes proposed yet</span>{{end}}</pre>
+  </div>
+</div>
