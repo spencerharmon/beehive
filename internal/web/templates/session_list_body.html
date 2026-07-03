@@ -1,3 +1,4 @@
+{{with .Sync}}<p class="sync-status{{if .Err}} stale{{end}}">followed {{.Ago}} ago{{if .Err}} · pull stalled: {{.Err}}{{end}}</p>{{end}}
 <ul class="sessions">
 {{range .Sessions}}<li>
   <a href="/submodule/{{$.Name}}/session/{{.ID}}">{{.ID}}</a>

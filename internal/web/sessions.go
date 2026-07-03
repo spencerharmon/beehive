@@ -30,6 +30,9 @@ func (s *Server) sessionsList(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Follow off-box runs: fast-forward local main so an agent's sessions on
+	// another host are visible on first paint, not only after the body poll.
+	s.followMain(r.Context(), time.Now())
 	s.render(w, "session_list.html", map[string]interface{}{"Name": sm.Name})
 }
 
@@ -40,8 +43,10 @@ func (s *Server) sessionsListBody(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	now := time.Now()
+	sync := s.followMain(r.Context(), now)
 	s.render(w, "session_list_body.html", map[string]interface{}{
-		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), sm.SessionsDir(), time.Now()),
+		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), sm.SessionsDir(), now), "Sync": sync,
 	})
 }
 
@@ -57,6 +62,9 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad branch", http.StatusBadRequest)
 		return
 	}
+	// Follow off-box runs before deriving liveness so a session that started on
+	// another host reads its stub locally (correct running/ended badge on load).
+	s.followMain(r.Context(), time.Now())
 	s.render(w, "session_view.html", map[string]interface{}{
 		"Name":   sm.Name,
 		"Branch": branch,
@@ -99,11 +107,15 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad branch", http.StatusBadRequest)
 		return
 	}
+	// Follow off-box runs: fast-forward local main so a stub an agent published on
+	// another host is present before we resolve/render it. sync backs the pane's
+	// staleness banner (nil on a single-host repo).
+	sync := s.followMain(r.Context(), time.Now())
 	sessRel := "submodules/" + sm.Name + "/sessions/" + branch + ".md"
 	b, err := os.ReadFile(filepath.Join(sm.SessionsDir(), branch+".md"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.render(w, "session_body.html", map[string]interface{}{"Body": "(waiting for session output…)"})
+			s.render(w, "session_body.html", map[string]interface{}{"Body": "(waiting for session output…)", "Sync": sync})
 			return
 		}
 		http.Error(w, err.Error(), 500)
@@ -127,7 +139,7 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.render(w, "session_body.html", map[string]interface{}{"Body": body})
+	s.render(w, "session_body.html", map[string]interface{}{"Body": body, "Sync": sync})
 }
 
 // readSessionBranch returns the transcript file as it stands on the isolated
@@ -250,4 +262,67 @@ func safeBranch(b string) bool {
 		}
 	}
 	return !strings.Contains(b, "..")
+}
+
+// syncStatus is the session panes' staleness banner: how long since the viewer
+// last fast-forwarded local main to follow off-box honeybee sessions, and the
+// last pull error if local main could not be advanced (e.g. a non-fast-forward
+// divergence). It is nil for a single-host repo (no remote), where sessions are
+// authored locally and there is nothing to follow.
+type syncStatus struct {
+	Ago string // human time since the last pull attempt ("never" before the first)
+	Err string // last pull error, if any — surfaced so a stalled follow is visible
+}
+
+// followMain advances local main toward the remote so a beehived on THIS host
+// sees the session stubs and final transcripts an off-box honeybee published to
+// origin/main, and returns the staleness banner for the session panes. The pull
+// is coalesced (pullIvl) so N polling panes make at most one network pull per
+// interval, and a non-fast-forward divergence is non-fatal: the pane renders the
+// last good state and the banner surfaces the error. Returns nil when the repo
+// has no remote (single-host: nothing to follow, no staleness to show).
+func (s *Server) followMain(ctx context.Context, now time.Time) *syncStatus {
+	remote, err := s.git.Remote(ctx)
+	if err != nil || remote == "" {
+		return nil
+	}
+	s.pullMain(ctx, remote)
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	st := &syncStatus{Ago: "never"}
+	if s.pulled {
+		st.Ago = humanAgo(now.Sub(s.lastPull))
+	}
+	if s.pullErr != nil {
+		st.Err = s.pullErr.Error()
+	}
+	return st
+}
+
+// pullMain runs a coalesced `git pull --ff-only main` from remote, recording the
+// outcome for the staleness banner. It is serialized with the frontend's own
+// commits/publish via gitMu (shared primary-checkout index). A non-fast-forward
+// is recorded, never merged: main here is a projection the swarm converges by
+// fast-forward, so a divergence is transient drift a later ff pull or a publish
+// heals — the viewer must not author a merge commit. The interval reservation
+// (set lastPull before pulling) means concurrent polls return immediately rather
+// than stampeding the remote; pullIvl<=0 disables coalescing (tests).
+func (s *Server) pullMain(ctx context.Context, remote string) {
+	s.syncMu.Lock()
+	if s.pulled && s.pullIvl > 0 && time.Since(s.lastPull) < s.pullIvl {
+		s.syncMu.Unlock()
+		return
+	}
+	s.pulled = true
+	s.lastPull = time.Now()
+	s.syncMu.Unlock()
+
+	s.gitMu.Lock()
+	perr := s.git.Pull(ctx, remote, "main")
+	s.gitMu.Unlock()
+
+	s.syncMu.Lock()
+	s.pullErr = perr
+	s.lastPull = time.Now()
+	s.syncMu.Unlock()
 }

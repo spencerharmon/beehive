@@ -1,1 +1,2 @@
+{{with .Sync}}<p class="sync-status{{if .Err}} stale{{end}}">followed {{.Ago}} ago{{if .Err}} · pull stalled: {{.Err}}{{end}}</p>{{end}}
 <pre class="session" id="session-transcript" data-scroll-preserve data-scroll-pin>{{.Body}}</pre>

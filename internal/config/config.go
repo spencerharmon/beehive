@@ -91,6 +91,12 @@ type Config struct {
 	// LOCALS.md is the human record of what to put here. Adding a map field makes
 	// Config non-comparable with ==; callers/tests use reflect.DeepEqual.
 	BuildEnv map[string]string `yaml:"build_env"`
+	// SessionPullSeconds is how often the frontend fast-forwards local main from
+	// the remote to follow off-box honeybee sessions (session stubs + final
+	// transcripts an agent on another host published). It coalesces the polled
+	// session panes so many open viewers make at most one `git pull --ff-only` per
+	// interval. 0 = the 2s default. Ignored on a single-host repo (no remote).
+	SessionPullSeconds int `yaml:"session_pull_seconds"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -105,6 +111,7 @@ func Defaults(dir string) Config {
 		MergeRetries:       8,
 		RejectLimit:        3,
 		TurnTimeoutMinutes: 60,
+		SessionPullSeconds: 2,
 	}
 }
 
@@ -195,6 +202,9 @@ func merge(base, over Config) Config {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
 	}
 	out.BuildEnv = mergeEnv(base.BuildEnv, over.BuildEnv)
+	if over.SessionPullSeconds != 0 {
+		out.SessionPullSeconds = over.SessionPullSeconds
+	}
 	return out
 }
 
