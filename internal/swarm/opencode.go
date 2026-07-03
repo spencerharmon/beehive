@@ -40,6 +40,12 @@ type Opencode struct {
 	pollMax time.Duration
 }
 
+// SetModel selects the provider/model for sessions opened after this call. The
+// runner calls it at dispatch to route a pass to a per-kind model (cheap vs
+// strong); the runner never passes an empty model, so this only ever narrows to
+// a configured choice. A no-op relative to the field it sets.
+func (o *Opencode) SetModel(model string) { o.Model = model }
+
 // Open creates a server session for the working directory dir (an absolute path;
 // opencode takes the cwd from the ?directory= query, not a body field) under the
 // given system prompt, WITHOUT sending a first message. The caller drives turns

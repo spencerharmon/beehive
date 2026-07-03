@@ -47,17 +47,31 @@ const fileName = "config.yaml"
 // Config is the parsed beehive config. Zero-valued fields are treated as "unset"
 // when layering (see merge): a layer only overrides the fields it actually sets.
 type Config struct {
-	Dir          string  `yaml:"-"`
-	GPGHome      string  `yaml:"gpg_home"`      // dir containing the keyring
-	GPGRecipient string  `yaml:"gpg_recipient"` // recipient for SECRETS.yaml.gpg
-	AgentCmd     string  `yaml:"agent_cmd"`     // opencode binary
-	AgentURL     string  `yaml:"agent_url"`     // opencode server base URL
-	Model        string  `yaml:"model"`         // provider/model for opencode
-	Temperature  float64 `yaml:"temperature"`   // sampling temperature for the agent model
-	MaxTokens    int     `yaml:"max_tokens"`    // max output tokens per turn (0 = backend default)
-	TTLMinutes   int     `yaml:"ttl_minutes"`   // GC heartbeat TTL
-	MaxTurns     int     `yaml:"max_turns"`     // per-honeybee turn cap
-	RejectLimit  int     `yaml:"reject_limit"`  // rejections before NEEDS-HUMAN
+	Dir          string `yaml:"-"`
+	GPGHome      string `yaml:"gpg_home"`      // dir containing the keyring
+	GPGRecipient string `yaml:"gpg_recipient"` // recipient for SECRETS.yaml.gpg
+	AgentCmd     string `yaml:"agent_cmd"`     // opencode binary
+	AgentURL     string `yaml:"agent_url"`     // opencode server base URL
+	Model        string `yaml:"model"`         // provider/model for opencode (the fallback for every kind)
+	// Models routes the agent model per task kind ("work", "reconcile", "review",
+	// "arbitrate", "bootstrap"), so a near-deterministic kind can run on a cheap
+	// model while real code Work stays on the strong one (ROI: cut tokens per
+	// honeybee). A kind absent here falls through to Model (see ModelFor). Merged
+	// key-by-key across layers, so a submodule can override a single kind. Unset =
+	// no routing: every kind resolves to Model, byte-identical to the single-model
+	// path.
+	Models      map[string]string `yaml:"models"`
+	Temperature float64           `yaml:"temperature"`  // sampling temperature for the agent model
+	MaxTokens   int               `yaml:"max_tokens"`   // max output tokens per turn (0 = backend default)
+	TTLMinutes  int               `yaml:"ttl_minutes"`  // GC heartbeat TTL
+	MaxTurns    int               `yaml:"max_turns"`    // per-honeybee turn cap
+	RejectLimit int               `yaml:"reject_limit"` // rejections before NEEDS-HUMAN
+	// StallTurns bounds idle churn: if a Work pass produces an identical code-
+	// worktree fingerprint for this many consecutive turns without reaching
+	// completion, the runner abandons it for GC instead of burning the whole
+	// turn/wall budget on a provably stuck session. 0 = off (the default), so a
+	// host that has not opted in behaves exactly as before.
+	StallTurns int `yaml:"stall_turns"`
 	// TurnTimeoutMinutes bounds a single agent turn (one opencode call). A stalled
 	// session is canceled at this cap so the honeybee abandons the task for GC
 	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
@@ -125,6 +139,22 @@ func merge(base, over Config) Config {
 	if over.Model != "" {
 		out.Model = over.Model
 	}
+	// Models merges key-by-key (not whole-map replace): a more specific layer's
+	// entry for a kind wins, unset kinds fall through, so a submodule can override
+	// a single kind without restating the rest. A fresh map is allocated so no
+	// layer's map is mutated in place (they alias through the `out := base` copy).
+	if len(base.Models) > 0 || len(over.Models) > 0 {
+		merged := make(map[string]string, len(base.Models)+len(over.Models))
+		for k, v := range base.Models {
+			merged[k] = v
+		}
+		for k, v := range over.Models {
+			if v != "" {
+				merged[k] = v
+			}
+		}
+		out.Models = merged
+	}
 	if over.Temperature != 0 {
 		out.Temperature = over.Temperature
 	}
@@ -140,10 +170,27 @@ func merge(base, over Config) Config {
 	if over.RejectLimit != 0 {
 		out.RejectLimit = over.RejectLimit
 	}
+	if over.StallTurns != 0 {
+		out.StallTurns = over.StallTurns
+	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
 	}
 	return out
+}
+
+// ModelFor returns the agent model to use for a pass of the given task kind: the
+// per-kind override from the layered Models map when set, otherwise the single
+// resolved Model. kind is the selection kind string ("work", "reconcile",
+// "review", "arbitrate", "bootstrap"). An empty return means "no model
+// configured" — callers treat that as inert (keep the client's own default), so
+// a host that sets neither models nor model is unaffected, and a single-model
+// host resolves every kind to the same Model it always used.
+func (c Config) ModelFor(kind string) string {
+	if m := c.Models[kind]; m != "" {
+		return m
+	}
+	return c.Model
 }
 
 // layerPaths returns the ordered config files (lowest precedence first, excluding

@@ -39,6 +39,15 @@ type Client interface {
 	Open(ctx context.Context, cwd, system string) (Session, error)
 }
 
+// modelSelector is an OPTIONAL Client capability: pick the model for the upcoming
+// session at dispatch time. The runner uses it to route a pass to a cheap or
+// strong model per task kind (Runner.ModelFor). A Client that does not implement
+// it (the test fakes) keeps whatever model it was constructed with, so routing is
+// purely additive.
+type modelSelector interface {
+	SetModel(model string)
+}
+
 // Runner drives a single honeybee turn loop.
 type Runner struct {
 	Repo     *repo.Repo
@@ -123,6 +132,28 @@ type Runner struct {
 	// byte-identical to the historical path; the runner flips it on from an env
 	// flag (see cmd/honeybee). Additive — the floor, not a cage.
 	LeanBrief bool
+
+	// ModelFor selects the agent model for a pass by its task kind (the layered
+	// config's per-kind override, falling through to the single Model). When it is
+	// set AND the Client implements modelSelector, the runner routes each dispatch
+	// to the returned model — so near-deterministic kinds (reconcile/review/
+	// arbitrate) run on a cheap model while code Work runs on the strong one. Nil,
+	// or a "" return, is inert: the client's preconfigured model stands, byte-
+	// identical to the single-model path.
+	ModelFor func(kind string) string
+
+	// StallTurns bounds idle churn: if a Work pass produces an identical code-
+	// worktree fingerprint (HEAD + porcelain status) for this many CONSECUTIVE
+	// turns after the first — an agent talking without changing a file — the runner
+	// abandons the pass for GC instead of burning the rest of the turn/wall budget.
+	// 0 = off (the default), so a host that has not opted in is unaffected.
+	StallTurns int
+
+	// Progress overrides the per-turn progress fingerprint the stall detector
+	// observes (tests inject a deterministic sequence). Nil = the real signal: the
+	// agent's code worktree HEAD + porcelain status. Only consulted when
+	// StallTurns > 0.
+	Progress func(context.Context) string
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -406,6 +437,20 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if r.LeanInject {
 		system = trimProtocol(system, sel.Kind)
 	}
+	// Per-kind model routing (opt-in). When the operator configured a model for
+	// this pass's kind (layered config -> ModelFor) and the Client can select one,
+	// route the dispatch to it before the session opens: a near-deterministic kind
+	// (reconcile/review/arbitrate) can run on a cheap model while real code Work
+	// runs on the strong one. Inert when ModelFor is nil or returns "" (no routing
+	// configured): the client keeps its preconfigured model, byte-identical to the
+	// single-model path.
+	if r.ModelFor != nil {
+		if ms, ok := r.Client.(modelSelector); ok {
+			if m := r.ModelFor(string(sel.Kind)); m != "" {
+				ms.SetModel(m)
+			}
+		}
+	}
 	sess, err := r.Client.Open(ctx, absRoot, system)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)
@@ -462,6 +507,17 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	var tc *turnCompactor
 	if r.LeanContext && sel.Kind == selectt.Work {
 		tc = newTurnCompactor()
+	}
+	// No-forward-progress guard. stall trips when the code worktree fingerprint is
+	// unchanged for StallTurns consecutive turns (see stallDetector); progressGit
+	// is the agent's own worktree (wtAbs) whose HEAD+status is that fingerprint —
+	// NOT the shared submodule checkout (r-side wg), which never moves as the agent
+	// commits on its branch. Both are inert when StallTurns==0 (limit<=0 never
+	// trips) so the default single-model host is unaffected.
+	stall := &stallDetector{limit: r.StallTurns}
+	var progressGit *git.Repo
+	if sel.Kind == selectt.Work && wtAbs != "" {
+		progressGit = git.New(wtAbs)
 	}
 	// finish stops the recorder, optionally records an abort warning to the
 	// transcript (so it shows in the UI), commits the final transcript to the
@@ -651,6 +707,26 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			cleanup()
 			return res, nil
 		}
+		// No-forward-progress guard: this turn did NOT complete the task, so
+		// fingerprint the agent's code worktree. An identical fingerprint for
+		// StallTurns turns running means the agent is churning — talking without
+		// changing a file — so abandon it for GC now rather than burn the remaining
+		// turn/wall budget on a provably stuck session. Fail-open: when no signal is
+		// available (a git error, or a non-Work pass with no worktree and no injected
+		// probe) progressSignal returns ok=false and the guard never fires, so a
+		// transient fault can never cause a false kill.
+		if sig, ok := r.progressSignal(ctx, progressGit); ok && stall.observe(sig) {
+			res.GCMarked = true
+			res.Warning = fmt.Sprintf(
+				"task %s made no forward progress across %d consecutive turns (idle churn); abandoning for GC",
+				taskID(sel), r.StallTurns)
+			if ferr := finish(res.Warning); ferr != nil {
+				cleanup()
+				return res, ferr
+			}
+			cleanup()
+			return res, nil
+		}
 		if r.now().After(deadline) {
 			break
 		}
@@ -676,6 +752,61 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	cleanup()
 	return res, nil
+}
+
+// stallDetector trips when a pass produces no forward progress — an identical
+// progress fingerprint — for `limit` CONSECUTIVE turns after the first. The first
+// observation of any fingerprint sets the reference (repeats=0); each subsequent
+// identical one increments the streak; a changed fingerprint resets it. An
+// idle-from-start agent therefore trips on the turn that completes `limit`
+// unchanged observations. limit<=0 disables it (never trips), which is the inert
+// default that leaves a host without stall bounding unchanged.
+type stallDetector struct {
+	limit   int
+	last    string
+	repeats int
+	seen    bool
+}
+
+// observe folds one turn's fingerprint in and reports whether the pass has now
+// stalled (limit consecutive unchanged fingerprints since the reference).
+func (s *stallDetector) observe(sig string) bool {
+	if s.limit <= 0 {
+		return false
+	}
+	if s.seen && sig == s.last {
+		s.repeats++
+	} else {
+		s.last = sig
+		s.repeats = 0
+		s.seen = true
+	}
+	return s.repeats >= s.limit
+}
+
+// progressSignal returns the fingerprint the stall detector observes this turn,
+// and whether one is available. Progress (when set) is the authoritative source
+// (tests inject a deterministic sequence); otherwise the real signal is the
+// agent's code worktree HEAD + porcelain status, so any commit or uncommitted
+// edit the agent makes changes it. ok=false (no worktree, or a transient git
+// error) means "no signal" — the caller skips the guard this turn, so a fault
+// can never manufacture a false idle-churn kill.
+func (r *Runner) progressSignal(ctx context.Context, wt *git.Repo) (string, bool) {
+	if r.Progress != nil {
+		return r.Progress(ctx), true
+	}
+	if wt == nil {
+		return "", false
+	}
+	head, err := wt.RevParse(ctx, "HEAD")
+	if err != nil {
+		return "", false
+	}
+	status, err := wt.Status(ctx)
+	if err != nil {
+		return "", false
+	}
+	return head + "\x00" + status, true
 }
 
 // nextPrompt is the "keep going" prompt sent on every turn after the first.

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -140,7 +141,7 @@ func TestResolveBareInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Defaults(hostDir)
-	if c != want {
+	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("bare Resolve = %+v, want Defaults %+v", c, want)
 	}
 }
@@ -155,5 +156,72 @@ func TestResolveMalformedErrors(t *testing.T) {
 
 	if _, err := Resolve(root, ""); err == nil {
 		t.Fatal("expected error for malformed config layer, got nil")
+	}
+}
+
+// TestResolveModelsLayering checks the per-kind model map (honeybee-model-routing):
+// a kind set in a more specific layer wins, layers merge key-by-key (an unset kind
+// falls through rather than the whole map being replaced), and a kind with no entry
+// anywhere falls through to the single Model — so code Work keeps the strong model
+// while trivial kinds route cheap.
+func TestResolveModelsLayering(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+
+	// Host: the fallback Model (strong) + cheap review/reconcile.
+	write(t, filepath.Join(hostDir, "config.yaml"), `
+model: strong/model
+models:
+  review: cheap/host
+  reconcile: cheap/host
+`)
+	// Global: override reconcile, add arbitrate (review untouched -> host shows through).
+	write(t, filepath.Join(root, "config.yaml"), `
+models:
+  reconcile: cheap/global
+  arbitrate: cheap/global
+`)
+	// Submodule (most specific): override review only.
+	write(t, filepath.Join(root, "submodules", "x", "config.yaml"), `
+models:
+  review: cheap/sub
+`)
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// submodule wins for review (set in the most specific layer)
+	if got := c.ModelFor("review"); got != "cheap/sub" {
+		t.Errorf("ModelFor(review) = %q, want cheap/sub (submodule wins)", got)
+	}
+	// global wins for reconcile (over host); merged key-by-key so review survives
+	if got := c.ModelFor("reconcile"); got != "cheap/global" {
+		t.Errorf("ModelFor(reconcile) = %q, want cheap/global (global over host)", got)
+	}
+	// arbitrate only set at global (host/submodule unset for it)
+	if got := c.ModelFor("arbitrate"); got != "cheap/global" {
+		t.Errorf("ModelFor(arbitrate) = %q, want cheap/global", got)
+	}
+	// work has no per-kind entry: falls through to the strong fallback Model
+	if got := c.ModelFor("work"); got != "strong/model" {
+		t.Errorf("ModelFor(work) = %q, want strong/model (fall through to Model)", got)
+	}
+}
+
+// TestModelForInert confirms the inert defaults: an empty config routes nothing
+// ("" for every kind — the runner keeps the client's own model), and a host that
+// set only a single Model resolves every kind to it (single-model host unchanged).
+func TestModelForInert(t *testing.T) {
+	var empty Config
+	if got := empty.ModelFor("work"); got != "" {
+		t.Errorf("empty ModelFor(work) = %q, want \"\" (inert: no routing configured)", got)
+	}
+	solo := Config{Model: "solo/model"}
+	for _, kind := range []string{"work", "reconcile", "review", "arbitrate", "bootstrap"} {
+		if got := solo.ModelFor(kind); got != "solo/model" {
+			t.Errorf("single-model ModelFor(%s) = %q, want solo/model", kind, got)
+		}
 	}
 }

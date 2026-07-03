@@ -510,6 +510,13 @@ func (r *Repo) Clean(ctx context.Context) (bool, error) {
 	return out == "", nil
 }
 
+// Status returns `git status --porcelain` (empty when the tree is clean): the
+// set of staged, unstaged, and untracked changes. The runner fingerprints it
+// (together with HEAD) to detect a Work pass that is making no forward progress.
+func (r *Repo) Status(ctx context.Context) (string, error) {
+	return r.Run(ctx, "status", "--porcelain")
+}
+
 // Merge merges ref into the current branch. Returns ErrConflict on conflict.
 func (r *Repo) Merge(ctx context.Context, ref string) error {
 	if _, err := r.Run(ctx, "merge", "--no-edit", ref); err != nil {
