@@ -284,6 +284,76 @@ func (r *Repo) Push(ctx context.Context, remote, refspec string) error {
 	return err
 }
 
+// LsRemoteBranch returns the commit SHA the remote currently advertises for
+// branch, or "" when the remote has no such branch. It reads the remote's live
+// ref advertisement (git ls-remote --heads) without fetching, so a caller can
+// decide whether a pushed source branch still exists before trying to delete it
+// — distinguishing "already reclaimed by a peer" from a branch still present.
+func (r *Repo) LsRemoteBranch(ctx context.Context, remote, branch string) (string, error) {
+	out, err := r.Run(ctx, "ls-remote", "--heads", remote, branch)
+	if err != nil {
+		return "", err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", nil
+	}
+	// "<sha>\trefs/heads/<branch>" (one line per match); take the first SHA.
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	return fields[0], nil
+}
+
+// IsAncestor reports whether commit maybe is contained in ref's history (an
+// ancestor of, or equal to, ref). It wraps `git merge-base --is-ancestor`, which
+// exits 0 for true and 1 for false; any other exit (e.g. a bad object) is a real
+// error, never silently folded into false. Used to gate destructive source-branch
+// reclamation on "the branch is already merged into the tracked main".
+func (r *Repo) IsAncestor(ctx context.Context, maybe, ref string) (bool, error) {
+	if _, err := r.Run(ctx, "merge-base", "--is-ancestor", maybe, ref); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// DeleteRemoteBranch deletes branch on remote (`git push remote --delete
+// refs/heads/branch`). It is idempotent against a peer that deleted the branch
+// first: git's "remote ref does not exist" rejection is reported as success, so
+// concurrent reclamation never errors. Any other failure (no permission,
+// protected branch) surfaces unchanged.
+func (r *Repo) DeleteRemoteBranch(ctx context.Context, remote, branch string) error {
+	if _, err := r.Run(ctx, "push", remote, "--delete", "refs/heads/"+branch); err != nil {
+		if isRemoteRefMissing(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// isRemoteRefMissing reports whether a push --delete failed only because the
+// remote branch was already gone (a concurrent peer reclaimed it). git phrases
+// this exactly as "remote ref does not exist"; that case is benign for an
+// idempotent delete, distinct from a real rejection (permission/protected).
+func isRemoteRefMissing(err error) bool {
+	return strings.Contains(err.Error(), "remote ref does not exist")
+}
+
+// DeleteBranch deletes the local branch (`git branch -D`), discarding it even if
+// unmerged. Used to drop a reclaimed source branch's local ref after its worktree
+// is removed. git errors when the branch is absent, so callers that treat the
+// local-ref cleanup as best-effort should ignore the returned error.
+func (r *Repo) DeleteBranch(ctx context.Context, branch string) error {
+	_, err := r.Run(ctx, "branch", "-D", branch)
+	return err
+}
+
 // HardReset discards the worktree and index to ref.
 func (r *Repo) HardReset(ctx context.Context, ref string) error {
 	_, err := r.Run(ctx, "reset", "--hard", ref)
