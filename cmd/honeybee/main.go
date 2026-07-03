@@ -226,6 +226,13 @@ func run() error {
 		// a whole-tree scan. Same env-flag rationale as LeanInject; off keeps the
 		// injected preamble byte-identical to the historical path.
 		LeanBrief: os.Getenv("BEEHIVE_LEAN_BRIEF") == "1",
+		// Host build/test environment (CGO_ENABLED=0 + root-fs GOTMPDIR/GOCACHE, …)
+		// resolved from the layered config. The runner exports it into the honeybee
+		// process at agent spawn AND states the mandated invocation once in the
+		// injected preamble (both sourced from this one map so they never drift), so
+		// no honeybee re-derives the build env (audit session-audit-001 F1). Inert
+		// (nil) on a normal host — LOCALS.md is the human record of what to set.
+		BuildEnv: eff.BuildEnv,
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {
