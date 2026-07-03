@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -361,5 +362,190 @@ func TestReconcilePrefixStampNoDrift(t *testing.T) {
 	}
 	if rng != "" {
 		t.Fatalf("short prefix stamp must read as no-drift, got range %q", rng)
+	}
+}
+
+// bareOrigin inits an empty bare repo (default branch main) that clones share as
+// their push/fetch origin, so a test can exercise Select's pre-evaluation pull.
+func bareOrigin(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if _, err := git.New(dir).Run(context.Background(), "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatalf("bare init: %v", err)
+	}
+	return dir
+}
+
+// clone checks out origin into a fresh dir named name, with a committer identity
+// configured, and returns its git handle plus working root.
+func clone(t *testing.T, origin, name string) (*git.Repo, string) {
+	t.Helper()
+	ctx := context.Background()
+	parent := t.TempDir()
+	dir := filepath.Join(parent, name)
+	if _, err := git.New(parent).Run(ctx, "clone", "-q", origin, dir); err != nil {
+		t.Fatalf("clone %s: %v", name, err)
+	}
+	g := git.New(dir)
+	for _, a := range [][]string{{"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		if _, err := g.Run(ctx, a...); err != nil {
+			t.Fatalf("config %v: %v", a, err)
+		}
+	}
+	return g, dir
+}
+
+// TestSelectPullsFreshMainBeforeReconcile is the core reconcile-dedup guard test:
+// a reconcile that another pass already folded and PUSHED must not be re-selected
+// just because this checkout has not pulled the stamp yet. A publisher clone seeds
+// the submodule (PLAN stamped to a dead sha), a honeybee clone snapshots that stale
+// state, then the publisher performs the reconcile (stamps PLAN to the real ROI
+// head) and pushes. Select must fast-forward the honeybee clone first, see the
+// fresh stamp, and pick the real Work task — not spawn a zero-progress reconcile.
+func TestSelectPullsFreshMainBeforeReconcile(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+
+	// Publisher seeds the submodule with a stale (dead) stamp and pushes.
+	pub, pubDir := clone(t, origin, "pub")
+	repo.Init(pubDir)
+	sub(pubDir, "a", map[string]string{
+		"ROI.md":  "intent\n",
+		"PLAN.md": "<!-- Beehive-ROI: deadbeef0000 -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	if err := pub.Commit(ctx, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Push(ctx, "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	roiHead, err := pub.LastCommit(ctx, "submodules/a/ROI.md")
+	if err != nil || roiHead == "" {
+		t.Fatalf("roi head: %q %v", roiHead, err)
+	}
+
+	// Honeybee snapshots the stale state (dead stamp), BEFORE the reconcile lands.
+	bee, beeDir := clone(t, origin, "bee")
+
+	// Publisher folds the reconcile: stamp PLAN to the real ROI head, push. ROI.md is
+	// untouched, so the ROI head is unchanged — only the stamp advances.
+	if err := os.WriteFile(filepath.Join(pubDir, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+roiHead+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Commit(ctx, "reconcile: stamp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Push(ctx, "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Precondition: the honeybee's local tree is still stale (dead stamp) — a
+	// selection off THIS tree would drift and pick reconcile.
+	pre, _ := os.ReadFile(filepath.Join(beeDir, "submodules/a/PLAN.md"))
+	if !strings.Contains(string(pre), "deadbeef0000") {
+		t.Fatalf("precondition: bee clone should be stale with dead stamp, got %q", pre)
+	}
+
+	beeRepo, _ := repo.Open(beeDir)
+	s := &Selector{Repo: beeRepo, Git: bee, Rand: rand.New(rand.NewSource(1)), TTL: time.Hour}
+	got, err := s.Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if got == nil || got.Kind != Work || got.Task.ID != "T1" {
+		t.Fatalf("want Work T1 after pull-refresh (reconcile already applied on origin), got %+v", got)
+	}
+	// The pull must have fast-forwarded the local working tree to the fresh stamp.
+	post, _ := os.ReadFile(filepath.Join(beeDir, "submodules/a/PLAN.md"))
+	if !strings.Contains(string(post), "Beehive-ROI: "+roiHead) {
+		t.Fatalf("Select did not fast-forward local main to origin; PLAN.md=%q", post)
+	}
+}
+
+// TestSelectPullSurfacesNewDrift is the converse guard: the pre-evaluation pull
+// must not SUPPRESS a genuine reconcile — it must SURFACE drift a stale checkout
+// would miss. The honeybee clone is up-to-date (stamp == ROI head) at snapshot
+// time; the publisher then advances ROI.md (new head) and pushes without
+// re-stamping. Select must pull, observe the newer ROI head, and pick Reconcile.
+func TestSelectPullSurfacesNewDrift(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+
+	pub, pubDir := clone(t, origin, "pub")
+	repo.Init(pubDir)
+	sub(pubDir, "a", map[string]string{
+		"ROI.md":  "intent v1\n",
+		"PLAN.md": "## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+	})
+	if err := pub.Commit(ctx, "seed roi"); err != nil {
+		t.Fatal(err)
+	}
+	head1, err := pub.LastCommit(ctx, "submodules/a/ROI.md")
+	if err != nil || head1 == "" {
+		t.Fatalf("roi head1: %q %v", head1, err)
+	}
+	// Stamp to the current head (reconciled) and push: this is the "up to date" base.
+	if err := os.WriteFile(filepath.Join(pubDir, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head1+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Commit(ctx, "stamp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Push(ctx, "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Honeybee snapshots the up-to-date state (stamp == head1): no local drift.
+	bee, beeDir := clone(t, origin, "bee")
+
+	// Publisher advances ROI.md (new head) WITHOUT re-stamping PLAN, and pushes.
+	if err := os.WriteFile(filepath.Join(pubDir, "submodules/a/ROI.md"), []byte("intent v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Commit(ctx, "advance roi"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Push(ctx, "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	beeRepo, _ := repo.Open(beeDir)
+	s := &Selector{Repo: beeRepo, Git: bee, Rand: rand.New(rand.NewSource(1)), TTL: time.Hour}
+	got, err := s.Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if got == nil || got.Kind != Reconcile || got.DiffRange == "" {
+		t.Fatalf("want Reconcile with a diff range after pull surfaces new ROI head, got %+v", got)
+	}
+}
+
+// TestSelectBackToBackNoReEmitAfterStamp models the exact audit finding ("two
+// reconcile runs back to back"): once a reconcile has stamped the current ROI head,
+// repeated selection cycles at that same head must NOT keep re-emitting reconcile.
+// The stamp-prefixes-head gate makes selection deterministic, so two consecutive
+// Select calls on a stamped tree both pick the real Work task.
+func TestSelectBackToBackNoReEmitAfterStamp(t *testing.T) {
+	_, g, root := hive(t)
+	ctx := context.Background()
+	sub(root, "a", map[string]string{"ROI.md": "intent\n", "PLAN.md": "## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	g.Commit(ctx, "seed")
+	head, _ := g.LastCommit(ctx, "submodules/a/ROI.md")
+	// Reconcile already folded: PLAN stamped to the live ROI head.
+	os.WriteFile(filepath.Join(root, "submodules/a/PLAN.md"),
+		[]byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(ctx, "stamp")
+
+	s := sel(root, g)
+	for cycle := 1; cycle <= 2; cycle++ {
+		got, err := s.Select(ctx)
+		if err != nil {
+			t.Fatalf("cycle %d select: %v", cycle, err)
+		}
+		if got == nil || got.Kind != Work || got.Task.ID != "T1" {
+			t.Fatalf("cycle %d: stamped head must not re-emit reconcile, got %+v", cycle, got)
+		}
 	}
 }

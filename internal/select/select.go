@@ -11,6 +11,8 @@ package selectt
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -55,6 +57,11 @@ type Selector struct {
 	Git  *git.Repo // beehive repo root, for ROI commit lookup
 	Rand *rand.Rand
 	TTL  time.Duration
+	// Debug, when non-nil, receives best-effort diagnostics (currently only a
+	// failed pre-selection refresh). Nil in production/tests keeps selection
+	// silent; the refresh miss degrades to evaluating the local tree, so nothing
+	// is lost by not logging it.
+	Debug io.Writer
 }
 
 // Select walks weighted-random submodules and returns the first workable item.
@@ -63,6 +70,18 @@ func (s *Selector) Select(ctx context.Context) (*Selection, error) {
 	subs, err := s.Repo.Submodules()
 	if err != nil {
 		return nil, err
+	}
+	// Refresh the beehive checkout to the freshest published main BEFORE evaluating
+	// any tier, so reconcile (priority 0) is judged against origin's PLAN.md/ROI.md
+	// rather than a not-yet-pulled local tree. This is the reconcile-dedup guard: the
+	// session audit found whole zero-progress passes spawned because a stale local
+	// stamp still read as ROI drift even though an earlier pass had already folded and
+	// stamped the delta (and pushed it to origin). Pulling first makes "reconcile
+	// already applied" a deterministic pre-dispatch no-op. Best-effort: a no-remote
+	// hive or a non-fast-forward on this worktree's branch degrades to evaluating the
+	// local tree — exactly the prior behavior — never a blocked selection.
+	if err := s.refreshTrackedMain(ctx); err != nil && s.Debug != nil {
+		fmt.Fprintf(s.Debug, "[select] refresh tracked main failed; evaluating local tree: %v\n", err)
 	}
 	graph, err := LoadEdges(s.Repo)
 	if err != nil {
@@ -178,6 +197,26 @@ func (s *Selector) reconcileRange(ctx context.Context, sm repo.Submodule) (strin
 		from = emptyTree
 	}
 	return from + ".." + head, nil
+}
+
+// refreshTrackedMain fast-forwards the beehive checkout to origin/main via the
+// git-remote-ops Pull (--ff-only) so selection — reconcile (priority 0) above all
+// — evaluates the freshest published PLAN.md/ROI.md instead of a stale local tree.
+// A repo with no remote (single-host install, tests) is a no-op: the local tree is
+// already authoritative. --ff-only never creates a merge commit, so a divergent
+// branch (e.g. this worktree carries a lost-race commit not on origin) errors
+// rather than merging; the caller treats that as a soft miss and evaluates local,
+// which is byte-identical to the pre-guard behavior — the refresh only ever makes
+// the evaluation FRESHER, never blocks it.
+func (s *Selector) refreshTrackedMain(ctx context.Context) error {
+	rem, err := s.Git.Remote(ctx)
+	if err != nil {
+		return err
+	}
+	if rem == "" {
+		return nil
+	}
+	return s.Git.Pull(ctx, rem, "main")
 }
 
 // weightedOrder returns submodules shuffled, each repeated by its weight, so

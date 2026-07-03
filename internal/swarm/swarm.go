@@ -472,6 +472,33 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		fmt.Fprintf(r.Debug, "[honeybee] orphan-worktree-gitlink sweep: %v\n", err)
 	}
 
+	// Reconcile dedup guard (defense-in-depth for the selection->dispatch window):
+	// select.reconcileRange already pulls+prefix-checks before PICKING a reconcile,
+	// but a concurrent pass can fold+stamp+push the same ROI delta between our
+	// selection and now. Re-pull main so we judge against the freshest published
+	// stamp, then short-circuit via the SAME prefix compare (Runner.reconciled): if
+	// PLAN.md's Beehive-ROI stamp already prefixes the current ROI head, the delta is
+	// already applied — report complete WITHOUT opening a session (zero agent turns,
+	// zero tokens), instead of spawning one of the zero-progress reconcile passes the
+	// session audit flagged. Genuine ROI drift (stamp does NOT prefix head) falls
+	// through and runs the reconcile normally.
+	if sel.Kind == selectt.Reconcile {
+		if err := r.refreshMain(ctx); err != nil && r.Debug != nil {
+			fmt.Fprintf(r.Debug, "[honeybee] reconcile pre-check pull failed; checking local PLAN stamp: %v\n", err)
+		}
+		done, err := r.reconciled(sel)
+		if err != nil {
+			return res, err
+		}
+		if done {
+			res.Completed = true
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] reconcile already applied for %s (PLAN stamp prefixes ROI head); skipping session\n", sel.Submodule.Name)
+			}
+			return res, nil
+		}
+	}
+
 	// Only a main Work task edits the submodule repo and needs a worktree.
 	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
 	var wg *git.Repo
@@ -1179,6 +1206,18 @@ func (r *Runner) statusLeft(sel *selectt.Selection, from plan.Status) (bool, err
 		return false, nil
 	}
 	return t.Status != from, nil
+}
+
+// refreshMain fast-forwards this honeybee's beehive worktree to origin/main via
+// the git-remote-ops Pull (--ff-only) so a pre-dispatch check reads the freshest
+// published PLAN.md/ROI.md. No remote (single-host install, tests) is a no-op; a
+// divergent branch errors and the caller falls back to the local tree — the pull
+// only ever makes the check FRESHER, never blocks it.
+func (r *Runner) refreshMain(ctx context.Context) error {
+	if r.Remote == "" {
+		return nil
+	}
+	return r.Git.Pull(ctx, r.Remote, "main")
 }
 
 func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
