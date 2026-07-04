@@ -11,10 +11,9 @@ instruction update` refreshes this file.
 
 ## Topology (read once)
 Each target lives at `submodules/<sm>/`: `ROI.md` (read-only), `PLAN.md`, `docs/`, `sessions/`, plus
-`repo/` (the target's source as a git submodule) and `worktrees/`. For a work task the runner has
-ALREADY created your code worktree at `submodules/<sm>/worktrees/bee-<taskid>/` — edit code THERE,
-never `submodules/<sm>/repo`. Your per-task Context message names the submodule, branch, and doc path;
-read it instead of re-deriving. Do not run worktree/submodule git plumbing yourself.
+`repo/` (the target's source as a git submodule) and `worktrees/`. For a work task you edit code in the
+worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` — never the shared
+`submodules/<sm>/repo` checkout.
 
 ## Absolute rules
 - NEVER edit `ROI.md`. It is the human record of intent. FORBIDDEN. (Also hook-enforced.)
@@ -39,6 +38,29 @@ every turn. Your requirements:
 - You never write session/heartbeat yourself.
 - You change only the task STATUS (its work phase). A task whose heartbeat is past the TTL is stale and
   reclaimable by anyone.
+
+## The runner does this — don't redo it
+A deterministic runner wraps your turn-loop and OWNS everything below; never reproduce, re-run, or
+second-guess it. Each pass the runner has already, or will automatically:
+- **Selected your task and its kind** — you do not choose or re-select. Priority: bootstrap → ROI
+  reconcile → weighted-random ready task; the task's status fixes the kind.
+- **Holds your claim** — stamps and re-stamps `session`+`heartbeat`, releases it on completion (see
+  Claim model). You only confirm it and edit STATUS.
+- **Created your code worktree** (work) off the submodule tip and precomputed your branch, submodule
+  pointer, tracked tip, doc path, and commit stamp — use those given values; do not run
+  worktree/submodule plumbing or scan the tree to re-derive them.
+- **Reverts git-config/remote drift** every turn, so never add a remote to "test" anything.
+- **Guards task removal** — pulls `main`; if your task vanished under you, the pass ends.
+- **Checks completion deterministically** each turn by your role section's predicate; meeting it exits
+  the pass — you need not announce "done".
+- **Publishes your work** — merges the commits YOU made in your worktree to `main`. On a conflict it
+  hands you only the conflicted files: STOP the task, rewrite them to a correct combined merge, remove
+  the markers, end your turn — the runner commits and pushes, not you. It then reclaims your merged
+  branch, streams the transcript to `sessions/`, and removes the worktree.
+
+What is still YOURS (per your role section): make and commit the code on `bee-<taskid>`, push that
+branch to the submodule origin, bump the submodule pointer, write the change doc, and flip STATUS. The
+runner merges that to `main` — it does not author the change for you.
 
 ## Status transitions (exhaustive)
 You perform the status edit; the runner manages session/heartbeat and the merge to main. The only
@@ -105,6 +127,12 @@ Done when the task leaves `NEEDS-ARBITRATION`.
    decision) → `beehive task human <sm> <task-id> --reason "<blocker + exact input needed>"`. Not for
    ordinary uncertainty or tedious work — pick a workable path and continue.
 5. **ROI.** You never touched `ROI.md`. Confirm.
+
+## Skills
+The hive `skills/` directory holds standard procedures as separate files, read LAZILY — never up front.
+In normal operation you need NONE: your pre-made worktree plus this protocol are the whole job and the
+runner owns the git plumbing. Read a single skill file only if a task explicitly calls for that
+procedure. `ROI.md` edits are never yours (`skills/modify-roi.md` is operator-only).
 
 ## Tooling
 The `beehive` CLI runs the deterministic git ops (submodule sync, worktree add/rm, `beehive task

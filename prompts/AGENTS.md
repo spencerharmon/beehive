@@ -88,10 +88,13 @@ exact complement. Each pass, the runner automatically:
   `NEEDS-REVIEW`; arbitrate: task left `NEEDS-ARBITRATION`; reconcile: `PLAN.md`'s ROI
   stamp matches `ROI.md` HEAD; bootstrap: `PLAN.md` exists. The agent need not
   self-declare done — meeting the predicate ends the pass.
-- **Publishes and cleans up** — merges the agent's commits to `main`, drives conflict
-  resolution, bumps the submodule pointer, pushes the source branch to the submodule
-  origin, reclaims merged branches, streams the session transcript to `sessions/`, and
-  removes the worktree. The agent never runs merges, pushes, or pointer bumps itself.
+- **Publishes and cleans up** — merges the commits the agent made in its worktree (the
+  `bee-<taskid>` code branch, the submodule-pointer bump, `PLAN.md`/`docs/`) to `main`,
+  drives conflict resolution (handing the agent only the conflicted files to rewrite),
+  reclaims the merged source branch, streams the session transcript to `sessions/`, and
+  removes the worktree. The agent authors and commits the change — including pushing its
+  `bee-<taskid>` branch to the submodule origin and bumping the pointer, per its role
+  step; the runner merges that to `main`, it does not write it for the agent.
 - **Dedups reconcile** (skips one already applied by a peer) and **bounds each turn**
   with a timeout, sending "continue" until the completion check passes or a cap hits.
 
@@ -170,8 +173,8 @@ add a local skill so agents can discover it.
   process in "Editing files" (see `skills/shared-checkout-edits.md`); in-place edits
   are silently reset by running passes.
 - Do NOT re-run, reproduce, or second-guess what the deterministic runner owns (task
-  selection, claim/heartbeat, worktree creation, completion checks, merges/publish,
-  pointer bumps) — see "The deterministic runtime".
+  selection, claim/heartbeat, worktree creation, completion checks, the merge/publish
+  to `main`, transcript, cleanup) — see "The deterministic runtime".
 - NEVER edit any `ROI.md` **as a honeybee** (an autonomous pass) — it is the human
   record of intent, hook-protected against the honeybee identity. Operator-directed
   edits are allowed: a hive agent acting on an operator's instruction, or the
