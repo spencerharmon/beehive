@@ -1,10 +1,11 @@
 # AGENTS.md — operating a beehive repo
 
 Generic guide for any agent (human-driven or autonomous) that operates a beehive
-repository. It is NOT the honeybee runtime protocol (that is `HONEYBEE.md`) and it
-holds no site-specific facts (those are in `LOCALS.md`). It describes what a beehive
-repo is, the files that carry context, and the standard procedures ("skills") for
-common operations.
+repository. It is NOT the honeybee runtime protocol (that is `HONEYBEE.md`, which the
+runner injects into every pass) and it holds no site-specific facts (those are in
+`LOCALS.md`). It describes what a beehive repo is, the files that carry context, the
+standard procedures ("skills"), how to change files without racing the swarm, and —
+so you never redo work the runner already does — what the deterministic process owns.
 
 This file is a beehive-managed default: the binary ships it and
 `beehive instruction update` refreshes it (with backup) when it advances. Edit it
@@ -20,6 +21,82 @@ lock. The repo's job is to hold, per target, the *intent* (`ROI.md`), the derive
 *source* (a git submodule under `repo/`).
 
 The repo root is a beehive repo; each tracked target lives at `submodules/<name>/`.
+
+## Editing files — NEVER edit the live checkout
+
+> This is the step agents miss most. Read `skills/shared-checkout-edits.md` BEFORE
+> you change any tracked file in a beehive repo whose passes/`beehived` are running.
+
+The working tree on `main` and every `submodules/<name>/repo/` checkout are **derived
+state, not editing surfaces**. Honeybees and `beehived` share this filesystem: on the
+next publish they reset the working tree to committed history (the dirty-tree heal)
+and `beehive submodule sync` clobbers `repo/` to the tracked tip verbatim. So an
+in-place edit is **silently discarded** — and a wedged dirty tree can block every
+component's publish. Every component instead works a private worktree off the
+freshest `main`/tip, commits there, and converges by merging/pushing back to `main`;
+your manual edit is just one more participant in that protocol. Three cases:
+
+- **Submodule CODE** — `submodules/<sm>/repo/` contents, including the self-hosting
+  `beehive` submodule itself:
+  `beehive submodule worktree add <sm> <branch>`; edit + commit inside
+  `submodules/<sm>/worktrees/<branch>/` (never `submodules/<sm>/repo/`); land it on
+  the tracked branch (`git push origin HEAD:main`); then
+  `beehive submodule sync <sm>` and `beehive submodule worktree rm <sm> <branch>`.
+- **Beehive-layer / superproject files** — the root instruction files (incl. this
+  one), `INFRASTRUCTURE.md`, `SUBMODULE-LINKS.yaml`, and a submodule's
+  `INFRASTRUCTURE.md` / `ARTIFACTS.md` / `docs/`:
+  `beehive worktree add <branch>`; edit under `.worktrees/<branch>/`; publish with
+  `git -C .worktrees/<branch> push . HEAD:main` (local-only hive with
+  `updateInstead`; push to `origin/main` if the hive has a remote); then
+  `beehive worktree rm <branch>`.
+- **`ROI.md`** — human-owned: prefer the `beehived` editor UI. Agents are hook-
+  blocked from committing it under the honeybee identity; operator-directed edits go
+  through the editor or the worktree process. See `skills/modify-roi.md`.
+
+Never `git reset`/`checkout`/`stash` the live primary tree to "make room" — you race
+in-flight publishes. Always remove your worktree + branch when done.
+`skills/shared-checkout-edits.md` carries the full procedure and failure modes.
+
+## The deterministic runtime (don't redo what the runner does)
+
+A honeybee pass is a thin LLM turn-loop wrapped by a deterministic runner. The runner
+— not the agent — owns everything in this list; a honeybee (and an operator-directed
+agent) must NOT re-implement, second-guess, or manually reproduce any of it.
+`HONEYBEE.md` is the per-kind role contract the agent DOES own; this section is its
+exact complement. Each pass, the runner automatically:
+
+- **Selects one task per submodule and fixes its KIND** deterministically — priority:
+  bootstrap (no `PLAN.md`) → ROI reconcile (`PLAN.md`'s `Beehive-ROI` stamp is behind
+  `ROI.md`) → a weighted-random pick among ready tasks. The picked task's status sets
+  the kind: `TODO`→work, `NEEDS-REVIEW`→review, `NEEDS-ARBITRATION`→arbitrate. The
+  agent never chooses the task or the kind and never re-runs selection.
+- **Owns the claim** — stamps `session=<id>` + a `heartbeat` on the task and
+  re-stamps every turn; releases it on completion; on failure/timeout/cap leaves the
+  stale claim as the GC signal. The agent never writes session/heartbeat and changes
+  only the task STATUS.
+- **Creates the code worktree** (work kind) at
+  `submodules/<sm>/worktrees/bee-<taskid>/` off the submodule tip before turn 1. The
+  agent edits there and never runs worktree/submodule plumbing or writes
+  `submodules/<sm>/repo`.
+- **Reverts git-config / remote drift** every turn, so a stray remote never outlives
+  a turn.
+- **Guards task removal** — pulls `main`; if the plan or the task vanished under it,
+  the pass ends rather than working something nobody wants.
+- **Checks completion deterministically** each turn, per kind — work: terminal status
+  (`DONE` / `NEEDS-REVIEW` / `NEEDS-ARBITRATION`, or `NEEDS-HUMAN` with a reason) AND
+  the change doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md`; review: task left
+  `NEEDS-REVIEW`; arbitrate: task left `NEEDS-ARBITRATION`; reconcile: `PLAN.md`'s ROI
+  stamp matches `ROI.md` HEAD; bootstrap: `PLAN.md` exists. The agent need not
+  self-declare done — meeting the predicate ends the pass.
+- **Publishes and cleans up** — merges the agent's commits to `main`, drives conflict
+  resolution, bumps the submodule pointer, pushes the source branch to the submodule
+  origin, reclaims merged branches, streams the session transcript to `sessions/`, and
+  removes the worktree. The agent never runs merges, pushes, or pointer bumps itself.
+- **Dedups reconcile** (skips one already applied by a peer) and **bounds each turn**
+  with a timeout, sending "continue" until the completion check passes or a cap hits.
+
+So: do your kind's role step (`HONEYBEE.md`), edit only your worktree + the beehive
+layer, flip STATUS, write the doc — and let the runner do the rest.
 
 ## Context files and ownership
 
@@ -60,19 +137,26 @@ Per submodule (`submodules/<name>/`):
 Standard procedures are NOT inlined here. Each lives as its own file under the
 repo-root **`skills/`** directory, is individually tracked and maintained, and is
 refreshed by `beehive instruction update` (the skill files are part of the managed
-set). **Read a skill file into context only when your task matches it** — do not load
-them all up front. Resolve a skill's path against `skills/` at the repo root.
+set). **Read a skill file into context only when your task matches it** — lazily,
+never all up front. Resolve a skill's path against `skills/` at the repo root.
 
-| Skill | Read it when | File |
-|-------|--------------|------|
-| Modify an ROI | a target's intent must change | `skills/modify-roi.md` |
-| Add a submodule | bringing a new target under the swarm | `skills/add-submodule.md` |
-| Remove a submodule | retiring a target | `skills/remove-submodule.md` |
-| Bootstrap | standing up a new target or whole install | `skills/bootstrap.md` |
-| Rebootstrap | rebuilding a target's plan from scratch | `skills/rebootstrap.md` |
-| Cleanup | clearing stale worktrees/branches/claims/drift | `skills/cleanup.md` |
-| Edit on a shared checkout | changing a submodule/layer file while honeybees or beehived share the filesystem | `skills/shared-checkout-edits.md` |
-| Update instructions | refreshing managed files to new binary defaults | `skills/update-instructions.md` |
+Two audiences use these. An **operator-directed hive agent** (you, acting on an
+operator's instruction at the hive root) runs the management skills below. An
+**autonomous honeybee** works under `HONEYBEE.md` with a pre-made worktree and
+normally needs NO skill — its only reach for one is `shared-checkout-edits`, and only
+if a task forces it to touch a file outside its handed worktree. The "Audience"
+column below marks who each is for.
+
+| Skill | Read it when | Audience | File |
+|-------|--------------|----------|------|
+| Edit on a shared checkout | before changing ANY submodule/layer file while passes or `beehived` share the filesystem — **mandatory, read first** | either | `skills/shared-checkout-edits.md` |
+| Modify an ROI | a target's intent must change | operator | `skills/modify-roi.md` |
+| Add a submodule | bringing a new target under the swarm | operator | `skills/add-submodule.md` |
+| Remove a submodule | retiring a target | operator | `skills/remove-submodule.md` |
+| Bootstrap | standing up a new target or whole install | operator | `skills/bootstrap.md` |
+| Rebootstrap | rebuilding a target's plan from scratch | operator | `skills/rebootstrap.md` |
+| Cleanup | clearing stale worktrees/branches/claims/drift | operator | `skills/cleanup.md` |
+| Update instructions | refreshing managed files to new binary defaults | operator | `skills/update-instructions.md` |
 
 The binary ships a default for every skill above; a site may add its own skill files
 to `skills/` (an update never deletes them) or customize a shipped one (an update
@@ -81,6 +165,13 @@ add a local skill so agents can discover it.
 
 ## Absolute rules (apply to every agent)
 
+- NEVER author in the live checkout — not the `main` working tree, not
+  `submodules/<name>/repo/`. Any tracked-file change goes through the worktree
+  process in "Editing files" (see `skills/shared-checkout-edits.md`); in-place edits
+  are silently reset by running passes.
+- Do NOT re-run, reproduce, or second-guess what the deterministic runner owns (task
+  selection, claim/heartbeat, worktree creation, completion checks, merges/publish,
+  pointer bumps) — see "The deterministic runtime".
 - NEVER edit any `ROI.md` **as a honeybee** (an autonomous pass) — it is the human
   record of intent, hook-protected against the honeybee identity. Operator-directed
   edits are allowed: a hive agent acting on an operator's instruction, or the
