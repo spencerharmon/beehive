@@ -67,7 +67,6 @@ type taskBrief struct {
 	TrackedTip    string // origin/<TrackedBranch> tip (== BaseSHA post-sync; "" single-host)
 	DocPath       string // REQUIRED change-doc path (beehive layer)
 	CommitStamp   string // Beehive: <taskid> <doc-path>
-	Card          string // the task's own PLAN card (header + body)
 	Files         []briefFile
 }
 
@@ -90,7 +89,6 @@ func (r *Runner) buildTaskBrief(ctx context.Context, sel *selectt.Selection, wg 
 		WorktreeAbs: wtAbs,
 		DocPath:     docPath,
 		CommitStamp: fmt.Sprintf("Beehive: %s %s", sel.Task.ID, docPath),
-		Card:        sel.Task.Card(),
 	}
 	if wtRel, err := filepath.Rel(absRoot, wtAbs); err == nil {
 		b.WorktreeRel = filepath.ToSlash(wtRel)
@@ -163,12 +161,6 @@ func (b taskBrief) render() string {
 	}
 	fmt.Fprintf(&sb, "- REQUIRED change-doc path (write it EXACTLY here): %s\n", b.DocPath)
 	fmt.Fprintf(&sb, "- Commit stamp (put this line on your submodule commit): %s\n", b.CommitStamp)
-
-	sb.WriteString("\n## Your PLAN card\n")
-	sb.WriteString(b.Card)
-	if !strings.HasSuffix(b.Card, "\n") {
-		sb.WriteByte('\n')
-	}
 
 	if len(b.Files) > 0 {
 		sb.WriteString("\n## Task files (from your card's `Files:` line — your working set; read these, not the tree)\n")

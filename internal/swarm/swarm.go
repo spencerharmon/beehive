@@ -552,10 +552,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		preamble = fmt.Sprintf(
 			"# Context (REVIEW — judge existing work, do NOT reimplement)\n"+
 				"cwd is the beehive repo root. Submodule: %[1]s. Task under review: %[2]s.\n"+
-				"Beehive layer (read/write on main): submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/. ROI.md is read-only.\n"+
+				"Beehive layer: write submodules/%[1]s/PLAN.md (status only) and submodules/%[1]s/docs/. Your task card "+
+				"(with its `Review:` note) is provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
 				"Implementer's work is on branch bee-%[2]s in submodules/%[1]s/repo — inspect read-only via git "+
-				"(fetch from origin if the branch is absent locally). Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
-				"the PLAN.md task body has a `Review:` note.\n"+
+				"(fetch from origin if the branch is absent locally). Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md.\n"+
 				"APPROVE -> merge the submodule pointer bump + PLAN.md task DONE + unlock dependents. "+
 				"REJECT -> PLAN.md task NEEDS-ARBITRATION + rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
 				"The run completes when the task leaves NEEDS-REVIEW. Act autonomously.\n\n",
@@ -564,7 +564,8 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		preamble = fmt.Sprintf(
 			"# Context (ARBITRATION — settle the dispute, do NOT reimplement)\n"+
 				"cwd is the beehive repo root. Submodule: %[1]s. Task in arbitration: %[2]s.\n"+
-				"Beehive layer (read/write on main): submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/. ROI.md is read-only.\n"+
+				"Beehive layer: write submodules/%[1]s/PLAN.md (status only) and submodules/%[1]s/docs/. Your task card is "+
+				"provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
 				"Implementer branch bee-%[2]s in submodules/%[1]s/repo; change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
 				"reviewer rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
 				"SIDE WITH IMPLEMENTER -> merge pointer bump + PLAN.md DONE + unlock dependents. "+
@@ -590,8 +591,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		preamble = fmt.Sprintf(
 			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+
-				"Coordination files (the beehive layer): submodules/%[1]s/ROI.md (read-only), "+
-				"submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/.\n"+
+				"Beehive layer: write submodules/%[1]s/PLAN.md ONLY to flip this task's status, and "+
+				"submodules/%[1]s/docs/ for the change doc. Your task is provided below — do NOT open PLAN.md or "+
+				"ROI.md for task context.\n"+
 				"Code worktree (already created and checked out for you): submodules/%[1]s/worktrees/%[2]s/ "+
 				"on branch %[2]s. Edit the submodule's CODE there; never write submodules/%[1]s/repo (the shared checkout).\n"+
 				"%[4]s"+
@@ -605,6 +607,19 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"Beehive layer: submodules/%[1]s/ROI.md (read-only), submodules/%[1]s/PLAN.md, submodules/%[1]s/docs/.\n"+
 				"Act autonomously: do not ask for confirmation; make the edits and commits the protocol requires.\n\n",
 			smName)
+	}
+	// Task description handoff (Work/Review/Arbitrate): the runner ALWAYS hands a
+	// task-bearing pass its full task card, so the agent never opens PLAN.md or ROI.md
+	// to discover or understand its task. It still WRITES PLAN.md, but only to record
+	// the status transition and unlock dependents. Bootstrap/Reconcile carry no task
+	// and author the plan from ROI themselves, so they get no card.
+	if hasTask(sel) {
+		preamble += fmt.Sprintf(
+			"## Your task (provided by the runner — your COMPLETE task description; do NOT open PLAN.md or ROI.md "+
+				"to find or understand it)\n%[1]sThe card above is your task. Read it, not the plan. Write "+
+				"submodules/%[2]s/PLAN.md ONLY to record this task's status transition (and to unlock dependents on "+
+				"DONE); never read PLAN.md or ROI.md for task context.\n\n",
+			sel.Task.Card(), smName)
 	}
 	if hasTask(sel) {
 		preamble += fmt.Sprintf(
@@ -626,10 +641,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		preamble += buildEnvPreamble(r.BuildEnv)
 	}
 	// Precomputed task brief (Work only): hand the agent the worktree/branch/pointer
-	// the setup already resolved, the deterministic doc-path/commit-stamp, its PLAN
-	// card, and head excerpts of its own files — so it skips discovery plumbing and
-	// a whole-tree scan. Inert by default (LeanBrief off) so the injected preamble
-	// is byte-identical to the historical path.
+	// the setup already resolved, the deterministic doc-path/commit-stamp, and head
+	// excerpts of its own files — so it skips discovery plumbing and a whole-tree scan.
+	// The task card itself is handed unconditionally above (task-description handoff);
+	// this brief is the Work-only precompute layer, inert by default (LeanBrief off).
 	if r.LeanBrief && sel.Kind == selectt.Work {
 		preamble += r.buildTaskBrief(ctx, sel, wg, wtAbs, absRoot, res.Branch).render()
 	}

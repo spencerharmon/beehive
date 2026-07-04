@@ -17,7 +17,7 @@ import (
 // TestWorkBriefInjected proves that with LeanBrief on, a Work dispatch injects a
 // precomputed task brief carrying the resolved worktree path, branch, submodule
 // pointer + tracked tip, the mandated (provided, not derived) change-doc path and
-// commit stamp, the task's own PLAN card, and head excerpts of the task's OWN
+// commit stamp, and head excerpts of the task's OWN
 // files — and that a file NOT in the card's Files: line is not pulled in (scoped
 // to the task's working set, not the whole tree).
 func TestWorkBriefInjected(t *testing.T) {
@@ -84,7 +84,7 @@ func TestWorkBriefInjected(t *testing.T) {
 		"Tracked tip (origin/main): " + originTip,
 		"REQUIRED change-doc path (write it EXACTLY here): submodules/sm/docs/bee-T1-T1.md",
 		"Commit stamp (put this line on your submodule commit): Beehive: T1 submodules/sm/docs/bee-T1-T1.md",
-		"## Your PLAN card",
+		"## Your task",
 		"## T1 [TODO]",             // the card header, canonically rendered
 		"Files: alpha.go, beta.go", // the card body (incl the Files: line)
 		"### alpha.go (first",      // task-file excerpt heading

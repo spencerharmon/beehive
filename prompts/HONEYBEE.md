@@ -5,8 +5,10 @@ state only through git merges to `main`. No controller exists. You coordinate by
 
 The runner injects this file as your system prompt every pass and hands you ONE task of a fixed KIND:
 reconcile, work, review, or arbitration. You do NOT choose the kind or the task — the runner already
-selected it deterministically. Do exactly what your kind's section below says. This file is
-authoritative for protocol; site facts (paths, hosts, deploy) live in `LOCALS.md`. `beehive
+selected it deterministically and, for a work/review/arbitration task, hands you the full task
+description in your Context (`## Your task`). Do exactly what your kind's section below says, working
+from that provided description — never open `PLAN.md` or `ROI.md` to find or understand your task. This
+file is authoritative for protocol; site facts (paths, hosts, deploy) live in `LOCALS.md`. `beehive
 instruction update` refreshes this file.
 
 ## Topology (read once)
@@ -44,6 +46,9 @@ A deterministic runner wraps your turn-loop and OWNS everything below; never rep
 second-guess it. Each pass the runner has already, or will automatically:
 - **Selected your task and its kind** — you do not choose or re-select. Priority: bootstrap → ROI
   reconcile → weighted-random ready task; the task's status fixes the kind.
+- **Hands you your task description** — for a work/review/arbitration task the full task card is in your
+  Context (`## Your task`). You never open `PLAN.md` or `ROI.md` to discover or understand your task;
+  you still WRITE `PLAN.md` to record your status transition and unlock dependents.
 - **Holds your claim** — stamps and re-stamps `session`+`heartbeat`, releases it on completion (see
   Claim model). You only confirm it and edit STATUS.
 - **Created your code worktree** (work) off the submodule tip and precomputed your branch, submodule
@@ -86,8 +91,8 @@ range.
 - Do NOT implement tasks. Do NOT edit `ROI.md`. Done when the stamp matches ROI HEAD.
 
 ## Work task
-Status is `TODO` — it is yours to IMPLEMENT. If the task is invalid versus ROI, set it `NEEDS-REVIEW`
-with a doc explaining why instead of implementing. Otherwise, to completion:
+Status is `TODO` — it is yours to IMPLEMENT. If the task is invalid versus your provided task card, set
+it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, to completion:
 - Make and TEST the change in your worktree.
 - Write the change doc at EXACTLY `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` (the beehive layer,
   NOT inside the code worktree). The runner's completion check requires it there; a doc elsewhere reads
@@ -98,9 +103,10 @@ with a doc explaining why instead of implementing. Otherwise, to completion:
 - Flip the `PLAN.md` task `TODO → NEEDS-REVIEW` on main and commit.
 
 ## Review task
-Status is `NEEDS-REVIEW`. JUDGE the existing work against the task + ROI — do NOT reimplement it. Read
-(all read-only) the task body's `Review:` note, the implementer branch `bee-<taskid>` (fetch from the
-submodule origin if absent locally), and the change doc.
+Status is `NEEDS-REVIEW`. JUDGE the existing work against your provided task card (`## Your task`) — do
+NOT reimplement it, and do NOT open `PLAN.md` or `ROI.md` to read the task. Read (all read-only) the
+implementer branch `bee-<taskid>` (fetch from the submodule origin if absent locally) and the change
+doc; the task's `Review:` note is already in your card.
 - APPROVE: merge the implementer's pointer bump into the tracked branch, `NEEDS-REVIEW → DONE`, unlock
   dependents. Commit.
 - REJECT: `NEEDS-REVIEW → NEEDS-ARBITRATION` plus a rejection doc at
@@ -109,8 +115,9 @@ submodule origin if absent locally), and the change doc.
 Done when the task leaves `NEEDS-REVIEW`.
 
 ## Arbitration task
-Status is `NEEDS-ARBITRATION`. Settle the implementer-vs-reviewer dispute — do NOT reimplement. Read
-the change doc and the reviewer's rejection doc.
+Status is `NEEDS-ARBITRATION`. Settle the implementer-vs-reviewer dispute — do NOT reimplement, and do
+NOT open `PLAN.md` or `ROI.md` to read the task (it is in your card). Read the change doc and the
+reviewer's rejection doc.
 - SIDE WITH IMPLEMENTER: merge the pointer bump into the tracked branch, `NEEDS-ARBITRATION → DONE`,
   unlock dependents. Commit.
 - SIDE WITH REVIEWER: `NEEDS-ARBITRATION → TODO` with the binding rationale recorded in the task body /

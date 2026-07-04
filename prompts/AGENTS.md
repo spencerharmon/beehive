@@ -70,6 +70,10 @@ exact complement. Each pass, the runner automatically:
   `ROI.md`) → a weighted-random pick among ready tasks. The picked task's status sets
   the kind: `TODO`→work, `NEEDS-REVIEW`→review, `NEEDS-ARBITRATION`→arbitrate. The
   agent never chooses the task or the kind and never re-runs selection.
+- **Hands the agent its task description** — a work/review/arbitration pass gets the
+  full task card injected in its Context, so the agent never opens `PLAN.md` or
+  `ROI.md` to find or understand its task (it still writes `PLAN.md` for the status
+  transition and dependent unlocks).
 - **Owns the claim** — stamps `session=<id>` + a `heartbeat` on the task and
   re-stamps every turn; releases it on completion; on failure/timeout/cap leaves the
   stale claim as the GC signal. The agent never writes session/heartbeat and changes
