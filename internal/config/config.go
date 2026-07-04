@@ -41,8 +41,10 @@ import (
 // DefaultDir is the shared config directory.
 const DefaultDir = "/etc/beehive"
 
-// fileName is the basename of every config layer (host dir, repo root, submodule dir).
-const fileName = "config.yaml"
+// FileName is the basename of every config layer (host dir, repo root, submodule
+// dir). Exported so callers that only need to detect a config's presence (e.g.
+// the frontend's bootstrap-state check) resolve the same path this package uses.
+const FileName = "config.yaml"
 
 // Config is the parsed beehive config. Zero-valued fields are treated as "unset"
 // when layering (see merge): a layer only overrides the fields it actually sets.
@@ -250,12 +252,12 @@ func mergeEnv(base, over map[string]string) map[string]string {
 // host + in-repo-global scopes.
 func layerPaths(dir, root, submodule string) []string {
 	paths := []string{
-		filepath.Join(dir, fileName),  // host file: /etc/beehive/config.yaml
-		filepath.Join(root, fileName), // in-repo global defaults
+		filepath.Join(dir, FileName),  // host file: /etc/beehive/config.yaml
+		filepath.Join(root, FileName), // in-repo global defaults
 	}
 	if submodule != "" {
 		// per-submodule override (beehive layer, alongside ROI.md/PLAN.md)
-		paths = append(paths, filepath.Join(root, "submodules", submodule, fileName))
+		paths = append(paths, filepath.Join(root, "submodules", submodule, FileName))
 	}
 	return paths
 }
@@ -300,7 +302,7 @@ func Resolve(root, submodule string) (Config, error) {
 func Load() (Config, error) {
 	dir := resolveDir()
 	c := Defaults(dir)
-	layer, ok, err := loadFile(filepath.Join(dir, fileName))
+	layer, ok, err := loadFile(filepath.Join(dir, FileName))
 	if err != nil {
 		return c, err
 	}

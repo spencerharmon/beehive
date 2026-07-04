@@ -9,15 +9,19 @@ import (
 	"sort"
 )
 
-// Layout names. ROI is human-owned and never written by honeybees.
+// Layout names. ROI is human-owned and never written by honeybees. LOCALS is
+// the site-specific operator record (authored per install, never managed);
+// BOOTSTRAP is the managed setup walkthrough installed at init.
 const (
-	AgentsFile  = "AGENTS.md"
-	PlanFile    = "PLAN.md"
-	ROIFile     = "ROI.md"
-	InfraFile   = "INFRASTRUCTURE.md"
-	Artifacts   = "ARTIFACTS.md"
-	LinksFile   = "SUBMODULE-LINKS.yaml"
-	SecretsFile = "SECRETS.yaml.gpg"
+	AgentsFile    = "AGENTS.md"
+	PlanFile      = "PLAN.md"
+	ROIFile       = "ROI.md"
+	InfraFile     = "INFRASTRUCTURE.md"
+	Artifacts     = "ARTIFACTS.md"
+	LinksFile     = "SUBMODULE-LINKS.yaml"
+	SecretsFile   = "SECRETS.yaml.gpg"
+	LocalsFile    = "LOCALS.md"
+	BootstrapFile = "BOOTSTRAP.md"
 )
 
 // roiStamp matches the PLAN.md reconcile marker: <!-- Beehive-ROI: <sha> -->

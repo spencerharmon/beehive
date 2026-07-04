@@ -108,6 +108,7 @@ func (s *Server) RecoverEditors(ctx context.Context) error {
 func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.dashboard)
+	mux.HandleFunc("GET /bootstrap", s.bootstrapAgent)
 	mux.HandleFunc("GET /stats", s.stats)
 	mux.HandleFunc("GET /submodule/{name}", s.explorer)
 	mux.HandleFunc("GET /submodule/{name}/branches", s.branches)
@@ -234,7 +235,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
 	}
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg})
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState()})
 }
 
 // subViews builds the dashboard card data for every submodule: State

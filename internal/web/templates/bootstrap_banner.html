@@ -1,0 +1,14 @@
+{{define "bootstrap-banner"}}
+{{if not .Bootstrapped}}
+<section class="card bootstrap-banner" role="status" aria-label="setup">
+  <h2>Finish setting up this beehive</h2>
+  <p>This repo isn't fully bootstrapped yet. The steps below are still outstanding — an AI setup guide is standing by to walk you through them. It only advises: nothing is written or committed without your approval.</p>
+  <ul class="bootstrap-steps">
+    {{range .Unmet}}<li><b>{{.Title}}</b> &mdash; {{.Detail}}</li>{{end}}
+  </ul>
+  <div id="bootstrap-agent" hx-get="/bootstrap" hx-trigger="load" hx-swap="innerHTML">
+    <p class="muted">loading setup assistant&hellip;</p>
+  </div>
+</section>
+{{end}}
+{{end}}
