@@ -18,15 +18,18 @@ import (
 )
 
 // fakeChatClient is a swarm.Client that returns a fixed reply for every turn and
-// records the cwd it was opened in, so a test can drive the propose/approve loop
-// without a real opencode server.
+// records the cwd and system prompt it was opened with, so a test can drive the
+// propose/approve loop — and assert the seeded per-file context — without a real
+// opencode server.
 type fakeChatClient struct {
-	reply string
-	cwd   string
+	reply  string
+	cwd    string
+	system string
 }
 
 func (f *fakeChatClient) Open(ctx context.Context, cwd, system string) (swarm.Session, error) {
 	f.cwd = cwd
+	f.system = system
 	return &fakeChatSession{reply: f.reply}, nil
 }
 
@@ -50,6 +53,13 @@ func proposeReply(msg, content string) string {
 // it proves the chat editor works over an ARBITRARY path (the single-file editor
 // would reject it).
 func chatFixture(t *testing.T, reply string) (*Server, string) {
+	t.Helper()
+	return chatFixtureClient(t, &fakeChatClient{reply: reply})
+}
+
+// chatFixtureClient is chatFixture with a caller-supplied swarm.Client, so a test
+// can hold the client reference (e.g. to assert the seeded system prompt).
+func chatFixtureClient(t *testing.T, client swarm.Client) (*Server, string) {
 	t.Helper()
 	root := t.TempDir()
 	g := git.New(root)
@@ -84,7 +94,7 @@ func chatFixture(t *testing.T, reply string) (*Server, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.chat = newChatManager(root, &fakeChatClient{reply: reply})
+	s.chat = newChatManager(root, client)
 	return s, root
 }
 

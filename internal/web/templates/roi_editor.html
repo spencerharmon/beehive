@@ -1,7 +1,7 @@
 {{template "header"}}
 <div id="roi-panel">
 <h1>ROI: {{.Name}}</h1>
-<p><a href="/edit?file=submodules/{{.Name}}/ROI.md">edit with AI chat</a> — propose changes conversationally on a branch, then merge.</p>
+<p><a href="/edit?path=submodules/{{.Name}}/ROI.md">edit with AI chat</a> — propose changes conversationally on a branch, then merge.</p>
 {{if .Saved}}<p class="ok" role="status">saved</p>{{end}}
 <section class="markdown" aria-label="rendered preview">{{.Rendered}}</section>
 <details class="inline-edit"{{if .Saved}} open{{end}}>

@@ -339,9 +339,15 @@ func normalizeProposal(body string) string {
 // chatSystemPrompt instructs the agent to propose (never apply) a full-file
 // change wrapped in the markers. The agent has no tool authority in this loop —
 // beehived applies the proposal only on human approval — so the system prompt is
-// explicit that it must not try to edit or run anything.
+// explicit that it must not try to edit or run anything. It also seeds the
+// file-specific editing rules (resolveFileContext, chat-diff-file-context) so a
+// PLAN.md edit keeps its line format, ROI.md is treated as human-owned intent,
+// etc. — the SAME context whether the session was opened from a per-file edit
+// link or the generic edit window.
 func chatSystemPrompt(path string) string {
 	return fmt.Sprintf(`You are a collaborative editor for ONE file in a git repository: %[1]s.
+
+%[4]s
 
 You do NOT have permission to modify files, run git, or use any tools. The system
 applies your proposal to %[1]s ONLY after the human approves it.
@@ -354,7 +360,7 @@ When you want to change %[1]s, reply with:
 
 If the user only asks a question, or the request is too ambiguous to act on,
 answer briefly and DO NOT include the markers (that means "no proposal").`,
-		path, proposeOpen, proposeClose)
+		path, proposeOpen, proposeClose, resolveFileContext(path))
 }
 
 // seedPrompt prepends the file's current content to the first user message so the
