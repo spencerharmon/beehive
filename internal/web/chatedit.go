@@ -60,6 +60,14 @@ type chatManager struct {
 
 	mu   sync.Mutex
 	byID map[string]*chatSession
+
+	// bootstrapID + bootstrapMu back the singleton bootstrap agent
+	// (bootstrap-agent-autodetect): the unbootstrapped-repo dashboard lazily
+	// opens ONE chat-edit session over LOCALS.md and reuses it across re-opens
+	// rather than cutting a fresh worktree each render. bootstrapMu serializes the
+	// check-or-open so concurrent dashboard loads converge on one session.
+	bootstrapMu sync.Mutex
+	bootstrapID string
 }
 
 // newChatManager builds a chatManager over the beehive repo at root, driving the
@@ -108,6 +116,15 @@ func (m *chatManager) open(ctx context.Context, rawPath string) (*chatSession, e
 	if err != nil {
 		return nil, err
 	}
+	return m.openWith(ctx, clean, chatSystemPrompt(clean))
+}
+
+// openWith cuts a fresh worktree/branch off local main and registers a session
+// for clean (an ALREADY-validated repo-relative path) under the caller-supplied
+// system prompt. It is the shared core of open (the generic per-file editor, with
+// chatSystemPrompt) and openBootstrap (the setup agent, with a bootstrap-seeded
+// prompt); callers that take untrusted input must run cleanRepoPath first.
+func (m *chatManager) openWith(ctx context.Context, clean, sys string) (*chatSession, error) {
 	branch := "edit-" + slugPath(clean) + "-" + fmt.Sprint(m.now().Unix())
 	wtPath := filepath.Join(m.absRoot, ".worktrees", branch)
 	if err := m.git.WorktreeAdd(ctx, wtPath, branch, "main"); err != nil {
@@ -118,7 +135,7 @@ func (m *chatManager) open(ctx context.Context, rawPath string) (*chatSession, e
 		Path:   clean,
 		Branch: branch,
 		wtPath: wtPath,
-		sys:    chatSystemPrompt(clean),
+		sys:    sys,
 		mgr:    m,
 		wt:     git.New(wtPath),
 	}
