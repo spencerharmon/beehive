@@ -2189,3 +2189,122 @@ func TestViewerFollowsOffBoxSessions(t *testing.T) {
 		t.Fatalf("ff-only pull must never start a merge (MERGE_HEAD present): err=%v", err)
 	}
 }
+
+// seedRootOrigin gives the beehive root an initial commit on a normalized "main"
+// branch and a bare origin it publishes to — the two-host convergence point the
+// frontend write path pushes onto. The branch is forced to main (regardless of
+// the host's init.defaultBranch) so publishMain, which pushes the checkout's
+// CURRENT branch, targets origin main. Returns the bare origin path.
+func seedRootOrigin(t *testing.T, root string) (origin string) {
+	t.Helper()
+	hygGit(t, root, "add", "-A")
+	hygGit(t, root, "commit", "-q", "-m", "root base")
+	hygGit(t, root, "branch", "-M", "main")
+	origin = filepath.Join(t.TempDir(), "root-origin.git")
+	hygGit(t, root, "init", "-q", "--bare", "-b", "main", origin)
+	hygGit(t, root, "remote", "add", "origin", origin)
+	hygGit(t, root, "push", "-q", "-u", "origin", "main")
+	return origin
+}
+
+// assertOriginAtLocalHead fails unless the bare origin's main is exactly the
+// root's local HEAD — i.e. the last frontend write was actually pushed, not just
+// committed locally.
+func assertOriginAtLocalHead(t *testing.T, root, origin string) {
+	t.Helper()
+	local := hygGit(t, root, "rev-parse", "HEAD")
+	if got := hygGit(t, origin, "rev-parse", "main"); got != local {
+		t.Fatalf("origin main=%s not at local HEAD=%s (write not published)", got, local)
+	}
+}
+
+// TestFrontendWritesReachOrigin is the core of publish-main-writes: a frontend
+// write does not merely commit locally, it PUSHES to origin main so other hosts'
+// honeybees (which branch off origin/main) see it. Two distinct handlers — a ROI
+// edit and an env deploy — both route through the shared publishMain path; after
+// each, origin main is at the local HEAD and carries the committed content.
+func TestFrontendWritesReachOrigin(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	s, root := setup(t)
+	origin := seedRootOrigin(t, root)
+
+	if w := postForm(t, s, "/roi/alpha", url.Values{"body": {"# new intent\n"}}); w.Code != 200 {
+		t.Fatalf("roi post %d: %s", w.Code, w.Body)
+	}
+	assertOriginAtLocalHead(t, root, origin)
+	if got := hygGit(t, origin, "show", "main:submodules/alpha/"+repo.ROIFile); !strings.Contains(got, "new intent") {
+		t.Fatalf("ROI edit did not reach origin main: %q", got)
+	}
+
+	if w := postForm(t, s, "/env/deploy", url.Values{"target": {"green"}}); w.Code != 200 {
+		t.Fatalf("deploy %d: %s", w.Code, w.Body)
+	}
+	assertOriginAtLocalHead(t, root, origin)
+	if got := hygGit(t, origin, "show", "main:"+repo.InfraFile); !strings.Contains(got, "Active: green") {
+		t.Fatalf("env deploy did not reach origin main: %q", got)
+	}
+}
+
+// TestFrontendWriteRetriesOnConcurrentAdvance proves the non-fast-forward retry:
+// when a peer advances origin main between our last sync and our write, the push
+// is rejected; publishMain fetches, merges the peer's commit in, and retries — so
+// our write lands WITHOUT dropping the peer's commit (no lost write).
+func TestFrontendWriteRetriesOnConcurrentAdvance(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	s, root := setup(t)
+	origin := seedRootOrigin(t, root)
+
+	// A peer on another host advances origin main out-of-band.
+	peer := filepath.Join(t.TempDir(), "peer")
+	hygGit(t, root, "clone", "-q", origin, peer)
+	hygGit(t, peer, "config", "user.email", "p@p")
+	hygGit(t, peer, "config", "user.name", "peer")
+	os.WriteFile(filepath.Join(peer, "peer.txt"), []byte("peer work\n"), 0o644)
+	hygGit(t, peer, "add", "-A")
+	hygGit(t, peer, "commit", "-q", "-m", "peer advance")
+	peerHead := hygGit(t, peer, "rev-parse", "HEAD")
+	hygGit(t, peer, "push", "-q", "origin", "main")
+
+	// Our write commits on the now-stale base, so the push is a non-ff. It must
+	// still succeed by fetch+merge+retry (the ROI edit and the peer's new file
+	// touch different paths, so the merge is clean).
+	if w := postForm(t, s, "/roi/alpha", url.Values{"body": {"# local intent\n"}}); w.Code != 200 {
+		t.Fatalf("roi post %d: %s", w.Code, w.Body)
+	}
+
+	originMain := hygGit(t, origin, "rev-parse", "main")
+	if originMain == peerHead {
+		t.Fatalf("our write never reached origin (still at peer head %s)", peerHead)
+	}
+	assertOriginAtLocalHead(t, root, origin)
+	// No lost write: BOTH the peer's file and our ROI edit are on origin main.
+	if got := hygGit(t, origin, "show", "main:peer.txt"); !strings.Contains(got, "peer work") {
+		t.Fatalf("peer commit lost from origin main: %q", got)
+	}
+	if got := hygGit(t, origin, "show", "main:submodules/alpha/"+repo.ROIFile); !strings.Contains(got, "local intent") {
+		t.Fatalf("local write lost from origin main: %q", got)
+	}
+	// The peer commit is an ANCESTOR of origin main (merged in, never clobbered).
+	anc := exec.Command("git", "merge-base", "--is-ancestor", peerHead, originMain)
+	anc.Dir = origin
+	if err := anc.Run(); err != nil {
+		t.Fatalf("peer commit %s not an ancestor of origin main %s (history clobbered)", peerHead, originMain)
+	}
+}
+
+// TestFrontendWriteNoOriginCommitsLocally proves the single-host path: with no
+// remote configured, a write still COMMITS locally (honeybees branch off local
+// main) and does not error trying to push.
+func TestFrontendWriteNoOriginCommitsLocally(t *testing.T) {
+	s, root := setup(t)
+	if r := hygGit(t, root, "remote"); r != "" {
+		t.Fatalf("precondition: root unexpectedly has a remote %q", r)
+	}
+	if w := postForm(t, s, "/roi/alpha", url.Values{"body": {"# solo\n"}}); w.Code != 200 {
+		t.Fatalf("roi post %d: %s", w.Code, w.Body)
+	}
+	// A real local commit carrying the edit landed on HEAD (no push, no error).
+	if got := hygGit(t, root, "show", "HEAD:submodules/alpha/"+repo.ROIFile); !strings.Contains(got, "solo") {
+		t.Fatalf("no-origin write not committed locally: %q", got)
+	}
+}
