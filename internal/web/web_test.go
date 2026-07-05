@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2307,4 +2308,266 @@ func TestFrontendWriteNoOriginCommitsLocally(t *testing.T) {
 	if got := hygGit(t, root, "show", "HEAD:submodules/alpha/"+repo.ROIFile); !strings.Contains(got, "solo") {
 		t.Fatalf("no-origin write not committed locally: %q", got)
 	}
+}
+
+// --- multi-repo routing (multi-repo-web-routing) ------------------------------
+
+// initBeehiveRepo scaffolds a standalone beehive repo root — its own git repo on
+// main, a committer identity (so the write path can commit), and exactly one
+// submodule (ROI.md + a stamped PLAN.md) — and returns the root. Each entry in a
+// multi-repo test registry points at a SEPARATE such root, so a request routed to
+// one repo can be proven to operate on that repo's submodule and never crawl into
+// another's.
+func initBeehiveRepo(t *testing.T, submodule string) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := repo.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range [][]string{{"user.email", "t@t"}, {"user.name", "t"}} {
+		c := exec.Command("git", "config", kv[0], kv[1])
+		c.Dir = root
+		if err := c.Run(); err != nil {
+			t.Fatalf("git config %v: %v", kv, err)
+		}
+	}
+	sm := filepath.Join(root, "submodules", submodule)
+	if err := os.MkdirAll(sm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sm, repo.ROIFile), []byte("# "+submodule+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sm, repo.PlanFile),
+		[]byte("<!-- Beehive-ROI: stamp-"+submodule+" -->\n# Plan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// twoRepoRegistry wires the multi-repo frontend over two standalone beehive repos
+// with DISTINCT per-repo keyrings: registry "alpha" -> submodule "redteam", and
+// registry "bravo" -> submodule "bluecrew". A hermetic BEEHIVE_CONFIG_DIR keeps
+// config.Resolve off any host/user config. It returns the wired container (whose
+// default active repo is the sorted-first name, "alpha") and both roots.
+func twoRepoRegistry(t *testing.T) (s *Server, rootAlpha, rootBravo string) {
+	t.Helper()
+	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
+	rootAlpha = initBeehiveRepo(t, "redteam")
+	rootBravo = initBeehiveRepo(t, "bluecrew")
+	reg := config.Registry{Repos: []config.RepoEntry{
+		{Name: "alpha", Root: rootAlpha, GPGHome: filepath.Join(rootAlpha, "gnupg"), GPGRecipient: "alpha@example.com"},
+		{Name: "bravo", Root: rootBravo, GPGHome: filepath.Join(rootBravo, "gnupg"), GPGRecipient: "bravo@example.com"},
+	}}
+	if err := reg.Validate(); err != nil {
+		t.Fatalf("fixture registry invalid: %v", err)
+	}
+	s, err := NewRegistry(reg)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	return s, rootAlpha, rootBravo
+}
+
+// getRepo issues GET path against h, optionally carrying the repo-selection cookie
+// (an empty repoName sends no cookie, exercising the default active repo).
+func getRepo(t *testing.T, h http.Handler, path, repoName string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", path, nil)
+	if repoName != "" {
+		req.AddCookie(&http.Cookie{Name: repoCookie, Value: repoName})
+	}
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// postRepo issues a form POST against h, optionally carrying the selection cookie.
+func postRepo(t *testing.T, h http.Handler, path, repoName string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if repoName != "" {
+		req.AddCookie(&http.Cookie{Name: repoCookie, Value: repoName})
+	}
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// TestNewRegistryEmptyErrors: an empty registry has no repo to serve and must be
+// a construction error (never a nil-serving daemon). ResolveRegistry never hands
+// NewRegistry an empty set, but the guard is explicit.
+func TestNewRegistryEmptyErrors(t *testing.T) {
+	if _, err := NewRegistry(config.Registry{}); err == nil {
+		t.Fatal("NewRegistry(empty) should error, got nil")
+	}
+}
+
+// TestNewRegistrySingleEntryFlatRoutes locks the no-regression path: a one-entry
+// registry is NOT multi — it keeps today's flat routes, exposes no /repo switch,
+// and serves its single repo exactly like New. (Byte-identity of the projected
+// config is the config layer's TestSingleEntryRegistryRoundTrip.)
+func TestNewRegistrySingleEntryFlatRoutes(t *testing.T) {
+	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
+	root := initBeehiveRepo(t, "onlysub")
+	reg := config.Registry{Repos: []config.RepoEntry{
+		{Name: "solo", Root: root, GPGHome: filepath.Join(root, "gnupg"), GPGRecipient: "solo@example.com"},
+	}}
+	s, err := NewRegistry(reg)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	if s.multi() {
+		t.Fatal("single-entry registry must not be multi")
+	}
+	mux := s.Routes()
+	// Flat routes still serve the one repo.
+	if w := getRepo(t, mux, "/", ""); w.Code != 200 || !strings.Contains(w.Body.String(), "onlysub") {
+		t.Fatalf("single-entry dashboard %d: %s", w.Code, w.Body)
+	}
+	// No /repo switch endpoint in single-repo mode.
+	if w := postRepo(t, mux, "/repo/solo", "", url.Values{}); w.Code != http.StatusNotFound {
+		t.Fatalf("single-repo mode must not register /repo (got %d)", w.Code)
+	}
+}
+
+// TestRegistryDefaultActiveSortedFirstOwnKeyring proves selection defaults to the
+// sorted-first registry name and that an UNKNOWN cookie falls back to it (never a
+// nil or arbitrary repo), and that each per-repo server carries its OWN keyring —
+// the web-layer half of the per-repo isolation the daemon must preserve.
+func TestRegistryDefaultActiveSortedFirstOwnKeyring(t *testing.T) {
+	s, _, _ := twoRepoRegistry(t)
+	if !s.multi() {
+		t.Fatal("two-entry registry must be multi")
+	}
+	if s.order[0] != "alpha" || s.name != "alpha" {
+		t.Fatalf("default active = %q (order[0]=%q), want alpha (sorted first)", s.name, s.order[0])
+	}
+	// No cookie -> the default active repo (the container itself).
+	if got := s.active(httptest.NewRequest("GET", "/", nil)); got != s {
+		t.Fatal("no-cookie request did not resolve to the default active repo")
+	}
+	// An unknown/unregistered cookie also falls back to the default, never nil.
+	req := httptest.NewRequest("GET", "/", nil)
+	req.AddCookie(&http.Cookie{Name: repoCookie, Value: "ghost"})
+	if got := s.active(req); got != s {
+		t.Fatal("unknown cookie must fall back to the default active repo")
+	}
+	// Per-repo keyring isolation: each server owns its own GPGHome + recipient,
+	// and the two never coincide (no shared keyring across routed repos).
+	a, b := s.siblings["alpha"], s.siblings["bravo"]
+	if a.cfg.GPGRecipient != "alpha@example.com" || b.cfg.GPGRecipient != "bravo@example.com" {
+		t.Fatalf("keyring recipients not per-repo: a=%q b=%q", a.cfg.GPGRecipient, b.cfg.GPGRecipient)
+	}
+	if a.cfg.GPGHome == b.cfg.GPGHome || a.cfg.GPGRecipient == b.cfg.GPGRecipient {
+		t.Fatalf("routed repos must not share a keyring: a=%q/%q b=%q/%q",
+			a.cfg.GPGHome, a.cfg.GPGRecipient, b.cfg.GPGHome, b.cfg.GPGRecipient)
+	}
+}
+
+// TestRegistryReadRoutingByCookie proves a read is dispatched to the repo named by
+// the selection cookie: the dashboard shows the ACTIVE repo's submodule and never
+// the other's. The default (no cookie) is the sorted-first repo.
+func TestRegistryReadRoutingByCookie(t *testing.T) {
+	s, _, _ := twoRepoRegistry(t)
+	mux := s.Routes()
+
+	def := getRepo(t, mux, "/", "").Body.String()
+	if !strings.Contains(def, "redteam") || strings.Contains(def, "bluecrew") {
+		t.Fatalf("default dashboard must show alpha's submodule only:\n%s", def)
+	}
+	alpha := getRepo(t, mux, "/", "alpha").Body.String()
+	if !strings.Contains(alpha, "redteam") || strings.Contains(alpha, "bluecrew") {
+		t.Fatalf("alpha dashboard must show redteam only:\n%s", alpha)
+	}
+	bravo := getRepo(t, mux, "/", "bravo").Body.String()
+	if !strings.Contains(bravo, "bluecrew") || strings.Contains(bravo, "redteam") {
+		t.Fatalf("bravo dashboard must show bluecrew only (routing leaked):\n%s", bravo)
+	}
+}
+
+// TestRegistryWriteRoutingAndCrossRepo404 proves a write lands in the ACTIVE
+// repo's submodule and that a submodule belonging to ANOTHER registered repo is
+// unreachable (404) — the write path never crawls across repos. With bravo
+// selected the same name resolves and the write reaches bravo's root.
+func TestRegistryWriteRoutingAndCrossRepo404(t *testing.T) {
+	s, rootAlpha, rootBravo := twoRepoRegistry(t)
+	mux := s.Routes()
+
+	// Default active = alpha: writing alpha's submodule succeeds and lands in rootAlpha.
+	if w := postRepo(t, mux, "/roi/redteam", "", url.Values{"body": {"# red\n"}}); w.Code != 200 {
+		t.Fatalf("write to active repo submodule %d: %s", w.Code, w.Body)
+	}
+	if b, _ := os.ReadFile(filepath.Join(rootAlpha, "submodules", "redteam", repo.ROIFile)); string(b) != "# red\n" {
+		t.Fatalf("active-repo write not persisted to rootAlpha: %q", b)
+	}
+	// bluecrew belongs to bravo; with alpha active it must 404 (no cross-repo crawl)
+	// and bravo's file must be untouched.
+	if w := postRepo(t, mux, "/roi/bluecrew", "", url.Values{"body": {"# leak\n"}}); w.Code != http.StatusNotFound {
+		t.Fatalf("cross-repo submodule must 404 under the active repo, got %d", w.Code)
+	}
+	if b, _ := os.ReadFile(filepath.Join(rootBravo, "submodules", "bluecrew", repo.ROIFile)); string(b) != "# bluecrew\n" {
+		t.Fatalf("cross-repo write leaked into rootBravo: %q", b)
+	}
+	// Select bravo: now bluecrew resolves and the write reaches rootBravo.
+	if w := postRepo(t, mux, "/roi/bluecrew", "bravo", url.Values{"body": {"# blue\n"}}); w.Code != 200 {
+		t.Fatalf("write to bravo submodule %d: %s", w.Code, w.Body)
+	}
+	if b, _ := os.ReadFile(filepath.Join(rootBravo, "submodules", "bluecrew", repo.ROIFile)); string(b) != "# blue\n" {
+		t.Fatalf("bravo write not persisted to rootBravo: %q", b)
+	}
+}
+
+// TestRegistryRepoSwitch locks the switch endpoint: POST /repo/{name} for a
+// REGISTERED repo sets the selection cookie and redirects, while a switch to an
+// unregistered handle is refused with 404 (an arbitrary name is never trusted).
+func TestRegistryRepoSwitch(t *testing.T) {
+	s, _, _ := twoRepoRegistry(t)
+	mux := s.Routes()
+
+	w := postRepo(t, mux, "/repo/bravo", "", url.Values{})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("switch to bravo: got %d, want 303", w.Code)
+	}
+	var set *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == repoCookie {
+			set = c
+		}
+	}
+	if set == nil || set.Value != "bravo" {
+		t.Fatalf("switch did not set %s=bravo cookie: %+v", repoCookie, w.Result().Cookies())
+	}
+	if u := postRepo(t, mux, "/repo/ghost", "", url.Values{}); u.Code != http.StatusNotFound {
+		t.Fatalf("switch to unregistered repo must 404, got %d", u.Code)
+	}
+}
+
+// TestRegistryConcurrentNoLeak is the core concurrency guarantee: selection lives
+// entirely in the per-request cookie, never a shared server field, so many
+// simultaneous requests each resolve their OWN active repo. Under -race, if a
+// selection ever leaked across requests a response would show the wrong repo's
+// submodule and the test fails.
+func TestRegistryConcurrentNoLeak(t *testing.T) {
+	s, _, _ := twoRepoRegistry(t)
+	mux := s.Routes()
+
+	cases := []struct{ cookie, want, notWant string }{
+		{"alpha", "redteam", "bluecrew"},
+		{"bravo", "bluecrew", "redteam"},
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 60; i++ {
+		c := cases[i%len(cases)]
+		wg.Add(1)
+		go func(cookie, want, notWant string) {
+			defer wg.Done()
+			body := getRepo(t, mux, "/", cookie).Body.String()
+			if !strings.Contains(body, want) || strings.Contains(body, notWant) {
+				t.Errorf("cookie %q routed wrong: want %q, must not contain %q:\n%s", cookie, want, notWant, body)
+			}
+		}(c.cookie, c.want, c.notWant)
+	}
+	wg.Wait()
 }

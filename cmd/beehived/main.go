@@ -5,12 +5,10 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 
 	"github.com/spencerharmon/beehive/internal/config"
-	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spencerharmon/beehive/internal/web"
 )
 
@@ -27,52 +25,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("registry: %v", err)
 	}
-	// Web routing is single-repo until multi-repo-web-routing lands; serve the
-	// active (first by sorted name) registered repo. For a bare install that is
-	// the synthesized single entry == today's --repo, projected to the same config.
-	entry, cfg, err := serveTarget(reg)
-	if err != nil {
-		log.Fatalf("registry: %v", err)
-	}
-	if len(reg.Repos) > 1 {
-		log.Printf("beehived: %d repos registered; serving %q until multi-repo routing lands", len(reg.Repos), entry.Name)
-	}
-	r, err := repo.Open(entry.Root)
-	if err != nil {
-		log.Fatalf("open repo %s: %v", entry.Root, err)
-	}
-	s, err := web.New(r, cfg)
+	// Serve EVERY registered repo under per-active-repo routing: NewRegistry wires
+	// one per-repo server (own repo/keyring/config) for each entry and dispatches
+	// each request to the selected repo (POST /repo/{name} switch; default = the
+	// first registered name). A single-entry (bare install) registry keeps today's
+	// flat single-repo routes with no regression.
+	s, err := web.NewRegistry(reg)
 	if err != nil {
 		log.Fatalf("web: %v", err)
 	}
-	// Startup housekeeping: recover in-flight editor sessions and prune stale
-	// edit worktrees a prior beehived left behind. Best-effort — a failure here
-	// must not stop the daemon from serving.
+	// Startup housekeeping: recover in-flight editor sessions and prune stale edit
+	// worktrees a prior beehived left behind, for every served repo. Best-effort —
+	// a failure here must not stop the daemon from serving.
 	if err := s.RecoverEditors(context.Background()); err != nil {
 		log.Printf("editor recovery: %v", err)
 	}
-	log.Printf("beehived listening on %s (repo %s)", *addr, entry.Root)
+	if names := reg.Names(); len(names) > 1 {
+		log.Printf("beehived: serving %d repos %v; default active %q (switch via POST /repo/{name})", len(names), names, names[0])
+	}
+	log.Printf("beehived listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, s.Routes()))
-}
-
-// serveTarget selects the active repo entry the daemon serves from a resolved
-// registry — the first repo by sorted name — and projects its effective config:
-// entry.Config(config.Resolve(entry.Root, "")), i.e. the per-repo keyring + agent
-// overrides layered over that repo's own resolved base config. This is the
-// temporary single-repo bridge; multi-repo-web-routing replaces it by handing the
-// whole registry to the web server so every repo is served under its own routes.
-func serveTarget(reg config.Registry) (config.RepoEntry, config.Config, error) {
-	names := reg.Names()
-	if len(names) == 0 {
-		return config.RepoEntry{}, config.Config{}, fmt.Errorf("empty registry: no repo to serve")
-	}
-	entry, ok := reg.Repo(names[0])
-	if !ok {
-		return config.RepoEntry{}, config.Config{}, fmt.Errorf("registry: repo %q missing", names[0])
-	}
-	base, err := config.Resolve(entry.Root, "")
-	if err != nil {
-		return config.RepoEntry{}, config.Config{}, err
-	}
-	return entry, entry.Config(base), nil
 }
