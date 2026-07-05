@@ -105,6 +105,18 @@ func TestInitScaffolds(t *testing.T) {
 	}
 }
 
+// TestRulesFileConstant pins the beehive-owned per-submodule RULES.md overlay path
+// (submodule-rules-md): it is exactly "RULES.md", sits alongside the other layout
+// constants, and is distinct from AGENTS.md (the overlay it is additive to).
+func TestRulesFileConstant(t *testing.T) {
+	if RulesFile != "RULES.md" {
+		t.Fatalf("RulesFile = %q, want %q", RulesFile, "RULES.md")
+	}
+	if RulesFile == AgentsFile {
+		t.Fatal("RulesFile must be distinct from AgentsFile (RULES.md is additive to AGENTS.md, not a rename)")
+	}
+}
+
 func gitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

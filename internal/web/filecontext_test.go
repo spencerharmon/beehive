@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/spencerharmon/beehive/internal/plan"
+	"github.com/spencerharmon/beehive/internal/repo"
 )
 
 // TestResolveFileContextDistinct: the resolver yields a distinct, file-appropriate
@@ -61,6 +62,35 @@ func TestResolveFileContextDistinct(t *testing.T) {
 	// bare ROI.md resolve to the same rule.
 	if resolveFileContext("submodules/alpha/ROI.md") != resolveFileContext("ROI.md") {
 		t.Error("ROI.md rule should match regardless of directory")
+	}
+}
+
+// TestRulesFileContextKeysOffConstant locks the submodule-rules-md wiring of the
+// chat-diff editor (agent/edit) context: the resolver keys the RULES.md rule off
+// the shared repo.RulesFile constant (not a stray literal), a submodule-qualified
+// RULES.md resolves the same as the bare basename, and the preamble states the
+// additive AGENTS-then-RULES order.
+func TestRulesFileContextKeysOffConstant(t *testing.T) {
+	smPath := filepath.ToSlash(filepath.Join("submodules", "alpha", repo.RulesFile))
+	got := resolveFileContext(smPath)
+	for _, sub := range []string{repo.RulesFile, "ADDITIVE", repo.AgentsFile} {
+		if !strings.Contains(got, sub) {
+			t.Errorf("RULES.md context missing %q:\n%s", sub, got)
+		}
+	}
+	// AGENTS.md applied first, then the additive RULES.md — the ordering the
+	// explorer and honeybee overlay also honor.
+	if !strings.Contains(got, "applied first") || !strings.Contains(got, "then RULES.md") {
+		t.Errorf("RULES.md context does not state AGENTS-then-RULES order:\n%s", got)
+	}
+	// Basename match: submodule-qualified resolves identically to the bare name,
+	// and both differ from the AGENTS.md overlay rule (RULES is additive, not a
+	// rename of AGENTS).
+	if resolveFileContext(smPath) != resolveFileContext(repo.RulesFile) {
+		t.Error("RULES.md rule should match regardless of directory")
+	}
+	if resolveFileContext(repo.RulesFile) == resolveFileContext(repo.AgentsFile) {
+		t.Error("RULES.md and AGENTS.md must resolve to distinct preambles")
 	}
 }
 

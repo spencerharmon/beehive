@@ -949,6 +949,56 @@ func TestExplorerRendersMarkdown(t *testing.T) {
 	}
 }
 
+// TestExplorerShowsAgentsAndRules locks the submodule-rules-md acceptance for the
+// explorer: a present AGENTS.md and the beehive-owned RULES.md overlay both render,
+// in AGENTS-then-RULES order (the additive-overlay order the agent context also
+// applies). The docs map renders by sorted key, so "AGENTS" deterministically
+// precedes "RULES".
+func TestExplorerShowsAgentsAndRules(t *testing.T) {
+	s, root := setup(t)
+	sm := filepath.Join(root, "submodules", "alpha")
+	if err := os.WriteFile(filepath.Join(sm, repo.AgentsFile), []byte("# alpha agents\nAGENTS-OVERLAY-MARKER\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sm, repo.RulesFile), []byte("# alpha rules\nRULES-OVERLAY-MARKER\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := get(t, s, "/submodule/alpha")
+	if w.Code != 200 {
+		t.Fatalf("explorer %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	// Both overlays are rendered (as markdown, not raw dumped).
+	for _, want := range []string{"<h2>AGENTS</h2>", "AGENTS-OVERLAY-MARKER", "<h2>RULES</h2>", "RULES-OVERLAY-MARKER"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("explorer missing %q:\n%s", want, body)
+		}
+	}
+	// AGENTS.md is applied first, then the additive RULES.md: the AGENTS section
+	// must precede the RULES section in the rendered page.
+	if ai, ri := strings.Index(body, "<h2>AGENTS</h2>"), strings.Index(body, "<h2>RULES</h2>"); ai < 0 || ri < 0 || ai > ri {
+		t.Fatalf("explorer order not AGENTS-then-RULES (agents@%d rules@%d):\n%s", ai, ri, body)
+	}
+}
+
+// TestExplorerRulesAbsentNoOp: with no RULES.md on disk the explorer renders
+// normally (200) and simply omits the RULES section — an absent overlay is a safe
+// no-op, never an error or an empty placeholder.
+func TestExplorerRulesAbsentNoOp(t *testing.T) {
+	s, root := setup(t)
+	// Guard the fixture: setup writes ROI.md + PLAN.md only, no RULES.md.
+	if _, err := os.Stat(filepath.Join(root, "submodules", "alpha", repo.RulesFile)); !os.IsNotExist(err) {
+		t.Fatalf("fixture unexpectedly has RULES.md (err=%v)", err)
+	}
+	w := get(t, s, "/submodule/alpha")
+	if w.Code != 200 {
+		t.Fatalf("explorer %d: %s", w.Code, w.Body)
+	}
+	if strings.Contains(w.Body.String(), "<h2>RULES</h2>") {
+		t.Fatalf("explorer showed a RULES section with no RULES.md on disk:\n%s", w.Body)
+	}
+}
+
 // TestROIViewRendersAndRawVerbatim locks the dual contract for the editor: the
 // ROI VIEW shows a rendered preview while the editable textarea keeps the RAW
 // source verbatim (the edit round-trip must not be lost to rendering).

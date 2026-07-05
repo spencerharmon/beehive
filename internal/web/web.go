@@ -324,8 +324,19 @@ func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 	// reachable through the per-file editor (ROI editor / chat editor links).
 	docs := map[string]template.HTML{}
 	// PLAN and ROI render their raw markdown (PLAN's structure lives in
-	// internal/plan; ROI is human-owned and edited verbatim).
-	for label, f := range map[string]string{"PLAN": repo.PlanFile, "ROI": repo.ROIFile} {
+	// internal/plan; ROI is human-owned and edited verbatim). AGENTS.md is the
+	// per-submodule rules overlay and RULES.md is the beehive-owned overlay
+	// ADDITIVE to it — both are shown when present (the explorer's docs map is
+	// rendered by sorted key, so "AGENTS" precedes "RULES": the AGENTS-then-RULES
+	// order the agent context also applies). os.ReadFile only populates a label on
+	// success, so an absent file is silently skipped — RULES.md's absence is a
+	// safe no-op.
+	for label, f := range map[string]string{
+		"PLAN":   repo.PlanFile,
+		"ROI":    repo.ROIFile,
+		"AGENTS": repo.AgentsFile,
+		"RULES":  repo.RulesFile,
+	} {
 		if b, err := os.ReadFile(filepath.Join(sm.Path, f)); err == nil {
 			docs[label] = renderMarkdown(string(b))
 		}
