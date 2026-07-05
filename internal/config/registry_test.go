@@ -199,6 +199,40 @@ func TestRepoEntryConfigPerKeyring(t *testing.T) {
 	}
 }
 
+// TestRepoByRootMatches confirms RepoByRoot resolves the entry that owns a given
+// filesystem root — the CLI's bridge from "the repo I'm invoked in" to that
+// repo's isolated keyring — matching regardless of a trailing slash or a
+// non-cleaned path, and reporting not-found for a root no entry owns (which the
+// caller turns into a fail-loud "not registered" rather than a shared-keyring
+// fallback). The empty registry owns no root.
+func TestRepoByRootMatches(t *testing.T) {
+	// Use real directories so the symlink-resolving normalization has targets.
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	reg := Registry{Repos: []RepoEntry{
+		{Name: "a", Root: rootA, GPGHome: filepath.Join(rootA, "gnupg"), GPGRecipient: "a@example.com"},
+		{Name: "b", Root: rootB, GPGHome: filepath.Join(rootB, "gnupg"), GPGRecipient: "b@example.com"},
+	}}
+	if e, ok := reg.RepoByRoot(rootA); !ok || e.Name != "a" {
+		t.Fatalf("RepoByRoot(rootA) = %+v ok=%v, want entry a", e, ok)
+	}
+	// A trailing slash and an un-cleaned path still resolve to the same entry.
+	if e, ok := reg.RepoByRoot(rootB + "/"); !ok || e.Name != "b" {
+		t.Fatalf("RepoByRoot(rootB/) = %+v ok=%v, want entry b", e, ok)
+	}
+	if e, ok := reg.RepoByRoot(filepath.Join(rootA, "sub", "..")); !ok || e.Name != "a" {
+		t.Fatalf("RepoByRoot(rootA/sub/..) = %+v ok=%v, want entry a", e, ok)
+	}
+	// A root no entry owns is not found (caller must fail loudly).
+	if _, ok := reg.RepoByRoot(t.TempDir()); ok {
+		t.Fatal("RepoByRoot(unregistered root) should be not-found")
+	}
+	// The empty (legacy) registry owns no root.
+	if _, ok := (Registry{}).RepoByRoot(rootA); ok {
+		t.Fatal("empty registry RepoByRoot should be not-found")
+	}
+}
+
 // TestLoadRegistryFromExplicitDir confirms LoadRegistryFrom reads an explicit dir
 // (the BEEHIVE_CONFIG_DIR-independent core), and a missing dir file is empty.
 func TestLoadRegistryFromExplicitDir(t *testing.T) {

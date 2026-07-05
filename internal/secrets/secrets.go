@@ -2,6 +2,13 @@
 // document (no document separators) holding key/value secrets. A global file
 // lives at repo root; per-submodule files live at submodules/<name>/. Encryption
 // shells out to gpg using the configured GPGHome keyring. Deterministic; no LLM.
+//
+// GPGHome is REQUIRED for any gpg operation: an empty GPGHome is a hard error,
+// never a silent fall-through to gpg's process-default keyring. In a multi-repo
+// daemon every repo carries its OWN keyring (config.RepoEntry.Config), so a
+// blank home could only mean a mis-wired caller — and letting it reach the shared
+// default keyring would break the per-repo secret isolation the registry
+// guarantees. Fail loudly instead.
 package secrets
 
 import (
@@ -20,7 +27,7 @@ import (
 // Store decrypts/encrypts one SECRETS.yaml.gpg via gpg with GPGHome + Recipient.
 type Store struct {
 	Path      string // path to SECRETS.yaml.gpg
-	GPGHome   string // keyring dir; "" = gpg default
+	GPGHome   string // keyring dir (REQUIRED; empty is an error, never gpg default)
 	Recipient string // gpg recipient (key id/email) for encryption
 }
 
@@ -32,11 +39,15 @@ func SubmodulePath(root, name string) string {
 	return filepath.Join(root, "submodules", name, repo.SecretsFile)
 }
 
-func (s Store) base() []string {
-	if s.GPGHome != "" {
-		return []string{"--homedir", s.GPGHome, "--batch", "--yes"}
+// base returns the shared gpg args (keyring home + batch flags), erroring when no
+// keyring is configured. An empty GPGHome is REFUSED rather than run against
+// gpg's process-default keyring, so a mis-wired caller can never cross the
+// per-repo secret-isolation boundary (no shared-keyring fallback).
+func (s Store) base() ([]string, error) {
+	if s.GPGHome == "" {
+		return nil, errors.New("secrets: no gpg keyring configured (refusing shared-keyring fallback)")
 	}
-	return []string{"--batch", "--yes"}
+	return []string{"--homedir", s.GPGHome, "--batch", "--yes"}, nil
 }
 
 // Load decrypts the file into a single yaml document. A missing file is an empty
@@ -52,8 +63,12 @@ func (s Store) Load(ctx context.Context) (map[string]any, error) {
 	if len(bytes.TrimSpace(enc)) == 0 {
 		return map[string]any{}, nil
 	}
+	args, err := s.base()
+	if err != nil {
+		return nil, err
+	}
 	var out, errb bytes.Buffer
-	cmd := exec.CommandContext(ctx, "gpg", append(s.base(), "--decrypt")...)
+	cmd := exec.CommandContext(ctx, "gpg", append(args, "--decrypt")...)
 	cmd.Stdin = bytes.NewReader(enc)
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -72,6 +87,10 @@ func (s Store) Save(ctx context.Context, doc map[string]any) error {
 	if s.Recipient == "" {
 		return errors.New("secrets: no gpg recipient configured")
 	}
+	args, err := s.base()
+	if err != nil {
+		return err
+	}
 	plain, err := yaml.Marshal(doc)
 	if err != nil {
 		return err
@@ -80,7 +99,7 @@ func (s Store) Save(ctx context.Context, doc map[string]any) error {
 		return err
 	}
 	var out, errb bytes.Buffer
-	cmd := exec.CommandContext(ctx, "gpg", append(s.base(), "--recipient", s.Recipient, "--encrypt")...)
+	cmd := exec.CommandContext(ctx, "gpg", append(args, "--recipient", s.Recipient, "--encrypt")...)
 	cmd.Stdin = bytes.NewReader(plain)
 	cmd.Stdout = &out
 	cmd.Stderr = &errb

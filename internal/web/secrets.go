@@ -13,8 +13,14 @@ import (
 )
 
 // listSecretKeys decrypts SECRETS.yaml.gpg and returns sorted top-level keys
-// only. Values are never exposed. Missing file => no keys, no error.
+// only. Values are never exposed. Missing file => no keys, no error. gpgHome is
+// the ACTIVE repo's keyring and is REQUIRED: an empty home is refused (fail
+// loudly) rather than run against gpg's process-default keyring, so a request
+// can never read secrets through a shared keyring.
 func listSecretKeys(ctx context.Context, gpgHome, path string) ([]string, error) {
+	if gpgHome == "" {
+		return nil, errors.New("secrets: no gpg keyring configured (refusing shared-keyring fallback)")
+	}
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -38,7 +44,12 @@ func listSecretKeys(ctx context.Context, gpgHome, path string) ([]string, error)
 }
 
 // setSecret decrypts (if present), sets key=value, and re-encrypts the doc.
+// gpgHome/recipient are the ACTIVE repo's keyring and are REQUIRED: an empty home
+// is refused (fail loudly) so a write can never land in a shared keyring.
 func setSecret(ctx context.Context, gpgHome, path, recipient, key, value string) error {
+	if gpgHome == "" {
+		return errors.New("secrets: no gpg keyring configured (refusing shared-keyring fallback)")
+	}
 	m := map[string]interface{}{}
 	if _, err := os.Stat(path); err == nil {
 		plain, err := gpgDecrypt(ctx, gpgHome, path)

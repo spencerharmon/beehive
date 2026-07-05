@@ -838,6 +838,10 @@ func (s *Server) roiPost(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "roi_editor.html", map[string]interface{}{"Name": sm.Name, "Body": body, "Saved": true, "Rendered": renderMarkdown(body)})
 }
 
+// secretsGet lists the ACTIVE repo's secret KEYS (never values). s is the
+// per-request active repo's server (resolved by bind/active), so s.cfg.GPGHome is
+// that repo's OWN isolated keyring and s.repo.Root its own SECRETS.yaml.gpg — a
+// request can only ever read the selected repo's secrets, never a sibling's.
 func (s *Server) secretsGet(w http.ResponseWriter, r *http.Request) {
 	keys, err := listSecretKeys(r.Context(), s.cfg.GPGHome, filepath.Join(s.repo.Root, repo.SecretsFile))
 	if err != nil {
@@ -847,6 +851,10 @@ func (s *Server) secretsGet(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "secrets_panel.html", map[string]interface{}{"Keys": keys})
 }
 
+// secretsPost writes one key into the ACTIVE repo's SECRETS.yaml.gpg. Like
+// secretsGet, s is the active repo's server, so the write is encrypted to that
+// repo's OWN recipient under its OWN keyring (s.cfg.GPGHome/GPGRecipient) and
+// lands in its OWN root — the per-repo keyring isolation the registry guarantees.
 func (s *Server) secretsPost(w http.ResponseWriter, r *http.Request) {
 	key, val := r.FormValue("key"), r.FormValue("value")
 	if key == "" {
