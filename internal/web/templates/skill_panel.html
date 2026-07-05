@@ -1,0 +1,23 @@
+{{if .Result}}
+<div class="skill-result">
+<p><span class="badge live">{{.Result.Done}} done</span>{{if .Result.Failed}} <span class="badge">{{.Result.Failed}} failed</span>{{end}}</p>
+{{if .Result.Lines}}<ul class="skill-outcome">{{range .Result.Lines}}<li>{{.}}</li>{{end}}</ul>{{end}}
+<p class="muted">Applied. Re-run the dry-run to confirm nothing remains.</p>
+</div>
+{{else if .Plan}}
+<div class="skill-plan">
+{{if .Plan.Report}}<ul class="skill-report">{{range .Plan.Report}}<li class="muted">{{.}}</li>{{end}}</ul>{{end}}
+{{if .Plan.Actionable}}
+<p><span class="badge">{{len .Plan.Actions}}</span> action(s) this apply would perform:</p>
+<ul class="skill-actions">{{range .Plan.Actions}}<li><code>{{.Summary}}</code></li>{{end}}</ul>
+{{if .Plan.Destructive}}
+<p class="state dirty">Destructive &mdash; applying performs the git/filesystem changes above.</p>
+<button class="merge danger" hx-post="/skills/{{.Plan.Skill}}/apply" hx-vals='{"confirm":"yes"}' hx-confirm="Apply these destructive maintenance actions?" hx-target="#skill-panel-{{.Plan.Skill}}" hx-swap="innerHTML">Apply</button>
+{{else}}
+<button class="merge" hx-post="/skills/{{.Plan.Skill}}/apply" hx-target="#skill-panel-{{.Plan.Skill}}" hx-swap="innerHTML">Apply</button>
+{{end}}
+{{else}}
+<p class="state live">Nothing to apply &mdash; report only.</p>
+{{end}}
+</div>
+{{end}}

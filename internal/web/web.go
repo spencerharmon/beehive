@@ -48,6 +48,13 @@ type Server struct {
 	// unified diff, applied+committed only on human approval (chat-diff-editor-core).
 	chat *chatManager
 
+	// skills is the named maintenance-skill surface (chat-skills): each skill runs
+	// a deterministic, read-only dry-run that previews the concrete actions it
+	// WOULD take, held in memory until the operator applies exactly that plan — a
+	// destructive skill's apply gated behind an explicit confirm. It mirrors the
+	// chat propose→approve loop for repo-global maintenance instead of a file edit.
+	skills *skillManager
+
 	// gitMu serializes operations that mutate the primary beehive checkout (where
 	// main is checked out): the viewer's periodic `git pull --ff-only main` that
 	// follows off-box sessions, and the frontend's own commit/publish. Without it a
@@ -86,7 +93,7 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	// the single-file editor); it opens a per-edit ROOT worktree and awaits each
 	// turn (opencode-turn-poll) before rendering the proposed diff.
 	oc := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}}
-	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: newChatManager(r.Root, oc)}, nil
+	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: newChatManager(r.Root, oc), skills: newSkillManager(r.Root, r, g)}, nil
 }
 
 // pullInterval is the resolved follow-the-remote coalescing window (config
@@ -137,6 +144,10 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /env/deploy", s.envDeploy)
 	mux.HandleFunc("GET /human", s.human)
 	mux.HandleFunc("GET /hygiene", s.hygiene)
+	// Named maintenance skills (chat-skills): list, dry-run preview, gated apply.
+	mux.HandleFunc("GET /skills", s.skillsPage)
+	mux.HandleFunc("POST /skills/{name}/plan", s.skillPlan)
+	mux.HandleFunc("POST /skills/{name}/apply", s.skillApply)
 	// AI editor chat (browser): one worktree branch per session.
 	mux.HandleFunc("GET /edit", s.editEntry)
 	mux.HandleFunc("POST /edit", s.chatOpen)

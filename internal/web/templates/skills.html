@@ -1,0 +1,14 @@
+{{template "header"}}
+<h1>Maintenance skills</h1>
+<p class="muted">Named, invocable maintenance operations. Each runs a deterministic, read-only <strong>dry-run</strong> that previews the concrete actions it would take &mdash; nothing is mutated until you apply that exact plan, and a destructive skill's apply requires an explicit confirmation.</p>
+<div class="cards">
+{{range .Skills}}
+<section class="card" id="skill-{{.Name}}" aria-label="skill {{.Name}}">
+<h3>{{.Title}} <code>{{.Name}}</code> {{if .Destructive}}<span class="badge">destructive</span>{{else}}<span class="badge live">read-only</span>{{end}}</h3>
+<p class="muted">{{.Summary}}</p>
+<button class="merge" hx-post="/skills/{{.Name}}/plan" hx-target="#skill-panel-{{.Name}}" hx-swap="innerHTML">Dry-run</button>
+<div class="skill-panel" id="skill-panel-{{.Name}}"></div>
+</section>
+{{end}}
+</div>
+{{template "footer"}}
