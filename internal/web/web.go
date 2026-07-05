@@ -7,6 +7,7 @@ import (
 	"context"
 	"embed"
 	"errors"
+	"fmt"
 	"html/template"
 	"net/http"
 	"os"
@@ -70,6 +71,19 @@ type Server struct {
 	// (sessionStream). 0 means the default (streamIvl); tests set it small to keep
 	// them fast.
 	streamInterval time.Duration
+
+	// Multi-repo routing (set ONLY on the container returned by NewRegistry; nil
+	// on a single-repo Server from New). The container IS one of the per-repo
+	// servers — siblings[order[0]], the default active repo — and additionally
+	// holds the whole registered set so Routes can dispatch each request to the
+	// server for that request's ACTIVE repo (see active/bind). Selection is
+	// per-request (the repoCookie), never a mutable field, so it can never leak
+	// across concurrent requests. name is this server's registry handle ("" for a
+	// single-repo server).
+	name     string
+	reg      config.Registry
+	siblings map[string]*Server // registry name -> per-repo server (incl. the container itself)
+	order    []string           // registry names sorted ascending; order[0] is the default active repo
 }
 
 // New builds a Server over the beehive repo at root.
@@ -90,6 +104,126 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: newChatManager(r.Root, oc)}, nil
 }
 
+// repoCookie carries the selected repo handle for a multi-repo daemon. Selection
+// lives ENTIRELY in this per-request cookie (set by POST /repo/{name}), never in
+// a server field, so concurrent requests each resolve their own active repo and a
+// switch can never leak across them. An absent or unregistered cookie falls back
+// to the default active repo (the first registered name, sorted).
+const repoCookie = "beehive_repo"
+
+// NewRegistry builds the multi-repo frontend: one fully-wired per-repo Server for
+// every RepoEntry in reg, each resolved exactly as the daemon contract specifies
+// — entry.Config(config.Resolve(entry.Root, "")) for the effective per-repo
+// config (that repo's own layered config under the entry's isolated keyring +
+// agent overrides) and repo.Open(entry.Root) for the repo. Each per-repo server
+// owns its OWN repo/git/config/editors/chat/cache, so repos never share mutable
+// state and a request routed to one can never crawl into another.
+//
+// The returned Server is the container: it IS the default active repo's server
+// (siblings[order[0]]) and additionally holds the registry + every sibling, so
+// Routes dispatches each request to the server for that request's active repo.
+// An empty registry is an error (the daemon always resolves at least a
+// synthesized single entry via config.ResolveRegistry). A single-entry registry
+// yields flat, unprefixed routes byte-identical to New's single-repo server
+// (multi reports false) — the no-regression path.
+func NewRegistry(reg config.Registry) (*Server, error) {
+	if reg.Empty() {
+		return nil, fmt.Errorf("web: empty registry, no repo to serve")
+	}
+	servers := make(map[string]*Server, len(reg.Repos))
+	for _, e := range reg.Repos {
+		base, err := config.Resolve(e.Root, "")
+		if err != nil {
+			return nil, fmt.Errorf("web: resolve config for repo %q: %w", e.Name, err)
+		}
+		r, err := repo.Open(e.Root)
+		if err != nil {
+			return nil, fmt.Errorf("web: open repo %q at %s: %w", e.Name, e.Root, err)
+		}
+		srv, err := New(r, e.Config(base))
+		if err != nil {
+			return nil, fmt.Errorf("web: build server for repo %q: %w", e.Name, err)
+		}
+		srv.name = e.Name
+		servers[e.Name] = srv
+	}
+	order := reg.Names() // sorted ascending; order[0] is the default active repo
+	container := servers[order[0]]
+	container.reg = reg
+	container.siblings = servers
+	container.order = order
+	return container, nil
+}
+
+// multi reports whether this server routes more than one registered repo. A
+// single-entry (or single-repo New) server is not multi: it keeps flat routes,
+// exposes no /repo switch, and every request resolves to this one server.
+func (s *Server) multi() bool { return len(s.siblings) > 1 }
+
+// targets is every per-repo server this frontend serves, in sorted registry
+// order. A single-repo server is its own only target. Used for cross-repo startup
+// housekeeping (RecoverEditors) that must touch every repo, not just the active
+// one.
+func (s *Server) targets() []*Server {
+	if len(s.siblings) == 0 {
+		return []*Server{s}
+	}
+	out := make([]*Server, 0, len(s.siblings))
+	for _, name := range s.order {
+		out = append(out, s.siblings[name])
+	}
+	return out
+}
+
+// active resolves the per-repo server a request is routed to: the repo named by
+// the request's selection cookie when it is a REGISTERED repo, else the default
+// (order[0]). A single-repo server always resolves to itself. Resolution reads
+// only the request and the immutable registry maps — no shared mutable selection
+// state — so concurrent requests never leak a selection across one another.
+func (s *Server) active(r *http.Request) *Server {
+	if !s.multi() {
+		return s
+	}
+	if c, err := r.Cookie(repoCookie); err == nil {
+		if srv, ok := s.siblings[c.Value]; ok {
+			return srv
+		}
+	}
+	return s // container == siblings[order[0]], the default active repo
+}
+
+// bind adapts a Server handler method to the request's active repo: it resolves
+// the active per-repo server per request and invokes the handler on it. Every
+// route is wired through bind, so in multi-repo mode a request transparently runs
+// against its selected repo and in single-repo mode against the only server — the
+// existing handlers are reused unchanged and never crawl across repos.
+func (s *Server) bind(h func(*Server, http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		h(s.active(r), w, r)
+	}
+}
+
+// repoSwitch selects the active repo for subsequent requests by setting the
+// selection cookie, rejecting a switch to an unregistered handle with 404 (never
+// trusting an arbitrary name). Registered only in multi-repo mode. The selection
+// lives in the client cookie, not a server field, so switching is per-client and
+// cannot race concurrent requests.
+func (s *Server) repoSwitch(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, ok := s.reg.Repo(name); !ok {
+		http.Error(w, "unknown repo "+name, http.StatusNotFound)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     repoCookie,
+		Value:    name,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 // pullInterval is the resolved follow-the-remote coalescing window (config
 // session_pull_seconds), defaulting to 2s when unset. It bounds how often the
 // polled session panes actually hit the remote to fast-forward local main.
@@ -101,68 +235,86 @@ func pullInterval(cfg config.Config) time.Duration {
 	return time.Duration(s) * time.Second
 }
 
-// RecoverEditors runs the editor's startup recovery: it re-registers persisted
-// in-flight edit sessions and prunes stale/abandoned edit worktrees left behind
-// by a previous beehived (see editor.Manager.Reload). It is best-effort startup
+// RecoverEditors runs the editor's startup recovery for EVERY served repo: a
+// multi-repo daemon must re-register each repo's persisted in-flight edit
+// sessions and prune each one's stale/abandoned edit worktrees, not just the
+// active repo's (see editor.Manager.Reload). It is best-effort startup
 // housekeeping — the daemon calls it once before serving and treats a failure as
 // non-fatal — so a recovery hiccup never blocks the frontend from starting.
 func (s *Server) RecoverEditors(ctx context.Context) error {
-	return s.editors.Reload(ctx)
+	for _, srv := range s.targets() {
+		if err := srv.editors.Reload(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Routes returns the mux wired to all handlers.
+// Routes returns the mux wired to all handlers. Every handler is bound through
+// s.bind, which dispatches the request to its ACTIVE repo (the selection cookie
+// in multi-repo mode, the sole repo otherwise) — so the one handler set serves
+// every registered repo without crawling across them. In multi-repo mode the
+// POST /repo/{name} switch is additionally registered; a single-repo (or
+// single-entry) server keeps exactly today's flat, unprefixed routes.
 func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.dashboard)
-	mux.HandleFunc("GET /bootstrap", s.bootstrapAgent)
-	mux.HandleFunc("GET /stats", s.stats)
-	mux.HandleFunc("GET /submodule/{name}", s.explorer)
-	mux.HandleFunc("GET /submodule/{name}/branches", s.branches)
-	mux.HandleFunc("GET /submodule/{name}/doc/{file}", s.doc)
-	mux.HandleFunc("GET /submodule/{name}/plan", s.plan)
-	mux.HandleFunc("POST /submodule/{name}/plan/delete", s.planDelete)
-	mux.HandleFunc("GET /submodule/{name}/sessions", s.sessionsList)
-	mux.HandleFunc("GET /submodule/{name}/sessions/body", s.sessionsListBody)
-	mux.HandleFunc("GET /submodule/{name}/session/{branch}", s.sessionView)
-	mux.HandleFunc("GET /submodule/{name}/session/{branch}/body", s.sessionBody)
-	mux.HandleFunc("GET /submodule/{name}/session/{branch}/stream", s.sessionStream)
-	mux.HandleFunc("GET /roi/{name}", s.roiGet)
-	mux.HandleFunc("POST /roi/{name}", s.roiPost)
-	mux.HandleFunc("GET /secrets", s.secretsGet)
-	mux.HandleFunc("POST /secrets", s.secretsPost)
-	mux.HandleFunc("GET /merge", s.mergeGet)
-	mux.HandleFunc("POST /merge", s.mergePost)
-	mux.HandleFunc("POST /submodule/add", s.submoduleAdd)
-	mux.HandleFunc("POST /submodule/link", s.submoduleLink)
-	mux.HandleFunc("GET /env", s.envGet)
-	mux.HandleFunc("POST /env/deploy", s.envDeploy)
-	mux.HandleFunc("GET /human", s.human)
-	mux.HandleFunc("GET /hygiene", s.hygiene)
+	b := s.bind
+	mux.HandleFunc("GET /{$}", b((*Server).dashboard))
+	mux.HandleFunc("GET /bootstrap", b((*Server).bootstrapAgent))
+	mux.HandleFunc("GET /stats", b((*Server).stats))
+	mux.HandleFunc("GET /submodule/{name}", b((*Server).explorer))
+	mux.HandleFunc("GET /submodule/{name}/branches", b((*Server).branches))
+	mux.HandleFunc("GET /submodule/{name}/doc/{file}", b((*Server).doc))
+	mux.HandleFunc("GET /submodule/{name}/plan", b((*Server).plan))
+	mux.HandleFunc("POST /submodule/{name}/plan/delete", b((*Server).planDelete))
+	mux.HandleFunc("GET /submodule/{name}/sessions", b((*Server).sessionsList))
+	mux.HandleFunc("GET /submodule/{name}/sessions/body", b((*Server).sessionsListBody))
+	mux.HandleFunc("GET /submodule/{name}/session/{branch}", b((*Server).sessionView))
+	mux.HandleFunc("GET /submodule/{name}/session/{branch}/body", b((*Server).sessionBody))
+	mux.HandleFunc("GET /submodule/{name}/session/{branch}/stream", b((*Server).sessionStream))
+	mux.HandleFunc("GET /roi/{name}", b((*Server).roiGet))
+	mux.HandleFunc("POST /roi/{name}", b((*Server).roiPost))
+	mux.HandleFunc("GET /secrets", b((*Server).secretsGet))
+	mux.HandleFunc("POST /secrets", b((*Server).secretsPost))
+	mux.HandleFunc("GET /merge", b((*Server).mergeGet))
+	mux.HandleFunc("POST /merge", b((*Server).mergePost))
+	mux.HandleFunc("POST /submodule/add", b((*Server).submoduleAdd))
+	mux.HandleFunc("POST /submodule/link", b((*Server).submoduleLink))
+	mux.HandleFunc("GET /env", b((*Server).envGet))
+	mux.HandleFunc("POST /env/deploy", b((*Server).envDeploy))
+	mux.HandleFunc("GET /human", b((*Server).human))
+	mux.HandleFunc("GET /hygiene", b((*Server).hygiene))
 	// Maintenance skills: an index of named actions each with a read-only dry-run
 	// (plan) and a separate apply; destructive skills gate apply on confirm.
-	mux.HandleFunc("GET /skills", s.skillsPage)
-	mux.HandleFunc("POST /skills/{name}/plan", s.skillPlanHandler)
-	mux.HandleFunc("POST /skills/{name}/apply", s.skillApplyHandler)
+	mux.HandleFunc("GET /skills", b((*Server).skillsPage))
+	mux.HandleFunc("POST /skills/{name}/plan", b((*Server).skillPlanHandler))
+	mux.HandleFunc("POST /skills/{name}/apply", b((*Server).skillApplyHandler))
 	// AI editor chat (browser): one worktree branch per session.
-	mux.HandleFunc("GET /edit", s.editEntry)
-	mux.HandleFunc("POST /edit", s.chatOpen)
-	mux.HandleFunc("GET /edit/{id}", s.chatPage)
-	mux.HandleFunc("GET /edit/{id}/panel", s.chatPanel)
-	mux.HandleFunc("POST /edit/{id}/message", s.chatMessage)
-	mux.HandleFunc("POST /edit/{id}/approve", s.chatApprove)
-	mux.HandleFunc("POST /edit/{id}/reject", s.chatReject)
-	mux.HandleFunc("GET /editor/{id}", s.editorPage)
-	mux.HandleFunc("GET /editor/{id}/panel", s.editorPanel)
-	mux.HandleFunc("POST /editor/{id}/chat", s.editorChat)
-	mux.HandleFunc("POST /editor/{id}/merge", s.editorMerge)
-	mux.HandleFunc("POST /editor/{id}/close", s.editorClose)
+	mux.HandleFunc("GET /edit", b((*Server).editEntry))
+	mux.HandleFunc("POST /edit", b((*Server).chatOpen))
+	mux.HandleFunc("GET /edit/{id}", b((*Server).chatPage))
+	mux.HandleFunc("GET /edit/{id}/panel", b((*Server).chatPanel))
+	mux.HandleFunc("POST /edit/{id}/message", b((*Server).chatMessage))
+	mux.HandleFunc("POST /edit/{id}/approve", b((*Server).chatApprove))
+	mux.HandleFunc("POST /edit/{id}/reject", b((*Server).chatReject))
+	mux.HandleFunc("GET /editor/{id}", b((*Server).editorPage))
+	mux.HandleFunc("GET /editor/{id}/panel", b((*Server).editorPanel))
+	mux.HandleFunc("POST /editor/{id}/chat", b((*Server).editorChat))
+	mux.HandleFunc("POST /editor/{id}/merge", b((*Server).editorMerge))
+	mux.HandleFunc("POST /editor/{id}/close", b((*Server).editorClose))
 	// AI editor chat (JSON API): browser-free clients.
-	mux.HandleFunc("POST /api/editor", s.apiEditorOpen)
-	mux.HandleFunc("GET /api/editor/{id}", s.apiEditorGet)
-	mux.HandleFunc("POST /api/editor/{id}/chat", s.apiEditorChat)
-	mux.HandleFunc("POST /api/editor/{id}/merge", s.apiEditorMerge)
-	mux.HandleFunc("GET /api/editor/{id}/diff", s.apiEditorDiff)
+	mux.HandleFunc("POST /api/editor", b((*Server).apiEditorOpen))
+	mux.HandleFunc("GET /api/editor/{id}", b((*Server).apiEditorGet))
+	mux.HandleFunc("POST /api/editor/{id}/chat", b((*Server).apiEditorChat))
+	mux.HandleFunc("POST /api/editor/{id}/merge", b((*Server).apiEditorMerge))
+	mux.HandleFunc("GET /api/editor/{id}/diff", b((*Server).apiEditorDiff))
 	mux.Handle("GET /assets/", http.FileServer(http.FS(assetFS)))
+	// Multi-repo selection: switch the active repo for subsequent requests. Only
+	// registered in multi-repo mode, so a single-repo daemon keeps today's flat
+	// routes with no extra endpoint.
+	if s.multi() {
+		mux.HandleFunc("POST /repo/{name}", s.repoSwitch)
+	}
 	return mux
 }
 
