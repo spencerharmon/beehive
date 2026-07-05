@@ -1,7 +1,10 @@
 #!/usr/bin/env sh
-# Package postinstall: scaffold /etc/beehive keyring + generate a key if absent.
-# Binaries and config.yaml are placed by the package payload; this only owns
-# the gpg keyring so reinstalls never clobber existing keys/config.
+# Package postinstall for the SYSTEM (opt-in) install: scaffold /etc/beehive
+# keyring + generate a key if absent. The rootless user install
+# (scripts/install.sh, default) is the documented primary path; a distro package
+# is the explicit /etc/beehive system install. Binaries and config.yaml are placed
+# by the package payload; this only owns the gpg keyring so reinstalls never
+# clobber existing keys/config.
 set -eu
 CONFDIR=/etc/beehive
 GPGHOME="$CONFDIR/gnupg"

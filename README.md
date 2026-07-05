@@ -29,40 +29,40 @@ done
 
 ## Install directly from repo
 
-System install to `/usr/local/bin` and `/etc/beehive`:
+User install (default, no root) to `$HOME/.local/bin` and `$HOME/.config/beehive`:
 
 ```sh
 git clone https://github.com/spencerharmon/beehive.git
 cd beehive
-sudo ./scripts/install.sh
+./scripts/install.sh
+export PATH="$HOME/.local/bin:$PATH"   # if not already on PATH
 beehive version
 ```
 
-User-local install without sudo:
+No sudo is needed to create or read the keyring; `beehive secret` works out of the box because the binary resolves `$HOME/.config/beehive` on its own (no `BEEHIVE_CONFIG_DIR` export).
+
+System install (opt-in) to `/usr/local/bin` and `/etc/beehive`:
 
 ```sh
-git clone https://github.com/spencerharmon/beehive.git
-cd beehive
-PREFIX="$HOME/.local" \
-BEEHIVE_CONFIG_DIR="$HOME/.config/beehive" \
-./scripts/install.sh
-export PATH="$HOME/.local/bin:$PATH"
+sudo ./scripts/install.sh --system
 beehive version
 ```
 
 Installer behavior:
 
+- Defaults to the rootless **user** install; `--system` selects `/usr/local` + `/etc/beehive`.
+- `PREFIX` and `BEEHIVE_CONFIG_DIR` override the per-mode defaults.
 - Installs `beehive`, `beehived`, and `honeybee`.
 - Prefers matching `dist/<binary>-<os>-<arch>` or `dist/<binary>` release artifacts when present.
 - Builds from source when artifacts are absent.
-- Creates config directory and `config.yaml` only if missing.
+- Creates config directory and `config.yaml` (with `gpg_recipient: beehive@localhost`) only if missing.
 - Creates gpg keyring and generates key only if `gpg` exists and no secret key exists.
 - Honors `PREFIX`, `BEEHIVE_CONFIG_DIR`, `DESTDIR`, `TMPDIR`, `CGO_ENABLED`, and `BEEHIVE_SKIP_KEYGEN=1`.
 
 Staged install for packaging:
 
 ```sh
-DESTDIR="$PWD/stage" PREFIX=/usr/local ./scripts/install.sh
+DESTDIR="$PWD/stage" ./scripts/install.sh --system
 ```
 
 ## Run beehived
@@ -118,13 +118,13 @@ beehived -repo .
 
 ## Systemd user units
 
-Install user units and a user-local gpg keyring/config:
+The default rootless way to run the services — user units plus a user-local gpg keyring/config, no root:
 
 ```sh
 ./scripts/install-systemd-user.sh --repo ~/beehive-infra --now
 ```
 
-The script writes `~/.config/systemd/user/opencode.service`, `beehived.service`, `beehive-honeybee.service`, and `beehive-honeybee.timer`; creates `~/.config/beehive/config.yaml`; and generates a real gpg key under `~/.config/beehive/gnupg` when no secret key exists. The opencode server unit (`opencode serve`, default `127.0.0.1:4096`) is installed by default; pass `--no-opencode` to skip it.
+The script writes `~/.config/systemd/user/opencode.service`, `beehived.service`, `beehive-honeybee.service`, and `beehive-honeybee.timer`; creates `~/.config/beehive/config.yaml`; and generates a real gpg key under `~/.config/beehive/gnupg` when no secret key exists. The opencode server unit (`opencode serve`, default `127.0.0.1:4096`) is installed by default; pass `--no-opencode` to skip it. With the default config dir the units carry no `BEEHIVE_CONFIG_DIR` export (the binary resolves `~/.config/beehive` itself); a custom `--config-dir` keeps an explicit override.
 
 Example unit contents and manual install steps live in `docs/orchestration.md`. They run the frontend on port `8955` and launch honeybee passes as transient `run-*.service` units so long passes do not block the timer.
 
@@ -154,12 +154,13 @@ beehive instruction list|update
 
 ## Configuration
 
-Default config dir: `/etc/beehive`. Override with `BEEHIVE_CONFIG_DIR`.
+The config/keyring dir is resolved **user-first**: `$BEEHIVE_CONFIG_DIR` if set, else `~/.config/beehive` when it exists (the default user install), else `/etc/beehive` (the system install). No `BEEHIVE_CONFIG_DIR` export is needed for either default.
 
-Default `config.yaml`:
+Default `config.yaml` (a user install substitutes `~/.config/beehive` for `/etc/beehive`):
 
 ```yaml
 gpg_home: /etc/beehive/gnupg
+gpg_recipient: beehive@localhost
 agent_cmd: opencode
 ttl_minutes: 60
 max_turns: 15

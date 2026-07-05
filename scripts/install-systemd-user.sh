@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
-# Install beehive systemd user units and user-local config/keyring.
+# Install beehive systemd USER units and user-local config/keyring — the default,
+# rootless way to run the services (no root, no sudo, no system units).
 #
 # Creates:
 #   ~/.config/beehive/config.yaml
@@ -8,6 +9,10 @@
 #   ~/.config/systemd/user/beehived.service
 #   ~/.config/systemd/user/beehive-honeybee.service
 #   ~/.config/systemd/user/beehive-honeybee.timer
+#
+# When the config dir is the default ~/.config/beehive, the binary resolves it on
+# its own (config-dir-user-first), so the generated units carry NO
+# BEEHIVE_CONFIG_DIR export; a custom --config-dir keeps an explicit override.
 #
 # Safe to re-run: existing config.yaml and gpg keys are not clobbered. Unit files
 # are regenerated from arguments so path/port/schedule changes take effect after
@@ -45,8 +50,21 @@ Environment defaults:
 EOF
 }
 
+# Default user config/keyring dir, kept in lockstep with internal/config
+# resolveDir: use $XDG_CONFIG_HOME when ABSOLUTE (a relative value is invalid per
+# the XDG Base Directory spec and ignored), else ~/.config; always suffixed with
+# /beehive. Matching resolveDir is what lets the binary find the installed dir with
+# no BEEHIVE_CONFIG_DIR export.
+user_config_dir() {
+  base="$HOME/.config"
+  case "${XDG_CONFIG_HOME:-}" in
+    /*) base="$XDG_CONFIG_HOME" ;;
+  esac
+  printf '%s/beehive' "$base"
+}
+
 repo="${BEEHIVE_REPO:-}"
-config_dir="${BEEHIVE_CONFIG_DIR:-$HOME/.config/beehive}"
+config_dir="${BEEHIVE_CONFIG_DIR:-$(user_config_dir)}"
 addr="0.0.0.0:8955"
 calendar="*:0/7"
 on_active="2min"
@@ -152,6 +170,19 @@ unit_on_active=$(escape_unit "$on_active")
 unit_opencode_cmd=$(escape_unit "$opencode_cmd")
 unit_opencode_hostname=$(escape_unit "$opencode_hostname")
 
+# BEEHIVE_CONFIG_DIR in the units: with config-dir-user-first the binary
+# auto-resolves the DEFAULT user config dir (~/.config/beehive) from HOME/XDG with
+# no env, so the units need NO export in that case (unit_config_env / run_config_env
+# stay empty). A CUSTOM --config-dir is not auto-resolved, so keep an explicit
+# override so beehived and each honeybee pass open the right keyring.
+if [ "$config_dir" = "$(user_config_dir)" ]; then
+  unit_config_env=""
+  run_config_env=""
+else
+  unit_config_env="Environment=\"BEEHIVE_CONFIG_DIR=$unit_config_dir\""
+  run_config_env="\"BEEHIVE_CONFIG_DIR=$unit_config_dir\" "
+fi
+
 # add_opencode_dep inserts `Wants=/After=opencode.service` into a unit's [Unit]
 # section (right after its `After=network-online.target` line) so the frontend and
 # each honeybee pass order after a reachable opencode server. No-op when the
@@ -176,6 +207,7 @@ chmod 0700 "$gpg_home"
 if [ ! -f "$config_dir/config.yaml" ]; then
   cat > "$config_dir/config.yaml" <<EOF
 gpg_home: $gpg_home
+gpg_recipient: beehive@localhost
 agent_cmd: opencode
 ttl_minutes: 60
 max_turns: 15
@@ -245,7 +277,7 @@ After=network-online.target
 [Service]
 Type=simple
 Environment="PATH=$unit_path_escaped"
-Environment="BEEHIVE_CONFIG_DIR=$unit_config_dir"
+$unit_config_env
 ExecStart=/usr/bin/env beehived -addr "$unit_addr" -repo "$unit_repo"
 Restart=on-failure
 RestartSec=5s
@@ -269,11 +301,11 @@ After=network-online.target
 [Service]
 Type=oneshot
 Environment="PATH=$unit_path_escaped"
-Environment="BEEHIVE_CONFIG_DIR=$unit_config_dir"
+$unit_config_env
 ExecStart=/usr/bin/systemd-run --user --collect --quiet \\
   -p SyslogIdentifier=honeybee \\
   -p RuntimeMaxSec=$runtime_max \\
-  /usr/bin/env "PATH=$unit_path_escaped" "BEEHIVE_CONFIG_DIR=$unit_config_dir" \\
+  /usr/bin/env "PATH=$unit_path_escaped" ${run_config_env}\\
   beehive honeybee start "$unit_repo"$honeybee_debug_arg
 EOF
 add_opencode_dep "$unit_dir/beehive-honeybee.service"
@@ -324,6 +356,11 @@ fi
 echo "installed systemd user units in $unit_dir"
 echo "config: $config_dir"
 echo "gpg_home: $gpg_home"
+if [ -n "$unit_config_env" ]; then
+  echo "config resolution: units export BEEHIVE_CONFIG_DIR=$config_dir (custom dir)"
+else
+  echo "config resolution: auto (default ~/.config/beehive; no BEEHIVE_CONFIG_DIR export)"
+fi
 echo "repo: $repo"
 if [ "$opencode_enable" -eq 1 ]; then
   echo "opencode server: $opencode_cmd serve --hostname $opencode_hostname --port $opencode_port"
