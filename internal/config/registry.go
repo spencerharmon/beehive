@@ -158,6 +158,39 @@ func (r Registry) Repo(name string) (RepoEntry, bool) {
 	return RepoEntry{}, false
 }
 
+// RepoByRoot returns the entry whose Root is the SAME filesystem path as root
+// (compared after normalizing both to an absolute, symlink-resolved, cleaned
+// path). ok is false when no registered repo lives at that root. The CLI uses it
+// to resolve the ACTIVE repo's isolated keyring from the directory it runs in:
+// with a present registry, a root that is not a registered repo MUST fail loudly
+// (the caller refuses a shared-keyring fallback) rather than silently reuse a
+// process-global keyring.
+func (r Registry) RepoByRoot(root string) (RepoEntry, bool) {
+	want := normRoot(root)
+	for _, e := range r.Repos {
+		if normRoot(e.Root) == want {
+			return e, true
+		}
+	}
+	return RepoEntry{}, false
+}
+
+// normRoot normalizes a repo root for identity comparison: absolute, with
+// symlinks resolved when the path exists (so e.g. /tmp vs /private/tmp or a
+// bind-mounted root compare equal), falling back to a plain lexical clean of the
+// absolute path when the target does not exist. It never fails — a bad path just
+// compares unequal, so RepoByRoot reports "not registered" and the caller fails
+// loudly.
+func normRoot(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return filepath.Clean(p)
+}
+
 // Validate enforces the registry invariants. An empty Registry (legacy
 // single-repo mode) is always valid. For a non-empty Registry every entry must
 // set Name, Root, GPGHome and GPGRecipient, and across entries the Name, Root,

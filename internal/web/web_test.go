@@ -2705,3 +2705,135 @@ func TestRegistryConcurrentNoLeak(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// newGPGKeyring generates a self-contained gpg keyring in home with its OWN
+// keypair (recipient email); it skips the test when gpg is unavailable or key
+// generation fails. Two such keyrings share NO key material, so a document
+// encrypted to one can never be decrypted by the other — the substrate for the
+// cross-repo isolation proof.
+func newGPGKeyring(t *testing.T, home, recipient string) {
+	t.Helper()
+	if _, err := exec.LookPath("gpg"); err != nil {
+		t.Skip("gpg not installed")
+	}
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(home, 0o700)
+	batch := "Key-Type: RSA\nKey-Length: 2048\nName-Real: bh\nName-Email: " +
+		recipient + "\nExpire-Date: 0\n%no-protection\n%commit\n"
+	cmd := exec.Command("gpg", "--homedir", home, "--batch", "--gen-key")
+	cmd.Stdin = strings.NewReader(batch)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("gpg gen-key failed: %v: %s", err, out)
+	}
+}
+
+// twoRealKeyringRegistry wires a two-repo frontend whose entries carry REAL,
+// distinct gpg keyrings (unlike twoRepoRegistry, which only sets keyring paths for
+// routing tests). It is the fixture for the end-to-end secret-isolation proof.
+func twoRealKeyringRegistry(t *testing.T) (s *Server, rootAlpha, rootBravo string) {
+	t.Helper()
+	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
+	rootAlpha = initBeehiveRepo(t, "redteam")
+	rootBravo = initBeehiveRepo(t, "bluecrew")
+	// Keep the keyrings OUTSIDE the repo roots so publishMain's `git add -A` never
+	// stages gpg keyring/agent files, and each repo's SECRETS.yaml.gpg is the only
+	// secret artifact under its root.
+	keyDir := t.TempDir()
+	homeA := filepath.Join(keyDir, "alpha")
+	homeB := filepath.Join(keyDir, "bravo")
+	rcptA, rcptB := "alpha@example.com", "bravo@example.com"
+	newGPGKeyring(t, homeA, rcptA)
+	newGPGKeyring(t, homeB, rcptB)
+	reg := config.Registry{Repos: []config.RepoEntry{
+		{Name: "alpha", Root: rootAlpha, GPGHome: homeA, GPGRecipient: rcptA},
+		{Name: "bravo", Root: rootBravo, GPGHome: homeB, GPGRecipient: rcptB},
+	}}
+	if err := reg.Validate(); err != nil {
+		t.Fatalf("fixture registry invalid: %v", err)
+	}
+	s, err := NewRegistry(reg)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	return s, rootAlpha, rootBravo
+}
+
+// TestRegistrySecretKeyringIsolation is the acceptance isolation proof: with two
+// registered repos and two real gpg homes, a secret written through repo alpha's
+// handler is encrypted to alpha's OWN keyring, alpha can read it back, and repo
+// bravo's keyring CANNOT decrypt alpha's SECRETS.yaml.gpg. The write also never
+// touches bravo's root — the handler uses the active repo's keyring only.
+func TestRegistrySecretKeyringIsolation(t *testing.T) {
+	s, rootAlpha, rootBravo := twoRealKeyringRegistry(t)
+	mux := s.Routes()
+	ctx := context.Background()
+
+	// Write a secret via alpha's handler (alpha is the default active repo).
+	if w := postRepo(t, mux, "/secrets", "alpha", url.Values{"key": {"db_pw"}, "value": {"hunter2"}}); w.Code != 200 {
+		t.Fatalf("alpha secret write: %d %s", w.Code, w.Body)
+	}
+	alphaPath := filepath.Join(rootAlpha, repo.SecretsFile)
+	if _, err := os.Stat(alphaPath); err != nil {
+		t.Fatalf("alpha SECRETS.yaml.gpg not written: %v", err)
+	}
+	homeA := s.siblings["alpha"].cfg.GPGHome
+	homeB := s.siblings["bravo"].cfg.GPGHome
+	if homeA == homeB {
+		t.Fatal("fixture bug: alpha and bravo share a keyring home")
+	}
+
+	// Alpha's OWN keyring reads its OWN secret's key back.
+	keys, err := listSecretKeys(ctx, homeA, alphaPath)
+	if err != nil {
+		t.Fatalf("alpha keyring must read its own secret: %v", err)
+	}
+	if len(keys) != 1 || keys[0] != "db_pw" {
+		t.Fatalf("alpha keys = %v, want [db_pw]", keys)
+	}
+
+	// THE PROOF: bravo's keyring CANNOT decrypt alpha's SECRETS.yaml.gpg. A nil
+	// error here would mean bravo could read alpha's secrets — isolation broken.
+	if _, err := listSecretKeys(ctx, homeB, alphaPath); err == nil {
+		t.Fatal("SECURITY: bravo's keyring decrypted alpha's secrets — per-repo isolation broken")
+	}
+
+	// The write landed only in alpha's root; bravo's has no secrets file.
+	if _, err := os.Stat(filepath.Join(rootBravo, repo.SecretsFile)); !os.IsNotExist(err) {
+		t.Fatalf("alpha secret write leaked into bravo root (stat err=%v)", err)
+	}
+
+	// Symmetric direction: bravo's handler writes under bravo's keyring, and alpha
+	// cannot decrypt it either.
+	if w := postRepo(t, mux, "/secrets", "bravo", url.Values{"key": {"api_key"}, "value": {"s3cr3t"}}); w.Code != 200 {
+		t.Fatalf("bravo secret write: %d %s", w.Code, w.Body)
+	}
+	bravoPath := filepath.Join(rootBravo, repo.SecretsFile)
+	if bkeys, err := listSecretKeys(ctx, homeB, bravoPath); err != nil || len(bkeys) != 1 || bkeys[0] != "api_key" {
+		t.Fatalf("bravo keyring must read its own secret: keys=%v err=%v", bkeys, err)
+	}
+	if _, err := listSecretKeys(ctx, homeA, bravoPath); err == nil {
+		t.Fatal("SECURITY: alpha's keyring decrypted bravo's secrets — per-repo isolation broken")
+	}
+}
+
+// TestSecretsNoKeyringFailsLoudly confirms the web secrets primitives refuse to
+// operate with no keyring configured (empty gpgHome) instead of silently falling
+// through to gpg's process-default keyring — the "no shared-keyring fallback"
+// rule, enforced independent of whether gpg is installed.
+func TestSecretsNoKeyringFailsLoudly(t *testing.T) {
+	ctx := context.Background()
+	// A present, non-empty ciphertext file so listSecretKeys does not take the
+	// missing-file fast path before the keyring guard.
+	p := filepath.Join(t.TempDir(), repo.SecretsFile)
+	if err := os.WriteFile(p, []byte("ciphertext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := listSecretKeys(ctx, "", p); err == nil {
+		t.Fatal("listSecretKeys with empty gpgHome must fail loudly")
+	}
+	if err := setSecret(ctx, "", p, "x@example.com", "k", "v"); err == nil {
+		t.Fatal("setSecret with empty gpgHome must fail loudly")
+	}
+}

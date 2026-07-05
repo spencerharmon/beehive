@@ -8,6 +8,54 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// secretStore builds the secrets.Store for the beehive repo at root, scoped to
+// the ACTIVE repo's OWN gpg keyring — never a process-global keyring.
+//
+//   - Multi-repo (a host repos.yaml is present): the entry whose root is this
+//     repo supplies the keyring via RepoEntry.Config, exactly as the daemon wires
+//     each per-repo server. A root that is NOT a registered repo is a hard error:
+//     we refuse to fall back to a shared/global keyring (the isolation guarantee).
+//   - Legacy single-repo (no repos.yaml): the host-layer config keyring is used,
+//     byte-identical to before, so bare installs are unchanged.
+//
+// recipient, when non-empty, overrides the resolved recipient (an explicit
+// operator choice); submodule selects the per-submodule secrets path under the
+// same repo root and keyring.
+func secretStore(root, submodule, recipient string) (secrets.Store, error) {
+	reg, err := config.LoadRegistry()
+	if err != nil {
+		return secrets.Store{}, err
+	}
+	var cfg config.Config
+	if reg.Empty() {
+		// Legacy single-repo path: unchanged host-layer keyring resolution.
+		if cfg, err = config.Load(); err != nil {
+			return secrets.Store{}, err
+		}
+	} else {
+		e, ok := reg.RepoByRoot(root)
+		if !ok {
+			return secrets.Store{}, fmt.Errorf(
+				"beehive secret: repo at %s is not registered in %s; refusing a shared-keyring fallback (register it with its own gpg_home/gpg_recipient)",
+				root, config.RegistryFile)
+		}
+		base, err := config.Resolve(root, "")
+		if err != nil {
+			return secrets.Store{}, err
+		}
+		cfg = e.Config(base) // per-repo isolated keyring (GPGHome + GPGRecipient)
+	}
+	rcpt := recipient
+	if rcpt == "" {
+		rcpt = cfg.GPGRecipient
+	}
+	path := secrets.GlobalPath(root)
+	if submodule != "" {
+		path = secrets.SubmodulePath(root, submodule)
+	}
+	return secrets.Store{Path: path, GPGHome: cfg.GPGHome, Recipient: rcpt}, nil
+}
+
 func secretCmd() *cobra.Command {
 	var submodule, recipient string
 	c := &cobra.Command{Use: "secret", Short: "manage gpg-encrypted SECRETS.yaml.gpg"}
@@ -19,19 +67,7 @@ func secretCmd() *cobra.Command {
 		if err != nil {
 			return secrets.Store{}, err
 		}
-		cfg, err := config.Load()
-		if err != nil {
-			return secrets.Store{}, err
-		}
-		rcpt := recipient
-		if rcpt == "" {
-			rcpt = cfg.GPGRecipient
-		}
-		path := secrets.GlobalPath(root)
-		if submodule != "" {
-			path = secrets.SubmodulePath(root, submodule)
-		}
-		return secrets.Store{Path: path, GPGHome: cfg.GPGHome, Recipient: rcpt}, nil
+		return secretStore(root, submodule, recipient)
 	}
 
 	var file string

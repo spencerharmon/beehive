@@ -83,3 +83,30 @@ func TestMultiDocRejected(t *testing.T) {
 		t.Fatal("multi-doc not rejected")
 	}
 }
+
+// TestEmptyGPGHomeFailsLoudly confirms a Store with no keyring configured refuses
+// every gpg operation instead of silently falling through to gpg's process-
+// default keyring (the shared-keyring fallback that would break per-repo secret
+// isolation). Load of a NON-EMPTY file and any Save must error; the missing-file
+// fast path (no gpg invoked) stays a benign empty map.
+func TestEmptyGPGHomeFailsLoudly(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "SECRETS.yaml.gpg")
+	s := Store{Path: path, GPGHome: "", Recipient: "x@example.com"}
+
+	// Missing file: still no gpg call, so the empty-map contract is preserved.
+	if d, err := s.Load(ctx); err != nil || len(d) != 0 {
+		t.Fatalf("missing-file Load with empty home = %v, %v; want empty map, nil", d, err)
+	}
+	// A present, non-empty file would need gpg to decrypt: must fail loudly.
+	if err := os.WriteFile(path, []byte("not-empty-ciphertext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load(ctx); err == nil {
+		t.Fatal("Load with empty GPGHome must fail loudly (no shared-keyring fallback)")
+	}
+	// Save always needs gpg: must fail loudly regardless of file state.
+	if err := s.Save(ctx, map[string]any{"k": "v"}); err == nil {
+		t.Fatal("Save with empty GPGHome must fail loudly (no shared-keyring fallback)")
+	}
+}
