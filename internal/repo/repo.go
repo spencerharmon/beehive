@@ -11,13 +11,16 @@ import (
 
 // Layout names. ROI is human-owned and never written by honeybees. LOCALS is
 // the site-specific operator record (authored per install, never managed);
-// BOOTSTRAP is the managed setup walkthrough installed at init.
+// BOOTSTRAP is the managed setup walkthrough installed at init. RULES is a
+// beehive-owned, per-submodule rules overlay ADDITIVE to any AGENTS.md (both are
+// read into agent context, AGENTS first then RULES); its absence is a safe no-op.
 const (
 	AgentsFile    = "AGENTS.md"
 	PlanFile      = "PLAN.md"
 	ROIFile       = "ROI.md"
 	InfraFile     = "INFRASTRUCTURE.md"
 	Artifacts     = "ARTIFACTS.md"
+	RulesFile     = "RULES.md"
 	LinksFile     = "SUBMODULE-LINKS.yaml"
 	SecretsFile   = "SECRETS.yaml.gpg"
 	LocalsFile    = "LOCALS.md"

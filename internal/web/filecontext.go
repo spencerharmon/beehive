@@ -30,13 +30,13 @@ type fileContextRule struct {
 }
 
 // fileContextRules is the resolver table. Order is irrelevant (basenames are
-// unique); the first exact-basename match wins. RULES.md rides submodule-rules-md
-// (a beehive-owned per-submodule overlay); its rule is present here so the
-// context is ready the moment that file exists.
+// unique); the first exact-basename match wins. RULES.md is the beehive-owned
+// per-submodule overlay (repo.RulesFile, submodule-rules-md); its rule keys off
+// the same constant every other reader uses so the context stays in lockstep.
 var fileContextRules = []fileContextRule{
 	{repo.ROIFile, roiFileContext},
 	{repo.PlanFile, planFileContext},
-	{"RULES.md", rulesFileContext},
+	{repo.RulesFile, rulesFileContext},
 	{repo.AgentsFile, agentsFileContext},
 	{repo.InfraFile, infraFileContext},
 	{repo.Artifacts, artifactsFileContext},
