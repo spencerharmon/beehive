@@ -11,7 +11,8 @@ import (
 
 // Layout names. ROI is human-owned and never written by honeybees. LOCALS is
 // the site-specific operator record (authored per install, never managed);
-// BOOTSTRAP is the managed setup walkthrough installed at init.
+// AGENTS/HONEYBEE/BOOTSTRAP are the managed instruction defaults the binary ships
+// and `beehive instruction update` refreshes.
 const (
 	AgentsFile    = "AGENTS.md"
 	PlanFile      = "PLAN.md"
@@ -22,6 +23,7 @@ const (
 	SecretsFile   = "SECRETS.yaml.gpg"
 	LocalsFile    = "LOCALS.md"
 	BootstrapFile = "BOOTSTRAP.md"
+	HoneybeeFile  = "HONEYBEE.md"
 )
 
 // roiStamp matches the PLAN.md reconcile marker: <!-- Beehive-ROI: <sha> -->

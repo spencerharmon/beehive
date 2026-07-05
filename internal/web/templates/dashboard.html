@@ -15,6 +15,17 @@
   <div class="card-links"><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">branches</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <a href="/roi/{{.Name}}">roi</a> · <a href="/edit?path=submodules/{{.Name}}/ROI.md">edit roi (AI)</a></div>
 </div>{{else}}<p>no submodules</p>{{end}}
 </div>
+<section class="instruction-files">
+<h2>Instruction files</h2>
+<ul class="doc-list">
+{{range .RootDocs}}<li class="doc-row">
+  <span class="doc-name">{{.Title}}</span>
+  <span class="badge{{if .Managed}} managed{{end}}" title="{{if .Managed}}beehive-managed default — instruction update refreshes it{{else}}site-authored — never auto-generated{{end}}">{{if .Managed}}managed{{else}}site{{end}}</span>
+  {{if .Present}}<span class="badge present" title="present on disk">present</span> <span class="doc-links"><a href="{{.ViewHref}}">view</a> · <a href="{{.EditHref}}">edit (AI)</a></span>{{else}}<span class="badge absent" title="not created yet">absent</span> <span class="doc-links"><a href="{{.EditHref}}">create (AI)</a></span>{{end}}
+  <p class="muted small">{{.Purpose}}</p>
+</li>{{end}}
+</ul>
+</section>
 <div class="cards">{{template "hygiene-widget" .Hygiene}}</div>
 <form method="post" action="/submodule/add">
   <input name="url" placeholder="repo url (git@host:org/repo.git)" required>

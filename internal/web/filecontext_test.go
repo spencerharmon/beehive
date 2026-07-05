@@ -64,6 +64,62 @@ func TestResolveFileContextDistinct(t *testing.T) {
 	}
 }
 
+// TestRootInstructionFileContexts: each of the three root instruction files that
+// gains a dedicated create/edit rule (HONEYBEE.md, BOOTSTRAP.md, LOCALS.md)
+// resolves to its own file-appropriate preamble, and all are pairwise distinct
+// from each other, from AGENTS.md, and from the generic default. This is what
+// makes an absent-file create seed the RIGHT ownership guidance (managed vs
+// site-authored) rather than a generic one.
+func TestRootInstructionFileContexts(t *testing.T) {
+	cases := map[string]struct {
+		path        string
+		wantSubs    []string
+		wantNotSubs []string
+	}{
+		"honeybee":  {"HONEYBEE.md", []string{"HONEYBEE.md", "RUNTIME PROTOCOL", "instruction update"}, []string{"SITE-SPECIFIC", "ordinary file"}},
+		"bootstrap": {"BOOTSTRAP.md", []string{"BOOTSTRAP.md", "SETUP WALKTHROUGH", "instruction update"}, []string{"RUNTIME PROTOCOL", "ordinary file"}},
+		// LOCALS.md is site-authored: its guidance marks it site-specific and forbids
+		// auto-generation (it DOES name "instruction update" — to say it never touches
+		// it — so that is not a distinguishing negative; the managed protocol/setup
+		// tokens are).
+		"locals": {"LOCALS.md", []string{"LOCALS.md", "SITE-SPECIFIC", "auto-generated", "never touches"}, []string{"RUNTIME PROTOCOL", "SETUP WALKTHROUGH", "ordinary file"}},
+	}
+	got := map[string]string{}
+	for name, c := range cases {
+		p := resolveFileContext(c.path)
+		if strings.TrimSpace(p) == "" {
+			t.Fatalf("%s: empty preamble for %q", name, c.path)
+		}
+		for _, sub := range c.wantSubs {
+			if !strings.Contains(p, sub) {
+				t.Errorf("%s (%q): preamble missing %q:\n%s", name, c.path, sub, p)
+			}
+		}
+		for _, sub := range c.wantNotSubs {
+			if strings.Contains(p, sub) {
+				t.Errorf("%s (%q): preamble should not contain %q:\n%s", name, c.path, sub, p)
+			}
+		}
+		got[name] = p
+	}
+	// Distinct from each other, from AGENTS.md, and from the generic default.
+	got["agents"] = resolveFileContext("AGENTS.md")
+	got["default"] = resolveFileContext("internal/web/web.go")
+	names := []string{"honeybee", "bootstrap", "locals", "agents", "default"}
+	for i := 0; i < len(names); i++ {
+		for j := i + 1; j < len(names); j++ {
+			if got[names[i]] == got[names[j]] {
+				t.Errorf("preambles for %s and %s are identical; expected distinct", names[i], names[j])
+			}
+		}
+	}
+	// Basename match is directory-independent: a submodule-qualified HONEYBEE.md
+	// resolves to the same rule as the bare root basename.
+	if resolveFileContext("submodules/alpha/HONEYBEE.md") != resolveFileContext("HONEYBEE.md") {
+		t.Error("HONEYBEE.md rule should match regardless of directory")
+	}
+}
+
 // TestChatSystemPromptSeedsFileRules: the system prompt built for a path carries
 // that file's rules, AND the same prompt is what is seeded into the opencode
 // session (captured end-to-end via the fake client). This is the "seeded prompt

@@ -38,6 +38,9 @@ var fileContextRules = []fileContextRule{
 	{repo.PlanFile, planFileContext},
 	{"RULES.md", rulesFileContext},
 	{repo.AgentsFile, agentsFileContext},
+	{repo.HoneybeeFile, honeybeeFileContext},
+	{repo.BootstrapFile, bootstrapFileContext},
+	{repo.LocalsFile, localsFileContext},
 	{repo.InfraFile, infraFileContext},
 	{repo.Artifacts, artifactsFileContext},
 }
@@ -93,6 +96,32 @@ const agentsFileContext = `This file is AGENTS.md — an operating guide / rules
 clear, imperative set of instructions and conventions. Preserve the existing rules
 unless the request is explicitly to change them, and make the smallest coherent
 edit; agents read this verbatim as guidance.`
+
+const honeybeeFileContext = `This file is HONEYBEE.md — the honeybee RUNTIME PROTOCOL the runner injects as the
+system prompt of every pass. It is a beehive-MANAGED default: the binary ships it
+and "beehive instruction update" refreshes it (the on-disk copy is authoritative; an
+operator edit may be backed up and replaced by an update). Keep it a precise,
+imperative description of the per-pass roles (reconcile/work/review/arbitration),
+the claim model, and the status transitions. It is NOT site-specific (machine
+paths/hosts belong in LOCALS.md) and NOT a task list (that is PLAN.md). If you are
+creating it from empty, follow the shipped protocol structure rather than inventing
+a new format.`
+
+const bootstrapFileContext = `This file is BOOTSTRAP.md — the install SETUP WALKTHROUGH: a step-by-step guide to
+stand up a new beehive install (authoring LOCALS.md, the runner config, registering
+target submodules, the scheduler). It is a beehive-MANAGED default shipped by the
+binary and refreshed by "beehive instruction update". Keep it an ordered, imperative
+walkthrough of setup steps; it describes the generic procedure, so do not bake THIS
+install's site-specific values into it (those belong in LOCALS.md).`
+
+const localsFileContext = `This file is LOCALS.md — the SITE-SPECIFIC operator record for THIS install:
+machine paths, source/build and deploy commands, scheduler units, hostnames/ports,
+topology, and local safety rules. It is authored PER INSTALL and is NOT
+beehive-managed — "beehive instruction update" never touches it and it must NEVER be
+auto-generated. Fill it with this install's REAL facts gathered from the operator;
+never invent, guess, or leave placeholder values. Keep it a concise, factual
+reference distinct from the managed instruction files (AGENTS.md/HONEYBEE.md/
+BOOTSTRAP.md).`
 
 const infraFileContext = `This file is INFRASTRUCTURE.md — a structured document parsed by a typed model
 (internal/artifacts) that round-trips its body verbatim plus its Active/Envs deploy

@@ -1990,3 +1990,154 @@ func TestViewerFollowsOffBoxSessions(t *testing.T) {
 		t.Fatalf("ff-only pull must never start a merge (MERGE_HEAD present): err=%v", err)
 	}
 }
+
+// TestDashboardRootInstructionFiles: the dashboard surfaces the DECLARED root
+// instruction-file set uniformly. repo.Init scaffolds the three managed defaults
+// but never LOCALS.md, so LOCALS.md must appear as an ABSENT, creatable member —
+// proving the section is driven by the declared set, not an os.ReadDir. Managed
+// files link to a read-only view AND the AI editor; the absent site file links
+// only to create; and rendering must NEVER auto-generate LOCALS.md.
+func TestDashboardRootInstructionFiles(t *testing.T) {
+	s, root := setup(t)
+	if _, err := os.Stat(filepath.Join(root, repo.LocalsFile)); !os.IsNotExist(err) {
+		t.Fatalf("precondition: LOCALS.md should be absent after Init, err=%v", err)
+	}
+	dash := get(t, s, "/").Body.String()
+
+	for _, name := range []string{repo.AgentsFile, repo.HoneybeeFile, repo.BootstrapFile, repo.LocalsFile} {
+		if !strings.Contains(dash, name) {
+			t.Errorf("dashboard missing instruction file %q", name)
+		}
+	}
+	// Ownership badges: the three managed defaults render "managed", LOCALS.md "site".
+	if !strings.Contains(dash, ">managed<") {
+		t.Errorf("dashboard missing a managed badge:\n%s", dash)
+	}
+	if !strings.Contains(dash, ">site<") {
+		t.Errorf("dashboard missing the site (LOCALS.md) ownership badge")
+	}
+	// Presence badges: managed files present, LOCALS.md absent.
+	if !strings.Contains(dash, ">present<") || !strings.Contains(dash, ">absent<") {
+		t.Errorf("dashboard missing present/absent state badges:\n%s", dash)
+	}
+	// A present managed file offers view + AI-edit on its real content.
+	for _, want := range []string{
+		`/instruction/AGENTS.md`, `/edit?path=AGENTS.md`,
+		`/instruction/HONEYBEE.md`, `/edit?path=HONEYBEE.md`,
+		`/instruction/BOOTSTRAP.md`, `/edit?path=BOOTSTRAP.md`,
+	} {
+		if !strings.Contains(dash, want) {
+			t.Errorf("dashboard missing present-file link %q", want)
+		}
+	}
+	// The absent LOCALS.md offers a create link into the SAME chat-diff surface,
+	// but NO read-only view (there is nothing to view yet).
+	if !strings.Contains(dash, `/edit?path=LOCALS.md`) {
+		t.Errorf("dashboard missing LOCALS.md create link:\n%s", dash)
+	}
+	if strings.Contains(dash, `/instruction/LOCALS.md`) {
+		t.Errorf("absent LOCALS.md must not offer a read-only view link")
+	}
+	// Rendering the dashboard must never auto-generate the site-authored LOCALS.md.
+	if _, err := os.Stat(filepath.Join(root, repo.LocalsFile)); !os.IsNotExist(err) {
+		t.Fatalf("rendering the dashboard auto-generated LOCALS.md; it must only be stat'd, err=%v", err)
+	}
+}
+
+// TestInstructionViewHandler: GET /instruction/{file} renders a present, DECLARED
+// instruction file as read-only markdown (200) with an AI-edit affordance; an
+// absent-but-declared file 404s (create is offered on the dashboard instead); and
+// an UNDECLARED root file 404s even when it exists on disk — the handler is guarded
+// to the declared set, never an arbitrary path.
+func TestInstructionViewHandler(t *testing.T) {
+	s, root := setup(t)
+
+	w := get(t, s, "/instruction/AGENTS.md")
+	if w.Code != 200 {
+		t.Fatalf("view of present AGENTS.md: got %d, want 200", w.Code)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `/edit?path=AGENTS.md`) {
+		t.Errorf("instruction view missing its AI-edit link:\n%s", body)
+	}
+
+	if w := get(t, s, "/instruction/LOCALS.md"); w.Code != 404 {
+		t.Errorf("view of absent LOCALS.md: got %d, want 404", w.Code)
+	}
+	if _, err := os.Stat(filepath.Join(root, repo.LocalsFile)); !os.IsNotExist(err) {
+		t.Fatalf("viewing absent LOCALS.md auto-generated it")
+	}
+
+	// INFRASTRUCTURE.md EXISTS on disk (repo.Init scaffolds it) but is NOT a declared
+	// instruction file, so it must not be viewable through this handler — the guard is
+	// the declared set, not disk presence (no tree traversal / info leak).
+	if _, err := os.Stat(filepath.Join(root, repo.InfraFile)); err != nil {
+		t.Fatalf("precondition: INFRASTRUCTURE.md should exist after Init: %v", err)
+	}
+	if w := get(t, s, "/instruction/INFRASTRUCTURE.md"); w.Code != 404 {
+		t.Errorf("view of undeclared INFRASTRUCTURE.md: got %d, want 404", w.Code)
+	}
+	if w := get(t, s, "/instruction/PLAN.md"); w.Code != 404 {
+		t.Errorf("view of undeclared PLAN.md: got %d, want 404", w.Code)
+	}
+}
+
+// TestRootInstructionChatCreateAndView: the create-if-absent / view-if-present flow
+// rides the generic chat-diff surface with the RIGHT seeded ownership context.
+// LOCALS.md (absent, site-authored) opens on an EMPTY base seeded with the
+// site-specific/never-auto-generate guidance and approve creates it byte-exact;
+// HONEYBEE.md (present, managed) opens on the REAL committed base seeded with the
+// managed runtime-protocol guidance.
+func TestRootInstructionChatCreateAndView(t *testing.T) {
+	ctx := context.Background()
+
+	// ABSENT -> create.
+	fc := &fakeChatClient{reply: proposeReply("Created LOCALS.", "# LOCALS\n\nhost: example")}
+	s, _ := chatFixtureClient(t, fc)
+	sess, err := s.chat.open(ctx, repo.LocalsFile)
+	if err != nil {
+		t.Fatalf("open LOCALS.md: %v", err)
+	}
+	if b, err := sess.base(ctx); err != nil || b != "" {
+		t.Fatalf("absent LOCALS.md base = %q (err=%v), want empty (a create)", b, err)
+	}
+	if !strings.Contains(sess.sys, "SITE-SPECIFIC") || !strings.Contains(sess.sys, "auto-generated") {
+		t.Fatalf("LOCALS.md create session not seeded with site-authored guidance:\n%s", sess.sys)
+	}
+	if err := sess.chat(ctx, "create locals"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if err := sess.approve(ctx); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(sess.wtPath, repo.LocalsFile))
+	if err != nil {
+		t.Fatalf("read created LOCALS.md: %v", err)
+	}
+	if string(got) != "# LOCALS\n\nhost: example\n" {
+		t.Fatalf("created LOCALS.md not byte-exact: %q", string(got))
+	}
+
+	// PRESENT -> view+edit on real content.
+	fc2 := &fakeChatClient{reply: "ok"}
+	s2, root2 := chatFixtureClient(t, fc2)
+	hb, err := s2.chat.open(ctx, repo.HoneybeeFile)
+	if err != nil {
+		t.Fatalf("open HONEYBEE.md: %v", err)
+	}
+	b, err := hb.base(ctx)
+	if err != nil {
+		t.Fatalf("base HONEYBEE.md: %v", err)
+	}
+	if b == "" {
+		t.Fatal("present HONEYBEE.md must edit its real content, not create from empty")
+	}
+	if want := strings.TrimSpace(gitShow(t, root2, "HEAD", repo.HoneybeeFile)); b != want {
+		t.Fatalf("present HONEYBEE.md base not the committed content:\n got %q\nwant %q", b, want)
+	}
+	if !strings.Contains(hb.sys, "RUNTIME PROTOCOL") {
+		t.Fatalf("HONEYBEE.md session not seeded with managed runtime-protocol guidance:\n%s", hb.sys)
+	}
+	if strings.Contains(hb.sys, "SITE-SPECIFIC") {
+		t.Fatalf("HONEYBEE.md session leaked LOCALS.md site guidance:\n%s", hb.sys)
+	}
+}

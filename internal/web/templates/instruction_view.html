@@ -1,0 +1,6 @@
+{{template "header"}}
+<p><a href="/">&larr; dashboard</a></p>
+<h1>{{.Title}} <span class="badge{{if .Managed}} managed{{end}}">{{if .Managed}}managed{{else}}site{{end}}</span></h1>
+<p><a href="/edit?path={{.Name}}">edit (AI)</a></p>
+<div class="markdown">{{.Body}}</div>
+{{template "footer"}}

@@ -105,6 +105,51 @@ func TestInitScaffolds(t *testing.T) {
 	}
 }
 
+func TestRootInstructionFiles(t *testing.T) {
+	files := RootInstructionFiles()
+	// The set is DECLARED and fixed (not an os.ReadDir), so assert the exact
+	// members, order, and ownership rather than just a count.
+	want := []struct {
+		name    string
+		managed bool
+	}{
+		{AgentsFile, true},
+		{HoneybeeFile, true},
+		{BootstrapFile, true},
+		{LocalsFile, false},
+	}
+	if len(files) != len(want) {
+		t.Fatalf("RootInstructionFiles() = %d members, want %d: %+v", len(files), len(want), files)
+	}
+	seen := map[string]bool{}
+	for i, w := range want {
+		f := files[i]
+		if f.Name != w.name {
+			t.Errorf("member %d Name = %q, want %q", i, f.Name, w.name)
+		}
+		if f.Managed != w.managed {
+			t.Errorf("%s Managed = %v, want %v", f.Name, f.Managed, w.managed)
+		}
+		if strings.TrimSpace(f.Title) == "" {
+			t.Errorf("%s Title is empty", f.Name)
+		}
+		if strings.TrimSpace(f.Purpose) == "" {
+			t.Errorf("%s Purpose is empty", f.Name)
+		}
+		if seen[f.Name] {
+			t.Errorf("%s appears more than once", f.Name)
+		}
+		seen[f.Name] = true
+	}
+	// LOCALS.md is the SOLE site-authored member; it must never be marked managed
+	// (an update must never refresh/overwrite it).
+	for _, f := range files {
+		if f.Name == LocalsFile && f.Managed {
+			t.Errorf("%s must be site-authored (Managed=false), never beehive-managed", LocalsFile)
+		}
+	}
+}
+
 func gitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

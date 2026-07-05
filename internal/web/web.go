@@ -137,6 +137,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /env/deploy", s.envDeploy)
 	mux.HandleFunc("GET /human", s.human)
 	mux.HandleFunc("GET /hygiene", s.hygiene)
+	mux.HandleFunc("GET /instruction/{file}", s.instruction)
 	// AI editor chat (browser): one worktree branch per session.
 	mux.HandleFunc("GET /edit", s.editEntry)
 	mux.HandleFunc("POST /edit", s.chatOpen)
@@ -241,7 +242,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
 	}
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState()})
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootDocs": s.rootDocViews()})
 }
 
 // subViews builds the dashboard card data for every submodule: State
@@ -311,6 +312,84 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 		views = append(views, v)
 	}
 	return views, nil
+}
+
+// rootDocView is one repo-root instruction file as shown on the dashboard: its
+// declared identity (Title/Purpose/Managed) plus live Present state. A present
+// file links to view+edit on the real content; an absent file links to the
+// chat-diff create flow on an empty base. Managed marks the beehive-shipped
+// defaults (AGENTS/HONEYBEE/BOOTSTRAP); LOCALS.md is site-authored (Managed
+// false) and is only ever stat'd here, never auto-generated.
+type rootDocView struct {
+	Name    string
+	Title   string
+	Purpose string
+	Managed bool
+	Present bool
+}
+
+// EditHref is the generic chat-diff editor link. It is the SAME surface for both
+// states: for a present file the editor's base is the real content (view+edit);
+// for an absent file the base is empty (create). No special write path — the
+// edit is applied only on human approval, exactly like any other chat-edit.
+func (v rootDocView) EditHref() string { return "/edit?path=" + v.Name }
+
+// ViewHref is the read-only rendered-markdown view of a present file.
+func (v rootDocView) ViewHref() string { return "/instruction/" + v.Name }
+
+// rootDocViews projects the DECLARED root instruction-file set
+// (repo.RootInstructionFiles) into view models, statting each under the repo root
+// for live presence. It reads a fixed set — never an os.ReadDir of the root — so a
+// missing managed default or an unwritten LOCALS.md is still surfaced (with a
+// create link). It NEVER writes: LOCALS.md in particular is only stat'd, never
+// auto-generated, and presence re-reflects disk every render so a manual root-file
+// commit shows on the next load.
+func (s *Server) rootDocViews() []rootDocView {
+	files := repo.RootInstructionFiles()
+	out := make([]rootDocView, 0, len(files))
+	for _, f := range files {
+		out = append(out, rootDocView{
+			Name:    f.Name,
+			Title:   f.Title,
+			Purpose: f.Purpose,
+			Managed: f.Managed,
+			Present: fileExists(filepath.Join(s.repo.Root, f.Name)),
+		})
+	}
+	return out
+}
+
+// instruction renders ONE declared repo-root instruction file as read-only
+// sanitized markdown. The {file} path value is guarded against the declared set
+// (repo.RootInstructionFiles) — never an arbitrary path — so it can only ever read
+// a known root doc, never traverse the tree. An absent (but declared) file 404s;
+// the dashboard offers its create link instead. The read is live (no cache), so a
+// manual commit to the file shows on the next load.
+func (s *Server) instruction(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("file")
+	var match *repo.RootInstructionFile
+	for _, f := range repo.RootInstructionFiles() {
+		if f.Name == name {
+			f := f
+			match = &f
+			break
+		}
+	}
+	if match == nil {
+		http.NotFound(w, r)
+		return
+	}
+	b, err := os.ReadFile(filepath.Join(s.repo.Root, match.Name))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	s.render(w, "instruction_view.html", map[string]interface{}{
+		"Name":    match.Name,
+		"Title":   match.Title,
+		"Managed": match.Managed,
+		"Body":    renderMarkdown(string(b)),
+	})
 }
 
 func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
