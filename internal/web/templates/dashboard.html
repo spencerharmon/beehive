@@ -2,6 +2,18 @@
 {{template "bootstrap-banner" .Bootstrap}}
 <h1>Submodules</h1>
 <p>Active env: <b>{{.Env.Active}}</b> · <a href="/edit?path=INFRASTRUCTURE.md">edit infrastructure with AI</a></p>
+<nav class="file-index" aria-label="repo instruction files">
+  <h2>Repo instruction files</h2>
+  <ul class="file-links">
+  {{range .RootFiles}}
+    <li class="file-link {{if .Present}}present{{else}}absent{{end}}">
+      <span class="file-name">{{.File}}</span>
+      {{if .Managed}}<span class="badge" title="beehive ships and refreshes a default (beehive instruction update)">managed</span>{{else}}<span class="badge" title="site-authored, never managed or auto-generated">site-authored</span>{{end}}
+      {{if .Present}}<a href="/edit?path={{.File}}">view / edit</a>{{else}}<span class="muted">not created</span> <a href="/edit?path={{.File}}">create</a>{{end}}
+    </li>
+  {{end}}
+  </ul>
+</nav>
 <div class="cards">
 {{range .Subs}}<div class="card{{if .Working}} active{{end}}">
   <h3><a href="/submodule/{{.Name}}">{{.Name}}</a></h3>

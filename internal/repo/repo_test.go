@@ -147,6 +147,60 @@ func TestOptionalFilesSet(t *testing.T) {
 	}
 }
 
+// TestRootInstructionFilesSet pins the declared repo-ROOT instruction-file set the
+// frontend renders discoverable view/edit/create links from (root-instruction-
+// file-links). It must be exactly the four root instruction files keyed off the
+// shared name constants, carry the correct per-file Managed flag (AGENTS/HONEYBEE/
+// BOOTSTRAP managed, LOCALS site-authored) for instruction-update-drift, and must
+// NOT include any per-submodule file (ROI/PLAN/RULES) — those ride OptionalFiles.
+func TestRootInstructionFilesSet(t *testing.T) {
+	want := map[string]bool{ // file -> managed
+		AgentsFile:    true,
+		HoneybeeFile:  true,
+		BootstrapFile: true,
+		LocalsFile:    false,
+	}
+	if len(RootInstructionFiles) != len(want) {
+		t.Fatalf("RootInstructionFiles = %v, want %d members", RootInstructionFiles, len(want))
+	}
+	seen := map[string]bool{}
+	for _, f := range RootInstructionFiles {
+		if f.File == "" {
+			t.Fatal("RootInstructionFiles contains an empty entry")
+		}
+		if seen[f.File] {
+			t.Fatalf("RootInstructionFiles has a duplicate entry %q", f.File)
+		}
+		seen[f.File] = true
+		mg, ok := want[f.File]
+		if !ok {
+			t.Errorf("RootInstructionFiles has unexpected member %q", f.File)
+			continue
+		}
+		if f.Managed != mg {
+			t.Errorf("RootInstructionFiles[%q].Managed = %v, want %v", f.File, f.Managed, mg)
+		}
+	}
+	for f := range want {
+		if !seen[f] {
+			t.Errorf("RootInstructionFiles missing %q", f)
+		}
+	}
+	// The site-authored LOCALS.md is the ONLY unmanaged member: it is never
+	// shipped/refreshed by the binary, so instruction-update-drift skips it.
+	if seen[LocalsFile] && want[LocalsFile] {
+		t.Error("LOCALS.md must be site-authored (Managed=false), never managed")
+	}
+	// Root-vs-submodule guard: these are root files, not the per-submodule
+	// optional set (which owns ROI/PLAN/RULES). A root member must not leak in as
+	// a per-submodule optional and vice versa for the ownership-sensitive ones.
+	for _, f := range []string{ROIFile, PlanFile, RulesFile} {
+		if seen[f] {
+			t.Errorf("RootInstructionFiles must NOT include per-submodule file %q", f)
+		}
+	}
+}
+
 func gitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

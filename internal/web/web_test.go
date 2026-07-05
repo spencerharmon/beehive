@@ -1148,6 +1148,140 @@ func TestExplorerROICreateThroughEditorNoAutogen(t *testing.T) {
 	}
 }
 
+// TestDashboardRootInstructionFileLinks locks root-instruction-file-links: the
+// dashboard renders a uniform view/edit (or, when absent, create) link for EVERY
+// member of the declared repo-ROOT instruction-file set repo.RootInstructionFiles
+// — driven by that SET, not the directory listing — with the per-file managed flag
+// exposed. In the fixture (repo.Init) AGENTS/HONEYBEE/BOOTSTRAP exist but LOCALS.md
+// does not, yet all four links render (LOCALS as a create path), and a plain manual
+// LOCALS.md commit picked up off disk flips its row to present on the next render.
+func TestDashboardRootInstructionFileLinks(t *testing.T) {
+	s, root := setup(t)
+	// Guard the fixture: the three managed files are laid down by Init; LOCALS is not.
+	for _, f := range []string{repo.AgentsFile, repo.HoneybeeFile, repo.BootstrapFile} {
+		if _, err := os.Stat(filepath.Join(root, f)); err != nil {
+			t.Fatalf("fixture missing managed root file %s: %v", f, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, repo.LocalsFile)); !os.IsNotExist(err) {
+		t.Fatalf("fixture unexpectedly has LOCALS.md (err=%v)", err)
+	}
+
+	// White-box: one row per declared member, membership set-driven, Present
+	// following disk and Managed following the SET (not disk).
+	links := s.rootFileLinks()
+	if len(links) != len(repo.RootInstructionFiles) {
+		t.Fatalf("rootFileLinks = %d rows, want %d (the declared set)", len(links), len(repo.RootInstructionFiles))
+	}
+	byFile := map[string]rootFileLink{}
+	for _, l := range links {
+		if l.File == "" || l.Label != strings.TrimSuffix(l.File, ".md") {
+			t.Fatalf("row label %q not derived from file %q", l.Label, l.File)
+		}
+		byFile[l.File] = l
+	}
+	for _, want := range []struct {
+		file    string
+		present bool
+		managed bool
+	}{
+		{repo.AgentsFile, true, true},
+		{repo.HoneybeeFile, true, true},
+		{repo.BootstrapFile, true, true},
+		{repo.LocalsFile, false, false},
+	} {
+		got, ok := byFile[want.file]
+		if !ok {
+			t.Errorf("root set missing a row for %q (set must drive membership)", want.file)
+			continue
+		}
+		if got.Present != want.present {
+			t.Errorf("%s Present = %v, want %v", want.file, got.Present, want.present)
+		}
+		if got.Managed != want.managed {
+			t.Errorf("%s Managed = %v, want %v", want.file, got.Managed, want.managed)
+		}
+	}
+
+	// Rendered: a root-relative editor link for EVERY member (incl. absent LOCALS),
+	// the present ones as view/edit and the absent one as a create path, plus the
+	// exposed managed / site-authored flags.
+	body := get(t, s, "/").Body.String()
+	for _, f := range repo.RootInstructionFiles {
+		if want := "/edit?path=" + f.File; !strings.Contains(body, want) {
+			t.Errorf("dashboard missing set-driven root-file link %q:\n%s", want, body)
+		}
+	}
+	if !strings.Contains(body, "view / edit") {
+		t.Error("dashboard missing a view/edit link for the present managed root files")
+	}
+	if !strings.Contains(body, "not created") || !strings.Contains(body, "create") {
+		t.Error("dashboard missing a create affordance for the absent LOCALS.md")
+	}
+	if !strings.Contains(body, ">managed<") || !strings.Contains(body, ">site-authored<") {
+		t.Errorf("dashboard did not expose the managed / site-authored flags:\n%s", body)
+	}
+
+	// Manual-commit-picked-up: creating LOCALS.md on disk (as a plain manual commit
+	// would) flips its row to present on the next render — no special write path.
+	if err := os.WriteFile(filepath.Join(root, repo.LocalsFile), []byte("# locals\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var locals rootFileLink
+	for _, l := range s.rootFileLinks() {
+		if l.File == repo.LocalsFile {
+			locals = l
+		}
+	}
+	if !locals.Present {
+		t.Error("LOCALS.md now on disk but its row is still marked absent")
+	}
+	if locals.Managed {
+		t.Error("LOCALS.md must stay site-authored (Managed=false) even once present")
+	}
+}
+
+// TestRootAbsentFileEmptyBaseCreateSeeded locks the absent root-file create path:
+// the site-authored LOCALS.md link opens the chat-diff editor on an EMPTY base,
+// seeded with LOCALS.md's site-authored / never-auto-generated rules (chat-diff-
+// file-context), and the file is written ONLY on approval (never auto-generated).
+func TestRootAbsentFileEmptyBaseCreateSeeded(t *testing.T) {
+	fc := &fakeChatClient{reply: proposeReply("Drafted locals.", "# LOCALS\nHost: spray")}
+	s, _ := chatFixtureClient(t, fc)
+	ctx := context.Background()
+	path := repo.LocalsFile // absent in the fixture (Init does not lay it down)
+
+	sess, err := s.chat.open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if base, _ := sess.base(ctx); base != "" {
+		t.Fatalf("absent root file must open on an empty base, got %q", base)
+	}
+	if sess.sys != chatSystemPrompt(path) {
+		t.Fatal("session not seeded from resolveFileContext (chat-diff-file-context)")
+	}
+	if err := sess.chat(ctx, "draft locals"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	// Seeded with the LOCALS.md ownership rules: site-authored, never auto-generated.
+	for _, want := range []string{repo.LocalsFile, "auto-generated"} {
+		if !strings.Contains(fc.system, want) {
+			t.Fatalf("empty-base create not seeded with LOCALS rules (missing %q):\n%s", want, fc.system)
+		}
+	}
+	// Nothing on disk before approval — LOCALS.md is never auto-generated.
+	if _, err := os.Stat(filepath.Join(sess.wtPath, filepath.FromSlash(path))); !os.IsNotExist(err) {
+		t.Fatalf("LOCALS.md must not exist before approval (err=%v)", err)
+	}
+	if err := sess.approve(ctx); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if got := gitShow(t, sess.wtPath, "HEAD", path); got != "# LOCALS\nHost: spray" {
+		t.Fatalf("empty-base create did not commit the new LOCALS.md: %q", got)
+	}
+}
+
 // TestROIViewRendersAndRawVerbatim locks the dual contract for the editor: the
 // ROI VIEW shows a rendered preview while the editable textarea keeps the RAW
 // source verbatim (the edit round-trip must not be lost to rendering).

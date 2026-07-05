@@ -247,7 +247,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
 	}
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState()})
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": s.rootFileLinks()})
 }
 
 // subViews builds the dashboard card data for every submodule: State
@@ -346,6 +346,46 @@ func optionalFileLinks(sm repo.Submodule) []fileLink {
 			Label:   strings.TrimSuffix(f, ".md"),
 			File:    f,
 			Present: err == nil,
+		})
+	}
+	return links
+}
+
+// rootFileLink is one row of the dashboard's repo-ROOT instruction-file index: a
+// uniform view/edit (or, when absent, create) link for one member of the DECLARED
+// set repo.RootInstructionFiles (AGENTS.md, HONEYBEE.md, BOOTSTRAP.md, LOCALS.md).
+// It is the root analogue of fileLink: the index is driven by that SET, not the
+// directory listing, so an absent file renders a discoverable create link (into
+// the chat-diff editor's empty-base create path, seeded per file via
+// chat-diff-file-context) instead of being invisible (root-instruction-file-
+// links). File is the basename and the template composes the repo-ROOT editor path
+// /edit?path=<File> (no submodules/<name>/ prefix — these live at the repo root).
+// Managed exposes whether beehive ships/refreshes a default for the file (the
+// signal instruction-update-drift keys off); LOCALS.md is site-authored, so it is
+// never managed and never auto-generated (create still routes through the same
+// approval-gated editor).
+type rootFileLink struct {
+	Label   string // display name, e.g. "AGENTS" (basename minus .md)
+	File    string // basename at the repo root, e.g. "AGENTS.md"
+	Present bool   // file exists on disk at the repo root
+	Managed bool   // beehive ships/refreshes a default (vs. site-authored)
+}
+
+// rootFileLinks builds the dashboard's repo-ROOT instruction-file index from the
+// DECLARED set repo.RootInstructionFiles (never the disk listing), stamping each
+// member present/absent by a plain existence check at the repo root so a missing
+// file (e.g. an unwritten LOCALS.md) still yields a discoverable row. It is read
+// fresh each render, so a plain manual commit that lands a root file on disk flips
+// its row to present on the next dashboard load with no special write path.
+func (s *Server) rootFileLinks() []rootFileLink {
+	links := make([]rootFileLink, 0, len(repo.RootInstructionFiles))
+	for _, f := range repo.RootInstructionFiles {
+		_, err := os.Stat(filepath.Join(s.repo.Root, f.File))
+		links = append(links, rootFileLink{
+			Label:   strings.TrimSuffix(f.File, ".md"),
+			File:    f.File,
+			Present: err == nil,
+			Managed: f.Managed,
 		})
 	}
 	return links

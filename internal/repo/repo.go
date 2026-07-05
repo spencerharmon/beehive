@@ -16,6 +16,7 @@ import (
 // read into agent context, AGENTS first then RULES); its absence is a safe no-op.
 const (
 	AgentsFile    = "AGENTS.md"
+	HoneybeeFile  = "HONEYBEE.md"
 	PlanFile      = "PLAN.md"
 	ROIFile       = "ROI.md"
 	InfraFile     = "INFRASTRUCTURE.md"
@@ -26,6 +27,33 @@ const (
 	LocalsFile    = "LOCALS.md"
 	BootstrapFile = "BOOTSTRAP.md"
 )
+
+// RootInstructionFile is one repo-ROOT instruction file the frontend surfaces a
+// uniform view/edit (or, when absent, create) link for. Managed marks the members
+// beehive ships a default for and that `beehive instruction update` refreshes
+// (AGENTS.md, HONEYBEE.md, BOOTSTRAP.md — the instruct.Files set); it is false for
+// the site-authored LOCALS.md, which is never managed or auto-generated. The flag
+// is what instruction-update-drift keys off to scope its staleness check.
+type RootInstructionFile struct {
+	File    string // basename at the repo root, e.g. "AGENTS.md"
+	Managed bool   // beehive ships/refreshes a default (vs. site-authored)
+}
+
+// RootInstructionFiles is the DECLARED set of repo-ROOT instruction files the
+// frontend renders discoverable links for UNIFORMLY — present or absent — driven
+// by THIS set, not the directory listing, so a missing member (e.g. an unwritten
+// LOCALS.md) is discoverable and offers a create path instead of being invisible.
+// It is the root analogue of OptionalFiles (which is per-submodule). The root
+// AGENTS.md here is the GENERIC operating guide and is deliberately NOT the same
+// thing as a per-submodule submodules/<sm>/AGENTS.md rules overlay (that overlay
+// rides OptionalFiles). Order is the render order. This is the single source of
+// truth for membership and the per-file managed flag.
+var RootInstructionFiles = []RootInstructionFile{
+	{AgentsFile, true},    // AGENTS.md — generic operating guide (managed)
+	{HoneybeeFile, true},  // HONEYBEE.md — honeybee runtime protocol (managed)
+	{BootstrapFile, true}, // BOOTSTRAP.md — install walkthrough (managed)
+	{LocalsFile, false},   // LOCALS.md — site-authored, never managed
+}
 
 // OptionalFiles is the KNOWN set of optional per-submodule files the frontend
 // renders view/edit links for UNIFORMLY — present or absent — so a missing file

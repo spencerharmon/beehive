@@ -227,3 +227,81 @@ func TestPerFileEditLinksRouteToChatDiff(t *testing.T) {
 		t.Errorf("dashboard still routes a per-file link to the legacy editor (?file=):\n%s", dash)
 	}
 }
+
+// TestRootInstructionFileContextNotConflated locks root-instruction-file-links'
+// chat-diff-file-context seeding: each repo-ROOT instruction file resolves to its
+// OWN distinct purpose/ownership preamble, the three managed files (AGENTS/
+// HONEYBEE/BOOTSTRAP) note they are beehive-managed while the site-authored
+// LOCALS.md does not, and — critically — the generic root AGENTS.md is NOT
+// conflated with a per-submodule submodules/<sm>/AGENTS.md overlay.
+func TestRootInstructionFileContextNotConflated(t *testing.T) {
+	// The generic root AGENTS.md must resolve to a DIFFERENT context than a
+	// per-submodule AGENTS.md overlay — the exact conflation the task forbids.
+	rootAgents := resolveFileContext(repo.AgentsFile)
+	subAgents := resolveFileContext(filepath.ToSlash(filepath.Join("submodules", "alpha", repo.AgentsFile)))
+	if rootAgents == subAgents {
+		t.Fatal("root AGENTS.md must resolve to a DIFFERENT context than a per-submodule AGENTS.md overlay")
+	}
+	if !strings.Contains(rootAgents, "GENERIC") {
+		t.Errorf("root AGENTS.md context should mark it the generic guide:\n%s", rootAgents)
+	}
+
+	// Each managed root file carries its own distinct preamble stating its purpose
+	// and that it is beehive-managed (the flag instruction-update-drift honors).
+	managed := []struct {
+		path string
+		subs []string
+	}{
+		{repo.AgentsFile, []string{"AGENTS.md", "operating guide"}},
+		{repo.HoneybeeFile, []string{"HONEYBEE.md", "runtime protocol"}},
+		{repo.BootstrapFile, []string{"BOOTSTRAP.md", "install"}},
+	}
+	seen := map[string]bool{}
+	for _, c := range managed {
+		got := resolveFileContext(c.path)
+		for _, sub := range append(c.subs, "beehive-MANAGED") {
+			if !strings.Contains(got, sub) {
+				t.Errorf("%s context missing %q:\n%s", c.path, sub, got)
+			}
+		}
+		if seen[got] {
+			t.Errorf("%s context is not distinct from another root file", c.path)
+		}
+		seen[got] = true
+	}
+
+	// LOCALS.md is site-authored: its context states site-specific / never
+	// auto-generated, is distinct from the managed files, and must NOT claim to be
+	// beehive-managed.
+	locals := resolveFileContext(repo.LocalsFile)
+	if seen[locals] {
+		t.Error("LOCALS.md context is not distinct from a managed root file")
+	}
+	for _, sub := range []string{"LOCALS.md", "SITE-SPECIFIC", "auto-generated"} {
+		if !strings.Contains(locals, sub) {
+			t.Errorf("LOCALS.md context missing %q:\n%s", sub, locals)
+		}
+	}
+	if strings.Contains(locals, "beehive-MANAGED") {
+		t.Errorf("LOCALS.md is site-authored; its context must not mark it beehive-MANAGED:\n%s", locals)
+	}
+
+	// The end-to-end seed carries the resolved rules into the opencode session for
+	// a root file opened through the generic chat-diff surface.
+	fc := &fakeChatClient{reply: "ok"}
+	s, _ := chatFixtureClient(t, fc)
+	ctx := context.Background()
+	sess, err := s.chat.open(ctx, repo.HoneybeeFile)
+	if err != nil {
+		t.Fatalf("open HONEYBEE.md: %v", err)
+	}
+	if sess.sys != chatSystemPrompt(repo.HoneybeeFile) {
+		t.Fatal("root-file session not seeded from the resolver")
+	}
+	if err := sess.chat(ctx, "hello"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if !strings.Contains(fc.system, "runtime protocol") {
+		t.Fatalf("HONEYBEE.md session not seeded with its protocol rules:\n%s", fc.system)
+	}
+}
