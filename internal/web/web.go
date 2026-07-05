@@ -84,14 +84,20 @@ type Server struct {
 	reg      config.Registry
 	siblings map[string]*Server // registry name -> per-repo server (incl. the container itself)
 	order    []string           // registry names sorted ascending; order[0] is the default active repo
+
+	// container is every per-repo server's back-reference to the registry hub (the
+	// container == siblings[order[0]]); it points to itself on the container and is
+	// nil on a single-repo Server from New. reg/siblings/order live ONLY on the
+	// container, but a request is dispatched (bind/active) to the SELECTED repo's
+	// server, and that server must still reach the whole registered set to render
+	// the cross-repo switcher (persistent chrome) and the dashboard's repos
+	// overview. hub() resolves that: the active server reads the registry through
+	// this back-reference while its own name marks which repo is active.
+	container *Server
 }
 
 // New builds a Server over the beehive repo at root.
 func New(r *repo.Repo, cfg config.Config) (*Server, error) {
-	t, err := template.ParseFS(tmplFS, "templates/*.html")
-	if err != nil {
-		return nil, err
-	}
 	em, err := editor.NewManager(r.Root, cfg)
 	if err != nil {
 		return nil, err
@@ -101,7 +107,18 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	// the single-file editor); it opens a per-edit ROOT worktree and awaits each
 	// turn (opencode-turn-poll) before rendering the proposed diff.
 	oc := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}}
-	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: newChatManager(r.Root, oc)}, nil
+	s := &Server{repo: r, cfg: cfg, git: g, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: newChatManager(r.Root, oc)}
+	// Parse templates with the per-server "switcher" func bound to THIS server, so
+	// the shared layout chrome can render the multi-repo switcher for whichever repo
+	// a request is routed to. The method value captures s and reads the registry
+	// wiring (set later by NewRegistry) only at render time, so a single-repo server
+	// resolves it to an empty list and the chrome stays byte-identical to today.
+	t, err := template.New("").Funcs(template.FuncMap{"switcher": s.switcher}).ParseFS(tmplFS, "templates/*.html")
+	if err != nil {
+		return nil, err
+	}
+	s.tmpl = t
+	return s, nil
 }
 
 // repoCookie carries the selected repo handle for a multi-repo daemon. Selection
@@ -152,13 +169,61 @@ func NewRegistry(reg config.Registry) (*Server, error) {
 	container.reg = reg
 	container.siblings = servers
 	container.order = order
+	// Back-reference every per-repo server (including the container to itself) to the
+	// registry hub, so a request dispatched to any SELECTED repo can still reach the
+	// whole registered set for the switcher chrome and repos overview (see hub()).
+	for _, srv := range servers {
+		srv.container = container
+	}
 	return container, nil
+}
+
+// hub returns the server that holds the registry wiring (reg/siblings/order): the
+// container == siblings[order[0]]. Every per-repo server keeps a back-reference to
+// it, so a handler running on the request's SELECTED repo (resolved by bind) can
+// still reach the whole registered set to render the switcher and repos overview. A
+// single-repo Server from New has no container and is its own hub (an empty set).
+func (s *Server) hub() *Server {
+	if s.container != nil {
+		return s.container
+	}
+	return s
 }
 
 // multi reports whether this server routes more than one registered repo. A
 // single-entry (or single-repo New) server is not multi: it keeps flat routes,
-// exposes no /repo switch, and every request resolves to this one server.
-func (s *Server) multi() bool { return len(s.siblings) > 1 }
+// exposes no /repo switch, and every request resolves to this one server. It reads
+// the registered set through hub() so it is correct on ANY per-repo server, not
+// just the container (a selected sibling still knows it is part of a multi daemon).
+func (s *Server) multi() bool { return len(s.hub().siblings) > 1 }
+
+// switchRepo is one entry of the persistent repo switcher rendered in the layout
+// chrome: a registered repo's handle and whether it is the request's ACTIVE repo.
+// It carries only the repo handle — never a submodule name — so the switcher never
+// leaks one repo's internals into another's view.
+type switchRepo struct {
+	Name   string
+	Active bool
+}
+
+// switcher is the template func (bound per-server in New) backing the persistent
+// switcher in the layout chrome. It returns one switchRepo per registered repo in
+// sorted order, marking the one this server serves (its name) active. It returns
+// nil in single-repo mode (len(siblings) <= 1), so the chrome renders NOTHING and
+// stays byte-identical to today. Because it is bound to the SELECTED repo's server
+// (bind resolves active before render), the active mark tracks the request's repo
+// with no shared mutable state.
+func (s *Server) switcher() []switchRepo {
+	h := s.hub()
+	if len(h.siblings) <= 1 {
+		return nil
+	}
+	out := make([]switchRepo, 0, len(h.order))
+	for _, name := range h.order {
+		out = append(out, switchRepo{Name: name, Active: name == s.name})
+	}
+	return out
+}
 
 // targets is every per-repo server this frontend serves, in sorted registry
 // order. A single-repo server is its own only target. Used for cross-repo startup
@@ -386,7 +451,8 @@ func (s *Server) headSHA(ctx context.Context) string {
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
-	views, err := s.subViews(r.Context(), time.Now(), s.ttl())
+	now, ttl := time.Now(), s.ttl()
+	views, err := s.subViews(r.Context(), now, ttl)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -399,7 +465,16 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
 	}
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": s.rootFileLinks()})
+	// Cross-repo overview (multi-repo daemons only): one aggregate card per
+	// registered repo, folded from each repo's own subViews and sharing this
+	// render's now/ttl snapshot. nil in single-repo mode, so the dashboard template
+	// renders exactly today's page (the {{if .Repos}} guard collapses to nothing).
+	repos, err := s.repoOverview(r.Context(), now, ttl)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": s.rootFileLinks(), "Repos": repos, "Active": s.name})
 }
 
 // subViews builds the dashboard card data for every submodule: State
@@ -469,6 +544,56 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 		views = append(views, v)
 	}
 	return views, nil
+}
+
+// repoCard is one registered repo's row in the multi-repo dashboard overview: a
+// read-only, aggregate status summary folded from that repo's OWN subViews. It
+// reuses the subView status vocabulary at the repo grain — Pending/Human are the
+// sums across the repo's submodules and Working is true when any submodule has a
+// live claim — plus the submodule count and whether it is the ACTIVE repo (the one
+// whose scoped detail the dashboard renders below). It deliberately carries NO
+// submodule names or per-submodule deep links: the overview summarises every repo
+// but the drill-down stays scoped to the selected repo, so one repo's internals
+// never bleed into another's view.
+type repoCard struct {
+	Name    string
+	Active  bool
+	Subs    int
+	Pending int
+	Human   int
+	Working bool
+}
+
+// repoOverview builds the dashboard's cross-repo overview: one repoCard per
+// registered repo, in sorted order, each folded from that repo's own subViews
+// (reusing the exact per-submodule status computation the single-repo dashboard
+// uses). It returns nil in single-repo mode (len(siblings) <= 1) so the dashboard
+// renders byte-identically to today — no overview, no switcher noise. Each sibling
+// is read through its OWN repo/git (an aggregate read, never a cross-repo crawl:
+// only counts cross the boundary, never names or links). now/ttl are shared with
+// the active repo's own subViews call so every card reflects one coherent snapshot.
+func (s *Server) repoOverview(ctx context.Context, now time.Time, ttl time.Duration) ([]repoCard, error) {
+	h := s.hub()
+	if len(h.siblings) <= 1 {
+		return nil, nil
+	}
+	cards := make([]repoCard, 0, len(h.order))
+	for _, name := range h.order {
+		vs, err := h.siblings[name].subViews(ctx, now, ttl)
+		if err != nil {
+			return nil, err
+		}
+		c := repoCard{Name: name, Active: name == s.name, Subs: len(vs)}
+		for _, v := range vs {
+			c.Pending += v.Pending
+			c.Human += v.Human
+			if v.Working {
+				c.Working = true
+			}
+		}
+		cards = append(cards, c)
+	}
+	return cards, nil
 }
 
 // fileLink is one row of the explorer's optional-file index: a view/edit (or,

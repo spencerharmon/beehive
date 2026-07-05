@@ -1,5 +1,21 @@
 {{template "header"}}
 {{template "bootstrap-banner" .Bootstrap}}
+{{if .Repos}}<section class="repo-overview" aria-label="registered repos">
+<h1>Repos</h1>
+<p class="muted">Read-only overview of every registered repo. The switcher (top bar) scopes the views below to one repo.</p>
+<div class="cards">
+{{range .Repos}}<div class="card repo-card{{if .Active}} active{{end}}">
+  <h3>{{.Name}}{{if .Active}} <span class="badge live" title="the repo the views below are scoped to">active</span>{{end}}</h3>
+  <div class="card-meta">
+    <span class="badge" title="submodules in this repo">{{.Subs}} submodules</span>
+    <span class="badge" title="tasks not DONE across this repo">pending {{.Pending}}</span>
+    {{if .Human}}<span class="badge human" title="tasks needing a human across this repo">needs-human {{.Human}}</span>{{end}}
+    {{if .Working}}<span class="badge live" title="a task is actively claimed in this repo">working</span>{{end}}
+  </div>
+  {{if .Active}}<p class="muted small">showing this repo below</p>{{else}}<form class="repo-switch" method="post" action="/repo/{{.Name}}"><button type="submit">switch to {{.Name}}</button></form>{{end}}
+</div>{{end}}
+</div>
+</section>{{end}}
 <h1>Submodules</h1>
 <p>Active env: <b>{{.Env.Active}}</b> · <a href="/edit?path=INFRASTRUCTURE.md">edit infrastructure with AI</a></p>
 <nav class="file-index" aria-label="repo instruction files">

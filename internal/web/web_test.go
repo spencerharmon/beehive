@@ -2705,3 +2705,112 @@ func TestRegistryConcurrentNoLeak(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestRegistrySwitcherPersistentChrome proves the multi-repo switcher lives in the
+// SHARED layout chrome (so it renders on every page, not just the dashboard), lists
+// every registered repo, marks the request's active repo as current (never its own
+// switch target), and offers a POST /repo/<name> switch for the others. Because
+// selection is a per-request cookie, switching flips which repo is current with no
+// shared server state.
+func TestRegistrySwitcherPersistentChrome(t *testing.T) {
+	s, _, _ := twoRepoRegistry(t)
+	mux := s.Routes()
+	// Assert on the dashboard AND an unrelated page (human), proving the switcher is
+	// persistent chrome from the layout header, not a dashboard-only widget.
+	for _, path := range []string{"/", "/human"} {
+		body := getRepo(t, mux, path, "alpha").Body.String()
+		if !strings.Contains(body, `class="repo-switcher"`) {
+			t.Fatalf("%s: switcher missing from chrome:\n%s", path, body)
+		}
+		if !strings.Contains(body, `class="repo-current" aria-current="true"`) || !strings.Contains(body, `>alpha</span>`) {
+			t.Fatalf("%s: active repo alpha must render as current:\n%s", path, body)
+		}
+		if !strings.Contains(body, `action="/repo/bravo"`) {
+			t.Fatalf("%s: switcher must offer a switch to bravo:\n%s", path, body)
+		}
+		if strings.Contains(body, `action="/repo/alpha"`) {
+			t.Fatalf("%s: the active repo must not be its own switch target:\n%s", path, body)
+		}
+	}
+	// Selecting bravo flips the current/target roles — no shared, cross-request state.
+	body := getRepo(t, mux, "/human", "bravo").Body.String()
+	if !strings.Contains(body, `>bravo</span>`) || !strings.Contains(body, `action="/repo/alpha"`) || strings.Contains(body, `action="/repo/bravo"`) {
+		t.Fatalf("bravo selected: bravo must be current and alpha the switch target:\n%s", body)
+	}
+}
+
+// TestRegistryDashboardOverview proves the multi-repo dashboard renders the
+// cross-repo overview: one aggregate card per registered repo (both handles
+// listed), the active repo marked and the other offered as a switch. The overview
+// folds COUNTS, never names — so no other repo's submodule name bleeds into the
+// page — and the per-submodule detail below stays scoped to the active repo.
+func TestRegistryDashboardOverview(t *testing.T) {
+	s, _, _ := twoRepoRegistry(t)
+	mux := s.Routes()
+
+	body := getRepo(t, mux, "/", "alpha").Body.String()
+	if !strings.Contains(body, `class="repo-overview"`) {
+		t.Fatalf("dashboard missing repos overview:\n%s", body)
+	}
+	// Both repos appear as overview cards (aggregate, by handle).
+	for _, name := range []string{"alpha", "bravo"} {
+		if !strings.Contains(body, ">"+name) {
+			t.Fatalf("overview must list repo %q:\n%s", name, body)
+		}
+	}
+	// The active repo card is marked; the other is a switch target.
+	if !strings.Contains(body, `repo-card active`) {
+		t.Fatalf("active repo card must carry the active class:\n%s", body)
+	}
+	if !strings.Contains(body, `action="/repo/bravo"`) {
+		t.Fatalf("overview must offer a switch to bravo:\n%s", body)
+	}
+	// Aggregate only: bravo's submodule name must NEVER appear on alpha's dashboard
+	// (the overview folds counts, not names — read-only, no cross crawl), while the
+	// active repo's own submodule detail (redteam) still renders.
+	if strings.Contains(body, "bluecrew") {
+		t.Fatalf("overview leaked bravo's submodule name into alpha's dashboard:\n%s", body)
+	}
+	if !strings.Contains(body, "redteam") {
+		t.Fatalf("active repo's own submodule detail (redteam) must still render:\n%s", body)
+	}
+}
+
+// TestSingleRepoNoSwitcherNoOverview locks the no-regression guarantee for BOTH
+// single-repo paths: a bare Server (New, no registry) and a one-entry registry
+// (NewRegistry) each render NEITHER the switcher chrome NOR the repos overview and
+// expose no /repo target — the page is exactly today's, no switcher noise.
+func TestSingleRepoNoSwitcherNoOverview(t *testing.T) {
+	// Path 1: a bare single-repo Server (New, no registry) — today's daemon.
+	s, _ := setup(t)
+	if s.multi() {
+		t.Fatal("bare single-repo server must not be multi")
+	}
+	assertNoSwitchChrome(t, get(t, s, "/").Body.String(), "bare New")
+
+	// Path 2: a one-entry registry (NewRegistry) — also not multi, same chrome.
+	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
+	root := initBeehiveRepo(t, "onlysub")
+	reg := config.Registry{Repos: []config.RepoEntry{
+		{Name: "solo", Root: root, GPGHome: filepath.Join(root, "gnupg"), GPGRecipient: "solo@example.com"},
+	}}
+	one, err := NewRegistry(reg)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	if one.multi() {
+		t.Fatal("single-entry registry must not be multi")
+	}
+	assertNoSwitchChrome(t, getRepo(t, one.Routes(), "/", "").Body.String(), "single-entry registry")
+}
+
+// assertNoSwitchChrome fails if body carries any multi-repo switcher/overview
+// markup — the shared assertion behind the single-repo no-regression guarantee.
+func assertNoSwitchChrome(t *testing.T, body, label string) {
+	t.Helper()
+	for _, absent := range []string{`class="repo-switcher"`, `class="repo-overview"`, `action="/repo/`} {
+		if strings.Contains(body, absent) {
+			t.Fatalf("%s: single-repo page must not contain %q:\n%s", label, absent, body)
+		}
+	}
+}

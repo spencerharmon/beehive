@@ -189,6 +189,27 @@ small, .small { font-size: var(--text-sm); }
 .nav-links a { color: var(--text-muted); }
 .nav-links a:hover { color: var(--accent); text-decoration: none; }
 
+/* Multi-repo switcher (top-bar chrome) ----------------------------------- */
+/* Persistent repo selector: only emitted when >1 repo is registered, so a
+   single-repo daemon's chrome is unchanged. Pushed to the right of the nav; the
+   active repo is a solid pill, the others are pill-outline switch buttons that
+   POST /repo/<name>. All tokens are the shared nav/badge set so it tracks
+   light/dark. */
+.repo-switcher { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-left: auto; font-size: var(--text-sm); }
+.repo-switcher-label { color: var(--text-muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: 0.04em; }
+.repo-current { font-weight: 700; color: var(--accent-contrast); background: var(--accent); padding: 0.12em 0.7em; border-radius: var(--radius-pill); }
+.repo-switch { display: inline; margin: 0; }
+.repo-switch button { font: inherit; font-size: var(--text-sm); cursor: pointer; color: var(--text-muted); background: var(--surface-2); border: var(--border-width) solid var(--border); border-radius: var(--radius-pill); padding: 0.12em 0.7em; }
+.repo-switch button:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Repos overview (dashboard, multi-repo only) ---------------------------- */
+/* Cross-repo aggregate cards above the scoped submodule view. Reuses the .card /
+   .badge system; the active repo's card is accent-bordered to tie it to the
+   scoped detail below. */
+.repo-overview { margin-bottom: var(--space-6); }
+.repo-card.active { border-color: var(--accent); }
+.repo-card .repo-switch { margin-top: var(--space-2); }
+
 .container {
   max-width: 66rem;
   margin: 0 auto;
