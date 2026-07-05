@@ -689,7 +689,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// (submodules/<sm>/sessions/<branch>.md) and, when Debug is set, tees live
 	// activity (reasoning, tool commands + output) to stderr. beehived reads the
 	// repo file, so opencode is polled exactly once regardless of UI viewers.
-	recCtx, recStop := context.WithCancel(ctx)
 	sid := SessionID(res.Branch, r.now())
 	res.SessionID = sid
 	// The transcript streams as rapid commits to the isolated session branch (via
@@ -720,6 +719,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if err != nil {
 		return res, err
 	}
+	// Cancellable context for the recorder goroutine, created only AFTER the
+	// fallible startSession above so an early return there cannot leak it. finish()
+	// calls recStop then waits on recDone.
+	recCtx, recStop := context.WithCancel(ctx)
 	recDone := make(chan struct{})
 	go func() { rec.loop(recCtx); close(recDone) }()
 
