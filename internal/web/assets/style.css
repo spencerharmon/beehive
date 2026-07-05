@@ -246,6 +246,32 @@ small, .small { font-size: var(--text-sm); }
 .ok { color: var(--success); font-weight: 600; }
 .muted { color: var(--text-muted); }
 
+/* Explorer optional-file index (optional-file-links): a compact pill row of
+   view/edit (or, when absent, create) links for the KNOWN optional-file set,
+   rendered whether or not each file exists on disk so a missing member is
+   discoverable rather than invisible. An absent row is dimmed and offers a
+   "create" link into the chat-diff editor's empty-base create path. */
+.file-index { margin-bottom: var(--space-4); }
+.file-index .file-links {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: 0;
+}
+.file-links .file-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: 0.12em 0.6em;
+  font-size: var(--text-sm);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+}
+.file-links .file-link.absent { opacity: 0.8; }
+.file-links .file-name { font-weight: 600; }
+
 /* Status pills ----------------------------------------------------------- *
  * Shape rule lists every slug so a bare `.status-done` renders fully; the
  * slug rules that follow only set the hue (--sh). `.status` alone is a neutral

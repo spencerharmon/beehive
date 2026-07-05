@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -313,6 +314,38 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 	return views, nil
 }
 
+// fileLink is one row of the explorer's optional-file index: a view/edit (or,
+// when absent, create) link for one member of the KNOWN per-submodule optional-
+// file set (repo.OptionalFiles). The index is driven by that DECLARED set, not by
+// the directory listing, so an absent file renders a discoverable create link
+// instead of being invisible (optional-file-links). File is the basename and the
+// template composes the repo-relative editor path submodules/<name>/<File>; the
+// chat-diff editor (chat-diff-editor-core) opens a present file on its current
+// contents (view+edit) and an absent one on an EMPTY base (create), seeded per
+// file via chat-diff-file-context — including ROI.md, which stays human-owned and
+// is therefore never auto-generated (the editor only writes on human approval).
+type fileLink struct {
+	Label   string // display name, e.g. "INFRASTRUCTURE" (basename minus .md)
+	File    string // basename, e.g. "INFRASTRUCTURE.md"
+	Present bool   // file exists on disk in this submodule
+}
+
+// optionalFileLinks builds the explorer's optional-file index for sm from the
+// DECLARED set repo.OptionalFiles (never the disk listing), stamping each member
+// present/absent by a plain existence check so a missing file still yields a row.
+func optionalFileLinks(sm repo.Submodule) []fileLink {
+	links := make([]fileLink, 0, len(repo.OptionalFiles))
+	for _, f := range repo.OptionalFiles {
+		_, err := os.Stat(filepath.Join(sm.Path, f))
+		links = append(links, fileLink{
+			Label:   strings.TrimSuffix(f, ".md"),
+			File:    f,
+			Present: err == nil,
+		})
+	}
+	return links
+}
+
 func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -351,7 +384,16 @@ func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 	if a, err := artifacts.LoadArtifacts(filepath.Join(sm.Path, repo.Artifacts)); err == nil && a.Present() {
 		docs["ARTIFACTS"] = renderMarkdown(a.String())
 	}
-	s.render(w, "explorer.html", map[string]interface{}{"Name": sm.Name, "Docs": docs})
+	// The optional-file index (optional-file-links) renders view/edit/create links
+	// for the FULL known optional-file set UNIFORMLY, present or absent, so a file
+	// that does not exist yet is still discoverable (the docs map above only shows
+	// present files' rendered content — the index is what makes an absent member
+	// reachable). Driven by the declared set, not the directory listing.
+	s.render(w, "explorer.html", map[string]interface{}{
+		"Name":  sm.Name,
+		"Docs":  docs,
+		"Files": optionalFileLinks(sm),
+	})
 }
 
 func (s *Server) branches(w http.ResponseWriter, r *http.Request) {

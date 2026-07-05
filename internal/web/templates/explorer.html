@@ -1,4 +1,15 @@
 {{template "header"}}
 <h1>{{.Name}}</h1>
+{{$name := .Name}}
+<nav class="file-index" aria-label="optional files">
+  <ul class="file-links">
+  {{range .Files}}
+    <li class="file-link {{if .Present}}present{{else}}absent{{end}}">
+      <span class="file-name">{{.Label}}</span>
+      {{if .Present}}<a href="/edit?path=submodules/{{$name}}/{{.File}}">view / edit</a>{{else}}<span class="muted">not created</span> <a href="/edit?path=submodules/{{$name}}/{{.File}}">create</a>{{end}}
+    </li>
+  {{end}}
+  </ul>
+</nav>
 {{range $k, $v := .Docs}}<section><h2>{{$k}}</h2><div class="markdown">{{$v}}</div></section>{{end}}
 {{template "footer"}}

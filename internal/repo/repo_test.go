@@ -117,6 +117,36 @@ func TestRulesFileConstant(t *testing.T) {
 	}
 }
 
+// TestOptionalFilesSet pins the declared optional-file set the explorer renders
+// discoverable view/edit links from (optional-file-links). It must be exactly the
+// five per-submodule optional files, keyed off the shared name constants (not
+// stray literals), and must NOT include PLAN.md (honeybee-owned, bootstrap-
+// produced, with its own view) so a create link is never offered for it.
+func TestOptionalFilesSet(t *testing.T) {
+	want := []string{InfraFile, RulesFile, Artifacts, AgentsFile, ROIFile}
+	if len(OptionalFiles) != len(want) {
+		t.Fatalf("OptionalFiles = %v, want %v", OptionalFiles, want)
+	}
+	got := map[string]bool{}
+	for _, f := range OptionalFiles {
+		if f == "" {
+			t.Fatal("OptionalFiles contains an empty entry")
+		}
+		if got[f] {
+			t.Fatalf("OptionalFiles has a duplicate entry %q", f)
+		}
+		got[f] = true
+	}
+	for _, f := range want {
+		if !got[f] {
+			t.Errorf("OptionalFiles missing %q", f)
+		}
+	}
+	if got[PlanFile] {
+		t.Error("OptionalFiles must NOT include PLAN.md (honeybee-owned, not a discoverable optional file)")
+	}
+}
+
 func gitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

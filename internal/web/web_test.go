@@ -999,6 +999,155 @@ func TestExplorerRulesAbsentNoOp(t *testing.T) {
 	}
 }
 
+// TestExplorerOptionalFileLinks locks optional-file-links: the explorer renders a
+// view/edit (or, when absent, create) link for EVERY member of the declared
+// optional-file set repo.OptionalFiles — driven by that SET, not the directory
+// listing — so a file that does not exist yet is discoverable. In the fixture
+// alpha has ROI.md present but no INFRASTRUCTURE/RULES/ARTIFACTS/AGENTS, yet all
+// five links render (four of them for absent files).
+func TestExplorerOptionalFileLinks(t *testing.T) {
+	s, root := setup(t)
+	sm := repo.Submodule{Name: "alpha", Path: filepath.Join(root, "submodules", "alpha")}
+	// Guard the fixture: of the optional set only ROI.md exists on disk.
+	for _, f := range []string{repo.InfraFile, repo.RulesFile, repo.Artifacts, repo.AgentsFile} {
+		if _, err := os.Stat(filepath.Join(sm.Path, f)); !os.IsNotExist(err) {
+			t.Fatalf("fixture unexpectedly has %s (err=%v)", f, err)
+		}
+	}
+
+	// White-box: the index is built from the DECLARED set, one row per member,
+	// with Present reflecting disk existence (not driving membership).
+	links := optionalFileLinks(sm)
+	if len(links) != len(repo.OptionalFiles) {
+		t.Fatalf("optionalFileLinks = %d rows, want %d (the declared set)", len(links), len(repo.OptionalFiles))
+	}
+	present := map[string]bool{}
+	for _, l := range links {
+		if l.File == "" || l.Label == "" {
+			t.Fatalf("row missing File/Label: %+v", l)
+		}
+		if l.Label != strings.TrimSuffix(l.File, ".md") {
+			t.Errorf("row label %q not derived from file %q", l.Label, l.File)
+		}
+		present[l.File] = l.Present
+	}
+	if !present[repo.ROIFile] {
+		t.Error("ROI.md is on disk but its row is marked absent")
+	}
+	for _, f := range []string{repo.InfraFile, repo.RulesFile, repo.Artifacts, repo.AgentsFile} {
+		if _, ok := present[f]; !ok {
+			t.Errorf("declared optional file %q missing a row (set must drive membership)", f)
+		}
+		if present[f] {
+			t.Errorf("%q is absent on disk but its row is marked present", f)
+		}
+	}
+
+	// Rendered: a link for EVERY optional file (incl. the four absent ones), the
+	// present ROI as view/edit and the absent ones as create.
+	body := get(t, s, "/submodule/alpha").Body.String()
+	for _, f := range repo.OptionalFiles {
+		if want := "/edit?path=submodules/alpha/" + f; !strings.Contains(body, want) {
+			t.Errorf("explorer missing set-driven optional-file link %q:\n%s", want, body)
+		}
+	}
+	if !strings.Contains(body, "view / edit") {
+		t.Errorf("explorer missing a view/edit link for the present ROI.md:\n%s", body)
+	}
+	if !strings.Contains(body, "create") || !strings.Contains(body, "not created") {
+		t.Errorf("explorer missing a create affordance for the absent optional files:\n%s", body)
+	}
+
+	// Present detection follows disk: creating RULES.md flips its row to present.
+	if err := os.WriteFile(filepath.Join(sm.Path, repo.RulesFile), []byte("# rules\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range optionalFileLinks(sm) {
+		if l.File == repo.RulesFile && !l.Present {
+			t.Error("RULES.md now on disk but its row is still marked absent")
+		}
+	}
+}
+
+// TestExplorerAbsentFileEmptyBaseCreate locks the absent-member create path: the
+// optional-file link opens the chat-diff editor on an EMPTY base, seeded with the
+// file's rules (chat-diff-file-context), and the new file is written ONLY on
+// approval (never auto-generated).
+func TestExplorerAbsentFileEmptyBaseCreate(t *testing.T) {
+	fc := &fakeChatClient{reply: proposeReply("Drafted infra.", "# Infra\nActive: blue")}
+	s, _ := chatFixtureClient(t, fc)
+	ctx := context.Background()
+	path := "submodules/alpha/" + repo.InfraFile // absent in the fixture
+
+	sess, err := s.chat.open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if base, _ := sess.base(ctx); base != "" {
+		t.Fatalf("absent optional file must open on an empty base, got %q", base)
+	}
+	if sess.sys != chatSystemPrompt(path) {
+		t.Fatal("session not seeded from resolveFileContext (chat-diff-file-context)")
+	}
+	if err := sess.chat(ctx, "draft infra"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	// The opencode session was seeded with the INFRASTRUCTURE.md rules.
+	if !strings.Contains(fc.system, "internal/artifacts") {
+		t.Fatalf("empty-base create not seeded with INFRASTRUCTURE rules:\n%s", fc.system)
+	}
+	// Nothing on disk before approval.
+	if _, err := os.Stat(filepath.Join(sess.wtPath, filepath.FromSlash(path))); !os.IsNotExist(err) {
+		t.Fatalf("file must not exist before approval (err=%v)", err)
+	}
+	if err := sess.approve(ctx); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if got := gitShow(t, sess.wtPath, "HEAD", path); got != "# Infra\nActive: blue" {
+		t.Fatalf("empty-base create did not commit the new file: %q", got)
+	}
+}
+
+// TestExplorerROICreateThroughEditorNoAutogen locks ROI ownership: the explorer
+// routes ROI.md's create/edit through the chat-diff editor (not an auto-
+// generator), the seeded context marks it human-owned / honeybee-FORBIDDEN, and a
+// proposed ROI change is NEVER written without explicit human approval.
+func TestExplorerROICreateThroughEditorNoAutogen(t *testing.T) {
+	s0, _ := setup(t)
+	body := get(t, s0, "/submodule/alpha").Body.String()
+	if !strings.Contains(body, "/edit?path=submodules/alpha/"+repo.ROIFile) {
+		t.Fatalf("explorer must route ROI create/edit through the editor:\n%s", body)
+	}
+	sp := chatSystemPrompt("submodules/alpha/" + repo.ROIFile)
+	for _, want := range []string{"human-owned", "FORBIDDEN"} {
+		if !strings.Contains(sp, want) {
+			t.Errorf("ROI editor context missing ownership token %q:\n%s", want, sp)
+		}
+	}
+
+	// Never auto-generated: a proposed ROI edit stays unwritten until approval.
+	fc := &fakeChatClient{reply: proposeReply("Draft.", "# alpha\nGoals: ship it.")}
+	s, _ := chatFixtureClient(t, fc)
+	ctx := context.Background()
+	path := "submodules/alpha/" + repo.ROIFile
+	sess, err := s.chat.open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if !strings.Contains(sess.sys, "human-owned") {
+		t.Fatal("ROI session not seeded with human-owned rules")
+	}
+	if err := sess.chat(ctx, "draft"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if _, ok := sess.pending(); !ok {
+		t.Fatal("expected a pending ROI proposal")
+	}
+	if got := gitShow(t, sess.wtPath, "HEAD", path); got != "# alpha" {
+		t.Fatalf("ROI must not be auto-generated before approval, got %q", got)
+	}
+}
+
 // TestROIViewRendersAndRawVerbatim locks the dual contract for the editor: the
 // ROI VIEW shows a rendered preview while the editable textarea keeps the RAW
 // source verbatim (the edit round-trip must not be lost to rendering).

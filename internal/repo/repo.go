@@ -27,6 +27,23 @@ const (
 	BootstrapFile = "BOOTSTRAP.md"
 )
 
+// OptionalFiles is the KNOWN set of optional per-submodule files the frontend
+// renders view/edit links for UNIFORMLY — present or absent — so a missing file
+// is discoverable instead of invisible (the explorer drives links from THIS set,
+// not from the directory listing). It mirrors the layout name constants above
+// (RULES.md rides the submodule-rules-md overlay); ROI.md is human-owned and is
+// edited only through the frontend editor, never auto-generated. PLAN.md is
+// deliberately excluded: it is honeybee-owned, is produced by bootstrap rather
+// than authored ad hoc, and has its own dedicated plan view. Order is the
+// discovery order the explorer index renders in.
+var OptionalFiles = []string{
+	InfraFile,  // INFRASTRUCTURE.md
+	RulesFile,  // RULES.md
+	Artifacts,  // ARTIFACTS.md
+	AgentsFile, // AGENTS.md
+	ROIFile,    // ROI.md
+}
+
 // roiStamp matches the PLAN.md reconcile marker: <!-- Beehive-ROI: <sha> -->
 var roiStamp = regexp.MustCompile(`Beehive-ROI:\s*([0-9a-f]+)`)
 
