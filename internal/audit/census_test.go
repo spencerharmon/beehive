@@ -1,0 +1,262 @@
+package audit
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/spencerharmon/beehive/internal/repo"
+)
+
+// writeStub plants a repo.SessionStub placeholder at dir/<stem>.md pointing at
+// branch — an UNFINALIZED session file, the shape the census must classify as a
+// stub (not a parse error). stem (the file name) is the session id; branch is the
+// distinct live branch the transcript streams to.
+func writeStub(t *testing.T, dir, stem, branch string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, stem+".md"), []byte(repo.SessionStub(branch)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestParseDirCensusClassifies is the binding acceptance: a sessions dir mixing
+// finalized transcripts, repo.SessionStub files, and one malformed file yields
+// correct counts (finalized N, stubs M with sids+branches, errors 1), and the
+// stubs are NOT reported as generic parse errors. It also pins ParseDir's
+// unchanged (sessions, joined-malformed-error) contract over the same dir.
+func TestParseDirCensusClassifies(t *testing.T) {
+	dir := t.TempDir()
+	// Finalized (mineable) transcripts.
+	writeSynth(t, dir, "bee-alpha-100", KindWork, 3, "")
+	writeSynth(t, dir, "bee-beta-200", KindReview, 2, "")
+	// Unfinalized stubs: the file stem (sid) deliberately differs from the branch
+	// the stub streams to — exactly as the live runner writes them
+	// (sessions/bee-<task>-<epoch>-<pid>.md holding a "<sm>-<epoch>-<pid>-session"
+	// branch) — proving sid=stem and branch=parsed are recorded independently.
+	writeStub(t, dir, "bee-gamma-300", "beehive-300-777-session")
+	writeStub(t, dir, "bee-delta-400", "beehive-400-888-session")
+	// One genuinely malformed file: no header, and not a stub.
+	if err := os.WriteFile(filepath.Join(dir, "bee-garbage-500.md"),
+		[]byte("# session\n\nthere is no header line here\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := ParseDirCensus(dir)
+	if err != nil {
+		t.Fatalf("ParseDirCensus: %v", err)
+	}
+	if c.Finalized() != 2 {
+		t.Errorf("finalized=%d want 2 (%v)", c.Finalized(), ids(c.Sessions))
+	}
+	if c.StubCount() != 2 {
+		t.Fatalf("stubs=%d want 2 (%+v)", c.StubCount(), c.Stubs)
+	}
+	if c.ErrorCount() != 1 {
+		t.Fatalf("errors=%d want 1 (%v)", c.ErrorCount(), c.Errors)
+	}
+	if c.Total() != 5 {
+		t.Errorf("total=%d want 5", c.Total())
+	}
+	// Stubs record sid (file stem) + the branch they stream to, sid-sorted.
+	wantStubs := []Stub{
+		{SID: "bee-delta-400", Branch: "beehive-400-888-session"},
+		{SID: "bee-gamma-300", Branch: "beehive-300-777-session"},
+	}
+	if !reflect.DeepEqual(c.Stubs, wantStubs) {
+		t.Errorf("stubs=%+v want %+v", c.Stubs, wantStubs)
+	}
+	// The single error names ONLY the malformed file; no stub sid leaks into it.
+	joined := errors.Join(c.Errors...).Error()
+	if !strings.Contains(joined, "bee-garbage-500.md") {
+		t.Errorf("error %q should name the malformed file", joined)
+	}
+	for _, stub := range []string{"bee-gamma-300", "bee-delta-400"} {
+		if strings.Contains(joined, stub) {
+			t.Errorf("stub %s wrongly reported as a parse error in %q", stub, joined)
+		}
+	}
+
+	// ParseDir keeps its original contract: 2 sessions and a joined error naming
+	// only the malformed file — stubs are neither sessions nor errors.
+	ss, derr := ParseDir(dir)
+	if len(ss) != 2 {
+		t.Errorf("ParseDir sessions=%d want 2 (%v)", len(ss), ids(ss))
+	}
+	if derr == nil || !strings.Contains(derr.Error(), "bee-garbage-500.md") {
+		t.Fatalf("ParseDir err=%v want it to name the malformed file", derr)
+	}
+	for _, stub := range []string{"bee-gamma-300", "bee-delta-400"} {
+		if strings.Contains(derr.Error(), stub) {
+			t.Errorf("ParseDir wrongly surfaced stub %s as an error", stub)
+		}
+	}
+}
+
+// TestParseDirCensusStubFixture parses the committed stub fixture (a real
+// repo.SessionStub written to disk) and asserts it is classified as one
+// unfinalized stub — zero finalized, zero errors — with its sid and branch.
+func TestParseDirCensusStubFixture(t *testing.T) {
+	c, err := ParseDirCensus(filepath.Join("testdata", "stubs"))
+	if err != nil {
+		t.Fatalf("ParseDirCensus stub fixture: %v", err)
+	}
+	if c.Finalized() != 0 || c.ErrorCount() != 0 {
+		t.Fatalf("fixture finalized=%d errors=%d want 0/0 (%v)", c.Finalized(), c.ErrorCount(), c.Errors)
+	}
+	want := []Stub{{
+		SID:    "bee-example-task-1782800000-98765",
+		Branch: "beehive-1782800000-98765-session",
+	}}
+	if !reflect.DeepEqual(c.Stubs, want) {
+		t.Errorf("stubs=%+v want %+v", c.Stubs, want)
+	}
+}
+
+// TestCorpusFinalizedNotStubbed guards the false-positive direction: the real
+// finalized corpus must classify entirely as mineable sessions with zero stubs
+// and zero errors (a healthy, fully-finalized corpus).
+func TestCorpusFinalizedNotStubbed(t *testing.T) {
+	c, err := ParseDirCensus(filepath.Join("testdata", "sessions"))
+	if err != nil {
+		t.Fatalf("ParseDirCensus sessions: %v", err)
+	}
+	if c.Finalized() != len(corpus) || c.StubCount() != 0 || c.ErrorCount() != 0 {
+		t.Fatalf("finalized=%d stubs=%d errors=%d want %d/0/0",
+			c.Finalized(), c.StubCount(), c.ErrorCount(), len(corpus))
+	}
+	if f := c.MineableFraction(); f != 1 {
+		t.Errorf("fully-finalized corpus mineable fraction=%v want 1.0", f)
+	}
+	if c.CorpusBroken(false) {
+		t.Errorf("fully-finalized corpus wrongly flagged broken")
+	}
+}
+
+// mkCensus builds a Census with the given counts (element identity is irrelevant
+// to the census math, which is purely count-based).
+func mkCensus(finalized, stubs, errs int) Census {
+	c := Census{}
+	for i := 0; i < finalized; i++ {
+		c.Sessions = append(c.Sessions, Session{ID: fmt.Sprintf("f%d", i)})
+	}
+	for i := 0; i < stubs; i++ {
+		c.Stubs = append(c.Stubs, Stub{SID: fmt.Sprintf("s%d", i)})
+	}
+	for i := 0; i < errs; i++ {
+		c.Errors = append(c.Errors, fmt.Errorf("e%d", i))
+	}
+	return c
+}
+
+// TestCensusMineableMath pins the census arithmetic, including the empty-dir edge
+// (defined as fully mineable so a genuinely empty sessions dir never warns).
+func TestCensusMineableMath(t *testing.T) {
+	cases := []struct {
+		fin, stub, err int
+		total          int
+		frac           float64
+	}{
+		{0, 0, 0, 0, 1.0},  // empty dir: fully mineable by definition
+		{3, 1, 0, 4, 0.75}, // one live stream against three finalized
+		{1, 2, 0, 3, 1.0 / 3},
+		{30, 729, 0, 759, 30.0 / 759}, // the ~96%-loss defect
+		{2, 0, 2, 4, 0.5},             // malformed files also count against the fraction
+	}
+	for _, tc := range cases {
+		c := mkCensus(tc.fin, tc.stub, tc.err)
+		if c.Total() != tc.total {
+			t.Errorf("total(%d,%d,%d)=%d want %d", tc.fin, tc.stub, tc.err, c.Total(), tc.total)
+		}
+		if c.Finalized() != tc.fin || c.StubCount() != tc.stub || c.ErrorCount() != tc.err {
+			t.Errorf("counts(%d,%d,%d)=%d/%d/%d", tc.fin, tc.stub, tc.err,
+				c.Finalized(), c.StubCount(), c.ErrorCount())
+		}
+		if got := c.MineableFraction(); got != tc.frac {
+			t.Errorf("fraction(%d,%d,%d)=%v want %v", tc.fin, tc.stub, tc.err, got, tc.frac)
+		}
+	}
+}
+
+// TestCorpusBroken exercises the warning decision across the four regimes.
+func TestCorpusBroken(t *testing.T) {
+	cases := []struct {
+		name        string
+		fin, stub   int
+		windowEmpty bool
+		broken      bool
+	}{
+		// Rest: everything finalized, window empty only because all audited.
+		{"rest-empty-window", 6, 0, true, false},
+		// Defect: window empty WHILE stubs exist — the exact starve signature.
+		{"unfinalized-empty-window", 3, 5, true, true},
+		// Degradation: majority stubs, window not yet empty -> fires below thresh.
+		{"low-fraction-nonempty", 1, 2, false, true},
+		// Healthy: a few live streams, high fraction, non-empty window -> silent.
+		{"few-stubs-high-fraction", 9, 1, false, false},
+		// No stubs is never broken, even with a low fraction from malformed files.
+		{"no-stubs-never-broken", 1, 0, true, false},
+	}
+	for _, tc := range cases {
+		c := mkCensus(tc.fin, tc.stub, 0)
+		if got := c.CorpusBroken(tc.windowEmpty); got != tc.broken {
+			t.Errorf("%s: CorpusBroken(%v)=%v want %v (frac=%.3f)",
+				tc.name, tc.windowEmpty, got, tc.broken, c.MineableFraction())
+		}
+	}
+}
+
+// TestCorpusFractionThreshold pins the low-fraction boundary: just below
+// LowMineableFraction fires, exactly at/above it is silent and byte-stable.
+func TestCorpusFractionThreshold(t *testing.T) {
+	// 2 finalized + 2 stubs = 0.50 == threshold -> NOT below -> silent.
+	at := mkCensus(2, 2, 0)
+	if at.MineableFraction() != LowMineableFraction {
+		t.Fatalf("fraction=%v want exactly the threshold %v", at.MineableFraction(), LowMineableFraction)
+	}
+	if at.CorpusBroken(false) {
+		t.Errorf("fraction exactly at threshold must not fire (non-empty window)")
+	}
+	if w := at.CorpusWarning(false); w != "" {
+		t.Errorf("at-threshold warning=%q want empty (byte-stable)", w)
+	}
+	// 1 finalized + 2 stubs = 0.33 < threshold -> fires.
+	below := mkCensus(1, 2, 0)
+	if !below.CorpusBroken(false) {
+		t.Errorf("fraction %.3f below threshold must fire", below.MineableFraction())
+	}
+}
+
+// TestCorpusWarningByteStable asserts the warning is silent (zero bytes) for a
+// healthy corpus and loud+informative for the defect, and that it distinguishes
+// the empty-window case in its text.
+func TestCorpusWarningByteStable(t *testing.T) {
+	// Healthy: no stubs -> exactly zero bytes, regardless of window state.
+	healthy := mkCensus(6, 0, 0)
+	if w := healthy.CorpusWarning(true); w != "" {
+		t.Errorf("healthy empty-window warning=%q want '' (rest, byte-stable)", w)
+	}
+	if w := healthy.CorpusWarning(false); w != "" {
+		t.Errorf("healthy warning=%q want '' (byte-stable)", w)
+	}
+	// Defect with an empty window: loud banner naming the counts and the cause.
+	defect := mkCensus(30, 729, 0)
+	w := defect.CorpusWarning(true)
+	if w == "" {
+		t.Fatal("defect warning empty, want the loud corpus-broken banner")
+	}
+	for _, want := range []string{"CORPUS BROKEN, NOT A REST", "729", "759", "EMPTY"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("warning missing %q:\n%s", want, w)
+		}
+	}
+	// Non-empty-window low-fraction defect omits the empty-window sentence but
+	// still fires.
+	w2 := mkCensus(1, 2, 0).CorpusWarning(false)
+	if w2 == "" || strings.Contains(w2, "window is EMPTY") {
+		t.Errorf("low-fraction non-empty warning=%q want fired without the empty-window line", w2)
+	}
+}

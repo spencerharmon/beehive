@@ -1,7 +1,9 @@
 package audit
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/spencerharmon/beehive/internal/plan"
 )
@@ -99,4 +101,99 @@ func DeliveredFromPlan(p *plan.Plan) map[string]bool {
 		}
 	}
 	return out
+}
+
+// Stub is one UNFINALIZED session file: a repo.SessionStub placeholder still on
+// main while its transcript streams to a live branch. It is a known, expected
+// shape (repo.ParseSessionStub recognises it), NOT corrupt noise — so the audit
+// engine records it as an unfinalized stub (its sid and the branch it points to)
+// rather than mis-filing it as a malformed parse error. A stub carries no
+// mineable metrics yet; it becomes a finalized transcript when its session ends
+// (that finalization is session-transcript-finalize's job, not audit's).
+type Stub struct {
+	SID    string // session id == the file stem (name without the ".md")
+	Branch string // the live branch the stub points to
+}
+
+// Census is the corpus-integrity summary of a sessions directory: how many files
+// are finalized (mineable) transcripts, how many are still unfinalized stubs, and
+// how many are genuinely malformed. It exists to tell an EMPTY audit window apart
+// from a rested swarm — empty-because-audited (healthy) versus
+// empty-because-unfinalized (a corpus-loss defect that is byte-for-byte identical
+// to a rest without this census). Reporting only: nothing here finalizes a stub.
+type Census struct {
+	// Sessions are the finalized, mineable transcripts, epoch-sorted (exactly the
+	// slice ParseDir returns).
+	Sessions []Session
+	// Stubs are the unfinalized stub files, deterministically ordered by SID.
+	Stubs []Stub
+	// Errors are the genuinely malformed files (missing/garbled header, unreadable
+	// bytes) — NEVER stubs. One error per bad file, none swallowed.
+	Errors []error
+}
+
+// Finalized is the count of mineable transcripts.
+func (c Census) Finalized() int { return len(c.Sessions) }
+
+// StubCount is the number of unfinalized stub files.
+func (c Census) StubCount() int { return len(c.Stubs) }
+
+// ErrorCount is the number of genuinely malformed files.
+func (c Census) ErrorCount() int { return len(c.Errors) }
+
+// Total is every classified ".md" file: finalized + stubs + malformed.
+func (c Census) Total() int { return c.Finalized() + c.StubCount() + c.ErrorCount() }
+
+// MineableFraction is the share of the corpus that is finalized and thus
+// mineable (finalized / total). An empty directory is defined as fully mineable
+// (1.0): nothing is broken, there is simply nothing there — so a genuinely empty
+// sessions dir never trips the corpus-broken warning.
+func (c Census) MineableFraction() float64 {
+	total := c.Total()
+	if total == 0 {
+		return 1
+	}
+	return float64(c.Finalized()) / float64(total)
+}
+
+// LowMineableFraction is the threshold below which a corpus that carries stubs is
+// judged "mostly unfinalized" and the loud warning fires even before the audit
+// window is fully empty. Chosen so a handful of live-streaming sessions against a
+// large finalized corpus stays quiet, while a corpus that is majority stubs (the
+// 96%-corpus-loss defect) is caught.
+const LowMineableFraction = 0.5
+
+// CorpusBroken reports the "unfinalized, not rested" defect: unfinalized stubs
+// exist AND either the mineable audit window is empty (nothing to mine, yet the
+// corpus is NOT actually rested) or the mineable fraction has fallen below
+// LowMineableFraction (the corpus is mostly unfinalized). A fully-finalized
+// corpus (zero stubs) is never broken, so a healthy rested swarm — its window
+// empty only because everything was audited — stays byte-for-byte silent.
+func (c Census) CorpusBroken(windowEmpty bool) bool {
+	if len(c.Stubs) == 0 {
+		return false
+	}
+	return windowEmpty || c.MineableFraction() < LowMineableFraction
+}
+
+// CorpusWarning returns the loud, human-facing "corpus broken, not a rest" banner
+// when the census+window is the unfinalized-not-rested defect (per CorpusBroken),
+// or "" when the corpus is healthy. It is byte-stable: a fully-finalized corpus
+// yields exactly zero bytes, so a caller can print the result unconditionally and
+// a healthy pass stays silent. Reporting only — it names the defect and points at
+// finalization; it does not finalize anything.
+func (c Census) CorpusWarning(windowEmpty bool) string {
+	if !c.CorpusBroken(windowEmpty) {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("================ CORPUS BROKEN, NOT A REST ================\n")
+	fmt.Fprintf(&b, "audit: %d of %d session files are UNFINALIZED stubs (mineable fraction %.2f, threshold %.2f).\n",
+		c.StubCount(), c.Total(), c.MineableFraction(), LowMineableFraction)
+	if windowEmpty {
+		b.WriteString("The audit window is EMPTY because the corpus is unfinalized, NOT because the swarm rested.\n")
+	}
+	b.WriteString("Do NOT read this as 'nothing to audit'. Finalize the streaming sessions so their transcripts become mineable (session-transcript-finalize).\n")
+	b.WriteString("===========================================================\n")
+	return b.String()
 }

@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/spencerharmon/beehive/internal/repo"
 )
 
 // warningHeader is the exact line internal/swarm.recorder.appendWarning emits on
@@ -35,27 +37,80 @@ var lostRaceRe = regexp.MustCompile(`(?i)lost (the )?(race|claim)|errlost|resele
 // are always returned; any per-file failures are surfaced (never swallowed) in a
 // joined error so the caller can report them. A clean directory returns a nil
 // error.
+//
+// An UNFINALIZED stub (a repo.SessionStub placeholder still streaming to a live
+// branch) is a known shape, NOT a parse error: ParseDir classifies it out via
+// ParseDirCensus so it is neither returned as a Session nor folded into the error
+// pile. Callers that need to tell an empty-because-audited window apart from an
+// empty-because-unfinalized one must use ParseDirCensus, which surfaces the stub
+// count; ParseDir preserves its original (sessions, joined-malformed-error)
+// contract for existing callers.
 func ParseDir(dir string) ([]Session, error) {
-	ents, err := os.ReadDir(dir)
+	c, err := ParseDirCensus(dir)
 	if err != nil {
 		return nil, err
 	}
-	var out []Session
-	var errs []error
+	return c.Sessions, errors.Join(c.Errors...)
+}
+
+// ParseDirCensus parses dir into a corpus Census: finalized (mineable) Sessions,
+// unfinalized Stubs, and genuinely malformed Errors. It is the corpus-integrity
+// front door: a session file that repo.ParseSessionStub recognises (a known
+// unfinalized shape, still streaming to a live branch) is recorded as a Stub —
+// its sid and the branch it points to — rather than mis-reported as a "no header
+// line" parse error. Only a file that is neither a valid transcript nor a
+// recognised stub becomes an Error. Sessions are epoch-sorted with the
+// reconcile-loop heuristic applied (exactly as ParseDir returns them); Stubs are
+// sid-sorted; both are deterministic. A directory that cannot be read is the only
+// hard error; per-file failures are collected in Census.Errors, never swallowed.
+//
+// This is what lets `beehive audit` tell empty-because-audited (a rested swarm)
+// apart from empty-because-unfinalized (a corpus-loss defect): the two are
+// byte-identical windows, distinguished only by whether unfinalized stubs exist.
+func ParseDirCensus(dir string) (Census, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return Census{}, err
+	}
+	var c Census
 	for _, e := range ents {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
-		s, err := ParseFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			errs = append(errs, err)
+		data, rerr := os.ReadFile(filepath.Join(dir, e.Name()))
+		if rerr != nil {
+			c.Errors = append(c.Errors, rerr)
 			continue
 		}
-		out = append(out, *s)
+		// Classify a stub BEFORE the transcript parse. A stub carries no
+		// "submodule · kind · branch" header, so parseTranscript would reject it
+		// as malformed and bury every unfinalized-but-known file in the error
+		// pile — the exact 729-errors-and-an-empty-window defect this guards
+		// against. repo.ParseSessionStub is the same recogniser beehived uses to
+		// resolve a live stub, so audit and the frontend agree on what a stub is.
+		if branch, ok := repo.ParseSessionStub(string(data)); ok {
+			c.Stubs = append(c.Stubs, Stub{
+				SID:    strings.TrimSuffix(e.Name(), ".md"),
+				Branch: branch,
+			})
+			continue
+		}
+		s, perr := parseTranscript(e.Name(), data)
+		if perr != nil {
+			c.Errors = append(c.Errors, perr)
+			continue
+		}
+		c.Sessions = append(c.Sessions, *s)
 	}
-	sortByEpoch(out)
-	markReconcileLoops(out)
-	return out, errors.Join(errs...)
+	sortByEpoch(c.Sessions)
+	markReconcileLoops(c.Sessions)
+	sortStubs(c.Stubs)
+	return c, nil
+}
+
+// sortStubs orders stubs by SID ascending, in place, for deterministic output.
+func sortStubs(s []Stub) {
+	sort.Slice(s, func(i, j int) bool { return s[i].SID < s[j].SID })
 }
 
 // ParseFile reads and parses a single transcript file. Bytes is the file size.

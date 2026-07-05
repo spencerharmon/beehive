@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,17 +46,9 @@ func auditCmd() *cobra.Command {
 				fmt.Printf("# no sessions for %s\n", sm.Name)
 				return nil
 			}
-			sessions, perr := audit.ParseDir(sessDir)
+			sessions, census, perr := parseSessions(sessDir)
 			if perr != nil {
-				// ParseDir is per-file resilient: a single unparsable/odd
-				// transcript name must not zero an entire pass. Surface the
-				// failures (never swallow them) but proceed with the sessions
-				// that did parse; only a directory that yields nothing usable is
-				// a hard error.
-				fmt.Fprintf(os.Stderr, "beehive: audit: skipped unparsable session(s):\n%v\n", perr)
-				if len(sessions) == 0 {
-					return perr
-				}
+				return perr
 			}
 			delivered, err := deliveredSet(sm)
 			if err != nil {
@@ -73,9 +66,16 @@ func auditCmd() *cobra.Command {
 			aggs := audit.Aggregate(sessions, delivered)
 			trend := audit.ComputeTrend(aggs, pass)
 
+			printCensus(census)
 			printWindow(window)
 			printAggregate(aggs)
 			printTrend(trend)
+			// Loud, byte-stable corpus-integrity alarm: an empty/sparse window over
+			// a corpus of unfinalized stubs is a finalization defect, not a rest.
+			// CorpusWarning yields "" (nothing printed) for a healthy corpus.
+			if w := census.CorpusWarning(len(window) == 0); w != "" {
+				fmt.Fprint(os.Stderr, w)
+			}
 
 			if write {
 				led.AppendPass(window, trend)
@@ -91,6 +91,30 @@ func auditCmd() *cobra.Command {
 	c.Flags().StringVar(&submodule, "submodule", "", "submodule to audit (default: the only one)")
 	c.Flags().BoolVar(&write, "write", false, "append this pass to the docs/audit ledger")
 	return c
+}
+
+// parseSessions runs the corpus census over sessDir and returns the finalized
+// (mineable) sessions plus the full census (finalized/stub/malformed counts).
+// Genuinely malformed files are surfaced on stderr (never swallowed) but must not
+// zero the pass. Unfinalized stubs are NOT errors — they are counted in the
+// census and drive the corpus-broken warning downstream. A hard error is returned
+// only when nothing at all is usable or recognisable (no sessions AND no stubs),
+// or when the directory itself cannot be read.
+func parseSessions(sessDir string) ([]audit.Session, audit.Census, error) {
+	census, err := audit.ParseDirCensus(sessDir)
+	if err != nil {
+		return nil, audit.Census{}, err
+	}
+	if len(census.Errors) > 0 {
+		joined := errors.Join(census.Errors...)
+		fmt.Fprintf(os.Stderr, "beehive: audit: skipped %d malformed session(s):\n%v\n", len(census.Errors), joined)
+		if census.Finalized() == 0 && census.StubCount() == 0 {
+			// Nothing usable and nothing even recognisable as a stub — a real
+			// failure, not a rest and not an unfinalized corpus.
+			return nil, audit.Census{}, joined
+		}
+	}
+	return census.Sessions, census, nil
 }
 
 // resolveSubmodule picks the named submodule, or the sole submodule when name is
@@ -136,6 +160,24 @@ func deliveredSet(sm repo.Submodule) (map[string]bool, error) {
 		return nil, err
 	}
 	return audit.DeliveredFromPlan(p), nil
+}
+
+func printCensus(c audit.Census) {
+	// The corpus census makes an empty audit window self-explaining:
+	// empty-because-audited (a rest) versus empty-because-unfinalized (a defect).
+	fmt.Println("# corpus census (finalized=mineable, stub=unfinalized, malformed=broken)")
+	fmt.Println(strings.Join([]string{"total", "finalized", "stub", "malformed", "mineable_fraction"}, "\t"))
+	fmt.Println(strings.Join([]string{
+		strconv.Itoa(c.Total()), strconv.Itoa(c.Finalized()), strconv.Itoa(c.StubCount()),
+		strconv.Itoa(c.ErrorCount()), strconv.FormatFloat(c.MineableFraction(), 'f', 3, 64),
+	}, "\t"))
+	if c.StubCount() > 0 {
+		fmt.Println("# unfinalized stubs (sid, branch)")
+		fmt.Println(strings.Join([]string{"sid", "branch"}, "\t"))
+		for _, s := range c.Stubs {
+			fmt.Println(strings.Join([]string{s.SID, s.Branch}, "\t"))
+		}
+	}
 }
 
 func printWindow(w []audit.Session) {
