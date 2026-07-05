@@ -5,6 +5,79 @@
      hx-get="/submodule/{{.Name}}/session/{{.Branch}}/body"
      hx-trigger="load, every 2s"
      hx-swap="innerHTML">
-  <p>loading…</p>
+  <p id="session-loading">loading…</p>
 </div>
+{{if .Live}}
+<script>
+/* session-stream: while a honeybee runs, stream its transcript over SSE so agent
+   output appears token-by-token instead of in the 2s poll jumps. The stream
+   carries the SAME file-derived transcript the htmx poll renders (git/disk, never
+   opencode), so it is a drop-in live channel: we cancel the poll while the stream
+   is connected and fall back to it on error or when the browser lacks
+   EventSource. A `sync` event carries the off-box follow staleness banner so it
+   stays fresh while the poll (which normally refreshes it) is cancelled. On the
+   stream's "end" event (session finished) we close it and do one authoritative
+   poll for the durable final transcript. A bottom-pinned reader keeps following
+   new output; a scrolled-back reader's position is held. No external libraries
+   (single-binary embed, no CDN). */
+(function () {
+  var body = document.getElementById('session-body');
+  if (!body || !window.EventSource) return; // no SSE support: htmx poll is the sole path
+  var SLACK = 4;
+  window.__sseLive = false;
+
+  // While the stream is connected it is the authoritative live channel, so cancel
+  // THIS pane's htmx poll (a concurrent poll would double-render the same text).
+  document.addEventListener('htmx:beforeRequest', function (e) {
+    if (window.__sseLive && e.detail && e.detail.elt === body) e.preventDefault();
+  });
+
+  function render(text) {
+    var pre = document.getElementById('session-transcript');
+    if (!pre) { // the poll hasn't rendered the container yet: create it ourselves
+      var lp = document.getElementById('session-loading');
+      if (lp) lp.remove();
+      pre = document.createElement('pre');
+      pre.className = 'session';
+      pre.id = 'session-transcript';
+      pre.setAttribute('data-scroll-preserve', '');
+      pre.setAttribute('data-scroll-pin', '');
+      body.appendChild(pre);
+    }
+    var pinned = pre.scrollHeight - pre.scrollTop - pre.clientHeight <= SLACK;
+    pre.textContent = text;
+    if (pinned) pre.scrollTop = pre.scrollHeight; // follow new output at the bottom
+  }
+
+  function renderSync(st) {
+    var p = document.getElementById('session-sync');
+    if (!st || !st.Ago) { if (p) p.remove(); return; } // single-host: no banner
+    if (!p) { p = document.createElement('p'); p.id = 'session-sync'; }
+    p.className = 'sync-status' + (st.Err ? ' stale' : '');
+    p.textContent = 'followed ' + st.Ago + ' ago' + (st.Err ? ' · pull stalled: ' + st.Err : '');
+    if (p.parentNode !== body) body.insertBefore(p, body.firstChild); // keep it above the transcript
+  }
+
+  var es = new EventSource('/submodule/{{.Name}}/session/{{.Branch}}/stream');
+  es.onmessage = function (e) { window.__sseLive = true; render(e.data); };
+  es.addEventListener('sync', function (e) {
+    window.__sseLive = true;
+    try { renderSync(JSON.parse(e.data)); } catch (_) {}
+  });
+  es.addEventListener('end', function () {
+    // Session finished: stop streaming and do ONE authoritative poll for the
+    // durable final transcript, which supersedes the last streamed frame.
+    window.__sseLive = false;
+    es.close();
+    if (window.htmx) htmx.trigger(body, 'load');
+  });
+  es.onerror = function () {
+    // Transient drop (or unsupported mid-stream): resume the poll fallback. The
+    // browser auto-reconnects; a successful reconnect flips __sseLive back on and
+    // the poll is cancelled again.
+    window.__sseLive = false;
+  };
+})();
+</script>
+{{end}}
 {{template "footer"}}
