@@ -28,6 +28,128 @@ func write(t *testing.T, path, body string) {
 	}
 }
 
+// mkdir creates dir (and parents) or fails the test; used to make a candidate
+// user config scope "exist" for resolveDir's existence probe.
+func mkdir(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestResolveDir locks in the USER-FIRST resolution order and its existence
+// probing (config-dir-user-first): $BEEHIVE_CONFIG_DIR (verbatim, even if it does
+// not exist) -> an EXISTING ${XDG_CONFIG_HOME:-~/.config}/beehive (a relative
+// XDG_CONFIG_HOME ignored per the XDG spec) -> DefaultDir (/etc/beehive) as the
+// unconditional final fallback (never stat-probed). Every case sets all three env
+// vars so the real environment can never leak into the result.
+func TestResolveDir(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T) string // sets env + dirs, returns the wanted dir
+	}{
+		{
+			// The explicit override wins and is used verbatim even when it does not
+			// exist (so a fresh scaffold can create it) — and even when a usable
+			// per-user dir is also present.
+			name: "override wins verbatim even if absent",
+			setup: func(t *testing.T) string {
+				home := t.TempDir()
+				mkdir(t, filepath.Join(home, ".config", "beehive")) // present but not chosen
+				t.Setenv("HOME", home)
+				t.Setenv("XDG_CONFIG_HOME", "")
+				override := filepath.Join(t.TempDir(), "no-such-dir")
+				t.Setenv("BEEHIVE_CONFIG_DIR", override)
+				return override
+			},
+		},
+		{
+			// XDG_CONFIG_HOME (absolute) is honored: an existing <xdg>/beehive wins,
+			// over the ~/.config fallback (HOME points elsewhere).
+			name: "existing XDG_CONFIG_HOME/beehive wins over HOME",
+			setup: func(t *testing.T) string {
+				t.Setenv("BEEHIVE_CONFIG_DIR", "")
+				home := t.TempDir()
+				mkdir(t, filepath.Join(home, ".config", "beehive")) // present but not chosen
+				t.Setenv("HOME", home)
+				xdg := t.TempDir()
+				t.Setenv("XDG_CONFIG_HOME", xdg)
+				want := filepath.Join(xdg, "beehive")
+				mkdir(t, want)
+				return want
+			},
+		},
+		{
+			// A relative XDG_CONFIG_HOME is invalid per the XDG spec: it is ignored
+			// and resolution falls back to an existing ~/.config/beehive.
+			name: "relative XDG_CONFIG_HOME ignored, falls back to ~/.config",
+			setup: func(t *testing.T) string {
+				t.Setenv("BEEHIVE_CONFIG_DIR", "")
+				t.Setenv("XDG_CONFIG_HOME", "relative/config") // not absolute -> ignored
+				home := t.TempDir()
+				t.Setenv("HOME", home)
+				want := filepath.Join(home, ".config", "beehive")
+				mkdir(t, want)
+				return want
+			},
+		},
+		{
+			// XDG unset: an existing ~/.config/beehive is picked.
+			name: "existing ~/.config/beehive picked when XDG unset",
+			setup: func(t *testing.T) string {
+				t.Setenv("BEEHIVE_CONFIG_DIR", "")
+				t.Setenv("XDG_CONFIG_HOME", "")
+				home := t.TempDir()
+				t.Setenv("HOME", home)
+				want := filepath.Join(home, ".config", "beehive")
+				mkdir(t, want)
+				return want
+			},
+		},
+		{
+			// Existence probing: HOME is set but ~/.config/beehive does NOT exist, so
+			// the user scope is skipped and the system default is used.
+			name: "absent user dir falls through to /etc/beehive",
+			setup: func(t *testing.T) string {
+				t.Setenv("BEEHIVE_CONFIG_DIR", "")
+				t.Setenv("XDG_CONFIG_HOME", "")
+				t.Setenv("HOME", t.TempDir()) // no .config/beehive created
+				return DefaultDir
+			},
+		},
+		{
+			// Existence probing on the XDG branch: an absolute XDG_CONFIG_HOME whose
+			// beehive subdir is absent falls through to the system default.
+			name: "absent XDG_CONFIG_HOME/beehive falls through to /etc/beehive",
+			setup: func(t *testing.T) string {
+				t.Setenv("BEEHIVE_CONFIG_DIR", "")
+				t.Setenv("HOME", "")
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // absolute, but no beehive subdir
+				return DefaultDir
+			},
+		},
+		{
+			// No override, no HOME, no XDG: there is no user scope, so the
+			// unconditional system default is returned (never stat-probed).
+			name: "HOME and XDG unset falls through to /etc/beehive",
+			setup: func(t *testing.T) string {
+				t.Setenv("BEEHIVE_CONFIG_DIR", "")
+				t.Setenv("HOME", "")
+				t.Setenv("XDG_CONFIG_HOME", "")
+				return DefaultDir
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := tc.setup(t)
+			if got := resolveDir(); got != want {
+				t.Fatalf("resolveDir() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // TestResolveLayering checks per-scope precedence field-by-field: a field set in
 // a more specific layer wins (submodule > global > host > default), and an unset
 // field falls through to the next-lower layer.

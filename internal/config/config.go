@@ -117,12 +117,49 @@ func Defaults(dir string) Config {
 	}
 }
 
-// resolveDir resolves the host config dir from BEEHIVE_CONFIG_DIR or DefaultDir.
+// resolveDir resolves the host config/keyring dir USER-FIRST — the first location
+// that is usable, in this order:
+//
+//  1. $BEEHIVE_CONFIG_DIR — an explicit override, honored VERBATIM even when it
+//     does not yet exist, so a fresh scaffold can create the dir at exactly that
+//     path.
+//  2. ${XDG_CONFIG_HOME:-~/.config}/beehive — the per-user config dir, but only
+//     when it already EXISTS, so a plain user install is picked up without having
+//     to export BEEHIVE_CONFIG_DIR into every process (systemd user units,
+//     transient passes, shells) and `beehive secret` reads the right keyring. A
+//     relative XDG_CONFIG_HOME is invalid per the XDG Base Directory spec and is
+//     ignored (fall back to ~/.config); with neither an absolute XDG_CONFIG_HOME
+//     nor HOME set this scope is skipped.
+//  3. DefaultDir (/etc/beehive) — the final, UNCONDITIONAL fallback (never
+//     stat-probed), so a bare system install is byte-identical to before.
 func resolveDir() string {
 	if d := os.Getenv("BEEHIVE_CONFIG_DIR"); d != "" {
-		return d
+		return d // explicit override, used verbatim (may not exist yet)
 	}
-	return DefaultDir
+	if d := userConfigDir(); d != "" {
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			return d // an existing per-user dir wins over the system default
+		}
+	}
+	return DefaultDir // unconditional fallback; /etc is never stat-probed
+}
+
+// userConfigDir returns ${XDG_CONFIG_HOME:-~/.config}/beehive, or "" when no
+// usable base exists. Per the XDG Base Directory spec a relative XDG_CONFIG_HOME
+// is invalid and ignored, falling back to ~/.config; with neither an absolute
+// XDG_CONFIG_HOME nor HOME set there is no user scope, so "" is returned and the
+// caller uses the system default. The path is NOT probed here — resolveDir owns
+// the existence check.
+func userConfigDir() string {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if !filepath.IsAbs(base) { // unset or relative -> invalid per XDG; use ~/.config
+		home := os.Getenv("HOME")
+		if home == "" {
+			return "" // no HOME and no absolute XDG_CONFIG_HOME: no user scope
+		}
+		base = filepath.Join(home, ".config")
+	}
+	return filepath.Join(base, "beehive")
 }
 
 // loadFile reads one config layer from path. A missing file is not an error: it
