@@ -126,6 +126,38 @@ func commitFile(t *testing.T, r *Repo, name, body, msg string) string {
 	return sha
 }
 
+// writeRaw writes body to an absolute path (unlike writeFile, which is rooted at
+// r.Dir) so a test can seed cruft directly inside a submodule checkout.
+func writeRaw(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// superWithSubmodule builds a superproject on main carrying one committed,
+// .gitmodules-declared submodule "sub" (a real gitlink checked out at a base
+// commit) — the shape of a live submodules/<name>/repo checkout — so the heal's
+// submodule handling can be exercised end to end. Returns the superproject Repo.
+func superWithSubmodule(t *testing.T) *Repo {
+	t.Helper()
+	ctx := context.Background()
+	// The submodule's origin, with tracked content the clean must preserve.
+	origin := initRepo(t)
+	commitFile(t, origin, "file.txt", "hello\n", "sub base")
+
+	super := initRepo(t)
+	// file:// submodule add is gated by protocol.file.allow since git 2.38.
+	if _, err := super.Run(ctx, "-c", "protocol.file.allow=always",
+		"submodule", "add", origin.Dir, "sub"); err != nil {
+		t.Fatalf("submodule add: %v", err)
+	}
+	if _, err := super.Run(ctx, "commit", "-m", "add sub"); err != nil {
+		t.Fatalf("commit add sub: %v", err)
+	}
+	return super
+}
+
 // TestRemoteRoundTrip exercises Push -> Fetch -> Pull through a bare origin:
 // clone a seeds origin, clone b advances it via Push, a's Fetch advances the
 // remote-tracking ref (without moving HEAD), and a's Pull fast-forwards HEAD to
@@ -565,6 +597,88 @@ func TestEnsureCleanCheckout(t *testing.T) {
 	healed, err = r2.EnsureCleanCheckout(ctx)
 	if !healed || err == nil {
 		t.Fatalf("un-resettable drift: want (true,err), got (%v,%v)", healed, err)
+	}
+}
+
+// TestHealCleansSubmoduleUntrackedContent proves the heal git-cleans UNTRACKED
+// cruft out of a declared submodule checkout. `submodule update --force` restores
+// only TRACKED content, so a stray untracked file/dir inside submodules/<name>/repo
+// (e.g. an operator's Emacs #autosave# / .#lock turds from editing the live
+// checkout) kept the superproject gitlink "modified (untracked content)" — which
+// wedged EVERY honeybee preflight ("still dirty after heal") until cleaned by hand.
+// The heal now resets tracked drift AND cleans the checkout, so the superproject
+// reaches a clean HEAD projection and the pass proceeds; tracked content survives.
+func TestHealCleansSubmoduleUntrackedContent(t *testing.T) {
+	ctx := context.Background()
+	super := superWithSubmodule(t)
+	subRepo := filepath.Join(super.Dir, "sub")
+
+	// Seed the exact cruft the field report describes: an Emacs autosave file, a
+	// dangling .#lock symlink, and a stray untracked directory with a file.
+	writeRaw(t, filepath.Join(subRepo, "#scratch.md#"), "autosave\n")
+	if err := os.Symlink("user@host.1234:5678", filepath.Join(subRepo, ".#scratch.md")); err != nil {
+		t.Fatalf("symlink lock: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(subRepo, "stray"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRaw(t, filepath.Join(subRepo, "stray", "junk"), "junk\n")
+
+	// Precondition: the untracked content dirties the superproject gitlink.
+	if st, _ := super.Status(ctx); st == "" {
+		t.Fatal("precondition: submodule untracked content should dirty the superproject")
+	}
+
+	// Heal must clean the checkout so the tree is a clean HEAD projection.
+	healed, err := super.EnsureCleanCheckout(ctx)
+	if !healed || err != nil {
+		t.Fatalf("heal with submodule cruft: want (true,nil), got (%v,%v)", healed, err)
+	}
+	if st, _ := super.Status(ctx); st != "" {
+		t.Fatalf("superproject still dirty after heal: %q", st)
+	}
+	// The cruft is gone...
+	for _, gone := range []string{"#scratch.md#", ".#scratch.md", "stray"} {
+		if _, err := os.Lstat(filepath.Join(subRepo, gone)); !os.IsNotExist(err) {
+			t.Fatalf("cruft %q not cleaned (lstat err=%v)", gone, err)
+		}
+	}
+	// ...and the submodule's TRACKED content is intact (clean must not nuke it).
+	if b, err := os.ReadFile(filepath.Join(subRepo, "file.txt")); err != nil || string(b) != "hello\n" {
+		t.Fatalf("tracked submodule content damaged by clean: %q err=%v", b, err)
+	}
+}
+
+// TestHealSurfacesUncleanableSubmodule proves the submodule clean is NON-SILENT:
+// when a checkout holds untracked cruft git-clean cannot remove (permission
+// denied), the heal returns an error rather than a swallowed success, so the
+// preflight aborts loudly instead of the swarm silently spinning on a wedge.
+func TestHealSurfacesUncleanableSubmodule(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions; cannot simulate an un-cleanable path")
+	}
+	ctx := context.Background()
+	super := superWithSubmodule(t)
+	subRepo := filepath.Join(super.Dir, "sub")
+
+	// An untracked file inside a read-only directory: git-clean cannot unlink it,
+	// so the untracked content — and thus the dirty gitlink — survives the heal.
+	lockDir := filepath.Join(subRepo, "locked")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRaw(t, filepath.Join(lockDir, "turd"), "x\n")
+	if err := os.Chmod(lockDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(lockDir, 0o755) // restore so t.TempDir cleanup can remove it
+
+	healed, err := super.EnsureCleanCheckout(ctx)
+	if !healed || err == nil {
+		t.Fatalf("un-cleanable submodule: want (true, error), got (%v,%v)", healed, err)
+	}
+	if !strings.Contains(err.Error(), "still dirty after heal") {
+		t.Fatalf("error must name the still-dirty heal, got %q", err.Error())
 	}
 }
 

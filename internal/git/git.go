@@ -515,8 +515,13 @@ func isDirtyTreeRejection(err error) bool {
 // clean projection of its committed HEAD so the next push is accepted. It resets
 // tracked-file drift and force re-checks-out every .gitmodules-declared submodule
 // to its recorded gitlink (iterating only declared paths so an orphan gitlink —
-// a committed honeybee worktree with no .gitmodules URL — cannot fatal the sync).
-// Returns an error (never swallows) if the tree is still dirty afterward.
+// a committed honeybee worktree with no .gitmodules URL — cannot fatal the sync),
+// then git-cleans UNTRACKED cruft out of each declared submodule checkout —
+// `submodule update --force` only restores TRACKED content, so a stray untracked
+// file inside submodules/<name>/repo (an operator's Emacs #autosave#/.#lock turds,
+// a leftover build dir) would otherwise keep the gitlink "modified (untracked
+// content)" and wedge every pass. Returns an error (never swallows) if the tree is
+// still dirty afterward.
 func (r *Repo) healLocalMain(ctx context.Context) error {
 	dir, err := r.mainWorktreeDir(ctx)
 	if err != nil {
@@ -538,6 +543,28 @@ func (r *Repo) healLocalMain(ctx context.Context) error {
 		// recorded commit into the submodule when it is missing.
 		if _, err := m.Run(ctx, "submodule", "update", "--init", "--force", "--", p); err != nil {
 			failed = append(failed, p)
+			continue
+		}
+		// submodule update --force restores TRACKED content to the recorded commit
+		// but leaves UNTRACKED files in place. Stray untracked content in the
+		// checkout (an operator's Emacs #autosave#/.#lock turds from editing the
+		// live checkout, a leftover build dir, a stray clone) keeps the superproject
+		// gitlink "modified (untracked content)", so status never reaches a clean
+		// HEAD projection and every preflight/publish aborts "still dirty after
+		// heal" until cleaned by hand. Clean the checkout to a pure projection:
+		// -d recurse untracked dirs, -ff also drop an untracked nested git dir (a
+		// tracked/registered nested submodule is index content and is never
+		// touched). Scoped to the declared submodules/<name>/repo checkout only,
+		// never the operator worktrees under submodules/<name>/worktrees. Ignored
+		// files (-x) are intentionally left: they do not dirty the gitlink (so they
+		// never wedge a pass), and leaving them keeps this consistent with the
+		// tracked reset above, which likewise never removes ignored files. Never
+		// silent: a path clean cannot fix is recorded in failed and surfaced by the
+		// dirty-tree check below (and the leftover keeps status non-empty regardless
+		// of git-clean's own exit code).
+		sub := &Repo{Dir: filepath.Join(dir, p)}
+		if _, err := sub.Run(ctx, "clean", "-ffd"); err != nil {
+			failed = append(failed, p)
 		}
 	}
 	out, serr := m.Run(ctx, "status", "--porcelain")
@@ -546,7 +573,7 @@ func (r *Repo) healLocalMain(ctx context.Context) error {
 	}
 	if strings.TrimSpace(out) != "" {
 		if len(failed) > 0 {
-			return fmt.Errorf("git: main worktree still dirty after heal (submodule resync failed for %s)", strings.Join(failed, ", "))
+			return fmt.Errorf("git: main worktree still dirty after heal (submodule resync/clean failed for %s)", strings.Join(failed, ", "))
 		}
 		return fmt.Errorf("git: main worktree still dirty after heal: %s", strings.SplitN(strings.TrimSpace(out), "\n", 2)[0])
 	}
