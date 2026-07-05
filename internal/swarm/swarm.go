@@ -173,6 +173,12 @@ type Runner struct {
 	// injectable seam: nil runs the real os.Setenv loop; tests set it to capture the
 	// exported map without mutating the real process env.
 	ExportEnv func(map[string]string)
+	// RunVerify runs one handoff verify-gate command (gofmt/go vet/go test) in the
+	// code worktree and reports whether it ran-and-failed (a red) versus could-not-
+	// run (an infra error). The injectable seam: nil uses realRunVerify (real exec
+	// inheriting the exported BuildEnv); tests set it to force red/green and to
+	// assert the static invocation. See verify.go.
+	RunVerify func(ctx context.Context, dir, name string, args ...string) (verifyOutcome, error)
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -732,6 +738,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	deadline := r.now().Add(r.WallCap)
 	prompt := first
+	// gateHint carries a handoff verify-gate failure from the turn that detected it
+	// to the NEXT prompt: when the gate reds a would-be NEEDS-REVIEW handoff we keep
+	// the claim and feed the agent the failure to fix forward (set in the gate block
+	// below, consumed in the prompt selection at the loop's end).
+	var gateHint string
 	// LeanContext bounds each post-first turn's prompt to (changed-file diffs +
 	// rolling summary) via tc; nil (the default, and every non-Work kind) leaves
 	// the loop on the byte-identical bare "continue"/lean-hint path.
@@ -945,6 +956,31 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 			return res, err
 		}
+		// Runner-owned handoff verify-gate: before ACCEPTING a Work task's flip to
+		// NEEDS-REVIEW as complete, the code worktree must pass the mechanical checks
+		// (gofmt/vet/test) so a reviewer never burns a whole session rejecting a
+		// regression a deterministic check catches. Red => do NOT complete: keep the
+		// claim and hand the agent the failure as the next prompt (fix forward, same
+		// session). Pin sel.Task.Status to the flipped status so the NEXT turn's
+		// heartbeat re-stamps (ownership — and the claim that keeps peers off a not-
+		// yet-ready NEEDS-REVIEW — stays fresh) instead of tripping ErrResolved on a
+		// terminal status we deliberately left in place. A non-Work kind, a non-
+		// NEEDS-REVIEW flip, and a green gate all return "" and leave completion
+		// unchanged; an infra failure to run a check is fail-closed (blocks it).
+		if done {
+			hint, gerr := r.verifyGate(ctx, sel, wtAbs)
+			if gerr != nil {
+				if ferr := finish(""); ferr != nil {
+					return res, errors.Join(gerr, ferr)
+				}
+				return res, gerr
+			}
+			if hint != "" {
+				done = false
+				gateHint = hint
+				sel.Task.Status = plan.NeedsReview
+			}
+		}
 		if done {
 			// Completion is only real once the work lands on main. Publish first; if it
 			// fails, do NOT release the claim or report Completed — leave the task
@@ -1020,7 +1056,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if r.now().After(deadline) {
 			break
 		}
-		if tc != nil {
+		if gateHint != "" {
+			// The gate red'd this turn's would-be handoff: the NEXT turn's prompt IS the
+			// failure so the agent fixes forward. One-shot — clear it so a later clean
+			// turn falls back to the normal lean/continue prompt.
+			prompt = gateHint
+			gateHint = ""
+		} else if tc != nil {
 			prompt = r.leanContextPrompt(ctx, sess, tc, sel, res.Branch)
 		} else {
 			prompt = r.nextPrompt(sel, res.Branch)
