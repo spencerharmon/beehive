@@ -240,6 +240,13 @@ func run() error {
 		// no honeybee re-derives the build env (audit session-audit-001 F1). Inert
 		// (nil) on a normal host — LOCALS.md is the human record of what to set.
 		BuildEnv: eff.BuildEnv,
+		// Pre-handoff mechanical gate (handoff-verify-gate): the runner runs
+		// gofmt -l + go vet + go test ./... (static host BuildEnv, never -race) over a
+		// Work task's code worktree before its NEEDS-REVIEW flip may publish; red
+		// withholds the handoff and hands the agent the failure to fix forward. Wired
+		// unconditionally because it is a correctness gate (not an opt-in trim): a
+		// non-Go worktree passes trivially, so a non-Go target is unaffected.
+		VerifyGate: swarm.DefaultVerifyGate,
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	if debug {

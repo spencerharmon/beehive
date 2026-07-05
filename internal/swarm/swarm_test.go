@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1754,5 +1755,301 @@ func TestWorkCompletionKeepsUnmergedSourceBranch(t *testing.T) {
 	}
 	if res.Warning != "" {
 		t.Fatalf("keeping an unmerged branch must not warn, got %q", res.Warning)
+	}
+}
+
+// --- handoff-verify-gate ---
+
+// seedWorkGate stands up a minimal local (no-remote) Work submodule the runner can
+// build a code worktree for, seeded with a TODO task. It returns the paths and a
+// ready Work selection so each gate test drives only the behavior under test.
+func seedWorkGate(t *testing.T) (sm, planPath string, g *git.Repo, rp *repo.Repo, sel *selectt.Selection) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	g = gitInit(t, root)
+	repo.Init(root)
+	sm = filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(ctx, "base")
+	planPath = filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+	rp, _ = repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel = &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+	return sm, planPath, g, rp, sel
+}
+
+func flipToNeedsReview(sm, planPath string) {
+	os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+	os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+}
+
+// TestGateStepsAreStaticNoRace pins the accept-criterion: the gate's invocation is
+// the STATIC `go test ./...`, never a bare `go test -race` (this host is
+// CGO_ENABLED=0 and cannot link the race detector).
+func TestGateStepsAreStaticNoRace(t *testing.T) {
+	steps := gateSteps()
+	if len(steps) == 0 {
+		t.Fatal("gateSteps must not be empty")
+	}
+	var sawTest bool
+	for _, s := range steps {
+		joined := strings.Join(s, " ")
+		for _, a := range s {
+			if a == "-race" {
+				t.Fatalf("gate step %q must not use -race on a CGO_ENABLED=0 host", joined)
+			}
+		}
+		if len(s) >= 2 && s[0] == "go" && s[1] == "test" {
+			sawTest = true
+			if joined != "go test ./..." {
+				t.Fatalf("go test step must be the static `go test ./...`, got %q", joined)
+			}
+		}
+	}
+	if !sawTest {
+		t.Fatal("gate must run go test")
+	}
+}
+
+// TestVerifyGateGreenAllowsHandoff: a green gate lets the Work NEEDS-REVIEW handoff
+// complete, is invoked against the CODE worktree, and records a durable pass marker.
+func TestVerifyGateGreenAllowsHandoff(t *testing.T) {
+	ctx := context.Background()
+	sm, planPath, g, rp, sel := seedWorkGate(t)
+
+	var calls int
+	var gotDir string
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) { flipToNeedsReview(sm, planPath) }}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		VerifyGate: func(_ context.Context, dir string, _ map[string]string) (bool, string, error) {
+			calls++
+			gotDir = dir
+			return true, "", nil
+		}}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("green gate must allow the handoff, got %+v", res)
+	}
+	if calls == 0 {
+		t.Fatal("verify gate was never invoked for a Work NEEDS-REVIEW handoff")
+	}
+	if !strings.Contains(gotDir, filepath.Join("worktrees", "bee-T1")) {
+		t.Fatalf("gate must run against the code worktree, got dir %q", gotDir)
+	}
+	if _, err := os.Stat(filepath.Join(sm, "docs", "T1-verify-pass.md")); err != nil {
+		t.Fatalf("green gate must record a durable pass marker: %v", err)
+	}
+}
+
+// TestVerifyGateRedWithholdsAndFixesForward: a red gate withholds completion, hands
+// the SAME session the failure to fix forward, and completes once the retry is
+// green — never rejecting to a reviewer.
+func TestVerifyGateRedWithholdsAndFixesForward(t *testing.T) {
+	ctx := context.Background()
+	sm, planPath, g, rp, sel := seedWorkGate(t)
+
+	const report = "vet: undefined: Foo"
+	var calls int
+	var prompts []string
+	cl := &mockClient{sess: &mockSession{all: &prompts, onTurn: func(turn int) { flipToNeedsReview(sm, planPath) }}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		VerifyGate: func(_ context.Context, _ string, _ map[string]string) (bool, string, error) {
+			calls++
+			if calls == 1 {
+				return false, report, nil
+			}
+			return true, "", nil
+		}}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("must complete after fixing forward the same session, got %+v", res)
+	}
+	if calls != 2 {
+		t.Fatalf("gate should run red then green (2 calls), got %d", calls)
+	}
+	if len(prompts) < 2 {
+		t.Fatalf("want at least 2 turns (red then fix-forward), got %d prompts: %v", len(prompts), prompts)
+	}
+	var sawReport bool
+	for _, p := range prompts {
+		if strings.Contains(p, report) && strings.Contains(p, "WITHHELD") {
+			sawReport = true
+		}
+	}
+	if !sawReport {
+		t.Fatalf("agent was not handed the failing report to fix forward; prompts=%v", prompts)
+	}
+	if res.Lost {
+		t.Fatal("a withheld-then-fixed handoff must stay the same claim, not lose it")
+	}
+}
+
+// TestVerifyGateInertWhenUnwired: with no VerifyGate the handoff path is the
+// historical one — it completes and records nothing.
+func TestVerifyGateInertWhenUnwired(t *testing.T) {
+	ctx := context.Background()
+	sm, planPath, g, rp, sel := seedWorkGate(t)
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) { flipToNeedsReview(sm, planPath) }}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("unwired gate must be inert and complete, got %+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(sm, "docs", "T1-verify-pass.md")); !os.IsNotExist(err) {
+		t.Fatalf("unwired gate must record nothing, but a pass marker exists (err=%v)", err)
+	}
+}
+
+// TestRevertHandoffPreservesClaim: reverting a red handoff resets the status to
+// TODO but keeps the session+heartbeat, so the runner's per-turn heartbeat keeps
+// the task held (the fix-forward stays the same session).
+func TestRevertHandoffPreservesClaim(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= session=sess-1 heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+	r := &Runner{Repo: rp, Git: g}
+
+	if err := r.revertHandoff(ctx, sel); err != nil {
+		t.Fatalf("revertHandoff: %v", err)
+	}
+	b, _ := os.ReadFile(planPath)
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tk := p.Find("T1")
+	if tk.Status != plan.TODO {
+		t.Fatalf("status = %s, want TODO after revert", tk.Status)
+	}
+	if tk.Session != "sess-1" {
+		t.Fatalf("revert dropped the claim session: got %q want sess-1", tk.Session)
+	}
+	if tk.Heartbeat.IsZero() {
+		t.Fatal("revert dropped the heartbeat; the claim would look released")
+	}
+}
+
+func requireGoTools(t *testing.T) {
+	t.Helper()
+	for _, bin := range []string{"go", "gofmt"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not on PATH; skipping real-tool gate test", bin)
+		}
+	}
+}
+
+func writeGoModule(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestDefaultVerifyGateNoGoModPasses: a worktree with no go.mod (a non-Go target)
+// passes trivially — the gate never blocks what it cannot mechanically check.
+func TestDefaultVerifyGateNoGoModPasses(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("not go\n"), 0o644)
+	ok, report, err := DefaultVerifyGate(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if !ok {
+		t.Fatalf("a non-Go worktree must pass; report=%s", report)
+	}
+}
+
+// TestDefaultVerifyGateUnformattedFails: a gofmt-dirty worktree fails the gate and
+// the report names the offending file.
+func TestDefaultVerifyGateUnformattedFails(t *testing.T) {
+	requireGoTools(t)
+	dir := t.TempDir()
+	writeGoModule(t, dir, map[string]string{
+		"go.mod": "module gatetest\n\ngo 1.21\n",
+		"a.go":   "package gatetest\n\nfunc  F()  int { return 1 }\n",
+	})
+	ok, report, err := DefaultVerifyGate(context.Background(), dir, map[string]string{"CGO_ENABLED": "0"})
+	if err != nil {
+		t.Fatalf("infra err: %v", err)
+	}
+	if ok {
+		t.Fatal("a gofmt-dirty worktree must fail the gate")
+	}
+	if !strings.Contains(report, "a.go") {
+		t.Fatalf("report should name the unformatted file, got: %s", report)
+	}
+}
+
+// TestDefaultVerifyGateFailingTestFails: a clean-formatting module with a failing
+// test fails the gate at the go-test step.
+func TestDefaultVerifyGateFailingTestFails(t *testing.T) {
+	requireGoTools(t)
+	dir := t.TempDir()
+	writeGoModule(t, dir, map[string]string{
+		"go.mod":    "module gatetest\n\ngo 1.21\n",
+		"a.go":      "package gatetest\n\nfunc F() int { return 1 }\n",
+		"a_test.go": "package gatetest\n\nimport \"testing\"\n\nfunc TestF(t *testing.T) {\n\tif F() != 2 {\n\t\tt.Fatal(\"boom\")\n\t}\n}\n",
+	})
+	ok, report, err := DefaultVerifyGate(context.Background(), dir, map[string]string{"CGO_ENABLED": "0"})
+	if err != nil {
+		t.Fatalf("infra err: %v", err)
+	}
+	if ok {
+		t.Fatal("a failing test must fail the gate")
+	}
+	if !strings.Contains(report, "FAIL") {
+		t.Fatalf("report should carry the go test failure, got: %s", report)
+	}
+}
+
+// TestDefaultVerifyGateCleanPasses: a clean, formatted, passing module passes all
+// three steps.
+func TestDefaultVerifyGateCleanPasses(t *testing.T) {
+	requireGoTools(t)
+	dir := t.TempDir()
+	writeGoModule(t, dir, map[string]string{
+		"go.mod":    "module gatetest\n\ngo 1.21\n",
+		"a.go":      "package gatetest\n\nfunc F() int { return 1 }\n",
+		"a_test.go": "package gatetest\n\nimport \"testing\"\n\nfunc TestF(t *testing.T) {\n\tif F() != 1 {\n\t\tt.Fatal(\"boom\")\n\t}\n}\n",
+	})
+	ok, report, err := DefaultVerifyGate(context.Background(), dir, map[string]string{"CGO_ENABLED": "0"})
+	if err != nil {
+		t.Fatalf("infra err: %v", err)
+	}
+	if !ok {
+		t.Fatalf("a clean, formatted, passing module must pass the gate; report=%s", report)
 	}
 }

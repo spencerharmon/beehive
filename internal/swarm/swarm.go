@@ -173,6 +173,18 @@ type Runner struct {
 	// injectable seam: nil runs the real os.Setenv loop; tests set it to capture the
 	// exported map without mutating the real process env.
 	ExportEnv func(map[string]string)
+
+	// VerifyGate is the runner-owned pre-handoff MECHANICAL gate (task
+	// handoff-verify-gate): before a Work task's local flip to NEEDS-REVIEW is
+	// allowed to publish, the runner runs this over the agent's code worktree. It
+	// returns ok (mechanics clean -> allow the handoff), a bounded failure report
+	// (handed to the agent to fix forward on a red gate), and an error reserved for
+	// INFRASTRUCTURE faults running the gate (a missing toolchain) — distinct from a
+	// clean red. cmd/honeybee wires DefaultVerifyGate (gofmt -l + go vet + go test
+	// ./..., static host BuildEnv). Nil (the default, and every test that does not
+	// set it) is INERT: the historical handoff path is byte-identical, so
+	// pre-existing completion tests are unaffected. See verifygate.go.
+	VerifyGate func(ctx context.Context, dir string, env map[string]string) (ok bool, report string, err error)
 }
 
 // streamSession commits the current transcript to the isolated session branch
@@ -860,6 +872,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					return res, derr
 				}
 				if done {
+					// Same pre-handoff gate as the main completion path, applied
+					// defensively here: a Work NEEDS-REVIEW that surfaces as ErrResolved
+					// (flipped last turn with the doc landing only now) must still pass
+					// mechanics before it publishes. On red gateHandoff reverts to TODO
+					// (keeping the claim); break out of the switch and fall through to this
+					// turn's Prompt so the same session fixes forward immediately.
+					if pass, ffPrompt := r.gateHandoff(ctx, sel, wtAbs, res.Branch); !pass {
+						prompt = ffPrompt
+						break
+					}
 					// Publish first; only release + report complete if main advanced.
 					if ferr := finish(""); ferr != nil {
 						cleanup()
@@ -946,6 +968,19 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			return res, err
 		}
 		if done {
+			// Pre-handoff mechanical gate (handoff-verify-gate): before a Work
+			// NEEDS-REVIEW flip is allowed to publish, run gofmt/vet/test over the
+			// agent's code worktree. On red the gate reverts the flip to TODO (keeping
+			// the claim) and returns the failure as the next prompt, so the SAME session
+			// fixes forward instead of a reviewer rejecting a mechanical regression.
+			// Inert (pass, "") for every non-Work kind and when unwired.
+			if pass, ffPrompt := r.gateHandoff(ctx, sel, wtAbs, res.Branch); !pass {
+				if r.now().After(deadline) {
+					break // wall cap: leave the (reverted, still-claimed) task for GC/retry
+				}
+				prompt = ffPrompt
+				continue
+			}
 			// Completion is only real once the work lands on main. Publish first; if it
 			// fails, do NOT release the claim or report Completed — leave the task
 			// claimed (stale -> GC -> retry) so the work is re-driven, never silently
