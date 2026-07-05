@@ -124,6 +124,27 @@ func (in *Infra) SetActive(target string) {
 	in.present = true
 }
 
+// SetEnvs sets the available environment list, rewriting every Environments:
+// marker line in place (or appending one when the document has none). It mutates
+// the in-memory body and Envs field; call String to serialize for persistence.
+// Symmetric with SetActive, so a conventions writer can normalize both markers.
+// The serialized form is the historical comma-space list ("blue, green").
+func (in *Infra) SetEnvs(envs []string) {
+	in.Envs = append([]string(nil), envs...)
+	line := "Environments: " + strings.Join(envs, ", ")
+	found := false
+	for i, l := range in.body {
+		if envsRe.MatchString(l) {
+			in.body[i] = line
+			found = true
+		}
+	}
+	if !found {
+		in.body = append(in.body, line)
+	}
+	in.present = true
+}
+
 // String serializes the document verbatim. ParseInfra(s).String() reproduces s
 // for any newline-terminated file (the canonical form); an empty model serializes
 // to "". A trailing newline is always ensured for a non-empty body.

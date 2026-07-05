@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -368,6 +369,46 @@ func (m *Manager) Reload(ctx context.Context) error {
 		}
 	}
 	return m.persist()
+}
+
+// Reclaimable reports, without mutating anything, the edit-branch worktrees a
+// Reload would reclaim: those both stale (no fresh persisted record) and clean
+// (no pending unpublished change). It is the read-only half of Reload, so a gc
+// skill can present an exact dry-run plan ("these branches will be removed")
+// that applying (Reload) then performs. Branch names are sorted for a
+// deterministic plan. Non-edit worktrees (bee-*, beehive-*, main) are ignored.
+func (m *Manager) Reclaimable(ctx context.Context) ([]string, error) {
+	recs, err := m.store.load()
+	if err != nil {
+		return nil, err
+	}
+	byBranch := make(map[string]sessionRecord, len(recs))
+	for _, rec := range recs {
+		byBranch[rec.Branch] = rec
+	}
+	wts, err := m.primary.Worktrees(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := m.now()
+	var out []string
+	for _, w := range wts {
+		if !isEditBranch(w.Branch) {
+			continue
+		}
+		rec, hasRec := byBranch[w.Branch]
+		pending, perr := m.worktreePending(ctx, w)
+		if perr != nil {
+			return nil, perr
+		}
+		fresh := hasRec && now.Sub(rec.Activity) < m.ttl
+		if fresh || pending {
+			continue
+		}
+		out = append(out, w.Branch)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // worktreePending reports whether an edit worktree holds an unpublished change

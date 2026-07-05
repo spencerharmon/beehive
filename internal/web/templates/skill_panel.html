@@ -1,0 +1,37 @@
+<form class="skill-dryrun" hx-post="/skills/{{.Name}}/plan" hx-target="#skill-panel-{{.Name}}" hx-swap="innerHTML" hx-indicator="#htmx-progress">
+  <button type="submit">Dry-run</button>
+</form>
+{{if .Err}}<p class="msg err">&#9888; {{.Err}}</p>{{end}}
+{{if .Note}}<p class="skill-note badge warn">{{.Note}}</p>{{end}}
+{{with .Result}}
+<div class="skill-result">
+  <p><span class="badge live">applied</span></p>
+  <ul>{{range .Done}}<li>{{.}}</li>{{end}}</ul>
+</div>
+{{end}}
+{{with .Plan}}
+<div class="skill-plan">
+  {{if .Empty}}{{if not .ReportOnly}}<p><span class="badge live">nothing to do</span></p>{{end}}{{end}}
+  {{if .Report}}<ul class="skill-report">{{range .Report}}<li>{{.}}</li>{{end}}</ul>{{end}}
+  {{if .Actions}}
+  <p class="muted">Would perform {{len .Actions}} action(s):</p>
+  <ul class="skill-actions">{{range .Actions}}<li><code>{{.Op}}</code> <code>{{.Target}}</code> <span class="muted">{{.Detail}}</span></li>{{end}}</ul>
+  {{end}}
+</div>
+{{if $.Rows}}
+<pre class="diff" data-scroll-preserve>{{range $.Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
+{{end}}</pre>
+{{end}}
+{{if not .ReportOnly}}{{if not .Empty}}
+{{if $.Confirming}}
+<form class="skill-apply" hx-post="/skills/{{$.Name}}/apply" hx-target="#skill-panel-{{$.Name}}" hx-swap="innerHTML" hx-indicator="#htmx-progress">
+  <input type="hidden" name="confirm" value="on">
+  <button type="submit" class="danger">Confirm and apply</button>
+</form>
+{{else}}
+<form class="skill-apply" hx-post="/skills/{{$.Name}}/apply" hx-target="#skill-panel-{{$.Name}}" hx-swap="innerHTML" hx-indicator="#htmx-progress">
+  <button type="submit"{{if .Destructive}} class="danger"{{end}}>Apply</button>
+</form>
+{{end}}
+{{end}}{{end}}
+{{end}}

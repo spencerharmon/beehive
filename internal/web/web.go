@@ -138,6 +138,11 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /env/deploy", s.envDeploy)
 	mux.HandleFunc("GET /human", s.human)
 	mux.HandleFunc("GET /hygiene", s.hygiene)
+	// Maintenance skills: an index of named actions each with a read-only dry-run
+	// (plan) and a separate apply; destructive skills gate apply on confirm.
+	mux.HandleFunc("GET /skills", s.skillsPage)
+	mux.HandleFunc("POST /skills/{name}/plan", s.skillPlanHandler)
+	mux.HandleFunc("POST /skills/{name}/apply", s.skillApplyHandler)
 	// AI editor chat (browser): one worktree branch per session.
 	mux.HandleFunc("GET /edit", s.editEntry)
 	mux.HandleFunc("POST /edit", s.chatOpen)
