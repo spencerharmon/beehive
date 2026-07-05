@@ -128,6 +128,46 @@ func resultFor(res []Result, name string) Result {
 	return Result{}
 }
 
+// TestStatusOfReportsPerFileDrift locks the per-file drift helper the frontend
+// keys off (instruction-update-drift): a byte-identical managed file is Clean, a
+// modified one is Modified, an absent one is Missing, and a name that is NOT in the
+// managed set (e.g. the site-authored LOCALS.md) returns ok=false so the caller
+// shows no drift and never conflates it with a managed file.
+func TestStatusOfReportsPerFileDrift(t *testing.T) {
+	root := t.TempDir()
+	if _, err := Install(root); err != nil {
+		t.Fatal(err)
+	}
+
+	// Freshly installed => byte-identical to the embedded default => Clean.
+	st, ok, err := StatusOf(root, "AGENTS.md")
+	if err != nil || !ok || st != Clean {
+		t.Fatalf("clean managed file: st=%v ok=%v err=%v, want Clean,true,nil", st, ok, err)
+	}
+
+	// Operator edit => Modified (the drift the badge surfaces).
+	if err := os.WriteFile(filepath.Join(root, "HONEYBEE.md"), []byte("# custom\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if st, ok, err := StatusOf(root, "HONEYBEE.md"); err != nil || !ok || st != Modified {
+		t.Fatalf("modified managed file: st=%v ok=%v err=%v, want Modified,true,nil", st, ok, err)
+	}
+
+	// Absent managed file => Missing (still ok=true: it IS a managed file).
+	if err := os.Remove(filepath.Join(root, "BOOTSTRAP.md")); err != nil {
+		t.Fatal(err)
+	}
+	if st, ok, err := StatusOf(root, "BOOTSTRAP.md"); err != nil || !ok || st != Missing {
+		t.Fatalf("absent managed file: st=%v ok=%v err=%v, want Missing,true,nil", st, ok, err)
+	}
+
+	// Not a managed file (site-authored LOCALS.md, never in the set) => ok=false,
+	// so the caller (frontend) shows no drift and never checks it.
+	if st, ok, err := StatusOf(root, "LOCALS.md"); err != nil || ok {
+		t.Fatalf("unmanaged file: st=%v ok=%v err=%v, want _,false,nil", st, ok, err)
+	}
+}
+
 // prompts_Honeybee returns the default HONEYBEE.md body via the managed set, so
 // the test does not import the prompts package directly.
 func prompts_Honeybee() string {

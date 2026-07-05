@@ -242,6 +242,12 @@ small, .small { font-size: var(--text-sm); }
 .badge.env-blue { background: var(--accent); border-color: transparent; color: var(--accent-contrast); }
 .badge.env-green { background: var(--success); border-color: transparent; color: #fff; }
 .badge.human { background: hsl(var(--hue-human) 60% 45%); border-color: transparent; color: #fff; }
+/* Instruction-file drift (managed root files vs the binary's embedded default):
+   clean -> success (in sync), drift -> amber (customized/stale), missing -> danger
+   (absent). Shown only on managed files; the site-authored LOCALS.md has none. */
+.badge.drift-clean { background: var(--success); border-color: transparent; color: #fff; }
+.badge.drift-drift { background: hsl(var(--hue-review) 70% 42%); border-color: transparent; color: #fff; }
+.badge.drift-missing { background: var(--danger); border-color: transparent; color: #fff; }
 .ago { color: var(--text-muted); font-size: var(--text-xs); }
 .ok { color: var(--success); font-weight: 600; }
 .muted { color: var(--text-muted); }

@@ -85,6 +85,24 @@ func Scan(root string) (map[string]Status, error) {
 	return out, nil
 }
 
+// StatusOf reports the drift status of the single managed file named name under
+// root: Clean when it is byte-identical to the binary's embedded default, Modified
+// when it exists but differs, Missing when it is absent. ok is false when name is
+// not a managed file, in which case the caller must show no drift for it — this is
+// what keeps a site-authored file (LOCALS.md, which is never in the managed set)
+// out of the drift check. It is the per-file form of Scan for a caller (the
+// frontend) that iterates its OWN declared set and asks the drift status one file
+// at a time, reusing this package's single embedded-default source (no second copy).
+func StatusOf(root, name string) (st Status, ok bool, err error) {
+	for _, f := range Files() {
+		if f.Name == name {
+			st, _, err = stat(root, f)
+			return st, true, err
+		}
+	}
+	return Missing, false, nil
+}
+
 func stat(root string, f File) (Status, []byte, error) {
 	b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(f.Name)))
 	if os.IsNotExist(err) {

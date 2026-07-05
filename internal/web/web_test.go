@@ -17,8 +17,10 @@ import (
 
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/editor"
+	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/prompts"
 )
 
 func setup(t *testing.T) (*Server, string) {
@@ -1239,6 +1241,189 @@ func TestDashboardRootInstructionFileLinks(t *testing.T) {
 	}
 	if locals.Managed {
 		t.Error("LOCALS.md must stay site-authored (Managed=false) even once present")
+	}
+}
+
+// TestManagedRootFilesAreInstructManaged guards the two sources that must agree:
+// every Managed member of repo.RootInstructionFiles (what the dashboard scopes its
+// drift check and update action to) MUST be a file the shared installer
+// instruct.Files() actually ships/refreshes a default for — otherwise a "managed"
+// badge would promise an update the installer cannot perform. Conversely the
+// site-authored LOCALS.md must be in NEITHER set (categorically excluded).
+func TestManagedRootFilesAreInstructManaged(t *testing.T) {
+	instructNames := map[string]bool{}
+	for _, f := range instruct.Files() {
+		instructNames[f.Name] = true
+	}
+	for _, rf := range repo.RootInstructionFiles {
+		if rf.Managed && !instructNames[rf.File] {
+			t.Errorf("%s is Managed but not in instruct.Files() (drift badge would promise an impossible update)", rf.File)
+		}
+		if !rf.Managed && instructNames[rf.File] {
+			t.Errorf("%s is site-authored but instruct.Files() manages it (should be excluded)", rf.File)
+		}
+	}
+	if instructNames[repo.LocalsFile] {
+		t.Error("LOCALS.md must never be in the managed installer set")
+	}
+}
+
+// TestRootFileLinksDriftStatus locks the read-only drift status rootFileLinks
+// attaches to each MANAGED root file (instruction-update-drift): clean when the
+// on-disk file is byte-identical to the binary's embedded default, "drift" when it
+// exists but differs, "missing" when absent. The site-authored LOCALS.md is
+// categorically excluded (empty Drift, no badge) even when present with custom
+// content, and rootFilesDrift aggregates only the managed reasons to run update.
+func TestRootFileLinksDriftStatus(t *testing.T) {
+	s, root := setup(t)
+
+	driftOf := func() map[string]string {
+		m := map[string]string{}
+		for _, l := range s.rootFileLinks() {
+			m[l.File] = l.Drift
+		}
+		return m
+	}
+
+	// Fresh fixture: Init lays the managed files down from the SAME embedded
+	// defaults, so all three read clean and nothing has drifted.
+	d := driftOf()
+	for _, f := range []string{repo.AgentsFile, repo.HoneybeeFile, repo.BootstrapFile} {
+		if d[f] != "clean" {
+			t.Errorf("%s Drift = %q, want clean on a fresh fixture", f, d[f])
+		}
+	}
+	if d[repo.LocalsFile] != "" {
+		t.Errorf("LOCALS.md Drift = %q, want empty (site-authored, excluded)", d[repo.LocalsFile])
+	}
+	if rootFilesDrift(s.rootFileLinks()) {
+		t.Error("rootFilesDrift = true on a clean fixture, want false")
+	}
+
+	// A managed file edited on disk drifts, and flips the aggregate.
+	if err := os.WriteFile(filepath.Join(root, repo.AgentsFile), []byte("# hand-edited AGENTS\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if d := driftOf(); d[repo.AgentsFile] != "drift" {
+		t.Errorf("edited AGENTS.md Drift = %q, want drift", d[repo.AgentsFile])
+	}
+	if !rootFilesDrift(s.rootFileLinks()) {
+		t.Error("rootFilesDrift = false after a managed file drifted, want true")
+	}
+
+	// A deleted managed file reads missing (still a reason to run update).
+	if err := os.Remove(filepath.Join(root, repo.HoneybeeFile)); err != nil {
+		t.Fatal(err)
+	}
+	if d := driftOf(); d[repo.HoneybeeFile] != "missing" {
+		t.Errorf("removed HONEYBEE.md Drift = %q, want missing", d[repo.HoneybeeFile])
+	}
+
+	// LOCALS.md present with custom content stays excluded: never a drift badge.
+	if err := os.WriteFile(filepath.Join(root, repo.LocalsFile), []byte("# my locals\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if d := driftOf(); d[repo.LocalsFile] != "" {
+		t.Errorf("site-authored LOCALS.md Drift = %q, want empty even when present", d[repo.LocalsFile])
+	}
+}
+
+// TestDashboardDriftBadgeAndUpdateAction locks the dashboard surface for
+// instruction-update-drift: a per-managed-file drift badge and the POST
+// /instruction/update action. A clean fixture shows clean badges plus the
+// idempotent-action copy; a drifted managed file surfaces a drift badge and the
+// "have drifted" emphasis.
+func TestDashboardDriftBadgeAndUpdateAction(t *testing.T) {
+	s, root := setup(t)
+
+	clean := get(t, s, "/").Body.String()
+	if !strings.Contains(clean, `action="/instruction/update"`) {
+		t.Errorf("dashboard missing the instruction-update action:\n%s", clean)
+	}
+	if !strings.Contains(clean, "drift-clean") {
+		t.Error("dashboard missing a clean drift badge for the managed files")
+	}
+	if !strings.Contains(clean, "managed files match the shipped default") {
+		t.Error("clean fixture should show the up-to-date instruction-update copy")
+	}
+	// A clean managed set never renders a drift/missing badge.
+	if strings.Contains(clean, "drift-drift") || strings.Contains(clean, "drift-missing") {
+		t.Errorf("clean fixture must not render a drift/missing badge:\n%s", clean)
+	}
+
+	// Drift a managed file: the badge and the emphasis copy flip.
+	if err := os.WriteFile(filepath.Join(root, repo.AgentsFile), []byte("# hand-edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	drifted := get(t, s, "/").Body.String()
+	if !strings.Contains(drifted, "drift-drift") {
+		t.Errorf("dashboard missing a drift badge after a managed file drifted:\n%s", drifted)
+	}
+	if !strings.Contains(drifted, "managed files have drifted from the shipped default") {
+		t.Error("drifted set should show the drift emphasis copy")
+	}
+}
+
+// TestInstructionUpdateRestoresManagedFiles drives POST /instruction/update end to
+// end: a drifted managed file is backed up to <name>.<epoch>.bak and restored to
+// the binary's embedded default, a missing one is recreated, and the site-authored
+// LOCALS.md is never touched or backed up. A second run is a no-op (idempotent):
+// still exactly one backup and the managed set reads clean.
+func TestInstructionUpdateRestoresManagedFiles(t *testing.T) {
+	s, root := setup(t)
+	// A real hive always has history; seed an initial commit so the installer's
+	// scoped CommitPaths runs against a born HEAD (the production path).
+	commitAll(t, root, "seed")
+
+	const customAgents = "# hand-edited AGENTS\n"
+	const customLocals = "# site locals\nHost: spray\n"
+	if err := os.WriteFile(filepath.Join(root, repo.AgentsFile), []byte(customAgents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, repo.BootstrapFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, repo.LocalsFile), []byte(customLocals), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if w := postForm(t, s, "/instruction/update", url.Values{}); w.Code != http.StatusSeeOther {
+		t.Fatalf("instruction update %d: %s", w.Code, w.Body)
+	}
+
+	// AGENTS.md restored to the embedded default...
+	if got, _ := os.ReadFile(filepath.Join(root, repo.AgentsFile)); string(got) != prompts.Agents {
+		t.Error("AGENTS.md not restored to the binary's embedded default")
+	}
+	// ...with its prior contents preserved in exactly one <name>.<epoch>.bak.
+	baks, _ := filepath.Glob(filepath.Join(root, repo.AgentsFile+".*.bak"))
+	if len(baks) != 1 {
+		t.Fatalf("AGENTS.md backups = %d, want exactly 1: %v", len(baks), baks)
+	}
+	if b, _ := os.ReadFile(baks[0]); string(b) != customAgents {
+		t.Errorf("backup did not preserve the operator's edit, got %q", b)
+	}
+	// The missing BOOTSTRAP.md was recreated from the default.
+	if got, _ := os.ReadFile(filepath.Join(root, repo.BootstrapFile)); string(got) != prompts.BootstrapGuide {
+		t.Error("BOOTSTRAP.md not recreated from the embedded default")
+	}
+	// LOCALS.md was never touched and never backed up (excluded from the set).
+	if got, _ := os.ReadFile(filepath.Join(root, repo.LocalsFile)); string(got) != customLocals {
+		t.Errorf("site-authored LOCALS.md was modified: %q", got)
+	}
+	if lbaks, _ := filepath.Glob(filepath.Join(root, repo.LocalsFile+".*.bak")); len(lbaks) != 0 {
+		t.Errorf("LOCALS.md must never be backed up, found %v", lbaks)
+	}
+
+	// Idempotent: a second run over the now-clean set writes nothing new.
+	if w := postForm(t, s, "/instruction/update", url.Values{}); w.Code != http.StatusSeeOther {
+		t.Fatalf("second instruction update %d: %s", w.Code, w.Body)
+	}
+	if baks2, _ := filepath.Glob(filepath.Join(root, repo.AgentsFile+".*.bak")); len(baks2) != 1 {
+		t.Fatalf("second run changed backup count to %d, want still 1: %v", len(baks2), baks2)
+	}
+	if rootFilesDrift(s.rootFileLinks()) {
+		t.Error("managed set still drifted after instruction update")
 	}
 }
 

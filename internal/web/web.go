@@ -20,6 +20,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spencerharmon/beehive/internal/submod"
 	"github.com/spencerharmon/beehive/internal/swarm"
@@ -280,6 +281,10 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /merge", b((*Server).mergePost))
 	mux.HandleFunc("POST /submodule/add", b((*Server).submoduleAdd))
 	mux.HandleFunc("POST /submodule/link", b((*Server).submoduleLink))
+	// Refresh the managed repo-ROOT instruction files (AGENTS/HONEYBEE/BOOTSTRAP)
+	// to the binary's embedded defaults via the SAME installer the CLI uses
+	// (internal/instruct.Update, clobber path). LOCALS.md is never touched.
+	mux.HandleFunc("POST /instruction/update", b((*Server).instructionUpdate))
 	mux.HandleFunc("GET /env", b((*Server).envGet))
 	mux.HandleFunc("POST /env/deploy", b((*Server).envDeploy))
 	mux.HandleFunc("GET /human", b((*Server).human))
@@ -399,7 +404,8 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
 	}
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": s.rootFileLinks()})
+	rootFiles := s.rootFileLinks()
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": rootFiles, "RootFilesDrift": rootFilesDrift(rootFiles)})
 }
 
 // subViews builds the dashboard card data for every submodule: State
@@ -515,12 +521,33 @@ func optionalFileLinks(sm repo.Submodule) []fileLink {
 // Managed exposes whether beehive ships/refreshes a default for the file (the
 // signal instruction-update-drift keys off); LOCALS.md is site-authored, so it is
 // never managed and never auto-generated (create still routes through the same
-// approval-gated editor).
+// approval-gated editor). Drift is the read-only staleness of a MANAGED file
+// against the binary's embedded default ("clean" | "drift" | "missing"), empty for
+// the site-authored LOCALS.md which is categorically excluded from the drift check
+// (instruction-update-drift).
 type rootFileLink struct {
 	Label   string // display name, e.g. "AGENTS" (basename minus .md)
 	File    string // basename at the repo root, e.g. "AGENTS.md"
 	Present bool   // file exists on disk at the repo root
 	Managed bool   // beehive ships/refreshes a default (vs. site-authored)
+	Drift   string // "" (unmanaged) | "clean" | "drift" | "missing"
+}
+
+// driftLabel maps an instruct.Status to the drift vocabulary the dashboard badge
+// shows: a file byte-identical to the embedded default is "clean", one that exists
+// but differs has "drift"ed, an absent one is "missing". It is the presentation
+// mapping for the managed root files; the CLI keeps instruct's own "modified" word.
+func driftLabel(st instruct.Status) string {
+	switch st {
+	case instruct.Clean:
+		return "clean"
+	case instruct.Modified:
+		return "drift"
+	case instruct.Missing:
+		return "missing"
+	default:
+		return ""
+	}
 }
 
 // rootFileLinks builds the dashboard's repo-ROOT instruction-file index from the
@@ -529,18 +556,45 @@ type rootFileLink struct {
 // file (e.g. an unwritten LOCALS.md) still yields a discoverable row. It is read
 // fresh each render, so a plain manual commit that lands a root file on disk flips
 // its row to present on the next dashboard load with no special write path.
+//
+// For every MANAGED member it additionally attaches a read-only Drift status —
+// "clean" | "drift" | "missing" — by comparing the on-disk file against the
+// binary's embedded default through the SAME source the CLI uses (instruct), so a
+// stale managed file surfaces a badge and an operator can run the update. The
+// site-authored LOCALS.md is categorically excluded (Managed=false => no drift
+// check, no badge). A per-file scan read error leaves Drift empty (best-effort
+// overview, never a dashboard-wide failure), mirroring Present's tolerance.
 func (s *Server) rootFileLinks() []rootFileLink {
 	links := make([]rootFileLink, 0, len(repo.RootInstructionFiles))
 	for _, f := range repo.RootInstructionFiles {
 		_, err := os.Stat(filepath.Join(s.repo.Root, f.File))
-		links = append(links, rootFileLink{
+		l := rootFileLink{
 			Label:   strings.TrimSuffix(f.File, ".md"),
 			File:    f.File,
 			Present: err == nil,
 			Managed: f.Managed,
-		})
+		}
+		if f.Managed {
+			if st, ok, serr := instruct.StatusOf(s.repo.Root, f.File); ok && serr == nil {
+				l.Drift = driftLabel(st)
+			}
+		}
+		links = append(links, l)
 	}
 	return links
+}
+
+// rootFilesDrift reports whether ANY managed root file has drifted from or is
+// missing versus the binary's embedded default, i.e. whether `instruction update`
+// has anything to do. The dashboard uses it to emphasize the update action only
+// when it would change something (a clean set shows the action as idempotent).
+func rootFilesDrift(links []rootFileLink) bool {
+	for _, l := range links {
+		if l.Drift == "drift" || l.Drift == "missing" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
@@ -717,6 +771,15 @@ func (s *Server) publishMain(ctx context.Context, msg string) error {
 	// touch the primary checkout's index/refs (index.lock).
 	s.gitMu.Lock()
 	defer s.gitMu.Unlock()
+	return s.publishMainLocked(ctx, msg)
+}
+
+// publishMainLocked is publishMain's body; the CALLER MUST ALREADY HOLD gitMu. It
+// lets a handler that itself mutates the primary checkout under the lock — e.g. the
+// instruction-update installer, which writes AND commits — commit-and-publish
+// atomically without dropping the lock between its own commit and the push (a drop
+// would open a window for the follow-remote pull to race the index).
+func (s *Server) publishMainLocked(ctx context.Context, msg string) error {
 	if err := s.git.Commit(ctx, msg); err != nil && !errors.Is(err, git.ErrNothing) {
 		return err
 	}
@@ -948,6 +1011,33 @@ func (s *Server) submoduleLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.publishMain(r.Context(), "frontend: link "+from+" -> "+to); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// instructionUpdate runs `beehive instruction update` from the frontend. It
+// invokes the SAME shared installer the CLI uses (internal/instruct.Update) — it
+// never shells out and holds no second copy of the defaults — over the managed
+// repo-ROOT instruction files (AGENTS/HONEYBEE/BOOTSTRAP; the site-authored
+// LOCALS.md is not in the managed set, so it is never written, backed up, or
+// reported). It uses the clobber path (true): a clean file is a no-op, a missing
+// one is created, and a MODIFIED one is backed up to <name>.<epoch>.bak and
+// replaced, with both the backup and the refreshed copy committed. The whole
+// update+publish runs under a single gitMu hold via publishMainLocked so
+// instruct.Update's own commit cannot race the follow-remote pull, and the commit
+// is propagated to the remote (a no-op on a single-host hive). Idempotent: a second
+// run over an already-clean set writes nothing and produces no new backup.
+func (s *Server) instructionUpdate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	s.gitMu.Lock()
+	_, err := instruct.Update(ctx, s.repo.Root, true, nil)
+	if err == nil {
+		err = s.publishMainLocked(ctx, "frontend: beehive instruction update")
+	}
+	s.gitMu.Unlock()
+	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}

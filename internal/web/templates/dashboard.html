@@ -9,10 +9,15 @@
     <li class="file-link {{if .Present}}present{{else}}absent{{end}}">
       <span class="file-name">{{.File}}</span>
       {{if .Managed}}<span class="badge" title="beehive ships and refreshes a default (beehive instruction update)">managed</span>{{else}}<span class="badge" title="site-authored, never managed or auto-generated">site-authored</span>{{end}}
+      {{if .Drift}}<span class="badge drift drift-{{.Drift}}" title="on-disk vs the binary's embedded default">{{.Drift}}</span>{{end}}
       {{if .Present}}<a href="/edit?path={{.File}}">view / edit</a>{{else}}<span class="muted">not created</span> <a href="/edit?path={{.File}}">create</a>{{end}}
     </li>
   {{end}}
   </ul>
+  <form method="post" action="/instruction/update" class="instruction-update">
+    <button {{if not .RootFilesDrift}}class="muted"{{end}} title="refresh the managed files (AGENTS/HONEYBEE/BOOTSTRAP) to the binary's defaults; a modified file is backed up to &lt;name&gt;.&lt;epoch&gt;.bak first. LOCALS.md is never touched.">run instruction update</button>
+    {{if .RootFilesDrift}}<span class="muted small">managed files have drifted from the shipped default</span>{{else}}<span class="muted small">managed files match the shipped default</span>{{end}}
+  </form>
 </nav>
 <div class="cards">
 {{range .Subs}}<div class="card{{if .Working}} active{{end}}">
