@@ -32,6 +32,17 @@ worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` �
   `git config remote.*`). Config is SHARED across every worktree, so a stray remote leaks into the
   live repo and corrupts repo-rooted tooling. You publish by committing; the runner merges to `main`.
   Need to exercise remote/clone/fetch behavior? Use a THROWAWAY repo under `$TMPDIR`.
+- NEVER force-push and NEVER reconcile a diverged origin. Do not `git push --force`, `--force-with-lease`,
+  or `+<refspec>`; do not `git merge -s ours` an origin branch; do not rebase/reset onto an origin tip.
+  Your `bee-<taskid>` branch may ALREADY EXIST on origin from a prior attempt that orphaned before
+  landing (the task GC'd mid-flight) — this is NORMAL. That stale branch is the runner's to reclaim, not
+  yours to supersede, dedup, or overwrite. If a plain push is rejected non-fast-forward, do NOT fight it:
+  the runner reclaims stale branches and owns the merge to `main`. There is exactly ONE resolution —
+  commit your work on the branch the runner gave you, flip STATUS, write the doc, end the turn. Deciding
+  "which implementation to land", whether to force over an orphan, or how to reconcile a duplicate is
+  NEVER your call and NEVER a `NEEDS-HUMAN` blocker — it is routine reclaim the runner already handles.
+  Spending a turn analyzing branch divergence is the single most common way passes have burned their
+  whole turn budget and stranded the task; refuse the rabbit hole.
 - No shortcuts. Compute real values. No placeholders, no swallowed errors, no fake "done".
 - Every plan item you add ships a terse, LLM-targeted doc under `submodules/<sm>/docs/`.
 - Keep `PLAN.md`, `ARTIFACTS.md`, `INFRASTRUCTURE.md` current.
@@ -79,7 +90,10 @@ branch to the submodule origin, bump the submodule pointer, write the change doc
 runner merges that to `main` — it does not author the change for you. These are ROUTINE, expected steps
 of every work pass — not irreversible actions that need confirmation. Pushing your `bee-<taskid>`
 branch and bumping the pointer is exactly the publish protocol; NEVER pause, checkpoint, or ask before
-them. Just do them and let the turn's completion check end the pass.
+them. Just do them and let the turn's completion check end the pass. A push rejected because your
+branch already exists on origin (a prior orphaned attempt) is NOT a problem to solve here — see the
+"NEVER force-push" rule: the runner reclaims it. Never treat the presence of a prior attempt's branch
+or a near-duplicate on origin as a reason to stop, re-plan, force-push, or escalate.
 
 ## Status transitions (exhaustive)
 You perform the status edit; the runner manages session/heartbeat and the merge to main. The only
