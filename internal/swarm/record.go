@@ -14,16 +14,26 @@ import (
 
 // recorder polls one opencode session and renders its full transcript (user
 // prompts, assistant text, model reasoning, tool commands + output) to a file
-// on disk. When debug is set it also tees live activity to a writer. A single
-// recorder per honeybee means opencode is polled exactly once; beehived reads
-// the file (a gitignored, real-time live transcript) instead of polling opencode
-// itself. The file is NOT committed per poll — the runner makes one durable
-// commit at session end — so streaming never touches git.
+// on disk. It tees live activity to two DISJOINT sinks:
+//
+//   - concise (always-on): a terse per-turn activity log — tool-call names and
+//     stream-health notices — so every scheduled pass is observable live in the
+//     journal (journalctl -t honeybee) even with no --debug flag.
+//   - debug (--debug only): the verbose full-transcript tee — model reasoning and
+//     assistant-text deltas, user-prompt markers, and full tool OUTPUT bodies.
+//
+// The two sinks emit disjoint line sets, so with --debug (both set to the same
+// stderr) the output is a clean SUPERSET of the concise stream, no line doubled.
+// A single recorder per honeybee means opencode is polled exactly once; beehived
+// reads the file (a gitignored, real-time live transcript) instead of polling
+// opencode itself. The file is NOT committed per poll — the runner makes one
+// durable commit at session end — so streaming never touches git.
 type recorder struct {
-	sess   Session
-	path   string // session worktree file streamed to the session branch
-	header string
-	debug  io.Writer
+	sess    Session
+	path    string // session worktree file streamed to the session branch
+	header  string
+	concise io.Writer // always-on: terse per-turn activity (tool-call names, stream health)
+	debug   io.Writer // --debug only: verbose full-transcript tee (reasoning/text deltas, tool output bodies)
 
 	lastMD string // last rendered transcript, to skip rewriting an unchanged file
 
@@ -35,7 +45,7 @@ type recorder struct {
 	commitIvl  time.Duration
 	lastCommit time.Time
 
-	// debug-stream state (incremental, append-only diffing)
+	// live-stream state (incremental, append-only diffing) shared by both sinks
 	toolSt  map[string]string // callID -> last status streamed
 	partLen map[string]int    // "<kind>:<partID>" -> chars streamed
 	started map[string]bool   // markers already emitted (user msg / reasoning lead)
@@ -59,12 +69,12 @@ func (rc *recorder) loop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return // session ended: stop, no fallback
 		}
-		if rc.debug != nil {
-			if errors.Is(err, ErrNoStream) {
-				fmt.Fprint(rc.debug, "\n[recorder] opencode event stream unavailable; polling transcript\n")
-			} else if err != nil {
-				fmt.Fprintf(rc.debug, "\n[recorder] event stream ended (%v); falling back to polling\n", err)
-			}
+		// Stream-health notices are concise activity (they explain a stalled
+		// transcript), so they go to the always-on sink, not the debug-only tee.
+		if errors.Is(err, ErrNoStream) {
+			rc.activity("\n[recorder] opencode event stream unavailable; polling transcript\n")
+		} else if err != nil {
+			rc.activity(fmt.Sprintf("\n[recorder] event stream ended (%v); falling back to polling\n", err))
 		}
 		// Fall through to polling for the rest of the session.
 	}
@@ -113,16 +123,15 @@ func (rc *recorder) snapshot(ctx context.Context) error {
 }
 
 // render writes the rendered transcript for msgs to the worktree file, commits it
-// to the isolated session branch (throttled), and (when debug) streams new
-// activity. Shared by the poll path (snapshot) and the streaming path (loop's
-// onUpdate). The recorder loop treats errors as transient; final session
-// publication checks them so it never publishes a stale or missing file.
+// to the isolated session branch (throttled), and streams new live activity (the
+// always-on concise sink plus, under --debug, the verbose tee). Shared by the poll
+// path (snapshot) and the streaming path (loop's onUpdate). The recorder loop
+// treats errors as transient; final session publication checks them so it never
+// publishes a stale or missing file.
 func (rc *recorder) render(ctx context.Context, msgs []Message) error {
 	md := renderTranscript(rc.header, msgs)
 	if md == rc.lastMD {
-		if rc.debug != nil {
-			rc.streamDebug(msgs)
-		}
+		rc.streamActivity(msgs)
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(rc.path), 0o755); err != nil {
@@ -132,9 +141,7 @@ func (rc *recorder) render(ctx context.Context, msgs []Message) error {
 		return err
 	}
 	rc.lastMD = md
-	if rc.debug != nil {
-		rc.streamDebug(msgs)
-	}
+	rc.streamActivity(msgs)
 	// Stream to the session branch so beehived sees it near real time, throttled.
 	if rc.commit != nil {
 		now := time.Now()
@@ -230,13 +237,41 @@ func inputSummary(tool string, in map[string]any) string {
 	}
 }
 
-// streamDebug emits only newly-appeared content since the last poll to the debug
-// writer: user prompt markers, assistant text + reasoning deltas, and tool calls
-// with their command and (truncated) output.
-func (rc *recorder) streamDebug(msgs []Message) {
+// activity writes a concise, always-on activity line to the journal. It prefers
+// the concise sink (set on every real pass); with only the debug tee configured
+// (a verbose-only test) it falls back to that so concise lines still appear as
+// part of the superset. A nil-nil recorder (a plain unit test with no sinks) is a
+// no-op.
+func (rc *recorder) activity(s string) {
+	w := rc.concise
+	if w == nil {
+		w = rc.debug
+	}
+	if w != nil {
+		fmt.Fprint(w, s)
+	}
+}
+
+// streamActivity emits only newly-appeared content since the last poll, split
+// across two disjoint sinks so --debug is a clean superset of the always-on
+// journal stream (see the recorder doc comment):
+//
+//   - concise (always, via rc.activity): tool-call NAME lines — the pending/done/
+//     error markers with the tool and its input summary — so every scheduled pass
+//     shows what the agent is doing even without --debug.
+//   - debug (--debug only, direct to rc.debug): the verbose extras — user-prompt
+//     markers, assistant-text + model-reasoning deltas, and full tool OUTPUT
+//     bodies. These never duplicate a concise line.
+//
+// With neither sink configured it is a no-op, so a plain unit test's transcript
+// stays byte-identical.
+func (rc *recorder) streamActivity(msgs []Message) {
+	if rc.concise == nil && rc.debug == nil {
+		return
+	}
 	for _, m := range msgs {
 		if m.Role == "user" {
-			if !rc.started["u:"+m.ID] {
+			if rc.debug != nil && !rc.started["u:"+m.ID] {
 				rc.started["u:"+m.ID] = true
 				fmt.Fprintf(rc.debug, "\n> %s\n", firstLine(messageText(m)))
 			}
@@ -245,6 +280,9 @@ func (rc *recorder) streamDebug(msgs []Message) {
 		for _, p := range m.Parts {
 			switch p.Type {
 			case "reasoning":
+				if rc.debug == nil {
+					continue
+				}
 				key := "r:" + p.ID
 				if !rc.started[key] {
 					rc.started[key] = true
@@ -252,6 +290,9 @@ func (rc *recorder) streamDebug(msgs []Message) {
 				}
 				rc.streamDelta(key, p.Text)
 			case "text":
+				if rc.debug == nil {
+					continue
+				}
 				rc.streamDelta("t:"+p.ID, p.Text)
 			case "tool":
 				if rc.toolSt[p.CallID] == p.Status {
@@ -260,17 +301,21 @@ func (rc *recorder) streamDebug(msgs []Message) {
 				rc.toolSt[p.CallID] = p.Status
 				switch p.Status {
 				case "pending", "running":
-					fmt.Fprintf(rc.debug, "\n  \u00b7 %s %s\n", p.Tool, inputSummary(p.Tool, p.Input))
+					// Concise tool-call name + input summary (always-on).
+					rc.activity(fmt.Sprintf("\n  \u00b7 %s %s\n", p.Tool, inputSummary(p.Tool, p.Input)))
 				case "completed":
-					if out := strings.TrimRight(p.Output, "\n"); strings.TrimSpace(out) != "" {
-						if len(out) > 2000 {
-							out = out[:2000] + "\n    \u2026(truncated; full output in session file)"
+					// Full output body: verbose tee only. The ✓ marker is concise.
+					if rc.debug != nil {
+						if out := strings.TrimRight(p.Output, "\n"); strings.TrimSpace(out) != "" {
+							if len(out) > 2000 {
+								out = out[:2000] + "\n    \u2026(truncated; full output in session file)"
+							}
+							fmt.Fprintln(rc.debug, indent(out))
 						}
-						fmt.Fprintln(rc.debug, indent(out))
 					}
-					fmt.Fprintf(rc.debug, "  \u2713 %s\n", p.Tool)
+					rc.activity(fmt.Sprintf("  \u2713 %s\n", p.Tool))
 				case "error":
-					fmt.Fprintf(rc.debug, "  \u2717 %s: %s\n", p.Tool, firstLine(p.Error))
+					rc.activity(fmt.Sprintf("  \u2717 %s: %s\n", p.Tool, firstLine(p.Error)))
 				}
 			}
 		}

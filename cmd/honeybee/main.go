@@ -243,6 +243,12 @@ func run() error {
 		BuildEnv: eff.BuildEnv,
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, IdleTimeout: time.Duration(eff.TurnIdleTimeoutMinutes) * time.Minute, HTTP: &http.Client{Timeout: 0}}
+	// Always-on concise activity to stderr so every scheduled `systemd-run … honeybee`
+	// pass is observable live via `journalctl --user -t honeybee` (pass kind, per-turn
+	// boundaries, tool-call names, abandon/GC reasons) — not just the runner's warnings.
+	runner.Concise = os.Stderr
+	// --debug additionally tees the verbose full transcript (model reasoning,
+	// assistant text, tool OUTPUT bodies): a superset of the concise stream.
 	if debug {
 		runner.Debug = os.Stderr
 		oc.Debug = os.Stderr

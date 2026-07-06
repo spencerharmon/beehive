@@ -815,6 +815,48 @@ func TestTurnTimeoutAbandonsForGC(t *testing.T) {
 	}
 }
 
+// TestRunnerConciseActivityAlwaysOn proves the runner streams concise per-turn
+// activity to its always-on Concise sink with NO --debug (Debug nil): the pass
+// kind at session open, each turn boundary, and the abandon/GC reason. This is the
+// journal-activity-stream contract at the runner layer (the recorder's tool-call
+// stream is covered by TestRecorderConciseStreamsWithoutDebug). It fails before the
+// split, where these lines were gated behind Debug (the --debug flag) and a
+// scheduled pass was silent.
+func TestRunnerConciseActivityAlwaysOn(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	var concise strings.Builder
+	r := &Runner{
+		Repo: rp, Git: g, Client: idleClient{}, MaxTurns: 5,
+		WallCap: time.Hour, TTL: time.Hour,
+		TurnTimeout: time.Hour, TurnIdleTimeout: 15 * time.Minute,
+		Concise: &concise, // Debug intentionally nil: a scheduled pass has no --debug
+	}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := concise.String()
+	if !contains(got, "kind=bootstrap") || !contains(got, "opening session") {
+		t.Fatalf("concise stream missing the always-on pass-kind line; got:\n%s", got)
+	}
+	if !contains(got, "turn 1/5") {
+		t.Fatalf("concise stream missing an always-on turn boundary; got:\n%s", got)
+	}
+	if !contains(got, "idle timeout") {
+		t.Fatalf("concise stream missing the always-on abandon/GC reason; got:\n%s", got)
+	}
+}
+
 // TestReconciledPrefixMatch proves the Reconcile completion check (Runner.reconciled)
 // matches the PLAN.md ROI stamp against the full ROI head sha by PREFIX. The stamp
 // is frequently abbreviated while head is the full %H sha, so the prior exact `==`

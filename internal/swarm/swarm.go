@@ -61,7 +61,14 @@ type Runner struct {
 	WallCap      time.Duration
 	TTL          time.Duration
 	Now          func() time.Time
-	Debug        io.Writer // non-nil: stream session activity live
+	// Concise is the ALWAYS-ON activity sink (os.Stderr on a real pass): a terse
+	// per-turn log — pass kind, turn boundaries, and abandon/GC warnings — so every
+	// scheduled `honeybee` pass is observable live via `journalctl -t honeybee`
+	// even with no --debug flag. Its lines are disjoint from Debug's, so under
+	// --debug (both = stderr) the combined stream is a clean superset. Nil in tests
+	// that don't assert on it.
+	Concise io.Writer
+	Debug   io.Writer // --debug only: verbose full-transcript tee (superset of Concise)
 	// Session is this honeybee's unique claim token, stamped on the task it works
 	// so peers can tell a task is actively held (session + fresh heartbeat) versus
 	// free. Must match the token main used for the initial Claim.
@@ -439,6 +446,17 @@ func (r *Runner) now() time.Time {
 	return time.Now().UTC()
 }
 
+// logConcise writes one always-on per-turn activity line to the journal (kind,
+// turn boundary, abandon/GC reason). No-op when Concise is unset (tests). Debug
+// is deliberately NOT teed here: its lines are disjoint, so under --debug the
+// recorder's verbose tee plus these concise lines form the superset without any
+// line being emitted twice.
+func (r *Runner) logConcise(format string, args ...any) {
+	if r.Concise != nil {
+		fmt.Fprintf(r.Concise, format, args...)
+	}
+}
+
 // Result reports how a honeybee ended.
 type Result struct {
 	Completed bool
@@ -664,9 +682,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	}
 	first = preamble + first
 
-	if r.Debug != nil {
-		fmt.Fprintf(r.Debug, "[honeybee] dir=%s submodule=%s kind=%s opening session...\n", absRoot, sel.Submodule.Name, sel.Kind)
-	}
+	// Pass kind + submodule: always-on concise activity so the journal names what
+	// this scheduled pass is, even without --debug. One line (not teed to Debug) so
+	// --debug never doubles it.
+	r.logConcise("[honeybee] dir=%s submodule=%s kind=%s opening session...\n", absRoot, sel.Submodule.Name, sel.Kind)
 	// Lean mode: trim the injected protocol to only what this pass's kind acts on
 	// before opening the session. The system prompt is re-sent on EVERY turn, so
 	// trimming it once here compounds across the whole session. Off by default =
@@ -718,6 +737,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		sess:    sess,
 		path:    sessionFile,
 		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch),
+		concise: r.Concise,
 		debug:   r.Debug,
 		toolSt:  map[string]string{},
 		partLen: map[string]int{},
@@ -783,9 +803,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			if err := rec.appendWarning(warning); err != nil {
 				return sessionTranscriptError{err: fmt.Errorf("append session warning: %w", err)}
 			}
-			if r.Debug != nil {
-				fmt.Fprintf(r.Debug, "\n⚠️  %s\n", warning)
-			}
+			// The abandon/GC reason is concise activity: always-on to the journal so a
+			// killed pass explains itself live, not only in the --debug tee.
+			r.logConcise("\n⚠️  %s\n", warning)
 		}
 		if err := r.streamSession(ctx, sessionRel); err != nil { // durable final transcript on the session branch (beehived's live source)
 			return sessionTranscriptError{err: fmt.Errorf("stream final session transcript: %w", err)}
@@ -826,6 +846,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
+		// Always-on turn boundary: a live "still working, on turn N" heartbeat in the
+		// journal so a stalled pass is visibly stalled rather than silent.
+		r.logConcise("[honeybee] ── turn %d/%d ──\n", res.Turns, r.MaxTurns)
 		// Revert any change the agent made to the repo's git config (remotes) during
 		// the previous turn before doing more work. Honeybees publish via worktree
 		// merges to main but must never touch the shared repo config; this keeps that
