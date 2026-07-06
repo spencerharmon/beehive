@@ -1,0 +1,43 @@
+{{template "header"}}
+<h1>Resolve · {{.Sub}} · {{.Item.ID}}</h1>
+<p><a href="/human">← NEEDS-HUMAN</a> · <a href="/submodule/{{.Sub}}/plan">plan</a></p>
+
+<div class="card">
+  <h2>Blocker</h2>
+  <p><strong>Why the swarm needs you:</strong> {{if .Item.HumanReason}}{{.Item.HumanReason}}{{else}}<span class="muted">(no explicit reason recorded)</span>{{end}}</p>
+  <p><strong>Task:</strong> {{.Item.Desc}}</p>
+  {{if .Item.DepStates}}<p><strong>Dependents wait on this.</strong> Deps:
+    {{range .Item.DepStates}}<span class="dep {{if .Done}}done{{else}}pending{{end}}">{{.Name}}</span> {{end}}</p>{{end}}
+  {{if .Item.DocHref}}<p><a href="{{.Item.DocHref}}">change doc</a></p>{{end}}
+</div>
+
+<div class="card">
+  <h2>Actions</h2>
+  <p class="muted">Provide what the blocker needs, then reopen the task so the swarm resumes.</p>
+  <ul>
+    <li><a href="/secrets">Secrets panel</a> — add a credential/token (values stay encrypted; never paste them into chat).</li>
+    <li><a href="/edit?path=submodules/{{.Sub}}/ROI.md">Edit intent (ROI.md)</a> — clarify or correct the target's intent.</li>
+  </ul>
+  <form method="post" action="/human/{{.Sub}}/{{.Item.ID}}/resolve"
+        onsubmit="return confirm('Reopen {{.Item.ID}} as TODO and publish to main? The swarm will re-select it.');">
+    <button class="merge">Mark resolved → TODO</button>
+    <span class="muted">Flips NEEDS-HUMAN → TODO and publishes PLAN.md.</span>
+  </form>
+</div>
+
+<div class="card">
+  <h2>AI resolution chat</h2>
+  <p class="muted">Ask the assistant what this blocker needs and how to clear it. It can propose an edit to <code>{{.Path}}</code>; nothing is written or committed until you approve the diff.</p>
+  <div id="chatedit"
+       hx-get="/edit/{{.ChatID}}/panel"
+       hx-trigger="load"
+       hx-swap="innerHTML">
+    <p>loading…</p>
+  </div>
+  <form hx-post="/edit/{{.ChatID}}/message" hx-target="#chatedit" hx-swap="innerHTML"
+        hx-on::after-request="this.reset()">
+    <input name="message" placeholder="What does this blocker need to be resolved?" autocomplete="off" autofocus style="width:70%">
+    <button>send</button>
+  </form>
+</div>
+{{template "footer"}}

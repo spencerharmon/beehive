@@ -107,6 +107,25 @@ func (t *Task) RequestHuman(reason string, now time.Time) error {
 	return nil
 }
 
+// Resolve reopens a NEEDS-HUMAN task to TODO once the operator has cleared the
+// blocker: it moves the task back into the selectable pool, drops the resolved
+// Human-needed reason line, and releases any (now stale) claim. It is the inverse
+// of RequestHuman and the ONLY edge out of the terminal NEEDS-HUMAN state — an
+// explicit operator action, never an automatic transition (NEEDS-HUMAN stays
+// terminal for the state machine and the selector, so a bee can never silently
+// un-escalate its own blocker). It errors on a non-NEEDS-HUMAN task so a UI/CLI
+// mistake can't reset an in-flight task's status or claim.
+func (t *Task) Resolve(now time.Time) error {
+	if t.Status != StatusHuman {
+		return fmt.Errorf("plan: resolve on non-NEEDS-HUMAN task %s (%s)", t.ID, t.Status)
+	}
+	t.Status = StatusTODO
+	t.Session = ""
+	t.Heartbeat = time.Time{}
+	t.clearHumanReason()
+	return nil
+}
+
 // Selectable reports whether a task can be auto-selected: not terminal, not
 // NEEDS-HUMAN, and all LOCAL deps DONE in p. A dep id containing ":" names a
 // task in another submodule (<submodule>:<taskid>); the plan layer stays

@@ -193,6 +193,47 @@ func TestRequestHumanRejectsEmptyAndDone(t *testing.T) {
 	}
 }
 
+func TestResolveReopensHumanTask(t *testing.T) {
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	tk := &Task{ID: "a", Status: StatusTODO, Session: "bee-1", Heartbeat: now, Body: []string{"do thing"}}
+	if err := tk.RequestHuman("Need the Cloudflare API token.", now); err != nil {
+		t.Fatal(err)
+	}
+	// A stale claim may have been re-stamped onto the escalated task; Resolve must
+	// still clear it so the reopened TODO is unclaimed and freshly selectable.
+	tk.Claim("bee-2", now)
+	if err := tk.Resolve(now); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if tk.Status != StatusTODO {
+		t.Fatalf("status = %s, want TODO", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("resolve must release the claim")
+	}
+	if got := tk.HumanReason(); got != "" {
+		t.Fatalf("reason = %q, want cleared", got)
+	}
+	// The reopened task is now auto-selectable (no deps) and its serialized form
+	// carries neither the NEEDS-HUMAN status nor the Human-needed line.
+	p := &Plan{Tasks: []*Task{tk}}
+	if !p.Selectable(tk) {
+		t.Fatal("resolved task should be selectable")
+	}
+	if s := p.String(); strings.Contains(s, "NEEDS-HUMAN") || strings.Contains(s, "Human-needed:") {
+		t.Fatalf("serialized resolved plan still shows blocker:\n%s", s)
+	}
+}
+
+func TestResolveRejectsNonHuman(t *testing.T) {
+	now := time.Now()
+	for _, st := range []Status{StatusTODO, StatusReview, StatusArb, StatusDone} {
+		if err := (&Task{ID: "a", Status: st}).Resolve(now); err == nil {
+			t.Fatalf("resolve allowed on %s", st)
+		}
+	}
+}
+
 func TestSelectable(t *testing.T) {
 	p, _ := Parse(sample)
 	if p.Selectable(p.Task("t2")) {

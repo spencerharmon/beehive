@@ -251,6 +251,20 @@ func (t *Task) setHumanReason(reason string) {
 	t.Body = append(t.Body, field)
 }
 
+// clearHumanReason drops the Human-needed body field (and a trailing blank line
+// it may have introduced) when a NEEDS-HUMAN task is resolved, so a reopened task
+// does not carry a stale blocker reason. A no-op when no such field exists.
+func (t *Task) clearHumanReason() {
+	for i, line := range t.Body {
+		if _, ok := strings.CutPrefix(strings.TrimSpace(line), humanReasonPrefix); !ok {
+			continue
+		}
+		t.Body = append(t.Body[:i], t.Body[i+1:]...)
+		t.Body = trimTrailingBlank(t.Body)
+		return
+	}
+}
+
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 // Stamp sets the Beehive-ROI sha, inserting the comment if absent.

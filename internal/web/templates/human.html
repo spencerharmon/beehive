@@ -1,6 +1,13 @@
 {{template "header"}}
 <h1>NEEDS-HUMAN</h1>
-<table><tr><th>submodule</th><th>id</th><th>reason</th><th>desc</th></tr>
-{{range .Rows}}<tr><td>{{.Sub}}</td><td>{{.Item.ID}}</td><td>{{.Item.HumanReason}}</td><td>{{.Item.Desc}}</td></tr>{{else}}<tr><td colspan=4>none</td></tr>{{end}}
+<p class="muted">Tasks the swarm escalated for operator input. Each blocks its dependents until resolved. Open one to get an AI-assisted resolution workspace, or resolve it to reopen it as TODO.</p>
+<table><tr><th>submodule</th><th>id</th><th>reason</th><th>desc</th><th></th></tr>
+{{range .Rows}}<tr>
+  <td>{{.Sub}}</td>
+  <td>{{.Item.ID}}</td>
+  <td>{{.Item.HumanReason}}</td>
+  <td>{{.Item.Desc}}</td>
+  <td><a class="btn" href="/human/{{.Sub}}/{{.Item.ID}}">resolve…</a></td>
+</tr>{{else}}<tr><td colspan=5>none</td></tr>{{end}}
 </table>
 {{template "footer"}}

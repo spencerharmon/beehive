@@ -51,6 +51,12 @@ type Server struct {
 	// unified diff, applied+committed only on human approval (chat-diff-editor-core).
 	chat *chatManager
 
+	// humans maps each NEEDS-HUMAN task to its (reused) AI resolution chat session
+	// and drives the deterministic reopen (NEEDS-HUMAN -> TODO). It shares the chat
+	// manager above, so a resolution conversation is a normal chat-diff session
+	// (the /edit routes serve it) opened with a blocker-seeded system prompt.
+	humans *humanManager
+
 	// gitMu serializes operations that mutate the primary beehive checkout (where
 	// main is checked out): the viewer's periodic `git pull --ff-only main` that
 	// follows off-box sessions, and the frontend's own commit/publish. Without it a
@@ -102,7 +108,8 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	// the single-file editor); it opens a per-edit ROOT worktree and awaits each
 	// turn (opencode-turn-poll) before rendering the proposed diff.
 	oc := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}}
-	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: newChatManager(r.Root, oc)}, nil
+	chat := newChatManager(r.Root, oc)
+	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: chat, humans: newHumanManager(chat)}, nil
 }
 
 // repoCookie carries the selected repo handle for a multi-repo daemon. Selection
@@ -288,6 +295,8 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /env", b((*Server).envGet))
 	mux.HandleFunc("POST /env/deploy", b((*Server).envDeploy))
 	mux.HandleFunc("GET /human", b((*Server).human))
+	mux.HandleFunc("GET /human/{sub}/{id}", b((*Server).humanResolvePage))
+	mux.HandleFunc("POST /human/{sub}/{id}/resolve", b((*Server).humanResolveApply))
 	mux.HandleFunc("GET /hygiene", b((*Server).hygiene))
 	// Maintenance skills: an index of named actions each with a read-only dry-run
 	// (plan) and a separate apply; destructive skills gate apply on confirm.
