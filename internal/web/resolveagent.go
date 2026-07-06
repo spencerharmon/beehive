@@ -40,27 +40,29 @@ var (
 // backing them. Sessions are keyed by task (one general agent per blocked task,
 // reused across page reloads) and live in-memory only.
 type resolveManager struct {
-	root    string
-	git     *git.Repo // root repo (cuts the per-task worktrees)
-	client  swarm.Client
-	now     func() time.Time
-	subPath func(sub string) string // resolves a submodule name to its live repo checkout (for read-only context)
+	root        string
+	git         *git.Repo // root repo (cuts the per-task worktrees)
+	client      swarm.Client
+	now         func() time.Time
+	turnCeiling time.Duration // absolute per-turn wall-clock ceiling (0 = none)
 
 	mu     sync.Mutex
 	byTask map[string]*resolveSession // taskKey(sub,id) -> session
 }
 
 // newResolveManager builds a resolveManager over the beehive repo at root driving
-// the given opencode client. subPath maps a submodule name to its live checkout
-// path so the system prompt can point the agent at read-only source for context.
-func newResolveManager(root string, client swarm.Client, subPath func(sub string) string) *resolveManager {
+// the given opencode client. turnCeiling bounds a single agent turn so a wedged
+// tool call (e.g. an opencode permission elicitation that never resolves) can
+// never leave a session "working…" forever; the client's own IdleTimeout progress
+// watchdog is the finer-grained cut, this is the absolute backstop.
+func newResolveManager(root string, client swarm.Client, turnCeiling time.Duration) *resolveManager {
 	return &resolveManager{
-		root:    root,
-		git:     git.New(root),
-		client:  client,
-		now:     time.Now,
-		subPath: subPath,
-		byTask:  map[string]*resolveSession{},
+		root:        root,
+		git:         git.New(root),
+		client:      client,
+		now:         time.Now,
+		turnCeiling: turnCeiling,
+		byTask:      map[string]*resolveSession{},
 	}
 }
 
@@ -125,7 +127,7 @@ func (m *resolveManager) session(ctx context.Context, sub string, it PlanItem) (
 		Sub:    sub,
 		TaskID: it.ID,
 		wtPath: wtPath,
-		sys:    resolveSystemPrompt(sub, it, m.subPath(sub)),
+		sys:    resolveSystemPrompt(sub, it),
 		mgr:    m,
 		wt:     git.New(wtPath),
 		first:  true,
@@ -175,6 +177,9 @@ func (s *resolveSession) startChat(bg context.Context, msg string) error {
 	s.log = append(s.log, chatTurn{Role: "user", Text: msg, At: s.mgr.now()})
 	first := s.first
 	ctx, cancel := context.WithCancel(bg)
+	if s.mgr.turnCeiling > 0 {
+		ctx, cancel = context.WithTimeout(bg, s.mgr.turnCeiling)
+	}
 	s.cancel = cancel
 	s.mu.Unlock()
 
@@ -384,16 +389,16 @@ func (s *resolveSession) logCopy() []chatTurn {
 // real state before proposing, and drive toward exactly one of the concrete
 // clear-paths the system prompt enumerates.
 const resolveFirstTurnPreamble = "Before proposing anything, use your tools to inspect the real state of the " +
-	"repository and the blocker (read the task's ROI.md/PLAN.md and any change docs, grep the code, run read-only " +
-	"git/inspection commands). Then tell me which concrete clear-path resolves THIS blocker and take the part of it " +
-	"you can (editing coordination-layer files here), leaving the operator only the action that must be theirs."
+	"blocker using ONLY files inside your working directory: read this target's ROI.md, PLAN.md and any change " +
+	"docs under its submodules/<name>/docs/, and run read-only git commands in this worktree. Then tell me which " +
+	"concrete clear-path resolves THIS blocker and take the part of it you can (editing coordination-layer files " +
+	"here), leaving the operator only the action that must be theirs."
 
 // resolveSystemPrompt seeds the resolution agent with the concrete blocker, its
 // full tool authority and boundaries, and \u2014 crucially \u2014 the explicit set of ways a
 // NEEDS-HUMAN task actually clears, so the agent drives the operator to a real
-// unblock instead of dead-ending. subRepo is the live (read-only) submodule
-// checkout path for source context, or "" when unknown.
-func resolveSystemPrompt(sub string, it PlanItem, subRepo string) string {
+// unblock instead of dead-ending.
+func resolveSystemPrompt(sub string, it PlanItem) string {
 	reason := strings.TrimSpace(it.HumanReason)
 	if reason == "" {
 		reason = "(no explicit reason recorded on the task)"
@@ -401,10 +406,6 @@ func resolveSystemPrompt(sub string, it PlanItem, subRepo string) string {
 	desc := strings.TrimSpace(it.Desc)
 	if desc == "" {
 		desc = "(no description on the task)"
-	}
-	src := "(the target's source checkout path is not available in this session)"
-	if strings.TrimSpace(subRepo) != "" {
-		src = fmt.Sprintf("You may READ the target's live source at %s for context (read-only \u2014 never edit it here).", subRepo)
 	}
 	return fmt.Sprintf(`You are a general engineering agent helping a human operator CLEAR a task that an
 autonomous coding swarm escalated to NEEDS-HUMAN. A NEEDS-HUMAN task is blocked
@@ -420,8 +421,16 @@ You are working inside a private git worktree of the beehive COORDINATION repo
 (the "hive" superproject), checked out at its root. You have a full toolset
 (read, grep, bash, edit, write) and every tool action is auto-approved, so act:
 investigate first, then make the coordination-layer changes that help clear the
-blocker. %[5]s Nothing you write becomes live until the operator clicks Publish
-(which merges this worktree branch to the hive's main); Discard throws it away.
+blocker. Nothing you write becomes live until the operator clicks Publish (which
+merges this worktree branch to the hive's main); Discard throws it away.
+
+STAY INSIDE YOUR WORKING DIRECTORY
+Only read, write, and run commands on paths INSIDE this worktree. Do NOT read or
+write absolute paths outside it (for example another checkout elsewhere on the
+host): an out-of-tree file access blocks on a permission prompt that nothing can
+answer and will hang your turn. Note that submodules/%[2]s/repo/ is a submodule
+gitlink and is EMPTY in this worktree - the target's application source is not
+available here, and that is intentional (see below).
 
 WHAT YOU MAY CHANGE
   - Beehive-layer coordination files for this target: its ROI.md (human-owned
@@ -459,5 +468,5 @@ HOW THIS BLOCKER GETS CLEARED (drive the operator to exactly one; state which)
 Keep replies short. End each turn by naming which clear-path (1-4) applies to
 THIS blocker, what you have done toward it, and the single next action the
 operator must take.`,
-		it.ID, sub, desc, reason, src)
+		it.ID, sub, desc, reason)
 }

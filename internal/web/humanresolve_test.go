@@ -25,9 +25,7 @@ func humanFixture(t *testing.T, reply string) (*Server, string, *httptest.Server
 	client := &fakeChatClient{reply: reply}
 	s, root := chatFixtureClient(t, client)
 	// Rewire the resolution agent manager onto the same fake-backed client.
-	s.humans = newResolveManager(root, client, func(sub string) string {
-		return filepath.Join(root, "submodules", sub, "repo")
-	})
+	s.humans = newResolveManager(root, client, 0)
 	// Seed a real NEEDS-HUMAN task and commit it so headSHA/planView see it.
 	planRel := "submodules/alpha/PLAN.md"
 	write(t, root+"/"+planRel, "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
@@ -66,14 +64,23 @@ func waitIdle(t *testing.T, s *Server, sub, id string) *resolveSession {
 // resolved) \u2014 so the agent drives a real unblock instead of dead-ending.
 func TestResolveSystemPromptSeedsBlockerAndBoundaries(t *testing.T) {
 	it := PlanItem{ID: "needs-token", Desc: "Wire the external API client.", HumanReason: "provide the API token as api_token."}
-	sys := resolveSystemPrompt("alpha", it, "/repo/alpha/repo")
+	sys := resolveSystemPrompt("alpha", it)
 	for _, want := range []string{
 		"needs-token", "alpha", "provide the API token as api_token.", "Wire the external API client.",
 		"NEEDS-HUMAN", "submodules/alpha/repo/", "WORK task", "Secrets panel",
 		"Publish", "Mark resolved", "secret", "read, grep, bash, edit, write",
+		"STAY INSIDE YOUR WORKING DIRECTORY", "absolute paths outside it",
 	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, sys)
+		}
+	}
+	// Regression: the prompt must NOT direct the agent to read the live source via
+	// an absolute path outside the worktree — that wedges the turn on an
+	// unanswerable opencode permission prompt (the resolution-agent hang).
+	for _, bad := range []string{"live source at", "%[5]s"} {
+		if strings.Contains(sys, bad) {
+			t.Fatalf("system prompt still contains out-of-tree directive %q", bad)
 		}
 	}
 }

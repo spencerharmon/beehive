@@ -110,10 +110,34 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	// turn (opencode-turn-poll) before rendering the proposed diff.
 	oc := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	chat := newChatManager(r.Root, oc)
-	subPath := func(sub string) string {
-		return filepath.Join(r.Root, "submodules", sub, "repo")
+	// The resolution agent is a headless tool-using turn, so it needs the same
+	// wedge protection the honeybee runner gives its passes: a progress watchdog
+	// (IdleTimeout) that cuts a turn stuck on a hung tool call (e.g. an opencode
+	// permission elicitation that nothing can answer), plus an absolute per-turn
+	// ceiling. Without them a single wedged turn pins the session at "working…"
+	// forever. It drives its OWN client so tuning it never perturbs the chat-diff
+	// editor's behavior.
+	resolveOC := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}, IdleTimeout: turnIdleTimeout(cfg)}
+	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: chat, humans: newResolveManager(r.Root, resolveOC, turnCeiling(cfg))}, nil
+}
+
+// turnIdleTimeout is the resolution agent's per-turn PROGRESS watchdog (a turn
+// with no new transcript activity for this long is cut), from config with a
+// sane default when unset.
+func turnIdleTimeout(cfg config.Config) time.Duration {
+	if cfg.TurnIdleTimeoutMinutes > 0 {
+		return time.Duration(cfg.TurnIdleTimeoutMinutes) * time.Minute
 	}
-	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: chat, humans: newResolveManager(r.Root, oc, subPath)}, nil
+	return 5 * time.Minute
+}
+
+// turnCeiling is the resolution agent's absolute per-turn wall-clock ceiling,
+// from config with a sane default when unset.
+func turnCeiling(cfg config.Config) time.Duration {
+	if cfg.TurnTimeoutMinutes > 0 {
+		return time.Duration(cfg.TurnTimeoutMinutes) * time.Minute
+	}
+	return 20 * time.Minute
 }
 
 // repoCookie carries the selected repo handle for a multi-repo daemon. Selection
