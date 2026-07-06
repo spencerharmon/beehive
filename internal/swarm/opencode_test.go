@@ -60,6 +60,35 @@ func TestPromptThreadsModelKnobs(t *testing.T) {
 	}
 }
 
+// TestPromptDisablesQuestionTool proves every turn ships tools={question:false}
+// so opencode never offers its interactive elicitation tool to a headless
+// honeybee. A `question` call has no attached client to answer it, would block
+// the turn until the per-turn timeout, and would discard the pass's work; the
+// only sanctioned human escalation is `beehive task human` (NEEDS-HUMAN).
+func TestPromptDisablesQuestionTool(t *testing.T) {
+	var body map[string]any
+	srv := captureBody(t, &body)
+	defer srv.Close()
+
+	oc := &Opencode{Base: srv.URL, Model: "anthropic/claude-3", HTTP: srv.Client()}
+	s := &ocSession{oc: oc, id: "sess1", dir: "/wt", system: "sys"}
+
+	if _, err := s.Prompt(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	tools, ok := body["tools"].(map[string]any)
+	if !ok {
+		t.Fatalf("body tools = %v (%T), want a map disabling question", body["tools"], body["tools"])
+	}
+	enabled, present := tools["question"]
+	if !present {
+		t.Fatalf("body tools missing question key: %v", tools)
+	}
+	if b, _ := enabled.(bool); b {
+		t.Errorf("body tools[question] = %v, want false (tool disabled)", enabled)
+	}
+}
+
 // TestPromptOmitsUnsetKnobs proves an unset (zero) knob is omitted entirely, so
 // the request stays byte-identical to the pre-feature default path and the
 // backend's own default applies.

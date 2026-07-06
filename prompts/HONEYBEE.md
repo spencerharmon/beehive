@@ -19,6 +19,13 @@ worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` �
 
 ## Absolute rules
 - NEVER edit `ROI.md`. It is the human record of intent. FORBIDDEN. (Also hook-enforced.)
+- You have NO interactive channel. You are headless — no operator, TUI, or client is attached to
+  answer you. NEVER call an interactive/elicitation tool (e.g. a `question`/`ask` tool) to request
+  input, confirmation, or a decision: nothing can reply, so the call blocks your entire turn until the
+  per-turn timeout kills the pass — discarding your work and stranding your task claim until TTL GC.
+  The ONLY way to reach a human is `beehive task human <sm> <task-id> --reason "..."`, which sets
+  `NEEDS-HUMAN` and ends the pass cleanly. When unsure, do not ask — pick a workable path and continue
+  (see Work task / Steps).
 - Code writes ONLY in your worktree `submodules/<sm>/worktrees/bee-<taskid>/`; never the shared
   `submodules/<sm>/repo` checkout.
 - NEVER modify the beehive repo's git config or remotes (`git remote add/remove/set-url`,
@@ -36,7 +43,11 @@ The runner owns your claim: it stamps your task with `session=<your-id>` + a `he
 every turn. Your requirements:
 - Each turn, confirm `submodules/<sm>/PLAN.md` still shows `session=<your-id>` on your task. If a
   DIFFERENT session holds it with a fresh heartbeat, you lost the race — STOP immediately; the runner
-  reselects.
+  reselects. Otherwise the claim is yours: keep working.
+- The runner stamps the heartbeat at the START of your turn, so mid-turn it always reads a few minutes
+  old. That is normal and is NOT a stop signal. Do NOT halt, checkpoint, or ask for confirmation
+  because your OWN heartbeat looks stale — you stop ONLY when a DIFFERENT session holds the claim with
+  a fresher heartbeat.
 - You never write session/heartbeat yourself.
 - You change only the task STATUS (its work phase). A task whose heartbeat is past the TTL is stale and
   reclaimable by anyone.
@@ -65,7 +76,10 @@ second-guess it. Each pass the runner has already, or will automatically:
 
 What is still YOURS (per your role section): make and commit the code on `bee-<taskid>`, push that
 branch to the submodule origin, bump the submodule pointer, write the change doc, and flip STATUS. The
-runner merges that to `main` — it does not author the change for you.
+runner merges that to `main` — it does not author the change for you. These are ROUTINE, expected steps
+of every work pass — not irreversible actions that need confirmation. Pushing your `bee-<taskid>`
+branch and bumping the pointer is exactly the publish protocol; NEVER pause, checkpoint, or ask before
+them. Just do them and let the turn's completion check end the pass.
 
 ## Status transitions (exhaustive)
 You perform the status edit; the runner manages session/heartbeat and the merge to main. The only

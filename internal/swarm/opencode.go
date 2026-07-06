@@ -175,6 +175,16 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 		"system": s.system,
 		"model":  map[string]any{"providerID": prov, "modelID": model},
 		"parts":  []map[string]any{{"type": "text", "text": text}},
+		// Disable opencode's interactive elicitation tool. A honeybee pass is
+		// headless: nothing is attached to answer a `question` (elicitation)
+		// prompt, so a model that calls it blocks the whole turn until the
+		// per-turn timeout kills the pass — discarding the turn's work and
+		// stranding the task claim until TTL GC. The only sanctioned way for a
+		// pass to reach a human is `beehive task human` (NEEDS-HUMAN), which
+		// ends the pass cleanly; the elicitation tool must never be offered.
+		// opencode's message API takes a per-message tools map ({name: enabled})
+		// that overrides the agent's tool set for this turn.
+		"tools": map[string]bool{"question": false},
 	}
 	// Model knobs from the resolved (layered) config. Only sent when explicitly
 	// configured (non-zero): an unset knob leaves the request byte-identical to
