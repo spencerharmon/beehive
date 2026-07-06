@@ -51,11 +51,12 @@ type Server struct {
 	// unified diff, applied+committed only on human approval (chat-diff-editor-core).
 	chat *chatManager
 
-	// humans maps each NEEDS-HUMAN task to its (reused) AI resolution chat session
-	// and drives the deterministic reopen (NEEDS-HUMAN -> TODO). It shares the chat
-	// manager above, so a resolution conversation is a normal chat-diff session
-	// (the /edit routes serve it) opened with a blocker-seeded system prompt.
-	humans *humanManager
+	// humans owns the AI resolution AGENT for each NEEDS-HUMAN task and drives the
+	// deterministic reopen (NEEDS-HUMAN -> TODO). Each session is a general,
+	// tool-using opencode agent in a private worktree that can investigate the
+	// blocker and make multi-file beehive-layer changes (resolveagent.go); the
+	// operator reviews the diff and Publishes, then flips status via Mark resolved.
+	humans *resolveManager
 
 	// gitMu serializes operations that mutate the primary beehive checkout (where
 	// main is checked out): the viewer's periodic `git pull --ff-only main` that
@@ -109,7 +110,10 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	// turn (opencode-turn-poll) before rendering the proposed diff.
 	oc := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}}
 	chat := newChatManager(r.Root, oc)
-	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: chat, humans: newHumanManager(chat)}, nil
+	subPath := func(sub string) string {
+		return filepath.Join(r.Root, "submodules", sub, "repo")
+	}
+	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: chat, humans: newResolveManager(r.Root, oc, subPath)}, nil
 }
 
 // repoCookie carries the selected repo handle for a multi-repo daemon. Selection
@@ -296,6 +300,10 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /env/deploy", b((*Server).envDeploy))
 	mux.HandleFunc("GET /human", b((*Server).human))
 	mux.HandleFunc("GET /human/{sub}/{id}", b((*Server).humanResolvePage))
+	mux.HandleFunc("GET /human/{sub}/{id}/panel/{sid}", b((*Server).humanResolvePanel))
+	mux.HandleFunc("POST /human/{sub}/{id}/message/{sid}", b((*Server).humanResolveMessage))
+	mux.HandleFunc("POST /human/{sub}/{id}/publish/{sid}", b((*Server).humanResolvePublish))
+	mux.HandleFunc("POST /human/{sub}/{id}/discard/{sid}", b((*Server).humanResolveDiscard))
 	mux.HandleFunc("POST /human/{sub}/{id}/resolve", b((*Server).humanResolveApply))
 	mux.HandleFunc("GET /hygiene", b((*Server).hygiene))
 	// Maintenance skills: an index of named actions each with a read-only dry-run

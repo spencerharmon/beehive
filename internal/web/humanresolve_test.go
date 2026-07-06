@@ -6,23 +6,28 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 )
 
-// humanFixture builds a chat-backed Server (fake opencode client) whose alpha
-// submodule PLAN.md carries a NEEDS-HUMAN task, wires the human-resolution manager
-// to the same fake-backed chat manager, and serves it over httptest so path
-// values populate. It returns the server, its repo root, and the live test server.
+// humanFixture builds a Server whose alpha submodule PLAN.md carries a
+// NEEDS-HUMAN task and whose resolution manager is wired onto a fake opencode
+// client (so no real model is called). It returns the server, its repo root, and
+// a live httptest server so path values populate.
 func humanFixture(t *testing.T, reply string) (*Server, string, *httptest.Server) {
 	t.Helper()
-	s, root := chatFixture(t, reply)
-	// Rewire the human manager onto the fake-backed chat manager chatFixture swapped
-	// in (New wired it to the real opencode client).
-	s.humans = newHumanManager(s.chat)
+	client := &fakeChatClient{reply: reply}
+	s, root := chatFixtureClient(t, client)
+	// Rewire the resolution agent manager onto the same fake-backed client.
+	s.humans = newResolveManager(root, client, func(sub string) string {
+		return filepath.Join(root, "submodules", sub, "repo")
+	})
 	// Seed a real NEEDS-HUMAN task and commit it so headSHA/planView see it.
 	planRel := "submodules/alpha/PLAN.md"
 	write(t, root+"/"+planRel, "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
@@ -37,14 +42,36 @@ func humanFixture(t *testing.T, reply string) (*Server, string, *httptest.Server
 	return s, root, ts
 }
 
-// TestHumanResolveSystemPromptSeedsBlocker: the resolution system prompt carries
-// the concrete blocker (task id, submodule, reason) AND the generic chat-diff
-// contract for the target file (the propose markers), so the AI both understands
-// the blocker and stays inside the human-approved diff loop.
-func TestHumanResolveSystemPromptSeedsBlocker(t *testing.T) {
+// waitIdle polls until the task's resolution session finishes its background turn.
+func waitIdle(t *testing.T, s *Server, sub, id string) *resolveSession {
+	t.Helper()
+	key := taskKey(sub, id)
+	for i := 0; i < 200; i++ {
+		s.humans.mu.Lock()
+		sess := s.humans.byTask[key]
+		s.humans.mu.Unlock()
+		if sess != nil && !sess.isBusy() {
+			return sess
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("resolution session never went idle")
+	return nil
+}
+
+// TestResolveSystemPromptSeedsBlockerAndBoundaries: the resolution agent's system
+// prompt carries the concrete blocker AND the accurate capability/boundary
+// contract \u2014 tool authority, the repo/ code boundary, the no-secrets rule, and
+// the explicit ways a NEEDS-HUMAN task clears (Secrets panel, Publish, Mark
+// resolved) \u2014 so the agent drives a real unblock instead of dead-ending.
+func TestResolveSystemPromptSeedsBlockerAndBoundaries(t *testing.T) {
 	it := PlanItem{ID: "needs-token", Desc: "Wire the external API client.", HumanReason: "provide the API token as api_token."}
-	sys := humanResolveSystemPrompt("alpha", it, "submodules/alpha/ROI.md")
-	for _, want := range []string{"needs-token", "alpha", "provide the API token as api_token.", "Wire the external API client.", proposeOpen, proposeClose} {
+	sys := resolveSystemPrompt("alpha", it, "/repo/alpha/repo")
+	for _, want := range []string{
+		"needs-token", "alpha", "provide the API token as api_token.", "Wire the external API client.",
+		"NEEDS-HUMAN", "submodules/alpha/repo/", "WORK task", "Secrets panel",
+		"Publish", "Mark resolved", "secret", "read, grep, bash, edit, write",
+	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("system prompt missing %q:\n%s", want, sys)
 		}
@@ -52,23 +79,25 @@ func TestHumanResolveSystemPromptSeedsBlocker(t *testing.T) {
 }
 
 // TestHumanResolvePageOpensSession: opening a blocked task's resolution page
-// creates (and remembers) exactly one chat session, and reloading reuses it.
+// creates (and remembers) exactly one agent session, and reloading reuses it.
 func TestHumanResolvePageOpensSession(t *testing.T) {
 	s, _, ts := humanFixture(t, "How can I help?")
 	body := httpGet(t, ts.URL+"/human/alpha/needs-token")
-	if !strings.Contains(body, "AI resolution chat") || !strings.Contains(body, "provide the API token") {
-		t.Fatalf("resolution page missing chat/blocker:\n%s", body)
+	if !strings.Contains(body, "AI resolution agent") || !strings.Contains(body, "provide the API token") {
+		t.Fatalf("resolution page missing agent/blocker:\n%s", body)
 	}
 	s.humans.mu.Lock()
-	id1, ok := s.humans.bySession[sessionKey("alpha", "needs-token", "submodules/alpha/ROI.md")]
-	s.humans.mu.Unlock()
-	if !ok || id1 == "" {
-		t.Fatal("no chat session remembered for the task")
+	id1 := ""
+	if sess := s.humans.byTask["alpha/needs-token"]; sess != nil {
+		id1 = sess.ID
 	}
-	// Reload reuses the same session (no fresh worktree).
+	s.humans.mu.Unlock()
+	if id1 == "" {
+		t.Fatal("no agent session remembered for the task")
+	}
 	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
 	s.humans.mu.Lock()
-	id2 := s.humans.bySession[sessionKey("alpha", "needs-token", "submodules/alpha/ROI.md")]
+	id2 := s.humans.byTask["alpha/needs-token"].ID
 	s.humans.mu.Unlock()
 	if id1 != id2 {
 		t.Fatalf("reload cut a new session: %s != %s", id1, id2)
@@ -84,6 +113,104 @@ func TestHumanResolvePageStaleLink404(t *testing.T) {
 	}
 }
 
+// TestResolvePublishLandsChangesOnMain: a coordination-layer change made in the
+// agent's worktree is published to the hive main by the Publish action, so it is
+// live for the swarm. (The fake client makes no edits, so the test writes the
+// change into the worktree directly, exercising the real commit+publish path.)
+func TestResolvePublishLandsChangesOnMain(t *testing.T) {
+	s, root, _ := humanFixture(t, "")
+	it := PlanItem{ID: "needs-token", Desc: "Wire the client.", HumanReason: "token"}
+	sess, err := s.humans.session(context.Background(), "alpha", it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the agent editing a beehive-layer file in its worktree.
+	target := filepath.Join(sess.wtPath, "submodules", "alpha", "INFRASTRUCTURE.md")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("# alpha infra\ndocumented the process\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Commit the agent's work onto the branch (runTurn does this after a turn).
+	if err := sess.wt.Commit(context.Background(), "resolve: agent turn"); err != nil {
+		t.Fatal(err)
+	}
+	has, err := sess.hasChanges(context.Background())
+	if err != nil || !has {
+		t.Fatalf("expected pending change, has=%v err=%v", has, err)
+	}
+	remote, err := s.humans.publishRemote(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.publish(context.Background(), remote); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	got := gitShow(t, root, "HEAD", "submodules/alpha/INFRASTRUCTURE.md")
+	if !strings.Contains(got, "documented the process") {
+		t.Fatalf("published content not on main HEAD: %q", got)
+	}
+	if !sess.isPublished() {
+		t.Fatal("session not marked published")
+	}
+}
+
+// TestResolvePublishNothingIsRejected: Publish with no change is a clean error,
+// never an empty commit on main.
+func TestResolvePublishNothingIsRejected(t *testing.T) {
+	s, _, _ := humanFixture(t, "")
+	it := PlanItem{ID: "needs-token"}
+	sess, err := s.humans.session(context.Background(), "alpha", it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.publish(context.Background(), ""); err != errNothingToPub {
+		t.Fatalf("publish with no change = %v, want errNothingToPub", err)
+	}
+}
+
+// TestResolveMessageRunsTurnAndCommits: a chat message runs a background agent
+// turn that records the reply; the panel renders it once idle.
+func TestResolveMessageRunsTurnAndCommits(t *testing.T) {
+	s, _, ts := humanFixture(t, "I inspected the blocker; add api_token in the Secrets panel.")
+	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
+	resp := httpPostForm(t, ts.URL+"/human/alpha/needs-token/message/"+s.humans.byTask["alpha/needs-token"].ID,
+		url.Values{"message": {"what does this need?"}})
+	if resp != http.StatusOK {
+		t.Fatalf("message status = %d", resp)
+	}
+	sess := waitIdle(t, s, "alpha", "needs-token")
+	found := false
+	for _, tn := range sess.logCopy() {
+		if tn.Role == "agent" && strings.Contains(tn.Text, "Secrets panel") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("agent reply not recorded: %+v", sess.logCopy())
+	}
+}
+
+// TestHumanResolveDiscardResetsSession: discard tears down the agent worktree and
+// opens a fresh session (a different id) for the same task.
+func TestHumanResolveDiscardResetsSession(t *testing.T) {
+	s, _, ts := humanFixture(t, "")
+	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
+	s.humans.mu.Lock()
+	before := s.humans.byTask["alpha/needs-token"].ID
+	s.humans.mu.Unlock()
+	if code := httpPost(t, ts.URL+"/human/alpha/needs-token/discard/"+before); code != http.StatusOK && code != http.StatusSeeOther {
+		t.Fatalf("discard status = %d", code)
+	}
+	s.humans.mu.Lock()
+	after := s.humans.byTask["alpha/needs-token"].ID
+	s.humans.mu.Unlock()
+	if after == before {
+		t.Fatalf("discard did not reset the session: still %s", after)
+	}
+}
+
 // TestHumanResolveApplyReopens: resolving flips the task NEEDS-HUMAN -> TODO,
 // drops the Human-needed line, and publishes PLAN.md (the change is committed to
 // HEAD, so the swarm re-selects the task).
@@ -93,7 +220,6 @@ func TestHumanResolveApplyReopens(t *testing.T) {
 	if resp != http.StatusOK && resp != http.StatusSeeOther {
 		t.Fatalf("resolve status = %d", resp)
 	}
-	// Committed to HEAD (not just the working tree).
 	head := gitShow(t, root, "HEAD", "submodules/alpha/PLAN.md")
 	p, err := plan.Parse(head)
 	if err != nil {
@@ -116,82 +242,14 @@ func TestHumanResolveApplyReopens(t *testing.T) {
 // can never reset an in-flight task).
 func TestHumanResolveApplyRejectsNonHuman(t *testing.T) {
 	_, root, ts := humanFixture(t, "")
-	// First resolve moves it to TODO.
 	_ = httpPost(t, ts.URL+"/human/alpha/needs-token/resolve")
 	before := gitShow(t, root, "HEAD", "submodules/alpha/PLAN.md")
-	// Second resolve on the now-TODO task must be rejected without a new commit.
 	if code := httpPost(t, ts.URL+"/human/alpha/needs-token/resolve"); code != http.StatusConflict {
 		t.Fatalf("second resolve status = %d, want 409", code)
 	}
 	after := gitShow(t, root, "HEAD", "submodules/alpha/PLAN.md")
 	if before != after {
 		t.Fatal("rejected resolve still changed HEAD PLAN.md")
-	}
-}
-
-// TestHumanResolveRetargetsPerFile: pointing the resolution chat at a different
-// beehive-layer file via ?path= opens (and remembers) a DISTINCT session rather
-// than silently reusing the first file's session. This is the retargeting fix:
-// the session is keyed by (task, path), so "document this in INFRASTRUCTURE.md"
-// reaches a chat over that file, not the default ROI.md.
-func TestHumanResolveRetargetsPerFile(t *testing.T) {
-	s, _, ts := humanFixture(t, "ok")
-	_ = httpGet(t, ts.URL+"/human/alpha/needs-token") // default ROI.md target
-	_ = httpGet(t, ts.URL+"/human/alpha/needs-token?path=submodules/alpha/INFRASTRUCTURE.md")
-	s.humans.mu.Lock()
-	roi := s.humans.bySession[sessionKey("alpha", "needs-token", "submodules/alpha/ROI.md")]
-	infra := s.humans.bySession[sessionKey("alpha", "needs-token", "submodules/alpha/INFRASTRUCTURE.md")]
-	s.humans.mu.Unlock()
-	if roi == "" || infra == "" {
-		t.Fatalf("missing session: roi=%q infra=%q", roi, infra)
-	}
-	if roi == infra {
-		t.Fatal("retargeting to a different file reused the same session")
-	}
-	sess, ok := s.chat.get(infra)
-	if !ok || sess.Path != "submodules/alpha/INFRASTRUCTURE.md" {
-		t.Fatalf("retargeted session not over the requested file: %+v", sess)
-	}
-}
-
-// TestHumanResolveForgetDropsAllTargets: resolving forgets every per-file session
-// for the task, not just the default one, so a later re-escalation starts clean.
-func TestHumanResolveForgetDropsAllTargets(t *testing.T) {
-	s, _, ts := humanFixture(t, "ok")
-	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
-	_ = httpGet(t, ts.URL+"/human/alpha/needs-token?path=submodules/alpha/ARTIFACTS.md")
-	s.humans.forget("alpha", "needs-token")
-	s.humans.mu.Lock()
-	n := len(s.humans.bySession)
-	s.humans.mu.Unlock()
-	if n != 0 {
-		t.Fatalf("forget left %d sessions, want 0", n)
-	}
-}
-
-// TestHumanResolvePageRendersTargetSelector: the resolution page surfaces the
-// retarget controls (the beehive-layer files the chat can be pointed at) so the
-// operator is never stuck on ROI.md.
-func TestHumanResolvePageRendersTargetSelector(t *testing.T) {
-	_, _, ts := humanFixture(t, "ok")
-	body := httpGet(t, ts.URL+"/human/alpha/needs-token")
-	for _, want := range []string{"AI chat target", "submodules/alpha/INFRASTRUCTURE.md", "submodules/alpha/ARTIFACTS.md"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("resolution page missing target control %q", want)
-		}
-	}
-}
-
-// TestHumanResolveSystemPromptStatesCapabilities: the prompt must accurately tell
-// the AI it can retarget beehive-layer files and CANNOT run commands or edit the
-// submodule's repo/ source — so it never dead-ends on "I can only edit ROI.md".
-func TestHumanResolveSystemPromptStatesCapabilities(t *testing.T) {
-	it := PlanItem{ID: "needs-token", Desc: "Wire the client.", HumanReason: "provide the token."}
-	sys := humanResolveSystemPrompt("alpha", it, "submodules/alpha/ROI.md")
-	for _, want := range []string{"retarget", "INFRASTRUCTURE.md", "submodules/alpha/repo/", "WORK task", "NO tools", "NEVER pasted"} {
-		if !strings.Contains(sys, want) {
-			t.Fatalf("system prompt missing capability statement %q:\n%s", want, sys)
-		}
 	}
 }
 
@@ -225,6 +283,16 @@ func httpStatus(t *testing.T, u string) int {
 func httpPost(t *testing.T, u string) int {
 	t.Helper()
 	resp, err := noRedirect().PostForm(u, url.Values{})
+	if err != nil {
+		t.Fatalf("POST %s: %v", u, err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+func httpPostForm(t *testing.T, u string, form url.Values) int {
+	t.Helper()
+	resp, err := noRedirect().PostForm(u, form)
 	if err != nil {
 		t.Fatalf("POST %s: %v", u, err)
 	}

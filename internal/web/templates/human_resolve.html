@@ -12,46 +12,38 @@
 </div>
 
 <div class="card">
-  <h2>Actions</h2>
-  <p class="muted">Provide what the blocker needs, then reopen the task so the swarm resumes.</p>
-  <ul>
-    <li><a href="/secrets">Secrets panel</a> — add a credential/token (values stay encrypted; never paste them into chat).</li>
-    <li><a href="/edit?path=submodules/{{.Sub}}/ROI.md">Edit intent (ROI.md)</a> — clarify or correct the target's intent.</li>
-  </ul>
+  <h2>How to clear this blocker</h2>
+  <p class="muted">Do whichever one the blocker needs, then reopen the task so the swarm resumes.</p>
+  <ol>
+    <li><strong>Credential/secret?</strong> Add it in the <a href="/secrets">Secrets panel</a> (values stay encrypted; never paste them into chat).</li>
+    <li><strong>Decision, intent, or documentation?</strong> Use the AI agent below to draft the coordination-layer change, review the diff, and <strong>Publish</strong> it.</li>
+    <li><strong>Needs code?</strong> Have the agent capture what the swarm should build in <code>ROI.md</code> (Publish it); the swarm implements it once reopened.</li>
+    <li><strong>Then</strong> click <strong>Mark resolved</strong> below to flip this task NEEDS-HUMAN → TODO so the swarm re-selects it.</li>
+  </ol>
   <form method="post" action="/human/{{.Sub}}/{{.Item.ID}}/resolve"
         onsubmit="return confirm('Reopen {{.Item.ID}} as TODO and publish to main? The swarm will re-select it.');">
     <button class="merge">Mark resolved → TODO</button>
-    <span class="muted">Flips NEEDS-HUMAN → TODO and publishes PLAN.md.</span>
+    <span class="muted">Flips NEEDS-HUMAN → TODO and publishes PLAN.md. (The AI agent can never do this.)</span>
   </form>
 </div>
 
 <div class="card">
-  <h2>AI resolution chat</h2>
-  <p class="muted">Ask the assistant what this blocker needs and how to clear it. It can propose an edit to the targeted beehive-layer file below; nothing is written or committed until you approve the diff. It cannot run commands or edit the target's <code>repo/</code> source — code changes go through a normal swarm work task.</p>
-  <form method="get" action="/human/{{.Sub}}/{{.Item.ID}}" class="target-select">
-    <label>AI chat target:
-      <select name="path" onchange="this.form.submit()">
-        {{range .Targets}}<option value="{{.Path}}"{{if .Current}} selected{{end}}>{{.Label}}</option>{{end}}
-      </select>
-    </label>
-    <noscript><button>retarget</button></noscript>
-  </form>
-  <form method="get" action="/human/{{.Sub}}/{{.Item.ID}}" class="target-select">
-    <input name="path" placeholder="or a repo-relative beehive-layer path…" autocomplete="off" style="width:40%">
-    <button>retarget</button>
-    <span class="muted">Retargeting opens a separate conversation over that file (e.g. INFRASTRUCTURE.md / ARTIFACTS.md to document a process).</span>
-  </form>
-  <p class="muted">Currently editing: <code>{{.Path}}</code></p>
-  <div id="chatedit"
-       hx-get="/edit/{{.ChatID}}/panel"
-       hx-trigger="load"
+  <h2>AI resolution agent</h2>
+  <p class="muted">A general agent with full read/inspect/edit tools, working in its own branch of the coordination repo. It investigates the blocker and makes multi-file beehive-layer changes; nothing is live until you <strong>Publish</strong>. It cannot edit the target's <code>repo/</code> source or run destructive/external commands — code goes through a swarm work task.</p>
+  <div id="resolve"
+       hx-get="/human/{{.Sub}}/{{.Item.ID}}/panel/{{.SessID}}"
+       hx-trigger="load, every 2s"
        hx-swap="innerHTML">
     <p>loading…</p>
   </div>
-  <form hx-post="/edit/{{.ChatID}}/message" hx-target="#chatedit" hx-swap="innerHTML"
+  <form hx-post="/human/{{.Sub}}/{{.Item.ID}}/message/{{.SessID}}" hx-target="#resolve" hx-swap="innerHTML"
         hx-on::after-request="this.reset()">
-    <input name="message" placeholder="What does this blocker need to be resolved?" autocomplete="off" autofocus style="width:70%">
+    <input name="message" placeholder="What does this blocker need? Ask the agent to investigate or draft the change…" autocomplete="off" autofocus style="width:70%">
     <button>send</button>
+  </form>
+  <form method="post" action="/human/{{.Sub}}/{{.Item.ID}}/discard/{{.SessID}}"
+        onsubmit="return confirm('Discard the agent worktree and any unpublished changes, and start a fresh session?');">
+    <button class="danger">discard &amp; restart agent</button>
   </form>
 </div>
 {{template "footer"}}
