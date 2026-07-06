@@ -33,42 +33,52 @@ import (
 // action the LLM never performs — a model can never free-rewrite the multi-task
 // PLAN.md or silently un-escalate a blocker.
 
-// humanManager maps each NEEDS-HUMAN task to its (reused) resolution chat session.
-// The chat sessions themselves live in the shared chatManager (so the /edit routes
-// serve them); this only remembers, per task, which chat session backs its
-// resolution page, so re-opening the page reuses the same conversation instead of
-// cutting a fresh worktree each load.
+// humanManager maps each NEEDS-HUMAN task's resolution surface to its (reused)
+// chat session. The chat sessions themselves live in the shared chatManager (so
+// the /edit routes serve them); this only remembers which chat session backs a
+// given (task, target-file) pair, so re-opening the same page — or retargeting
+// the AI chat at a different beehive-layer file — reuses the matching
+// conversation instead of cutting a fresh worktree each load. Keying on the
+// target path (not the task alone) is what makes ?path= retargeting real: each
+// file the operator points the chat at gets its own remembered session.
 type humanManager struct {
 	chat *chatManager
 
-	mu     sync.Mutex
-	byTask map[string]string // "<sub>/<id>" -> chat session ID
+	mu        sync.Mutex
+	bySession map[string]string // sessionKey(sub,id,path) -> chat session ID
 }
 
 func newHumanManager(chat *chatManager) *humanManager {
-	return &humanManager{chat: chat, byTask: map[string]string{}}
+	return &humanManager{chat: chat, bySession: map[string]string{}}
 }
 
-// taskKey is the per-task map key; sub and id are already validated basenames.
-func taskKey(sub, id string) string { return sub + "/" + id }
+// taskPrefix is the shared prefix of every session key for a task; forget uses
+// it to drop all of a task's per-file sessions at once. sub and id are already
+// validated basenames, and the NUL separator cannot appear in a path.
+func taskPrefix(sub, id string) string { return sub + "/" + id + "\x00" }
 
-// session returns the resolution chat session for a task, opening one on first
-// use over targetPath under a blocker-seeded system prompt and reusing it (by id)
-// on later loads. A remembered id whose session has since been reclaimed
-// (chat.get miss) is transparently reopened.
+// sessionKey identifies a resolution chat by task AND target file, so pointing
+// the chat at a different beehive-layer file opens (and remembers) a distinct
+// conversation rather than silently reusing the first file's session.
+func sessionKey(sub, id, path string) string { return taskPrefix(sub, id) + path }
+
+// session returns the resolution chat session for a (task, target-file) pair,
+// opening one on first use over targetPath under a blocker-seeded system prompt
+// and reusing it (by id) on later loads. A remembered id whose session has since
+// been reclaimed (chat.get miss) is transparently reopened.
 func (m *humanManager) session(ctx context.Context, sub string, it PlanItem, targetPath string) (*chatSession, error) {
-	key := taskKey(sub, it.ID)
+	clean, err := cleanRepoPath(targetPath)
+	if err != nil {
+		return nil, err
+	}
+	key := sessionKey(sub, it.ID, clean)
 	m.mu.Lock()
-	id, ok := m.byTask[key]
+	id, ok := m.bySession[key]
 	m.mu.Unlock()
 	if ok {
 		if sess, live := m.chat.get(id); live {
 			return sess, nil
 		}
-	}
-	clean, err := cleanRepoPath(targetPath)
-	if err != nil {
-		return nil, err
 	}
 	sys := humanResolveSystemPrompt(sub, it, clean)
 	sess, err := m.chat.openWith(ctx, clean, sys)
@@ -76,7 +86,7 @@ func (m *humanManager) session(ctx context.Context, sub string, it PlanItem, tar
 		return nil, err
 	}
 	m.mu.Lock()
-	m.byTask[key] = sess.ID
+	m.bySession[key] = sess.ID
 	m.mu.Unlock()
 	return sess, nil
 }
@@ -103,17 +113,43 @@ Summary: %[3]s
 Why it is blocked (operator input required): %[4]s
 
 Your job: help the operator understand EXACTLY what is needed and how to provide
-it, then confirm when the blocker is cleared. The operator's available actions in
-this UI are:
-  - add a credential/token via the Secrets panel (secret values are encrypted and
-    are NEVER pasted into this chat or into files);
-  - edit a repository file (you may propose an edit to %[5]s here, applied only on
-    approval);
-  - click "Mark resolved" to flip this task back to TODO so the swarm resumes.
+it, then confirm when the blocker is cleared. Be concrete and specific to THIS
+blocker.
 
-Be concrete and specific to THIS blocker. If a change to %[5]s is what resolves
-it, propose it. If the resolution is a secret or an out-of-band action, explain
-precisely what to provide and in what format, and do NOT propose a file edit.
+WHAT YOU CAN DO IN THIS UI (and its limits — state them accurately, never claim
+you are locked to one file or that you have no way to help):
+  - Propose an edit to the beehive-layer file currently targeted by this chat:
+    %[5]s. The operator applies it only after approving the diff.
+  - The operator can RETARGET this chat at any other beehive-layer file (via the
+    "AI chat target" selector on the resolution page) — e.g. this submodule's
+    INFRASTRUCTURE.md or ARTIFACTS.md to DOCUMENT a process or operational rule,
+    or ROI.md (human-owned intent) to clarify what the target should do. If the
+    resolution needs a doc written, tell the operator which beehive-layer file to
+    retarget the chat at, then propose the documentation there.
+  - The operator can add a credential/token via the Secrets panel. Secret values
+    are encrypted and are NEVER pasted into this chat, into a transcript, or into
+    a file. If the blocker is a secret, explain precisely what to store and in
+    what format — do NOT propose a file edit and do NOT ask for the value here.
+  - The operator can click "Mark resolved" to flip this task back to TODO so the
+    swarm resumes.
+
+WHAT YOU CANNOT DO HERE (do NOT pretend otherwise, and route these correctly):
+  - You have NO tools: you cannot run commands, scripts, git, kubectl, or touch
+    any external system or cluster. Never claim to have run something.
+  - You cannot edit the submodule's own SOURCE CODE (files under
+    submodules/%[2]s/repo/). Application code — including new scripts that belong
+    in the target's repository — is written by a normal swarm WORK task, not this
+    dialog. If the blocker really needs code, say so, and describe what the work
+    task should implement so the operator can capture it in ROI.md / let the swarm
+    build it after you unblock. Do not tell the operator you simply "can't help."
+  - Actions that must run out-of-band on the operator's own host (e.g.
+    materializing a live secret into a cluster) are the operator's to run; give
+    exact, copy-pasteable steps and confirm the expected result, but never route
+    a raw secret through this chat.
+
+When a change to %[5]s (or a retargeted beehive-layer file) is what resolves the
+blocker, propose it in full. Otherwise explain precisely what the operator must
+provide, in what format, and how to confirm it worked.
 
 %[6]s`,
 		it.ID, sub, desc, reason, path, chatSystemPrompt(path))
@@ -176,11 +212,41 @@ func (s *Server) humanResolvePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, "human_resolve.html", map[string]interface{}{
-		"Sub":    sm.Name,
-		"Item":   it,
-		"ChatID": sess.ID,
-		"Path":   sess.Path,
+		"Sub":     sm.Name,
+		"Item":    it,
+		"ChatID":  sess.ID,
+		"Path":    sess.Path,
+		"Targets": humanTargetOptions(sm.Name, sess.Path),
 	})
+}
+
+// humanTargetOption is one entry in the resolution page's "AI chat target"
+// selector: a beehive-layer file the operator can point the AI chat at, its
+// human label, and whether it is the file currently targeted.
+type humanTargetOption struct {
+	Path    string
+	Label   string
+	Current bool
+}
+
+// humanTargetOptions lists the beehive-layer files the resolution chat can be
+// retargeted at for a submodule, marking the one currently loaded. These are the
+// operator-editable coordination files (never the submodule's repo/ code): ROI.md
+// (human-owned intent), INFRASTRUCTURE.md and ARTIFACTS.md (per-target operational
+// docs — the right home for "document the process" resolutions).
+func humanTargetOptions(sub, current string) []humanTargetOption {
+	base := "submodules/" + sub + "/"
+	defs := []struct{ file, label string }{
+		{repo.ROIFile, "Intent (ROI.md)"},
+		{repo.InfraFile, "Infrastructure notes (INFRASTRUCTURE.md)"},
+		{repo.Artifacts, "Artifacts / process docs (ARTIFACTS.md)"},
+	}
+	opts := make([]humanTargetOption, 0, len(defs))
+	for _, d := range defs {
+		p := base + d.file
+		opts = append(opts, humanTargetOption{Path: p, Label: d.label, Current: p == current})
+	}
+	return opts
 }
 
 // humanResolveApply flips a NEEDS-HUMAN task back to TODO (plan.Task.Resolve) and
@@ -234,10 +300,17 @@ func (s *Server) humanResolveApply(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/human", http.StatusSeeOther)
 }
 
-// forget drops the remembered resolution session for a task (called after resolve
-// so a later NEEDS-HUMAN re-escalation of the same id opens a fresh conversation).
+// forget drops every remembered resolution session for a task — across all target
+// files the operator retargeted the chat at (called after resolve so a later
+// NEEDS-HUMAN re-escalation of the same id opens fresh conversations, none
+// carrying the stale blocker context).
 func (m *humanManager) forget(sub, id string) {
+	prefix := taskPrefix(sub, id)
 	m.mu.Lock()
-	delete(m.byTask, taskKey(sub, id))
+	for k := range m.bySession {
+		if strings.HasPrefix(k, prefix) {
+			delete(m.bySession, k)
+		}
+	}
 	m.mu.Unlock()
 }

@@ -27,7 +27,21 @@
 
 <div class="card">
   <h2>AI resolution chat</h2>
-  <p class="muted">Ask the assistant what this blocker needs and how to clear it. It can propose an edit to <code>{{.Path}}</code>; nothing is written or committed until you approve the diff.</p>
+  <p class="muted">Ask the assistant what this blocker needs and how to clear it. It can propose an edit to the targeted beehive-layer file below; nothing is written or committed until you approve the diff. It cannot run commands or edit the target's <code>repo/</code> source — code changes go through a normal swarm work task.</p>
+  <form method="get" action="/human/{{.Sub}}/{{.Item.ID}}" class="target-select">
+    <label>AI chat target:
+      <select name="path" onchange="this.form.submit()">
+        {{range .Targets}}<option value="{{.Path}}"{{if .Current}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </label>
+    <noscript><button>retarget</button></noscript>
+  </form>
+  <form method="get" action="/human/{{.Sub}}/{{.Item.ID}}" class="target-select">
+    <input name="path" placeholder="or a repo-relative beehive-layer path…" autocomplete="off" style="width:40%">
+    <button>retarget</button>
+    <span class="muted">Retargeting opens a separate conversation over that file (e.g. INFRASTRUCTURE.md / ARTIFACTS.md to document a process).</span>
+  </form>
+  <p class="muted">Currently editing: <code>{{.Path}}</code></p>
   <div id="chatedit"
        hx-get="/edit/{{.ChatID}}/panel"
        hx-trigger="load"

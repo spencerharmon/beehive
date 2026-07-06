@@ -60,7 +60,7 @@ func TestHumanResolvePageOpensSession(t *testing.T) {
 		t.Fatalf("resolution page missing chat/blocker:\n%s", body)
 	}
 	s.humans.mu.Lock()
-	id1, ok := s.humans.byTask["alpha/needs-token"]
+	id1, ok := s.humans.bySession[sessionKey("alpha", "needs-token", "submodules/alpha/ROI.md")]
 	s.humans.mu.Unlock()
 	if !ok || id1 == "" {
 		t.Fatal("no chat session remembered for the task")
@@ -68,7 +68,7 @@ func TestHumanResolvePageOpensSession(t *testing.T) {
 	// Reload reuses the same session (no fresh worktree).
 	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
 	s.humans.mu.Lock()
-	id2 := s.humans.byTask["alpha/needs-token"]
+	id2 := s.humans.bySession[sessionKey("alpha", "needs-token", "submodules/alpha/ROI.md")]
 	s.humans.mu.Unlock()
 	if id1 != id2 {
 		t.Fatalf("reload cut a new session: %s != %s", id1, id2)
@@ -126,6 +126,72 @@ func TestHumanResolveApplyRejectsNonHuman(t *testing.T) {
 	after := gitShow(t, root, "HEAD", "submodules/alpha/PLAN.md")
 	if before != after {
 		t.Fatal("rejected resolve still changed HEAD PLAN.md")
+	}
+}
+
+// TestHumanResolveRetargetsPerFile: pointing the resolution chat at a different
+// beehive-layer file via ?path= opens (and remembers) a DISTINCT session rather
+// than silently reusing the first file's session. This is the retargeting fix:
+// the session is keyed by (task, path), so "document this in INFRASTRUCTURE.md"
+// reaches a chat over that file, not the default ROI.md.
+func TestHumanResolveRetargetsPerFile(t *testing.T) {
+	s, _, ts := humanFixture(t, "ok")
+	_ = httpGet(t, ts.URL+"/human/alpha/needs-token") // default ROI.md target
+	_ = httpGet(t, ts.URL+"/human/alpha/needs-token?path=submodules/alpha/INFRASTRUCTURE.md")
+	s.humans.mu.Lock()
+	roi := s.humans.bySession[sessionKey("alpha", "needs-token", "submodules/alpha/ROI.md")]
+	infra := s.humans.bySession[sessionKey("alpha", "needs-token", "submodules/alpha/INFRASTRUCTURE.md")]
+	s.humans.mu.Unlock()
+	if roi == "" || infra == "" {
+		t.Fatalf("missing session: roi=%q infra=%q", roi, infra)
+	}
+	if roi == infra {
+		t.Fatal("retargeting to a different file reused the same session")
+	}
+	sess, ok := s.chat.get(infra)
+	if !ok || sess.Path != "submodules/alpha/INFRASTRUCTURE.md" {
+		t.Fatalf("retargeted session not over the requested file: %+v", sess)
+	}
+}
+
+// TestHumanResolveForgetDropsAllTargets: resolving forgets every per-file session
+// for the task, not just the default one, so a later re-escalation starts clean.
+func TestHumanResolveForgetDropsAllTargets(t *testing.T) {
+	s, _, ts := humanFixture(t, "ok")
+	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
+	_ = httpGet(t, ts.URL+"/human/alpha/needs-token?path=submodules/alpha/ARTIFACTS.md")
+	s.humans.forget("alpha", "needs-token")
+	s.humans.mu.Lock()
+	n := len(s.humans.bySession)
+	s.humans.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("forget left %d sessions, want 0", n)
+	}
+}
+
+// TestHumanResolvePageRendersTargetSelector: the resolution page surfaces the
+// retarget controls (the beehive-layer files the chat can be pointed at) so the
+// operator is never stuck on ROI.md.
+func TestHumanResolvePageRendersTargetSelector(t *testing.T) {
+	_, _, ts := humanFixture(t, "ok")
+	body := httpGet(t, ts.URL+"/human/alpha/needs-token")
+	for _, want := range []string{"AI chat target", "submodules/alpha/INFRASTRUCTURE.md", "submodules/alpha/ARTIFACTS.md"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("resolution page missing target control %q", want)
+		}
+	}
+}
+
+// TestHumanResolveSystemPromptStatesCapabilities: the prompt must accurately tell
+// the AI it can retarget beehive-layer files and CANNOT run commands or edit the
+// submodule's repo/ source — so it never dead-ends on "I can only edit ROI.md".
+func TestHumanResolveSystemPromptStatesCapabilities(t *testing.T) {
+	it := PlanItem{ID: "needs-token", Desc: "Wire the client.", HumanReason: "provide the token."}
+	sys := humanResolveSystemPrompt("alpha", it, "submodules/alpha/ROI.md")
+	for _, want := range []string{"retarget", "INFRASTRUCTURE.md", "submodules/alpha/repo/", "WORK task", "NO tools", "NEVER pasted"} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("system prompt missing capability statement %q:\n%s", want, sys)
+		}
 	}
 }
 
