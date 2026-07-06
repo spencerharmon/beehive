@@ -731,6 +731,55 @@ func (blockingSession) Prompt(ctx context.Context, text string) (string, error) 
 func (blockingSession) Messages(ctx context.Context) ([]Message, error) {
 	return []Message{{ID: "m", Role: "assistant", Parts: []Part{{Type: "text", Text: "working"}}}}, nil
 }
+
+// idleClient's Prompt returns ErrTurnIdle, modeling the progress watchdog firing
+// on a turn that made no headway (the opencode client's IdleTimeout path).
+type idleClient struct{}
+
+func (idleClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	return idleSession{}, nil
+}
+
+type idleSession struct{}
+
+func (idleSession) Prompt(ctx context.Context, text string) (string, error) {
+	return "", ErrTurnIdle
+}
+func (idleSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+func (idleSession) Close() error                                    { return nil }
+
+// TestIdleTurnAbandonsForGC proves the runner treats a watchdog ErrTurnIdle like a
+// stalled agent: it abandons the task for GC (non-fatal) with a warning naming the
+// idle timeout, distinct from the absolute per-turn ceiling.
+func TestIdleTurnAbandonsForGC(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	r := &Runner{
+		Repo: rp, Git: g, Client: idleClient{}, MaxTurns: 5,
+		WallCap: time.Hour, TTL: time.Hour,
+		TurnTimeout: time.Hour, TurnIdleTimeout: 15 * time.Minute,
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("an idle-watchdog abandon must not be fatal, got: %v", err)
+	}
+	if !res.GCMarked {
+		t.Fatalf("want GCMarked on an idle-abandoned turn, got %+v", res)
+	}
+	if !contains(res.Warning, "idle timeout") {
+		t.Fatalf("warning should name the idle timeout, got %q", res.Warning)
+	}
+}
 func (blockingSession) Close() error { return nil }
 
 // TestTurnTimeoutAbandonsForGC proves a stalled agent turn is canceled at
@@ -761,8 +810,8 @@ func TestTurnTimeoutAbandonsForGC(t *testing.T) {
 	if !res.GCMarked {
 		t.Fatalf("want GCMarked on a stalled turn, got %+v", res)
 	}
-	if !contains(res.Warning, "per-turn timeout") {
-		t.Fatalf("warning should name the per-turn timeout, got %q", res.Warning)
+	if !contains(res.Warning, "per-turn ceiling") {
+		t.Fatalf("warning should name the per-turn ceiling, got %q", res.Warning)
 	}
 }
 

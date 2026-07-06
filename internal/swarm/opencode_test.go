@@ -3,6 +3,7 @@ package swarm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -195,5 +196,90 @@ func TestPromptIdlePollHonorsCancel(t *testing.T) {
 	defer cancel()
 	if _, err := s.Prompt(ctx, "hi"); err == nil {
 		t.Fatal("Prompt must surface the ctx cancellation of a never-idle turn, got nil error")
+	}
+}
+
+// TestIdleWatchdogAbandonsStuckTurn: a turn whose transcript never advances (the
+// message list is byte-identical on every poll) is abandoned with ErrTurnIdle once
+// IdleTimeout elapses — the wedged-agent case (dead socket / provider hang) the
+// runner reclaims for GC, instead of burning the full absolute ceiling.
+func TestIdleWatchdogAbandonsStuckTurn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			_, _ = w.Write([]byte(`{"info":{"id":"a1","time":{}},"parts":[]}`))
+			return
+		}
+		// Always the SAME in-flight transcript: no new parts, no completion — the
+		// fingerprint never advances, so the idle watchdog must fire.
+		_, _ = w.Write([]byte(`[{"info":{"id":"a1","role":"assistant","time":{}},` +
+			`"parts":[{"type":"text","text":"thinking"}]}]`))
+	}))
+	defer srv.Close()
+
+	oc := &Opencode{Base: srv.URL, Model: "anthropic/claude-3", HTTP: srv.Client(), IdleTimeout: 15 * time.Millisecond}
+	oc.pollMin, oc.pollMax = time.Millisecond, 2*time.Millisecond
+	s := &ocSession{oc: oc, id: "sess1", dir: "/wt", system: "sys"}
+
+	// ctx is far longer than IdleTimeout, so the watchdog (not ctx) must end it.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := s.Prompt(ctx, "hi")
+	if !errors.Is(err, ErrTurnIdle) {
+		t.Fatalf("stuck turn err = %v, want ErrTurnIdle", err)
+	}
+}
+
+// TestIdleWatchdogSpareProgressingTurn: a turn that keeps ADVANCING its transcript
+// (a new part on each poll) past several IdleTimeout windows is never abandoned —
+// the productive-long-turn case — and its settled text is returned on completion.
+// This is the whole point: distinguish "busy for a long time" from "wedged".
+func TestIdleWatchdogSpareProgressingTurn(t *testing.T) {
+	const completeOnPoll = 10
+	var mu sync.Mutex
+	var polls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			_, _ = w.Write([]byte(`{"info":{"id":"a1","time":{}},"parts":[]}`))
+			return
+		}
+		mu.Lock()
+		polls++
+		n := polls
+		mu.Unlock()
+		if n < completeOnPoll {
+			// Progress: N tool parts on poll N, so the fingerprint strictly grows
+			// each poll and keeps resetting the idle clock — even though each poll is
+			// spaced well past IdleTimeout below.
+			parts := ""
+			for i := 0; i < n; i++ {
+				if i > 0 {
+					parts += ","
+				}
+				parts += `{"type":"tool","state":{"status":"completed","output":"step"}}`
+			}
+			_, _ = w.Write([]byte(`[{"info":{"id":"a1","role":"assistant","time":{}},"parts":[` + parts + `]}]`))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"info":{"id":"a1","role":"assistant","time":{"completed":1700000000000}},` +
+			`"parts":[{"type":"text","text":"landed"}]}]`))
+	}))
+	defer srv.Close()
+
+	// IdleTimeout is several poll intervals long; the turn progresses on EVERY poll
+	// (a new part each time), so the idle clock is reset before it can elapse even
+	// though the whole turn outlasts one IdleTimeout window. A broken reset would
+	// fire ErrTurnIdle before completeOnPoll.
+	oc := &Opencode{Base: srv.URL, Model: "anthropic/claude-3", HTTP: srv.Client(), IdleTimeout: 20 * time.Millisecond}
+	oc.pollMin, oc.pollMax = 5*time.Millisecond, 5*time.Millisecond
+	s := &ocSession{oc: oc, id: "sess1", dir: "/wt", system: "sys"}
+
+	reply, err := s.Prompt(context.Background(), "hi")
+	if err != nil {
+		t.Fatalf("progressing turn wrongly abandoned: %v", err)
+	}
+	if reply != "landed" {
+		t.Fatalf("reply = %q, want the settled text %q", reply, "landed")
 	}
 }

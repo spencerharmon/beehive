@@ -13,7 +13,7 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.AgentCmd != "opencode" || c.TTLMinutes != 60 || c.MaxTurns != 15 || c.RejectLimit != 3 || c.TurnTimeoutMinutes != 60 {
+	if c.AgentCmd != "opencode" || c.TTLMinutes != 60 || c.MaxTurns != 15 || c.RejectLimit != 3 || c.TurnTimeoutMinutes != 180 || c.TurnIdleTimeoutMinutes != 15 {
 		t.Fatalf("bad defaults: %+v", c)
 	}
 }
@@ -214,8 +214,8 @@ max_tokens: 500
 	if c.RejectLimit != 3 {
 		t.Errorf("RejectLimit = %d, want 3 (default falls through)", c.RejectLimit)
 	}
-	if c.TurnTimeoutMinutes != 60 {
-		t.Errorf("TurnTimeoutMinutes = %d, want 60 (default falls through)", c.TurnTimeoutMinutes)
+	if c.TurnTimeoutMinutes != 180 {
+		t.Errorf("TurnTimeoutMinutes = %d, want 180 (default falls through)", c.TurnTimeoutMinutes)
 	}
 }
 

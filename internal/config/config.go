@@ -75,11 +75,24 @@ type Config struct {
 	// turn/wall budget on a provably stuck session. 0 = off (the default), so a
 	// host that has not opted in behaves exactly as before.
 	StallTurns int `yaml:"stall_turns"`
-	// TurnTimeoutMinutes bounds a single agent turn (one opencode call). A stalled
-	// session is canceled at this cap so the honeybee abandons the task for GC
-	// instead of wedging until the systemd RuntimeMaxSec backstop. 0 = no per-turn
-	// cap (the whole-run WallCap/TTL still applies between turns).
+	// TurnTimeoutMinutes is the ABSOLUTE per-turn ceiling (one opencode call): a
+	// hard wall-clock backstop so a turn can never run past it regardless of
+	// progress, short of the systemd RuntimeMaxSec. Day-to-day stall detection is
+	// the finer-grained TurnIdleTimeoutMinutes progress watchdog; this ceiling only
+	// bounds a pathological turn that keeps trickling progress forever. 0 = no
+	// absolute cap (the whole-run WallCap/TTL still applies between turns).
 	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
+
+	// TurnIdleTimeoutMinutes is the per-turn PROGRESS watchdog: a turn that produces
+	// no new transcript activity (no new tool call, streamed tool output, or text)
+	// for this long is abandoned for GC as a genuine stall. Unlike
+	// TurnTimeoutMinutes — an absolute wall-clock ceiling that kills a turn even
+	// while it is still making steady progress — this distinguishes a wedged agent
+	// from a long but productive one, so a big task's multi-step turn runs to
+	// completion while a dead HTTP socket is cut promptly. 0 = disabled (only the
+	// absolute ceiling applies). It is wired into the opencode client
+	// (Opencode.IdleTimeout); the runner mirrors it only for the GC warning wording.
+	TurnIdleTimeoutMinutes int `yaml:"turn_idle_timeout_minutes"`
 
 	// BuildEnv is the host-specific Go build/test environment the runner OWNS so no
 	// honeybee re-derives it (audit session-audit-001 F1: e.g. a broken host cgo
@@ -104,16 +117,17 @@ type Config struct {
 // Defaults are the lowest layer, applied when no file sets a field.
 func Defaults(dir string) Config {
 	return Config{
-		Dir:                dir,
-		GPGHome:            filepath.Join(dir, "gnupg"),
-		AgentCmd:           "opencode",
-		AgentURL:           "http://127.0.0.1:4096",
-		TTLMinutes:         60,
-		MaxTurns:           15,
-		MergeRetries:       8,
-		RejectLimit:        3,
-		TurnTimeoutMinutes: 60,
-		SessionPullSeconds: 2,
+		Dir:                    dir,
+		GPGHome:                filepath.Join(dir, "gnupg"),
+		AgentCmd:               "opencode",
+		AgentURL:               "http://127.0.0.1:4096",
+		TTLMinutes:             60,
+		MaxTurns:               15,
+		MergeRetries:           8,
+		RejectLimit:            3,
+		TurnTimeoutMinutes:     180,
+		TurnIdleTimeoutMinutes: 15,
+		SessionPullSeconds:     2,
 	}
 }
 
@@ -239,6 +253,9 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnTimeoutMinutes != 0 {
 		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
+	}
+	if over.TurnIdleTimeoutMinutes != 0 {
+		out.TurnIdleTimeoutMinutes = over.TurnIdleTimeoutMinutes
 	}
 	out.BuildEnv = mergeEnv(base.BuildEnv, over.BuildEnv)
 	if over.SessionPullSeconds != 0 {

@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	neturl "net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +26,12 @@ const (
 	defaultPollMax = 2 * time.Second
 )
 
+// ErrTurnIdle marks a turn abandoned by the progress watchdog: the agent produced
+// no new transcript activity within Opencode.IdleTimeout. The runner treats it as
+// a stalled-agent GC (distinct from the absolute per-turn ceiling), so a genuinely
+// wedged pass is reclaimed while a productive long turn is never cut.
+var ErrTurnIdle = errors.New("opencode: turn made no progress within the idle timeout")
+
 // Opencode talks to an opencode server's session API.
 type Opencode struct {
 	Base        string  // server base URL
@@ -32,6 +40,15 @@ type Opencode struct {
 	MaxTokens   int     // max output tokens; 0 = backend default (omitted from the request)
 	HTTP        *http.Client
 	Debug       io.Writer // non-nil: log each HTTP request/response
+
+	// IdleTimeout is the per-turn PROGRESS watchdog: a concurrent watcher (watchIdle,
+	// started by Prompt) abandons a turn that produces no new transcript activity (no
+	// new tool call, streamed output, or text) for this long, cancelling the turn and
+	// surfacing ErrTurnIdle. It distinguishes a wedged agent (dead socket / provider
+	// hang, zero progress) from a long but productive turn (steady tool calls), so a
+	// big task's multi-step turn runs to completion while a true stall is cut
+	// promptly. 0 = disabled (only the caller's ctx bounds the turn).
+	IdleTimeout time.Duration
 
 	// pollMin/pollMax bound the turn-idle backoff (see Prompt/awaitTurn). Zero =
 	// the package defaults; tests set tiny values to keep the wait loop fast. Kept
@@ -207,8 +224,24 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 			Text string `json:"text"`
 		} `json:"parts"`
 	}
-	if err := s.oc.post(ctx, "/session/"+s.id+"/message", s.dir, body, &reply); err != nil {
-		return "", err
+	// Drive the turn under an idle watchdog. opencode runs a turn SYNCHRONOUSLY:
+	// POST /message blocks for the entire turn (seen live: a trivial turn returns
+	// in seconds, a working turn blocks for minutes), so the POST — not awaitTurn —
+	// is where a wedged turn hangs. The watchdog polls the message transcript
+	// concurrently and, if it stops advancing for IdleTimeout, cancels the turn ctx
+	// (aborting the blocked POST) and flags idle; a productive turn that keeps
+	// streaming steps never trips it. IdleTimeout==0 keeps the historical behavior
+	// (only the caller's ctx bounds the turn).
+	turnCtx, cancelTurn := context.WithCancel(ctx)
+	defer cancelTurn()
+	idled := s.watchIdle(turnCtx, cancelTurn)
+
+	perr := s.oc.post(turnCtx, "/session/"+s.id+"/message", s.dir, body, &reply)
+	if idled != nil && idled.Load() {
+		return "", fmt.Errorf("%w (%s, session=%s)", ErrTurnIdle, s.oc.IdleTimeout, s.id)
+	}
+	if perr != nil {
+		return "", perr
 	}
 	// Synchronous server: the accept reply already carries time.completed, so the
 	// turn is done and its parts are authoritative — no need to poll.
@@ -221,8 +254,73 @@ func (s *ocSession) Prompt(ctx context.Context, text string) (string, error) {
 		}
 		return sb.String(), nil
 	}
-	// Fire-and-forget accept: wait for the assistant message to settle.
-	return s.awaitTurn(ctx, reply.Info.ID)
+	// Fire-and-forget accept: wait for the assistant message to settle. The same
+	// watchdog covers this poll loop — it cancels turnCtx on idle, which awaitTurn
+	// surfaces as a ctx error, re-mapped to ErrTurnIdle here.
+	text, aerr := s.awaitTurn(turnCtx, reply.Info.ID)
+	if idled != nil && idled.Load() {
+		return "", fmt.Errorf("%w (%s, session=%s)", ErrTurnIdle, s.oc.IdleTimeout, s.id)
+	}
+	return text, aerr
+}
+
+// watchIdle starts the per-turn progress watchdog and returns a flag set true iff
+// the watchdog fired — so the caller can tell an idle-cancel apart from a caller
+// ctx cancel or a real POST error. It runs only when IdleTimeout>0 (else a nil
+// no-op). The goroutine polls the transcript on the turn ctx, tracks the progress
+// fingerprint (turnPoll), and resets an idle clock every time the transcript
+// advances (new tool call, streamed output, more text). If the clock exceeds
+// IdleTimeout the turn is wedged: it flags idle and cancels the turn, aborting the
+// blocked POST/await. It exits when the turn ctx is done (Prompt's deferred
+// cancelTurn), so it never leaks past the turn.
+func (s *ocSession) watchIdle(ctx context.Context, cancel context.CancelFunc) *atomic.Bool {
+	if s.oc.IdleTimeout <= 0 {
+		return nil
+	}
+	wait, max := s.oc.pollMin, s.oc.pollMax
+	if wait <= 0 {
+		wait = defaultPollMin
+	}
+	if max <= 0 {
+		max = defaultPollMax
+	}
+	if max < wait {
+		max = wait
+	}
+	idled := &atomic.Bool{}
+	go func() {
+		var lastFP int64 = -1
+		lastProgress := time.Now()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+			_, _, fp, err := s.turnPoll(ctx, "")
+			if err != nil {
+				// Transient poll failure (or ctx cancel): not progress, not a stall;
+				// keep watching until ctx is done.
+				if ctx.Err() != nil {
+					return
+				}
+				continue
+			}
+			if fp != lastFP {
+				lastFP = fp
+				lastProgress = time.Now()
+			}
+			if time.Since(lastProgress) > s.oc.IdleTimeout {
+				idled.Store(true)
+				cancel()
+				return
+			}
+			if wait *= 2; wait > max {
+				wait = max
+			}
+		}
+	}()
+	return idled
 }
 
 // awaitTurn polls the session message list until the assistant message for the
@@ -243,7 +341,7 @@ func (s *ocSession) awaitTurn(ctx context.Context, assistantID string) (string, 
 		max = wait
 	}
 	for {
-		text, done, err := s.turnText(ctx, assistantID)
+		text, done, _, err := s.turnPoll(ctx, assistantID)
 		if err != nil {
 			return "", err
 		}
@@ -261,12 +359,16 @@ func (s *ocSession) awaitTurn(ctx context.Context, assistantID string) (string, 
 	}
 }
 
-// turnText fetches the session message list and reports whether the tracked
-// assistant turn has completed, returning its concatenated text when so. opencode
-// stamps a message's info.time.completed when its turn finishes; an in-flight
-// assistant message has no completed timestamp. A turn that has not yet created
-// its assistant message (or whose message is still in flight) reports done=false.
-func (s *ocSession) turnText(ctx context.Context, assistantID string) (text string, done bool, err error) {
+// turnPoll fetches the session message list and reports (a) whether the tracked
+// assistant turn has completed, returning its concatenated text when so, and (b) a
+// progress fingerprint over the WHOLE turn transcript. opencode stamps a message's
+// info.time.completed when its turn finishes; an in-flight assistant message has
+// no completed timestamp, and a turn that has not yet created its assistant
+// message reports done=false. The fingerprint sums every part's text, streamed
+// tool output, and status length across all messages (plus a per-part constant),
+// so a new tool call, more streamed output, or a running->completed transition all
+// advance it — the signal the idle watchdog resets on.
+func (s *ocSession) turnPoll(ctx context.Context, assistantID string) (text string, done bool, fp int64, err error) {
 	var raw []struct {
 		Info struct {
 			ID   string `json:"id"`
@@ -276,29 +378,35 @@ func (s *ocSession) turnText(ctx context.Context, assistantID string) (text stri
 			} `json:"time"`
 		} `json:"info"`
 		Parts []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type  string `json:"type"`
+			Text  string `json:"text"`
+			State struct {
+				Status string `json:"status"`
+				Output string `json:"output"`
+			} `json:"state"`
 		} `json:"parts"`
 	}
 	if err := s.oc.get(ctx, "/session/"+s.id+"/message", s.dir, &raw); err != nil {
-		return "", false, err
+		return "", false, 0, err
 	}
 	idx := -1
 	for i := range raw {
+		for _, p := range raw[i].Parts {
+			fp += int64(len(p.Text)) + int64(len(p.State.Output)) + int64(len(p.State.Status)) + 7
+		}
 		if raw[i].Info.Role != "assistant" {
 			continue
 		}
 		if assistantID != "" {
 			if raw[i].Info.ID == assistantID {
 				idx = i
-				break
 			}
 			continue
 		}
 		idx = i // no id to track: follow the last assistant message
 	}
 	if idx < 0 || raw[idx].Info.Time.Completed == 0 {
-		return "", false, nil // not created yet, or still in flight
+		return "", false, fp, nil // not created yet, or still in flight
 	}
 	var sb strings.Builder
 	for _, p := range raw[idx].Parts {
@@ -306,7 +414,7 @@ func (s *ocSession) turnText(ctx context.Context, assistantID string) (text stri
 			sb.WriteString(p.Text)
 		}
 	}
-	return sb.String(), true, nil
+	return sb.String(), true, fp, nil
 }
 
 func (s *ocSession) Close() error { return nil }

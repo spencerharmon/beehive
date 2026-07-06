@@ -204,8 +204,9 @@ func run() error {
 		Remote: remote, BaseMain: baseMain, Session: session,
 		SessionGit: sessGit, SessionRoot: sessPath, SessionBranch: sessBranch,
 		SessionPublish: sessPublish, SessionPush: sessPush,
-		RestoreConfig: restoreRemotes,
-		TurnTimeout:   time.Duration(c.TurnTimeoutMinutes) * time.Minute,
+		RestoreConfig:   restoreRemotes,
+		TurnTimeout:     time.Duration(c.TurnTimeoutMinutes) * time.Minute,
+		TurnIdleTimeout: time.Duration(eff.TurnIdleTimeoutMinutes) * time.Minute,
 		// Per-kind model routing from the layered config (honeybee-model-routing):
 		// a near-deterministic kind can run on a cheap model while code Work runs on
 		// the strong one. eff.ModelFor falls through to the single Model when a kind
@@ -241,7 +242,7 @@ func run() error {
 		// (nil) on a normal host — LOCALS.md is the human record of what to set.
 		BuildEnv: eff.BuildEnv,
 	}
-	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, HTTP: &http.Client{Timeout: 0}}
+	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, IdleTimeout: time.Duration(eff.TurnIdleTimeoutMinutes) * time.Minute, HTTP: &http.Client{Timeout: 0}}
 	if debug {
 		runner.Debug = os.Stderr
 		oc.Debug = os.Stderr

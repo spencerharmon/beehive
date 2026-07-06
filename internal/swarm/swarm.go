@@ -106,6 +106,14 @@ type Runner struct {
 	// backstop. 0 = no per-turn cap (tests).
 	TurnTimeout time.Duration
 
+	// TurnIdleTimeout is the per-turn PROGRESS-watchdog window used only to word the
+	// abandon warning; the watchdog itself runs in the opencode client
+	// (Opencode.IdleTimeout), set from the SAME config key (TurnIdleTimeoutMinutes).
+	// A turn that produces no new transcript activity for this long returns
+	// ErrTurnIdle, which the turn loop treats as a stalled-agent GC — distinct from
+	// the absolute TurnTimeout ceiling. 0 = watchdog disabled.
+	TurnIdleTimeout time.Duration
+
 	// LeanInject trims the per-pass injected system prompt to only what this pass's
 	// kind acts on (trimProtocol) and defers the Work completion rule from the
 	// up-front preamble to an at-decision-point "continue" hint (nextPrompt). Off
@@ -932,11 +940,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		_, perr := sess.Prompt(turnCtx, prompt)
 		timedOut := r.TurnTimeout > 0 && turnCtx.Err() == context.DeadlineExceeded
+		idleStalled := errors.Is(perr, ErrTurnIdle)
 		cancelTurn()
 		if perr != nil {
-			if timedOut {
+			if timedOut || idleStalled {
 				res.GCMarked = true
-				res.Warning = fmt.Sprintf("turn %d exceeded the %s per-turn timeout (stalled agent); abandoning for GC", res.Turns, r.TurnTimeout)
+				if idleStalled {
+					res.Warning = fmt.Sprintf("turn %d made no progress within the %s idle timeout (stalled agent); abandoning for GC", res.Turns, r.TurnIdleTimeout)
+				} else {
+					res.Warning = fmt.Sprintf("turn %d exceeded the %s per-turn ceiling; abandoning for GC", res.Turns, r.TurnTimeout)
+				}
 				if ferr := finish(res.Warning); ferr != nil {
 					cleanup()
 					return res, ferr
