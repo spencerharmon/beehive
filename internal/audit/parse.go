@@ -279,32 +279,57 @@ func parseHeaderLine(line string) (header, error) {
 	return h, nil
 }
 
-// scanBody counts assistant and user turns by the PINNED exact-line rule and
-// extracts the trailing "## ⚠️ warning" block text (everything after the warning
-// header line), if present. A scan failure (e.g. an over-long line) is surfaced,
-// never silently truncated.
+// scanBody counts assistant and user turns by the PINNED exact-line rule,
+// UNCONDITIONALLY end to end, and extracts the trailing "## ⚠️ warning" block
+// text (everything after the warning header line) — but ONLY if the file's
+// LAST exact warningHeader line is genuinely trailing: no "## assistant"/
+// "## user" turn-marker line occurs anywhere after it.
+//
+// A transcript's own work routinely greps/dumps a PRIOR session's transcript
+// as evidence (the session-audit series' explicit, permanent charter), which
+// can embed another file's exact "## ⚠️ warning" line mid-body. Such an
+// occurrence is quoted content, not this file's own abort marker: it must
+// never gate the turn count and must never seed the warning text. Only the
+// LAST occurrence in the file is even a candidate, and only when nothing real
+// (a turn marker) follows it does it count as this session's real trailing
+// abort block — matching the producer contract (internal/swarm.recorder.
+// appendWarning always writes the block LAST). A scan failure (e.g. an
+// over-long line) is surfaced, never silently truncated.
 func scanBody(data []byte) (turns, userTurns int, warning string, err error) {
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 0, 64*1024), 4<<20)
-	inWarn := false
-	var warn strings.Builder
+	var lines []string
+	lastWarn := -1 // index into lines of the LAST exact warningHeader line seen
 	for sc.Scan() {
 		line := strings.TrimRight(sc.Text(), "\r")
-		switch {
-		case inWarn:
-			warn.WriteString(line)
-			warn.WriteByte('\n')
-			continue
-		case line == "## assistant":
+		switch line {
+		case "## assistant":
 			turns++
-		case line == "## user":
+		case "## user":
 			userTurns++
-		case line == warningHeader:
-			inWarn = true
+		case warningHeader:
+			lastWarn = len(lines)
 		}
+		lines = append(lines, line)
 	}
 	if err := sc.Err(); err != nil {
 		return 0, 0, "", err
+	}
+	if lastWarn < 0 {
+		return turns, userTurns, "", nil
+	}
+	tail := lines[lastWarn+1:]
+	for _, l := range tail {
+		if l == "## assistant" || l == "## user" {
+			// A real turn follows the last occurrence: it is quoted content
+			// from elsewhere, not a genuine abort marker. Nothing gates on it.
+			return turns, userTurns, "", nil
+		}
+	}
+	var warn strings.Builder
+	for _, l := range tail {
+		warn.WriteString(l)
+		warn.WriteByte('\n')
 	}
 	return turns, userTurns, warn.String(), nil
 }

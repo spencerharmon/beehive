@@ -31,9 +31,14 @@
 // deterministic, producer-emitted abort signal is the trailing "## ⚠️ warning"
 // block that internal/swarm.recorder.appendWarning writes when the runner aborts
 // a session (wall/turn cap, lost claim, task removed). Abort/lost-race detection
-// therefore keys off that block ONLY. reconcile-loop is a corpus-level property
-// (adjacent reconcile sessions in epoch order) set by ParseDir, not by a single
-// file.
+// therefore keys off that block ONLY — and only the LAST exact occurrence of the
+// header line, and only when it is genuinely trailing (no further turn occurs
+// after it): a session's own work routinely greps/quotes a PRIOR session's
+// transcript as evidence (the session-audit series' explicit charter), which can
+// embed the exact header line mid-body, and such an occurrence must never gate
+// the turn count or seed the abort reason. reconcile-loop is a corpus-level
+// property (adjacent reconcile sessions in epoch order) set by ParseDir, not by
+// a single file.
 package audit
 
 // Session kinds, mirroring internal/swarm selection kinds as written into the
