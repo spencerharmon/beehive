@@ -218,6 +218,11 @@ func run() error {
 		// model host routes to the same model it already used (inert). oc.Model below
 		// stays the fallback the client is built with.
 		ModelFor: eff.ModelFor,
+		// Effective fallback model (the single layered-config Model the Opencode
+		// client is built with, below). Stamped into each session transcript header
+		// so the stats page derives per-model performance from git; when ModelFor
+		// routes a kind to an override, the runner stamps that instead.
+		Model: eff.Model,
 		// Idle-churn cap from the layered config: abandon a Work pass that makes no
 		// code-worktree progress for StallTurns consecutive turns. 0 (the default)
 		// leaves the pass bounded only by the turn/wall caps, exactly as before.

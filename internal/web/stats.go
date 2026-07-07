@@ -4,7 +4,10 @@ import (
 	"context"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/spencerharmon/beehive/internal/git"
@@ -22,20 +25,67 @@ import (
 //	                     never merged (finished work whose merge didn't land — the
 //	                     wedge indicator; not lost, GC never drops an unmerged branch).
 //	DeliveredPerBeePct  = 100 * DeliveredTasks / Honeybees   (the ✅/🐝 yield)
+//	Models              = the same figures split by the agent model each session
+//	                     ran on (transcript-header `model:` stamp), for A/B
+//	                     comparison across models. Delivered is attributed to the
+//	                     model of a DONE task's most-recent session.
 type subStat struct {
 	Name               string
 	DeliveredTasks     int
 	Honeybees          int
 	Stranded           int
 	DeliveredPerBeePct float64
+	Models             []modelStat
 }
 
-var sessionNameRE = regexp.MustCompile(`^bee-(.+)-\d+-\d+$`)
+// modelStat is one agent model's slice of a submodule's (or the total's)
+// performance, derived from the per-session transcript `model:` stamp.
+type modelStat struct {
+	Model              string
+	DeliveredTasks     int
+	Honeybees          int
+	DeliveredPerBeePct float64
+}
+
+func (m *modelStat) derive() {
+	if m.Honeybees > 0 {
+		m.DeliveredPerBeePct = 100 * float64(m.DeliveredTasks) / float64(m.Honeybees)
+	}
+}
+
+// defaultModel labels sessions whose transcript predates the model stamp (or was
+// written by a build without it). This host has only ever run opus, so crediting
+// unstamped history to it is exact rather than a guess (operator-approved).
+const defaultModel = "github-copilot/claude-opus-4.8"
+
+// sessionNameRE splits a transcript stem `bee-<task>-<epoch>-<pid>` into the task
+// id (1) and the epoch (2) / pid (3) that order a task's repeated attempts.
+var sessionNameRE = regexp.MustCompile(`^bee-(.+)-(\d+)-(\d+)$`)
+
+// modelStampRE pulls the model out of the transcript header's metadata line
+// ("submodule: … · kind: … · branch: … · model: <model>").
+var modelStampRE = regexp.MustCompile(`· model: (\S+)`)
 
 func (st *subStat) derive() {
 	if st.Honeybees > 0 {
 		st.DeliveredPerBeePct = 100 * float64(st.DeliveredTasks) / float64(st.Honeybees)
 	}
+}
+
+// sessionModel reads a transcript's header (bounded — the stamp is on line 3) and
+// returns the model it ran on, or defaultModel when unstamped/unreadable.
+func sessionModel(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return defaultModel
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	n, _ := f.Read(buf)
+	if m := modelStampRE.FindSubmatch(buf[:n]); m != nil {
+		return string(m[1])
+	}
+	return defaultModel
 }
 
 // computeStats returns per-submodule figures plus a total row.
@@ -45,6 +95,9 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 		return nil, subStat{}, err
 	}
 	total.Name = "total"
+	// Total-row per-model accumulators, summed across submodules.
+	totBees := map[string]int{}
+	totDelivered := map[string]int{}
 	for _, sm := range sms {
 		st := subStat{Name: sm.Name}
 		done := map[string]bool{}
@@ -58,15 +111,49 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 				}
 			}
 		}
+		// Per-model tallies for this submodule, plus the model of each task's
+		// most-recent session (epoch then pid) so a DONE task's delivery is
+		// attributed to the model that last drove it.
+		bees := map[string]int{}
+		type latest struct {
+			epoch, pid int
+			model      string
+		}
+		taskLatest := map[string]latest{}
 		if ents, rerr := os.ReadDir(sm.SessionsDir()); rerr == nil {
 			for _, e := range ents {
 				if !strings.HasSuffix(e.Name(), ".md") {
 					continue
 				}
-				if sessionNameRE.MatchString(strings.TrimSuffix(e.Name(), ".md")) {
-					st.Honeybees++
+				stem := strings.TrimSuffix(e.Name(), ".md")
+				m := sessionNameRE.FindStringSubmatch(stem)
+				if m == nil {
+					continue
+				}
+				st.Honeybees++
+				model := sessionModel(filepath.Join(sm.SessionsDir(), e.Name()))
+				bees[model]++
+				task := m[1]
+				epoch, _ := strconv.Atoi(m[2])
+				pid, _ := strconv.Atoi(m[3])
+				if cur, ok := taskLatest[task]; !ok || epoch > cur.epoch || (epoch == cur.epoch && pid > cur.pid) {
+					taskLatest[task] = latest{epoch, pid, model}
 				}
 			}
+		}
+		// Attribute each delivered task to its latest session's model.
+		delivered := map[string]int{}
+		for task := range done {
+			if l, ok := taskLatest[task]; ok {
+				delivered[l.model]++
+			}
+		}
+		st.Models = buildModelStats(bees, delivered)
+		for mdl, n := range bees {
+			totBees[mdl] += n
+		}
+		for mdl, n := range delivered {
+			totDelivered[mdl] += n
 		}
 		st.Stranded = strandedCount(ctx, git.New(sm.RepoDir()), done)
 		st.derive()
@@ -75,8 +162,38 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 		total.Honeybees += st.Honeybees
 		total.Stranded += st.Stranded
 	}
+	total.Models = buildModelStats(totBees, totDelivered)
 	total.derive()
 	return subs, total, nil
+}
+
+// buildModelStats folds the per-model session and delivered tallies into a stable,
+// display-ordered slice (most honeybees first, then model name) with the yield
+// derived. A model appears if it ran any session or delivered any task.
+func buildModelStats(bees, delivered map[string]int) []modelStat {
+	seen := map[string]bool{}
+	for m := range bees {
+		seen[m] = true
+	}
+	for m := range delivered {
+		seen[m] = true
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]modelStat, 0, len(seen))
+	for m := range seen {
+		ms := modelStat{Model: m, Honeybees: bees[m], DeliveredTasks: delivered[m]}
+		ms.derive()
+		out = append(out, ms)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Honeybees != out[j].Honeybees {
+			return out[i].Honeybees > out[j].Honeybees
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
 }
 
 // strandedCount counts bee-<task> branches ahead of the submodule's pull target

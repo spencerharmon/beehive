@@ -5,7 +5,9 @@
 than one merge, so we count the task) · <b>honeybees (🐝)</b> = one honeybee pass ·
 <b>✅/🐝</b> = delivered tasks per honeybee · <b>stranded</b> = tasks with finished
 work on a pushed branch that never merged (recoverable — GC never drops an unmerged
-branch). See <code>docs/conflict-resolution.md</code>.</p>
+branch). Expand <b>by model</b> to compare agent models head-to-head (delivered is
+attributed to the model of a done task's most-recent session). See
+<code>docs/conflict-resolution.md</code>.</p>
 <table>
 <tr><th>submodule</th><th>delivered tasks ✅</th><th>honeybees 🐝</th><th>✅/🐝</th><th>stranded</th></tr>
 {{range .Subs}}<tr>
@@ -14,13 +16,37 @@ branch). See <code>docs/conflict-resolution.md</code>.</p>
   <td>{{.Honeybees}}</td>
   <td>{{printf "%.1f%%" .DeliveredPerBeePct}}</td>
   <td>{{if .Stranded}}<span class="state danger">{{.Stranded}}</span>{{else}}0{{end}}</td>
-</tr>{{else}}<tr><td colspan=5 class="muted">no submodules</td></tr>{{end}}
+</tr>{{if .Models}}<tr class="models"><td colspan=5>
+  <details><summary class="muted">by model ({{len .Models}})</summary>
+  <table class="nested">
+  <tr><th>model</th><th>delivered ✅</th><th>honeybees 🐝</th><th>✅/🐝</th></tr>
+  {{range .Models}}<tr>
+    <td><code>{{.Model}}</code></td>
+    <td>{{.DeliveredTasks}}</td>
+    <td>{{.Honeybees}}</td>
+    <td>{{printf "%.1f%%" .DeliveredPerBeePct}}</td>
+  </tr>{{end}}
+  </table>
+  </details>
+</td></tr>{{end}}{{else}}<tr><td colspan=5 class="muted">no submodules</td></tr>{{end}}
 <tr class="total">
   <td><b>total</b></td>
   <td><b>{{.Total.DeliveredTasks}}</b></td>
   <td><b>{{.Total.Honeybees}}</b></td>
   <td><b>{{printf "%.1f%%" .Total.DeliveredPerBeePct}}</b></td>
   <td><b>{{.Total.Stranded}}</b></td>
-</tr>
+</tr>{{if .Total.Models}}<tr class="models"><td colspan=5>
+  <details><summary class="muted">total by model ({{len .Total.Models}})</summary>
+  <table class="nested">
+  <tr><th>model</th><th>delivered ✅</th><th>honeybees 🐝</th><th>✅/🐝</th></tr>
+  {{range .Total.Models}}<tr>
+    <td><code>{{.Model}}</code></td>
+    <td>{{.DeliveredTasks}}</td>
+    <td>{{.Honeybees}}</td>
+    <td>{{printf "%.1f%%" .DeliveredPerBeePct}}</td>
+  </tr>{{end}}
+  </table>
+  </details>
+</td></tr>{{end}}
 </table>
 {{template "footer"}}

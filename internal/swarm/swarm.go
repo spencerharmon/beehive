@@ -172,6 +172,13 @@ type Runner struct {
 	// identical to the single-model path.
 	ModelFor func(kind string) string
 
+	// Model is the effective fallback agent model for this pass (the layered
+	// config's single Model, i.e. the model the Opencode client is built with). It
+	// is the value stamped into the session transcript header for per-model stats
+	// when ModelFor does not route the pass to a per-kind override. Empty only in
+	// tests that construct a Runner without a model; the read side then defaults it.
+	Model string
+
 	// StallTurns bounds idle churn: if a Work pass produces an identical code-
 	// worktree fingerprint (HEAD + porcelain status) for this many CONSECUTIVE
 	// turns after the first — an agent talking without changing a file — the runner
@@ -719,10 +726,17 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// runs on the strong one. Inert when ModelFor is nil or returns "" (no routing
 	// configured): the client keeps its preconfigured model, byte-identical to the
 	// single-model path.
+	//
+	// passModel is the model this pass actually runs on — the routed override when
+	// one applies, else the client's preconfigured fallback (r.Model). It is stamped
+	// into the transcript header below so the stats page can derive per-model
+	// performance from git without any stored state.
+	passModel := r.Model
 	if r.ModelFor != nil {
 		if ms, ok := r.Client.(modelSelector); ok {
 			if m := r.ModelFor(string(sel.Kind)); m != "" {
 				ms.SetModel(m)
+				passModel = m
 			}
 		}
 	}
@@ -752,10 +766,19 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if r.SessionRoot != "" {
 		sessionFile = filepath.Join(r.SessionRoot, sessionRel)
 	}
+	// Transcript header doubles as the per-session metadata block the stats page
+	// reads back: the `model:` field is the sole source of truth for git-derived
+	// per-model performance. Always emit it when known (the host always resolves a
+	// model); omit only in tests that leave Runner.Model empty, where the read side
+	// defaults it.
+	modelTag := ""
+	if passModel != "" {
+		modelTag = " · model: " + passModel
+	}
 	rec := &recorder{
 		sess:    sess,
 		path:    sessionFile,
-		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch),
+		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s%s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch, modelTag),
 		debug:   r.Debug,
 		toolSt:  map[string]string{},
 		partLen: map[string]int{},

@@ -315,6 +315,7 @@ func TestRunPublishesSessionToMain(t *testing.T) {
 	}
 	r := &Runner{
 		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Model:          "test/model-x",
 		Publish:        func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
 		SessionGit:     sessGit,
 		SessionRoot:    sessPath,
@@ -340,6 +341,15 @@ func TestRunPublishesSessionToMain(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "submodules", "sm", "PLAN.md")); err != nil {
 		t.Fatalf("PLAN.md not published to main working tree: %v", err)
+	}
+	// The transcript header must carry the model this pass ran on, so the stats page
+	// can derive per-model performance from git.
+	body, err := os.ReadFile(filepath.Join(root, "submodules", "sm", "sessions", res.SessionID+".md"))
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	if !strings.Contains(string(body), "· model: test/model-x") {
+		t.Fatalf("transcript header missing model stamp; got head:\n%.200s", body)
 	}
 }
 
