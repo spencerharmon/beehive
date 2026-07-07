@@ -17,6 +17,7 @@ import (
 
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/editor"
+	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -1623,6 +1624,196 @@ func TestDocViewGuards(t *testing.T) {
 	}
 	if w := get(t, s, "/submodule/alpha/doc/nope.md"); w.Code != http.StatusNotFound {
 		t.Fatalf("missing doc: got %d, want 404", w.Code)
+	}
+}
+
+// writeHivePlan overwrites a submodule's PLAN.md (in the hive checkout, NOT a
+// submodule code repo) with a single task at status, for delivery-traceability
+// tests that need to commit a real TODO -> NEEDS-REVIEW -> DONE sequence to the
+// HIVE superproject's own history.
+func writeHivePlan(t *testing.T, root, sub, taskID, status string) {
+	t.Helper()
+	planPath := filepath.Join(root, "submodules", sub, repo.PlanFile)
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## "+taskID+" ["+status+"] <!-- attempts=0 deps= weight=1 -->\n"+
+			"build it\nDoc: bee-"+taskID+".md\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHiveDoneFlips locks hiveDoneFlips' core contract directly (white-box):
+// scanning the HIVE repo's own PLAN.md history, it returns the commit that
+// FIRST shows a task's status line as [DONE] — not an earlier TODO/
+// NEEDS-REVIEW commit, and not a wholly unrelated task that never went DONE.
+func TestHiveDoneFlips(t *testing.T) {
+	root := t.TempDir()
+	hygGit(t, root, "init", "-q")
+	hygGit(t, root, "config", "user.email", "t@t")
+	hygGit(t, root, "config", "user.name", "t")
+	os.MkdirAll(filepath.Join(root, "submodules", "alpha"), 0o755)
+
+	writeHivePlan(t, root, "alpha", "dt1", "TODO")
+	hygGit(t, root, "add", "-A")
+	hygGit(t, root, "commit", "-q", "-m", "c1 todo")
+	writeHivePlan(t, root, "alpha", "dt1", "NEEDS-REVIEW")
+	hygGit(t, root, "add", "-A")
+	hygGit(t, root, "commit", "-q", "-m", "c2 review")
+	writeHivePlan(t, root, "alpha", "dt1", "DONE")
+	hygGit(t, root, "add", "-A")
+	hygGit(t, root, "commit", "-q", "-m", "c3 done")
+	want := hygGit(t, root, "rev-parse", "HEAD")
+
+	planRel := filepath.Join("submodules", "alpha", repo.PlanFile)
+	flips := hiveDoneFlips(context.Background(), git.New(root), planRel,
+		map[string]bool{"dt1": true, "never-done": true})
+	if got := flips["dt1"]; got == "" || !strings.HasPrefix(want, got) {
+		t.Fatalf("hiveDoneFlips[dt1] = %q, want prefix of %q", got, want)
+	}
+	if got, ok := flips["never-done"]; ok {
+		t.Fatalf("never-done task must not appear in the result, got %q", got)
+	}
+}
+
+// TestComputeStatsDeliveryLinks is delivery-traceability's core end-to-end
+// assertion: computeStats (and the /stats page it feeds) links a DONE task to
+// BOTH the hive commit that flipped its PLAN.md status to DONE (half a) and
+// its submodule change doc (half b, branch-graph-sectioned's unchanged
+// resolveDocHref/changeDocsByTask). The negative control (submodule "beta")
+// has a DONE task whose PLAN.md was never committed to the hive and whose
+// submodule repo/ doesn't exist at all — both links must degrade to "" with no
+// error, never a dead href.
+func TestComputeStatsDeliveryLinks(t *testing.T) {
+	s, root := setup(t)
+
+	writeHivePlan(t, root, "alpha", "dt1", "TODO")
+	commitAll(t, root, "dt1-todo")
+	writeHivePlan(t, root, "alpha", "dt1", "NEEDS-REVIEW")
+	commitAll(t, root, "dt1-review")
+	writeHivePlan(t, root, "alpha", "dt1", "DONE")
+	commitAll(t, root, "dt1-done")
+	flipSHA := hygGit(t, root, "rev-parse", "--short=12", "HEAD")
+
+	docsDir := filepath.Join(root, "submodules", "alpha", "docs")
+	os.MkdirAll(docsDir, 0o755)
+	os.WriteFile(filepath.Join(docsDir, "bee-dt1.md"), []byte("# dt1 change doc\n"), 0o644)
+	commitRepoAt(t, filepath.Join(root, "submodules", "alpha", "repo"),
+		"impl dt1\n\nBeehive: dt1 bee-dt1.md")
+
+	// Negative control: a DONE task in an UNCOMMITTED PLAN.md (no hive commit
+	// ever touches it) with no submodule repo/ at all (no code stamp either).
+	os.MkdirAll(filepath.Join(root, "submodules", "beta"), 0o755)
+	writeHivePlan(t, root, "beta", "dt2", "DONE")
+
+	subs, _, err := s.computeStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	find := func(name string) subStat {
+		for _, st := range subs {
+			if st.Name == name {
+				return st
+			}
+		}
+		t.Fatalf("submodule %q missing from computeStats: %+v", name, subs)
+		return subStat{}
+	}
+	findDelivery := func(st subStat, id string) DeliveryLink {
+		for _, d := range st.Deliveries {
+			if d.TaskID == id {
+				return d
+			}
+		}
+		t.Fatalf("task %q missing from %s.Deliveries: %+v", id, st.Name, st.Deliveries)
+		return DeliveryLink{}
+	}
+
+	dt1 := findDelivery(find("alpha"), "dt1")
+	if dt1.FlipHref != "/submodule/alpha/commit/"+flipSHA {
+		t.Fatalf("dt1 FlipHref = %q, want hive commit %q", dt1.FlipHref, flipSHA)
+	}
+	if dt1.DocHref != "/submodule/alpha/doc/bee-dt1.md" {
+		t.Fatalf("dt1 DocHref = %q", dt1.DocHref)
+	}
+
+	dt2 := findDelivery(find("beta"), "dt2")
+	if dt2.FlipHref != "" || dt2.DocHref != "" {
+		t.Fatalf("dt2 (negative control) should have no locatable links, got %+v", dt2)
+	}
+
+	// End-to-end: /stats renders both links for dt1 and never a dead href for
+	// dt2 (no error, no /submodule/beta/commit/... or doc href in the body).
+	w := get(t, s, "/stats")
+	if w.Code != 200 {
+		t.Fatalf("stats %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `href="/submodule/alpha/commit/`+flipSHA+`"`) {
+		t.Fatalf("stats missing hive flip link:\n%s", body)
+	}
+	if !strings.Contains(body, `href="/submodule/alpha/doc/bee-dt1.md"`) {
+		t.Fatalf("stats missing change-doc link:\n%s", body)
+	}
+	if strings.Contains(body, "/submodule/beta/commit/") {
+		t.Fatalf("stats must never link an unlocated hive flip:\n%s", body)
+	}
+}
+
+// TestBranchesDeliveryLink checks the OTHER surface the ROI names: the
+// per-submodule branches view links a stamped commit's row to the hive commit
+// that flipped ITS task to DONE (half a), alongside the unchanged change-doc
+// link (half b).
+func TestBranchesDeliveryLink(t *testing.T) {
+	s, root := setup(t)
+
+	writeHivePlan(t, root, "alpha", "dt1", "TODO")
+	commitAll(t, root, "dt1-todo")
+	writeHivePlan(t, root, "alpha", "dt1", "NEEDS-REVIEW")
+	commitAll(t, root, "dt1-review")
+	writeHivePlan(t, root, "alpha", "dt1", "DONE")
+	commitAll(t, root, "dt1-done")
+	flipSHA := hygGit(t, root, "rev-parse", "--short=12", "HEAD")
+
+	commitRepoAt(t, filepath.Join(root, "submodules", "alpha", "repo"),
+		"impl dt1\n\nBeehive: dt1 bee-dt1.md")
+
+	w := get(t, s, "/submodule/alpha/branches")
+	if w.Code != 200 {
+		t.Fatalf("branches %d: %s", w.Code, w.Body)
+	}
+	if body := w.Body.String(); !strings.Contains(body, `href="/submodule/alpha/commit/`+flipSHA+`"`) {
+		t.Fatalf("branches missing hive flip link for dt1:\n%s", body)
+	}
+}
+
+// TestCommitView covers the delivery-traceability commit page a FlipHref
+// resolves to: 200 with the commit's PLAN.md diff and metadata for a real,
+// well-formed sha; 404 (never an error page) for an unresolvable-but-hex sha, a
+// non-hex sha, and an unknown submodule.
+func TestCommitView(t *testing.T) {
+	s, root := setup(t)
+	writeHivePlan(t, root, "alpha", "dt1", "TODO")
+	commitAll(t, root, "dt1-todo")
+	writeHivePlan(t, root, "alpha", "dt1", "DONE")
+	commitAll(t, root, "dt1-done")
+	sha := hygGit(t, root, "rev-parse", "--short=12", "HEAD")
+
+	w := get(t, s, "/submodule/alpha/commit/"+sha)
+	if w.Code != 200 {
+		t.Fatalf("commit view %d: %s", w.Code, w.Body)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "dt1-done") || !strings.Contains(body, "[DONE]") {
+		t.Fatalf("commit view missing subject/diff:\n%s", body)
+	}
+
+	if w := get(t, s, "/submodule/alpha/commit/"+strings.Repeat("0", 12)); w.Code != http.StatusNotFound {
+		t.Fatalf("unresolvable sha: got %d, want 404", w.Code)
+	}
+	if w := get(t, s, "/submodule/alpha/commit/zzzzzzzzzzzz"); w.Code != http.StatusNotFound {
+		t.Fatalf("non-hex sha: got %d, want 404", w.Code)
+	}
+	if w := get(t, s, "/submodule/none/commit/"+sha); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown submodule: got %d, want 404", w.Code)
 	}
 }
 

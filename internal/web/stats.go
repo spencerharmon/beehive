@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/spencerharmon/beehive/internal/git"
-	"github.com/spencerharmon/beehive/internal/plan"
 )
 
 // subStat is one submodule's honeybee-performance figures, all derived on read
@@ -29,6 +28,9 @@ import (
 //	                     ran on (transcript-header `model:` stamp), for A/B
 //	                     comparison across models. Delivered is attributed to the
 //	                     model of a DONE task's most-recent session.
+//	Deliveries          = delivery-traceability: one DeliveryLink per DONE task,
+//	                     linking the hive commit that flipped it to DONE and the
+//	                     submodule commit/doc that carries its code (see delivery.go).
 type subStat struct {
 	Name               string
 	DeliveredTasks     int
@@ -36,6 +38,7 @@ type subStat struct {
 	Stranded           int
 	DeliveredPerBeePct float64
 	Models             []modelStat
+	Deliveries         []DeliveryLink
 }
 
 // modelStat is one agent model's slice of a submodule's (or the total's)
@@ -98,19 +101,22 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 	// Total-row per-model accumulators, summed across submodules.
 	totBees := map[string]int{}
 	totDelivered := map[string]int{}
+	// Resolved ONCE and shared across every submodule's delivery lookup below,
+	// so a multi-submodule /stats render pays a single `rev-parse`, not one per
+	// submodule (mirrors headSHA's own doc comment / the planView cache key).
+	head := s.headSHA(ctx)
 	for _, sm := range sms {
 		st := subStat{Name: sm.Name}
-		done := map[string]bool{}
-		if b, rerr := os.ReadFile(sm.PlanPath()); rerr == nil {
-			if p, perr := plan.Parse(string(b)); perr == nil {
-				for _, t := range p.Tasks {
-					if t.Status == plan.StatusDone {
-						done[t.ID] = true
-						st.DeliveredTasks++
-					}
-				}
-			}
+		doneIDs := doneTaskIDs(sm)
+		done := make(map[string]bool, len(doneIDs))
+		for _, id := range doneIDs {
+			done[id] = true
 		}
+		st.DeliveredTasks = len(doneIDs)
+		// delivery-traceability: link each DONE task to the hive commit that
+		// flipped it (half a) and its submodule code/doc (half b) — see
+		// delivery.go. Best-effort/read-only; never fails the page.
+		st.Deliveries = s.buildDeliveries(ctx, head, sm, doneIDs)
 		// Per-model tallies for this submodule, plus the model of each task's
 		// most-recent session (epoch then pid) so a DONE task's delivery is
 		// attributed to the model that last drove it.

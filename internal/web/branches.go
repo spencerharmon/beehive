@@ -17,15 +17,23 @@ import (
 // the docpath resolves to a real file under the submodule's docs/ dir. DocHref
 // is "" when the stamp is absent or the doc is missing, so the template shows
 // plain text instead of a dead link.
+//
+// Flip* are delivery-traceability's half (a): when DocTask names a task that is
+// DONE, they link to the HIVE superproject commit that flipped it to DONE (see
+// hiveDoneFlips/indexDeliveries in delivery.go). Both are "" when DocTask is
+// empty, the task isn't DONE, or the flip commit can't be located — never a
+// dead link, matching DocHref's own contract.
 type Commit struct {
-	SHA     string
-	Refs    string
-	Subject string
-	Author  string
-	Date    string
-	DocTask string // task id from the Beehive stamp, "" if none
-	DocPath string // change-doc path from the stamp (display), "" if none
-	DocHref string // link to view the change doc, "" if it does not resolve
+	SHA      string
+	Refs     string
+	Subject  string
+	Author   string
+	Date     string
+	DocTask  string // task id from the Beehive stamp, "" if none
+	DocPath  string // change-doc path from the stamp (display), "" if none
+	DocHref  string // link to view the change doc, "" if it does not resolve
+	FlipSHA  string // short hive commit sha that flipped DocTask to DONE, "" if not applicable/unlocated
+	FlipHref string // link to view that hive commit, "" if not applicable/unlocated
 }
 
 // Section groups one submodule's commits by date for the sectioned branch view.

@@ -17,13 +17,14 @@
 <section class="card">
 <h2>{{.Date}}</h2>
 <table>
-<tr><th>sha</th><th>refs</th><th>subject</th><th>author</th><th>change doc</th></tr>
+<tr><th>sha</th><th>refs</th><th>subject</th><th>author</th><th>change doc</th><th>delivered</th></tr>
 {{range .Commits}}<tr>
 <td><code>{{.SHA}}</code></td>
 <td>{{if .Refs}}<span class="badge">{{.Refs}}</span>{{end}}</td>
 <td>{{.Subject}}</td>
 <td class="muted">{{.Author}}</td>
 <td>{{if .DocTask}}<span class="badge">{{.DocTask}}</span> {{if .DocHref}}<a href="{{.DocHref}}">{{.DocPath}}</a>{{else}}<span class="muted">{{.DocPath}}</span>{{end}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+<td>{{if .FlipHref}}<a href="{{.FlipHref}}">hive <code>{{.FlipSHA}}</code></a>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
 </tr>{{end}}
 </table>
 </section>

@@ -6,8 +6,10 @@ than one merge, so we count the task) · <b>honeybees (🐝)</b> = one honeybee 
 <b>✅/🐝</b> = delivered tasks per honeybee · <b>stranded</b> = tasks with finished
 work on a pushed branch that never merged (recoverable — GC never drops an unmerged
 branch). Expand <b>by model</b> to compare agent models head-to-head (delivered is
-attributed to the model of a done task's most-recent session). See
-<code>docs/conflict-resolution.md</code>.</p>
+attributed to the model of a done task's most-recent session). Expand
+<b>deliveries</b> to trace a DONE task to (a) the hive commit that flipped its PLAN
+status and (b) its submodule change doc — "why is this DONE" in one click across
+both repos. See <code>docs/conflict-resolution.md</code>.</p>
 <table>
 <tr><th>submodule</th><th>delivered tasks ✅</th><th>honeybees 🐝</th><th>✅/🐝</th><th>stranded</th></tr>
 {{range .Subs}}<tr>
@@ -25,6 +27,17 @@ attributed to the model of a done task's most-recent session). See
     <td>{{.DeliveredTasks}}</td>
     <td>{{.Honeybees}}</td>
     <td>{{printf "%.1f%%" .DeliveredPerBeePct}}</td>
+  </tr>{{end}}
+  </table>
+  </details>
+</td></tr>{{end}}{{if .Deliveries}}<tr class="models"><td colspan=5>
+  <details><summary class="muted">deliveries ({{len .Deliveries}})</summary>
+  <table class="nested">
+  <tr><th>task</th><th>hive PLAN flip</th><th>submodule change doc</th></tr>
+  {{range .Deliveries}}<tr>
+    <td><span class="badge">{{.TaskID}}</span></td>
+    <td>{{if .FlipHref}}<a href="{{.FlipHref}}"><code>{{.FlipSHA}}</code></a>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+    <td>{{if .DocHref}}<a href="{{.DocHref}}">{{.DocPath}}</a>{{else if .DocPath}}<span class="muted">{{.DocPath}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
   </tr>{{end}}
   </table>
   </details>
