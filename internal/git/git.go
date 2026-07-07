@@ -426,7 +426,10 @@ func (r *Repo) LsRemoteBranch(ctx context.Context, remote, branch string) (strin
 // ancestor of, or equal to, ref). It wraps `git merge-base --is-ancestor`, which
 // exits 0 for true and 1 for false; any other exit (e.g. a bad object) is a real
 // error, never silently folded into false. Used to gate destructive source-branch
-// reclamation on "the branch is already merged into the tracked main".
+// reclamation on "the branch is already merged into the tracked main", and by the
+// review-already-merged-guard dispatch check (the symmetric counterpart to
+// CommitReachable: not just "does this commit exist somewhere" but "is it already
+// folded into the tracked branch").
 func (r *Repo) IsAncestor(ctx context.Context, maybe, ref string) (bool, error) {
 	if _, err := r.Run(ctx, "merge-base", "--is-ancestor", maybe, ref); err != nil {
 		var ee *exec.ExitError

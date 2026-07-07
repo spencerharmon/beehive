@@ -726,7 +726,12 @@ func TestReviewDispatchBouncesUnreachableCommit(t *testing.T) {
 // resolves the SPECIFIC recorded sha, not just "whatever is checked out"). The
 // guard must find it reachable via the shared module store WITHOUT attempting
 // any fetch, and dispatch the review completely normally — a session opens and
-// completes the task, byte-identical to the pre-existing behavior.
+// completes the task, byte-identical to the pre-existing behavior. It also
+// doubles as the "genuinely pending, not yet merged" case for
+// finalizeIfAlreadyMerged (which now runs first): bee-R1's tip is never merged
+// into local main here, so that guard must correctly find it NOT an ancestor
+// and fall through to this same reachable-and-dispatches-normally path — no
+// false-positive auto-DONE on real pending work.
 func TestReviewDispatchReachableLocalSharingUnchanged(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -797,6 +802,216 @@ func TestReviewDispatchReachableLocalSharingUnchanged(t *testing.T) {
 	p, _ := plan.Parse(string(b))
 	if tk := p.Find("R1"); tk == nil || tk.Status != plan.Done {
 		t.Fatalf("status = %+v, want DONE (review dispatched and approved normally)", tk)
+	}
+}
+
+// TestReviewDispatchFinalizesAlreadyMergedRemote is the review-already-merged-
+// guard's remote-mode happy path (session-audit-005 F-1, the symmetric
+// counterpart of TestReviewDispatchBouncesUnreachableCommit): the task's
+// recorded submodule pointer (bumped by a Work pass) is ALREADY an ancestor of
+// the submodule's tracked origin/main — the shape a review leaves behind when
+// it merges bee-<taskid> into tracked main and pushes (durable) but is
+// interrupted before it can commit the hive-layer half (gitlink bump + PLAN.md
+// DONE). Tracked main is deliberately pushed PAST the implementer's own commit
+// (an unrelated follow-up commit lands on top) so the assertion that the
+// gitlink advances to the CURRENT tracked tip — not merely the implementer's
+// own sha — actually proves something. The runner must finalize
+// deterministically: NEVER spawn a second review session (refusingClient fails
+// the test if Open is ever called), bump the gitlink to the tracked tip, and
+// flip the task straight to DONE with a note — regression: before this guard a
+// whole redundant review pass would be dispatched to re-discover the merge.
+func TestReviewDispatchFinalizesAlreadyMergedRemote(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	// A prior (interrupted) review already merged bee-R1 into tracked main and
+	// pushed it; an unrelated follow-up commit then also landed on tracked main
+	// (a second, already-completed approval), so the recorded (pre-merge)
+	// implementer commit is an ancestor of tracked main WITHOUT being its tip.
+	sc := filepath.Join(t.TempDir(), "push")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+		t.Fatalf("scratch clone: %v", err)
+	}
+	scg := gitConfig(t, sc)
+	os.WriteFile(filepath.Join(sc, "feature.txt"), []byte("work\n"), 0o644)
+	if err := scg.Commit(ctx, "feat: work"); err != nil {
+		t.Fatalf("commit implementer work: %v", err)
+	}
+	implSHA, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse implementer commit: %v", err)
+	}
+	// The implementer's source branch is pushed too — a real interrupted review
+	// leaves bee-R1 on origin exactly like this: reclaiming it is gated on the
+	// task reaching DONE (reclaimSourceBranch), which never happened here. This
+	// is what makes the pre-fix failure mode the RIGHT one: bounceIfUnreachable
+	// finds bee-R1 genuinely reachable and dispatches a normal (redundant)
+	// review, rather than incorrectly bouncing to NEEDS-ARBITRATION for an
+	// unrelated reason.
+	if _, err := scg.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-R1"); err != nil {
+		t.Fatalf("push bee-R1 (still unreclaimed): %v", err)
+	}
+	os.WriteFile(filepath.Join(sc, "unrelated.txt"), []byte("other\n"), 0o644)
+	if err := scg.Commit(ctx, "unrelated follow-up merge"); err != nil {
+		t.Fatalf("commit follow-up: %v", err)
+	}
+	if err := scg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push tracked main past the implementer commit: %v", err)
+	}
+	mainTip, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse pushed main tip: %v", err)
+	}
+
+	// The beehive gitlink is left at the PRE-merge recorded pointer (the
+	// implementer's own commit) — exactly the interrupted-review shape.
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+implSHA+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed pre-merge gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("an already-merged task should finalize at dispatch time, got %+v", res)
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("R1")
+	if tk == nil {
+		t.Fatal("task R1 vanished from PLAN.md")
+	}
+	if tk.Status != plan.Done {
+		t.Fatalf("status = %s, want DONE", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("finalize must release the claim")
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if !contains(joined, "already merged into tracked main") || !contains(joined, mainTip) {
+		t.Fatalf("plan body missing finalize note naming the merged tip %s:\n%s", mainTip, joined)
+	}
+	out, err := g.Run(ctx, "ls-files", "-s", "submodules/sm/repo")
+	if err != nil {
+		t.Fatalf("ls-files gitlink: %v", err)
+	}
+	if !contains(out, mainTip) {
+		t.Fatalf("gitlink = %q, want bumped to the tracked-main tip %s (not left at the implementer commit %s)", out, mainTip, implSHA)
+	}
+}
+
+// TestReviewDispatchFinalizesAlreadyMergedLocalSharing mirrors
+// TestReviewDispatchFinalizesAlreadyMergedRemote in local-sharing mode (a
+// submodule checkout with NO remote at all): the recorded pointer is already an
+// ancestor of the LOCAL tracked main branch, resolved directly with no fetch —
+// the same shared-module-store contract CommitReachable's local fast path
+// relies on (no mode flag; derived from remotes). Must finalize without ever
+// dispatching a session.
+func TestReviewDispatchFinalizesAlreadyMergedLocalSharing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	sg := gitInit(t, repoDir) // a real checkout, deliberately NO remote (local-sharing)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("base\n"), 0o644)
+	if err := sg.Commit(ctx, "base"); err != nil {
+		t.Fatalf("submodule base commit: %v", err)
+	}
+	// The prior (interrupted) review already merged bee-R1 directly into the
+	// local main branch (no push needed: this IS the tracked main, in place) —
+	// a fast-forward, so the implementer commit and the tracked tip coincide.
+	os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("work\n"), 0o644)
+	if err := sg.Commit(ctx, "feat: work"); err != nil {
+		t.Fatalf("commit implementer work: %v", err)
+	}
+	implSHA, err := sg.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatalf("rev-parse main: %v", err)
+	}
+
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+implSHA+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("an already-merged task should finalize at dispatch time even with no remote, got %+v", res)
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("R1")
+	if tk == nil || tk.Status != plan.Done {
+		t.Fatalf("status = %+v, want DONE", tk)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("finalize must release the claim")
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if !contains(joined, "already merged into tracked main") {
+		t.Fatalf("plan body missing finalize note:\n%s", joined)
+	}
+	out, err := g.Run(ctx, "ls-files", "-s", "submodules/sm/repo")
+	if err != nil {
+		t.Fatalf("ls-files gitlink: %v", err)
+	}
+	if !contains(out, implSHA) {
+		t.Fatalf("gitlink = %q, want bumped to (fast-forward) tip %s", out, implSHA)
 	}
 }
 

@@ -249,6 +249,45 @@ func TestBounceUnreachableGuardedAndRequiresReason(t *testing.T) {
 	}
 }
 
+// TestFinalizeAlreadyMerged locks the review-dispatch-side deterministic
+// finalize (session-audit-005 F-1, the symmetric counterpart to
+// BounceUnreachable): NEEDS-REVIEW -> DONE with the note recorded as a review
+// note, claim released, never touching Attempts (this completes an interrupted
+// review's bookkeeping — it is not a verdict on a fresh review).
+func TestFinalizeAlreadyMerged(t *testing.T) {
+	tk := &Task{ID: "a", Status: StatusReview, Session: "bee-1", Heartbeat: time.Now(), Attempts: 1}
+	if err := tk.FinalizeAlreadyMerged("already merged into tracked main (a02a886) by a prior interrupted review; runner-finalized DONE (no re-review)", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if tk.Status != StatusDone {
+		t.Fatalf("status = %s, want DONE", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("finalize-already-merged must release the claim")
+	}
+	if tk.Attempts != 1 {
+		t.Fatalf("attempts = %d, want unchanged (1): this is not a review rejection", tk.Attempts)
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if !strings.Contains(joined, "Review (runner-finalized): already merged into tracked main (a02a886)") {
+		t.Fatalf("body missing finalize note:\n%s", joined)
+	}
+}
+
+// TestFinalizeAlreadyMergedGuardedAndRequiresNote: only legal from
+// NEEDS-REVIEW, and always requires a concrete note (an empty note would leave
+// no record of why the task jumped straight to DONE without a review verdict).
+func TestFinalizeAlreadyMergedGuardedAndRequiresNote(t *testing.T) {
+	for _, st := range []Status{StatusTODO, StatusArb, StatusDone, StatusHuman} {
+		if err := (&Task{ID: "a", Status: st}).FinalizeAlreadyMerged("note", time.Now()); err == nil {
+			t.Fatalf("finalize-already-merged allowed on %s", st)
+		}
+	}
+	if err := (&Task{ID: "a", Status: StatusReview}).FinalizeAlreadyMerged("", time.Now()); err == nil {
+		t.Fatal("finalize-already-merged allowed with an empty note")
+	}
+}
+
 func TestRequestHuman(t *testing.T) {
 	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
 	tk := &Task{ID: "a", Status: StatusTODO, Session: "bee-1", Heartbeat: now, Body: []string{"do thing"}}

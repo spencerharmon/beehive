@@ -3,6 +3,7 @@ package claim
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -250,6 +251,117 @@ func TestBounceUnreachableGuarded(t *testing.T) {
 	c, ctx := setup(t)
 	if err := c.BounceUnreachable(ctx, "T1", "reason"); err == nil {
 		t.Fatal("bounce-unreachable on TODO must error")
+	}
+}
+
+// TestFinalizeAlreadyMergedPublishesImmediately proves FinalizeAlreadyMerged —
+// like BounceUnreachable — commits AND publishes on its own (it runs standalone
+// before any turn loop, with no later finish() to piggyback on): the DONE
+// transition AND the bumped gitlink must both reach the given Publish func
+// synchronously so a peer never re-dispatches a review against this task again.
+// The gitlink assertion is the load-bearing one: it seeds the PRE-merge
+// (stale/phantom) recorded pointer, then — mirroring exactly what
+// swarm.finalizeIfAlreadyMerged does before calling this (sync the submodule
+// checkout to the tracked tip) — makes submodules/sm/repo a REAL nested repo at
+// a NEW sha, and asserts the committed gitlink lands at that new sha, proving
+// CommitPaths read the synced checkout's actual HEAD rather than keeping (or
+// blindly overwriting via a stale cached value) the pre-merge pointer.
+func TestFinalizeAlreadyMergedPublishesImmediately(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+	g := git.New(root)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		g.Run(ctx, a...)
+	}
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= session=bee-A heartbeat=2026-01-01T00:00:00Z -->\ndo it\n"), 0o644)
+	// Seed the PRE-merge recorded gitlink at a phantom sha, as a Work pass would
+	// have left it (a commit that only ever lived on bee-T1, not yet folded into
+	// tracked main).
+	staleSHA := strings.Repeat("a", 40)
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+staleSHA+",submodules/sm/repo"); err != nil {
+		t.Fatal(err)
+	}
+	g.Commit(ctx, "seed")
+
+	wt := filepath.Join(root, ".worktrees", "bee-a")
+	if err := g.WorktreeAdd(ctx, wt, "bee-a", "main"); err != nil {
+		t.Fatal(err)
+	}
+	rp, _ := repo.Open(wt)
+	subs, _ := rp.Submodules()
+	wg := git.New(wt)
+
+	// Simulate the caller's pre-sync: this worktree's OWN private gitlink
+	// directory becomes a real nested repo at a NEW sha (standing in for "the
+	// submodule checkout hard-reset to the now-merged tracked-main tip").
+	repoDir := filepath.Join(wt, "submodules", "sm", "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sg := git.New(repoDir)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		if _, err := sg.Run(ctx, a...); err != nil {
+			t.Fatalf("init synced checkout %v: %v", a, err)
+		}
+	}
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("merged\n"), 0o644)
+	if err := sg.Commit(ctx, "merged tip"); err != nil {
+		t.Fatalf("commit synced checkout: %v", err)
+	}
+	mergedTip, err := sg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse synced checkout HEAD: %v", err)
+	}
+
+	published := false
+	c := &Claimer{
+		Repo: rp, Sub: subs[0], Git: wg, TTL: time.Hour, Session: "bee-a",
+		Publish: func(ctx context.Context) error {
+			published = true
+			return wg.PublishToMain(ctx, "")
+		},
+	}
+	note := fmt.Sprintf("already merged into tracked main (%s) by a prior interrupted review; runner-finalized DONE (no re-review)", mergedTip)
+	if err := c.FinalizeAlreadyMerged(ctx, "T1", "submodules/sm/repo", note); err != nil {
+		t.Fatalf("finalize-already-merged: %v", err)
+	}
+	if !published {
+		t.Fatal("FinalizeAlreadyMerged must publish immediately (no later finish() to rely on)")
+	}
+
+	// Read back from the ORIGINAL (main) checkout, proving the correction really
+	// reached main and not just the worktree branch.
+	mp, err := plan.Parse(mustRead(t, filepath.Join(sm, "PLAN.md")))
+	if err != nil {
+		t.Fatalf("parse main PLAN.md: %v", err)
+	}
+	tk := mp.Find("T1")
+	if tk.Status != plan.Done {
+		t.Fatalf("main status = %s, want DONE", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("finalize-already-merged must release the claim on main")
+	}
+	if joined := strings.Join(tk.Body, "\n"); !strings.Contains(joined, "already merged into tracked main") {
+		t.Fatalf("main PLAN.md missing finalize note:\n%s", joined)
+	}
+	out, err := g.Run(ctx, "ls-files", "-s", "submodules/sm/repo")
+	if err != nil {
+		t.Fatalf("ls-files main gitlink: %v", err)
+	}
+	if !strings.Contains(out, mergedTip) {
+		t.Fatalf("main gitlink = %q, want bumped to the merged tip %s (not left at the stale %s)", out, mergedTip, staleSHA)
+	}
+}
+
+// TestFinalizeAlreadyMergedGuarded: only legal from NEEDS-REVIEW.
+func TestFinalizeAlreadyMergedGuarded(t *testing.T) {
+	c, ctx := setup(t)
+	if err := c.FinalizeAlreadyMerged(ctx, "T1", "submodules/sm/repo", "note"); err == nil {
+		t.Fatal("finalize-already-merged on TODO must error")
 	}
 }
 

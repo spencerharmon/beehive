@@ -321,6 +321,49 @@ func (c *Claimer) BounceUnreachable(ctx context.Context, taskID, reason string) 
 	return nil
 }
 
+// FinalizeAlreadyMerged completes taskID's bookkeeping deterministically,
+// without spawning a review, when its recorded submodule pointer is discovered
+// already merged into the submodule's tracked main — the symmetric counterpart
+// to BounceUnreachable (see plan.Task.FinalizeAlreadyMerged and
+// swarm.finalizeIfAlreadyMerged, the review-dispatch guard that calls this).
+// gitlinkPath is the beehive-repo path of the submodule's gitlink
+// (submodules/<sm>/repo); the CALLER is responsible for having already synced
+// that submodule checkout's own HEAD to the tracked-main tip it wants recorded
+// (mirroring syncWorktreeBase) BEFORE calling this — CommitPaths stages a
+// gitlink by reading the nested checkout's actual current HEAD, so committing
+// against a checkout that has NOT been moved to the intended tip would silently
+// record the checkout's stale HEAD instead. Transitions the task to DONE with
+// note, commits BOTH paths (PLAN.md and the gitlink) in one commit, and — like
+// BounceUnreachable — commits AND publishes immediately: this runs standalone
+// before any turn loop or session exists, so there is no later finish() to
+// piggyback the publish on. A publish conflict is benign (a peer already
+// resolved this exact task) and is swallowed, matching BounceUnreachable/Release.
+func (c *Claimer) FinalizeAlreadyMerged(ctx context.Context, taskID, gitlinkPath, note string) error {
+	p, err := c.load()
+	if err != nil {
+		return err
+	}
+	t := p.Find(taskID)
+	if t == nil {
+		return fmt.Errorf("finalize-already-merged: task %q absent", taskID)
+	}
+	if err := t.FinalizeAlreadyMerged(note, c.now()); err != nil {
+		return err
+	}
+	if err := c.save(p); err != nil {
+		return err
+	}
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "finalize-already-merged"), c.planRel(), gitlinkPath); err != nil && err != git.ErrNothing {
+		return err
+	}
+	if c.Publish != nil {
+		if err := c.Publish(ctx); err != nil && !errors.Is(err, git.ErrConflict) {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- Singleton locks (bootstrap / reconcile) -------------------------------
 //
 // Bootstrap and ROI-reconcile operate on PLAN.md as a whole and carry no task

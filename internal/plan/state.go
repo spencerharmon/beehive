@@ -142,6 +142,37 @@ func (t *Task) BounceUnreachable(reason string) error {
 	return nil
 }
 
+// FinalizeAlreadyMerged moves a NEEDS-REVIEW task straight to DONE,
+// deterministically and without ever spawning a review session, when its
+// recorded submodule pointer commit is discovered to already be an ancestor of
+// the submodule's tracked main — the SYMMETRIC counterpart to
+// BounceUnreachable (session-audit-005 F-1). A review's two effects are not
+// atomic: it (1) merges bee-<taskid> into the submodule's tracked main and
+// pushes (durable, irreversible), then (2) commits the hive-layer bookkeeping
+// (gitlink bump + this transition). Interrupted between them, the code is
+// merged-and-done at origin while the task still reads NEEDS-REVIEW at the
+// pre-merge pointer; dispatching a whole second review to re-discover an
+// already-landed merge wastes a full session on bookkeeping. Ancestry-of-main
+// can only follow a PRIOR approved-review merge (submodule main advances only
+// via approved reviews), so auto-finalizing is safe: it completes interrupted
+// bookkeeping, it never approves anything itself. note is appended as a body
+// line in the same free-form convention BounceUnreachable/Strand use. Valid
+// only from NEEDS-REVIEW. Releases the active claim.
+func (t *Task) FinalizeAlreadyMerged(note string, now time.Time) error {
+	if t.Status != StatusReview {
+		return fmt.Errorf("plan: finalize-already-merged on non-NEEDS-REVIEW task %s (%s)", t.ID, t.Status)
+	}
+	note = oneLine(note)
+	if note == "" {
+		return fmt.Errorf("plan: finalize-already-merged for %s requires a note", t.ID)
+	}
+	t.Status = StatusDone
+	t.Session = ""
+	t.Heartbeat = time.Time{}
+	t.appendNote("Review (runner-finalized): " + note)
+	return nil
+}
+
 // appendNote appends line as a new task body line, inserting a blank-line
 // separator first when the body is non-empty and does not already end on a
 // blank line — the same spacing setHumanReason uses when it first adds its

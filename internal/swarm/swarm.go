@@ -582,6 +582,31 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 	}
 
+	// Review-dispatch-side already-merged guard (session-audit-005 F-1; the
+	// symmetric counterpart to the reachability guard below): before ever
+	// opening a session for a NEEDS-REVIEW task, check whether its recorded
+	// implementer commit is ALREADY an ancestor of the submodule's tracked
+	// main. That shape can only follow a PRIOR review that merged bee-<taskid>
+	// into tracked main and pushed (durable) but was interrupted before it
+	// could commit the hive-layer half (gitlink bump + PLAN.md DONE) — spawning
+	// a whole second review would only re-discover the already-landed merge.
+	// Finalize deterministically instead, with zero agent turns spent. Fails
+	// OPEN (falls through to dispatch normally) on any uncertainty, exactly
+	// like bounceIfUnreachable.
+	if sel.Kind == selectt.Review {
+		finalized, ferr := r.finalizeIfAlreadyMerged(ctx, sel, absRoot)
+		if ferr != nil && r.Debug != nil {
+			fmt.Fprintf(r.Debug, "[honeybee] already-merged pre-check for %s failed; dispatching review normally: %v\n", sel.Task.ID, ferr)
+		}
+		if finalized {
+			res.Completed = true
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] %s implementer commit already merged into tracked main; runner-finalized DONE without spawning a review\n", sel.Task.ID)
+			}
+			return res, nil
+		}
+	}
+
 	// Review-dispatch-side reachability guard (session-audit-003 F-LIVE): before
 	// ever opening a session for a NEEDS-REVIEW task, verify its implementer
 	// branch/commit is reachable somewhere this host can see. A task set
@@ -1822,6 +1847,114 @@ func (r *Runner) demoteUnpushed(ctx context.Context, sel *selectt.Selection, rea
 		return false, err
 	}
 	if err := r.publish(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// finalizeIfAlreadyMerged is the Review-dispatch-side SYMMETRIC counterpart to
+// bounceIfUnreachable (session-audit-005 F-1): a review's two effects are not
+// atomic — it (1) merges bee-<taskid> into the submodule's tracked main and
+// pushes (durable, irreversible), then (2) commits the hive-layer bookkeeping
+// (gitlink bump + PLAN.md NEEDS-REVIEW -> DONE) for the runner to land.
+// Interrupted between them, the code is merged-and-DONE at origin while the
+// hive PLAN still reads NEEDS-REVIEW at the PRE-merge pointer, so the runner
+// re-selects the task and spawns a WHOLE second review just to re-discover the
+// merge (observed live: delivery-traceability's review re-fetched/re-tested/
+// re-diffed an already-merged task to byte-identity across 58 turns, only to
+// flip DONE). bounceIfUnreachable handles the OPPOSITE shape (recorded pointer
+// reachable NOWHERE); here the pointer IS an ancestor of tracked main, so that
+// guard correctly does not fire and a redundant review would be dispatched
+// instead — this guard closes that gap.
+//
+// Resolves the task's recorded submodule pointer identically to
+// bounceIfUnreachable (`git rev-parse HEAD:submodules/<sm>/repo` on this
+// honeybee's own freshly branched worktree — the exact commit a Work pass
+// bumped the gitlink to), then checks git.Repo.IsAncestor against the
+// submodule's tracked branch: origin/<branch> in remote mode (fetched fresh),
+// or the local <branch> ref directly in local-sharing mode (a shared checkout
+// with no remote — no mode flag, derived from remotes exactly like
+// bounceIfUnreachable/CommitReachable). Submodule main only ever advances via
+// an APPROVED review merge, so ancestry-of-main can only follow a prior
+// approval: auto-finalizing is safe — it completes interrupted bookkeeping, it
+// never approves anything itself, and it never fires on genuinely pending work
+// (not yet an ancestor). On a positive match it syncs THIS pass's own private
+// submodule checkout to the tracked branch's current tip (git.Repo.HardReset,
+// mirroring syncWorktreeBase) and transitions the task straight to DONE with a
+// terse note via Claimer.FinalizeAlreadyMerged, whose CommitPaths bumps the
+// beehive-layer gitlink by reading that now-synced checkout HEAD (a gitlink
+// staged any other way, e.g. `update-index --cacheinfo` without moving the
+// checkout, is silently overwritten the moment anything re-`git add`s the
+// path) and commits AND publishes immediately, mirroring BounceUnreachable —
+// this runs before any session/turn loop exists.
+//
+// Returns finalized=true only once that correction has actually landed. Any
+// uncertainty (no recorded gitlink to check, the submodule checkout cannot be
+// initialized here, a configured remote errors reaching it, or the ancestry
+// check itself errors — e.g. the recorded sha does not even exist locally,
+// bounceIfUnreachable's shape, not this guard's) returns (false, err): the
+// caller falls through to the reachability guard / normal dispatch rather than
+// risk a false finalize of a genuinely pending review.
+func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selection, absRoot string) (bool, error) {
+	repoDir := sel.Submodule.RepoDir()
+	rel, err := filepath.Rel(absRoot, repoDir)
+	if err != nil {
+		return false, err
+	}
+	sha, err := r.Git.RevParse(ctx, "HEAD:"+rel)
+	if err != nil {
+		return false, fmt.Errorf("resolve submodule %s pointer: %w", sel.Submodule.Name, err)
+	}
+	if !isSourceCheckout(ctx, repoDir) {
+		if _, err := r.Git.Run(ctx, "submodule", "update", "--init", "--", rel); err != nil {
+			return false, err
+		}
+	}
+	if !isSourceCheckout(ctx, repoDir) {
+		return false, fmt.Errorf("submodule %s not checked out at %s", sel.Submodule.Name, repoDir)
+	}
+	sg := git.New(repoDir)
+	rem, err := sg.Remote(ctx)
+	if err != nil {
+		return false, err
+	}
+	tracked := r.trackedBranch(ctx, rel)
+	trackedRef := tracked
+	if rem != "" {
+		if err := sg.Fetch(ctx, rem, tracked); err != nil {
+			return false, err
+		}
+		trackedRef = rem + "/" + tracked
+	}
+	merged, err := sg.IsAncestor(ctx, sha, trackedRef)
+	if err != nil || !merged {
+		return false, err
+	}
+	// The recorded pointer is already folded into tracked main: sync THIS pass's
+	// own (private, per-pass) submodule checkout to that tip — exactly
+	// syncWorktreeBase's pattern — so the beehive-layer gitlink bump below
+	// (Claimer.FinalizeAlreadyMerged -> CommitPaths) reads the checkout's real,
+	// now-matching HEAD. Staging a gitlink any other way (e.g. directly via
+	// `update-index --cacheinfo` without moving the checkout) is silently
+	// overwritten the moment anything re-`git add`s the path, because git always
+	// re-reads a live nested checkout's OWN HEAD when staging its gitlink —
+	// there is no such thing as a gitlink stage that survives independent of the
+	// checkout's actual state.
+	if err := sg.HardReset(ctx, trackedRef); err != nil {
+		return false, fmt.Errorf("sync submodule %s to %s: %w", sel.Submodule.Name, trackedRef, err)
+	}
+	tip, err := sg.RevParse(ctx, "HEAD")
+	if err != nil {
+		return false, err
+	}
+	note := fmt.Sprintf(
+		"already merged into tracked %s (%s) by a prior interrupted review; runner-finalized DONE (no re-review)",
+		tracked, tip)
+	cl := &claim.Claimer{
+		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
+		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
+	}
+	if err := cl.FinalizeAlreadyMerged(ctx, sel.Task.ID, rel, note); err != nil {
 		return false, err
 	}
 	return true, nil
