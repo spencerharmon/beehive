@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/spencerharmon/beehive/internal/audit"
+	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spf13/cobra"
@@ -49,6 +51,19 @@ func auditCmd() *cobra.Command {
 			sessions, census, perr := parseSessions(sessDir)
 			if perr != nil {
 				return perr
+			}
+			// Classify each stub's stream branch as CONFIRMED gone (resolves
+			// nowhere) or not, so CorpusBroken can exempt permanently
+			// un-finalizable stubs from its window/fraction math. Skipped
+			// entirely when there are no stubs (no git call needed). Only the
+			// coordination repo (root) is ever consulted here — never a
+			// target's repo/ checkout.
+			if census.StubCount() > 0 {
+				g := git.New(root)
+				remote, _ := g.Remote(cmd.Context())
+				audit.ClassifyStubs(&census, func(branch string) string {
+					return resolveSessionBranch(cmd.Context(), g, remote, branch)
+				})
 			}
 			delivered, err := deliveredSet(sm)
 			if err != nil {
@@ -91,6 +106,23 @@ func auditCmd() *cobra.Command {
 	c.Flags().StringVar(&submodule, "submodule", "", "submodule to audit (default: the only one)")
 	c.Flags().BoolVar(&write, "write", false, "append this pass to the docs/audit ledger")
 	return c
+}
+
+// resolveSessionBranch mirrors internal/swarm/sweep.go's private resolveRef
+// closure EXACTLY (refs/heads/<branch> then refs/remotes/<remote>/<branch>,
+// against the PRIMARY coordination repo g — never a target's repo/ checkout)
+// so audit's GoneBranch classification and the finalize sweep never drift on
+// what counts as a gone branch. Returns "" when branch resolves nowhere.
+func resolveSessionBranch(ctx context.Context, g *git.Repo, remote, branch string) string {
+	if _, err := g.RevParse(ctx, "refs/heads/"+branch); err == nil {
+		return "refs/heads/" + branch
+	}
+	if remote != "" {
+		if _, err := g.RevParse(ctx, "refs/remotes/"+remote+"/"+branch); err == nil {
+			return "refs/remotes/" + remote + "/" + branch
+		}
+	}
+	return ""
 }
 
 // parseSessions runs the corpus census over sessDir and returns the finalized
@@ -172,10 +204,15 @@ func printCensus(c audit.Census) {
 		strconv.Itoa(c.ErrorCount()), strconv.FormatFloat(c.MineableFraction(), 'f', 3, 64),
 	}, "\t"))
 	if c.StubCount() > 0 {
-		fmt.Println("# unfinalized stubs (sid, branch)")
-		fmt.Println(strings.Join([]string{"sid", "branch"}, "\t"))
+		// gone is the ClassifyStubs verdict (see resolveSessionBranch): true
+		// means the stub's stream branch is CONFIRMED to resolve nowhere, so
+		// it is permanently un-finalizable, not a live or growing defect.
+		// Every stub stays listed here — reporting only, nothing pruned — even
+		// though CorpusBroken (below) exempts gone stubs from its math.
+		fmt.Println("# unfinalized stubs (sid, branch, gone)")
+		fmt.Println(strings.Join([]string{"sid", "branch", "gone"}, "\t"))
 		for _, s := range c.Stubs {
-			fmt.Println(strings.Join([]string{s.SID, s.Branch}, "\t"))
+			fmt.Println(strings.Join([]string{s.SID, s.Branch, strconv.FormatBool(s.GoneBranch)}, "\t"))
 		}
 	}
 }

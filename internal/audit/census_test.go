@@ -171,6 +171,27 @@ func mkCensus(finalized, stubs, errs int) Census {
 	return c
 }
 
+// mkCensusGone builds a Census like mkCensus but splits its stubs between live
+// (GoneBranch == false) and gone (GoneBranch == true), so CorpusBroken's
+// gone-stub exemption math (NonGoneStubCount) can be exercised directly,
+// without a coordination repo or ClassifyStubs.
+func mkCensusGone(finalized, live, gone, errs int) Census {
+	c := Census{}
+	for i := 0; i < finalized; i++ {
+		c.Sessions = append(c.Sessions, Session{ID: fmt.Sprintf("f%d", i)})
+	}
+	for i := 0; i < live; i++ {
+		c.Stubs = append(c.Stubs, Stub{SID: fmt.Sprintf("live%d", i), Branch: fmt.Sprintf("live-branch-%d", i)})
+	}
+	for i := 0; i < gone; i++ {
+		c.Stubs = append(c.Stubs, Stub{SID: fmt.Sprintf("gone%d", i), Branch: fmt.Sprintf("gone-branch-%d", i), GoneBranch: true})
+	}
+	for i := 0; i < errs; i++ {
+		c.Errors = append(c.Errors, fmt.Errorf("e%d", i))
+	}
+	return c
+}
+
 // TestCensusMineableMath pins the census arithmetic, including the empty-dir edge
 // (defined as fully mineable so a genuinely empty sessions dir never warns).
 func TestCensusMineableMath(t *testing.T) {
@@ -362,5 +383,99 @@ func TestCorpusWarningMixedNamesBoth(t *testing.T) {
 		if !strings.Contains(w, want) {
 			t.Errorf("mixed warning missing %q:\n%s", want, w)
 		}
+	}
+}
+
+// TestCorpusBrokenGoneStubsExempt is the binding acceptance for
+// audit-gone-stub-exempt (session-audit-006 Finding #2): a stub CONFIRMED
+// permanently gone (its stream branch resolves nowhere) must never be able to
+// trip CorpusBroken on a future genuinely-rested window purely because the
+// dead file still exists — mirroring the real corpus, which held EXACTLY 99
+// such legacy stubs stable across three passes while zero errors occurred. A
+// single NEW live (non-gone) stub alongside the 99 gone ones must still flag
+// exactly as before (no regression on the guard's original purpose), and a
+// mixed gone+live corpus whose LIVE-only fraction falls below threshold must
+// still flag even with a non-empty window.
+func TestCorpusBrokenGoneStubsExempt(t *testing.T) {
+	// All 99 stubs confirmed gone, empty window, zero errors: the exact false
+	// alarm this task diagnosed (regression: today CorpusBroken(true) == true,
+	// CorpusWarning prints the "corpus broken" banner over dead files).
+	allGone := mkCensusGone(801, 0, 99, 0)
+	if allGone.CorpusBroken(true) {
+		t.Error("all-gone stubs + empty window + zero errors wrongly flagged broken (the false-alarm-on-a-rest case this task closes)")
+	}
+	if w := allGone.CorpusWarning(true); w != "" {
+		t.Errorf("all-gone stubs + empty window warning=%q want \"\" (byte-stable, no false alarm)", w)
+	}
+
+	// One NEW live stub alongside the 99 gone ones, window still empty: the
+	// guard's ORIGINAL purpose (an unfinalized live stream during a claimed
+	// rest) must still fire — the gone exemption must not swallow a real
+	// defect just because dead stubs are also present.
+	oneLive := mkCensusGone(801, 1, 99, 0)
+	if !oneLive.CorpusBroken(true) {
+		t.Error("one live stub among 99 gone + empty window must still flag (no regression on the guard's original purpose)")
+	}
+	if w := oneLive.CorpusWarning(true); w == "" {
+		t.Error("one live stub among 99 gone + empty window must still print the corpus-broken banner")
+	}
+
+	// Mixed gone+live where the LIVE-only fraction is below threshold, window
+	// NOT empty: must still flag via the fraction branch (3 finalized / (3
+	// live + 3 finalized) = 0.5... use asymmetric counts so it is strictly
+	// below LowMineableFraction regardless of how the gone stubs are counted).
+	mixed := mkCensusGone(3, 5, 50, 0) // live-only fraction 3/(3+5) = 0.375 < 0.5
+	if !mixed.CorpusBroken(false) {
+		t.Error("mixed gone+live with non-gone-only fraction below threshold must still flag")
+	}
+
+	// Symmetric sanity check: mixed gone+live whose LIVE-only fraction is AT
+	// the threshold, non-empty window, stays silent — the gone exemption must
+	// not itself manufacture a NEW false positive at the boundary.
+	atThreshold := mkCensusGone(5, 5, 40, 0) // live-only fraction 5/(5+5) = 0.5 == threshold
+	if atThreshold.CorpusBroken(false) {
+		t.Error("mixed gone+live with non-gone-only fraction exactly at threshold must not flag")
+	}
+}
+
+// TestClassifyStubs is the binding acceptance for the resolver wiring: it must
+// classify GoneBranch per the SAME two-step resolution order
+// internal/swarm/sweep.go's resolveRef uses — refs/heads/<branch> first, then
+// refs/remotes/<remote>/<branch>, else gone — so cmd/beehive/cmd_audit.go's
+// git-backed BranchResolver and the finalize sweep never disagree on what
+// counts as a gone branch.
+func TestClassifyStubs(t *testing.T) {
+	c := Census{Stubs: []Stub{
+		{SID: "s-heads", Branch: "resolves-via-heads"},
+		{SID: "s-remote", Branch: "resolves-via-remote"},
+		{SID: "s-gone", Branch: "resolves-nowhere"},
+	}}
+	resolve := func(branch string) string {
+		switch branch {
+		case "resolves-via-heads":
+			return "refs/heads/" + branch
+		case "resolves-via-remote":
+			return "refs/remotes/origin/" + branch
+		default:
+			return ""
+		}
+	}
+	ClassifyStubs(&c, resolve)
+	want := map[string]bool{"s-heads": false, "s-remote": false, "s-gone": true}
+	for _, s := range c.Stubs {
+		if s.GoneBranch != want[s.SID] {
+			t.Errorf("stub %s GoneBranch=%v want %v", s.SID, s.GoneBranch, want[s.SID])
+		}
+	}
+}
+
+// TestClassifyStubsNilResolver pins the safe no-op: without a resolver (e.g. a
+// caller with no coordination-repo access), every stub keeps GoneBranch ==
+// false, so CorpusBroken behaves exactly as it did before this field existed.
+func TestClassifyStubsNilResolver(t *testing.T) {
+	c := Census{Stubs: []Stub{{SID: "s", Branch: "whatever"}}}
+	ClassifyStubs(&c, nil)
+	if c.Stubs[0].GoneBranch {
+		t.Error("nil resolver must not classify anything gone")
 	}
 }
