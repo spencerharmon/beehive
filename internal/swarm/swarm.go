@@ -276,9 +276,29 @@ func (r *Runner) finalizeSession(ctx context.Context, sid, rel, stub string) err
 	if r.SessionGit == nil || stub == "" {
 		return nil
 	}
-	// Collapse stub..HEAD into one commit: --soft keeps the final file staged.
-	if _, err := r.SessionGit.Run(ctx, "reset", "--soft", stub); err != nil {
+	// Collapse stub..HEAD into a single transcript commit that leaves a CLEAN tree.
+	//
+	// startSession already published the stub to main, so main may have advanced
+	// (peer sessions/work) and the earlier SessionPublish merged that advance back
+	// onto this branch — HEAD can be a merge commit whose tree carries main's other
+	// files. A `reset --soft stub` rewinds PAST that merge while leaving its content
+	// staged; a pathspec commit of only `rel` then strands the rest as uncommitted
+	// residue, and the subsequent publish's `merge main` is REFUSED ("local changes
+	// would be overwritten") — reported as a bare/none conflict. That is the
+	// regression that left 96% of sessions as stubs on main. Rebuild the tree
+	// explicitly instead: capture the streamed tip, hard-reset to the stub (a
+	// pristine projection of main-at-session-start), then restore ONLY the transcript
+	// from the tip. The result is stub-tree + transcript and nothing else, so the
+	// publish cleanly re-merges the advanced main with no working-tree clash.
+	tip, err := r.SessionGit.RevParse(ctx, "HEAD")
+	if err != nil {
+		return fmt.Errorf("resolve session branch tip: %w", err)
+	}
+	if _, err := r.SessionGit.Run(ctx, "reset", "--hard", stub); err != nil {
 		return fmt.Errorf("reset session branch to stub: %w", err)
+	}
+	if _, err := r.SessionGit.Run(ctx, "checkout", tip, "--", rel); err != nil {
+		return fmt.Errorf("restore final transcript onto stub: %w", err)
 	}
 	if err := r.SessionGit.CommitPaths(ctx, "session: "+sid+"\n\nBeehive: session "+sid, rel); err != nil && err != git.ErrNothing {
 		return fmt.Errorf("commit final session transcript: %w", err)

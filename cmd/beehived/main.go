@@ -9,6 +9,9 @@ import (
 	"net/http"
 
 	"github.com/spencerharmon/beehive/internal/config"
+	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/swarm"
 	"github.com/spencerharmon/beehive/internal/web"
 )
 
@@ -40,9 +43,49 @@ func main() {
 	if err := s.RecoverEditors(context.Background()); err != nil {
 		log.Printf("editor recovery: %v", err)
 	}
+	// Also finish any session transcripts a failed finalize left as stubs on main
+	// while their real transcript sits on a kept stream branch (the finalize
+	// regression's backlog), for every served repo. Idempotent and best-effort: it
+	// promotes only what it can source from a surviving branch, never fabricates,
+	// and never stops the daemon from serving.
+	for _, e := range reg.Repos {
+		sweepSessions(context.Background(), e.Root)
+	}
 	if names := reg.Names(); len(names) > 1 {
 		log.Printf("beehived: serving %d repos %v; default active %q (switch via POST /repo/{name})", len(names), names, names[0])
 	}
 	log.Printf("beehived listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, s.Routes()))
+}
+
+// sweepSessions promotes to main any finished session transcript still stranded as
+// a stub there (a failed finalize left the transcript on its stream branch). It is
+// startup housekeeping like RecoverEditors: best-effort, never fatal, and it runs
+// the sweep against a served repo root, deriving the sharing mode (remote vs
+// local) from the repo's own remotes exactly as a honeybee does.
+func sweepSessions(ctx context.Context, root string) {
+	r, err := repo.Open(root)
+	if err != nil {
+		log.Printf("session sweep: open repo %s: %v", root, err)
+		return
+	}
+	subs, err := r.Submodules()
+	if err != nil {
+		log.Printf("session sweep: list submodules for %s: %v", root, err)
+		return
+	}
+	g := git.New(root)
+	remote, err := g.Remote(ctx)
+	if err != nil {
+		log.Printf("session sweep: resolve remote for %s: %v", root, err)
+		return
+	}
+	res, err := swarm.SweepSessionTranscripts(ctx, g, subs, remote)
+	if err != nil {
+		log.Printf("session sweep %s: %v (%s)", root, err, res.Summary())
+		return
+	}
+	if !res.Empty() {
+		log.Printf("session sweep %s: %s", root, res.Summary())
+	}
 }
