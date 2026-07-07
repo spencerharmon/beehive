@@ -127,7 +127,11 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   as "not done".
 - Commit the code on branch `bee-<taskid>` with the `Beehive: <taskid> <doc-path>` stamp and ensure that
   commit is PUSHED to the submodule's origin (an unpushed commit dangles the pointer for every other
-  host). Bump the submodule pointer.
+  host). Bump the submodule pointer: from the beehive-layer worktree (never `submodules/<sm>/repo`
+  itself), run `git update-index --cacheinfo 160000,<your-new-commit-sha>,submodules/<sm>/repo`, then
+  stage and commit it alongside `PLAN.md` and the doc. This only rewrites the gitlink INDEX entry — each
+  beehive-layer worktree already has its own private, worktree-local submodule checkout, so this is NOT
+  the forbidden "write to the shared checkout".
 - Flip the `PLAN.md` task `TODO → NEEDS-REVIEW` on main and commit.
 
 ## Review task
