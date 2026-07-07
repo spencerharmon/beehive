@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -190,20 +191,23 @@ func buildModelStats(bees, delivered map[string]int) []modelStat {
 	return out
 }
 
-// strandedCount counts bee-<task> branches ahead of the submodule's pull target
-// that carry the task's completion stamp but whose task isn't DONE — finished
-// work whose merge never landed. Best-effort: any git error yields 0 for that
-// submodule rather than failing the page.
-func strandedCount(ctx context.Context, g *git.Repo, done map[string]bool) int {
+// strandedTaskSet returns the SET of task ids whose bee-<task> branch is ahead
+// of the submodule's pull target and carries that task's completion stamp,
+// while the task itself isn't DONE — finished work whose merge never landed.
+// Best-effort: any git error yields an empty set for that submodule rather
+// than failing the page. Split out from strandedCount (which just counts it)
+// so stats-filter-groupby's grouped view can attribute EACH stranded task to
+// its tag tuple, the same way delivered tasks already are.
+func strandedTaskSet(ctx context.Context, g *git.Repo, done map[string]bool) map[string]bool {
 	ref := "main"
 	if _, err := g.RevParse(ctx, "origin/main"); err == nil {
 		ref = "origin/main"
 	}
 	out, err := g.Run(ctx, "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/bee-*")
 	if err != nil {
-		return 0
+		return nil
 	}
-	n := 0
+	set := map[string]bool{}
 	for _, br := range strings.Fields(out) {
 		i := strings.Index(br, "/bee-")
 		if i < 0 {
@@ -219,19 +223,331 @@ func strandedCount(ctx context.Context, g *git.Repo, done map[string]bool) int {
 		tr, _ := g.Run(ctx, "log", ref+".."+br, "--format=%(trailers:key=Beehive,valueonly)")
 		for _, line := range strings.Split(tr, "\n") {
 			if f := strings.Fields(line); len(f) > 0 && f[0] == task {
-				n++
+				set[task] = true
 				break
 			}
 		}
 	}
-	return n
+	return set
 }
 
-func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
-	subs, total, err := s.computeStats(r.Context())
+// strandedCount counts bee-<task> branches ahead of the submodule's pull target
+// that carry the task's completion stamp but whose task isn't DONE — finished
+// work whose merge never landed. Best-effort: any git error yields 0 for that
+// submodule rather than failing the page.
+func strandedCount(ctx context.Context, g *git.Repo, done map[string]bool) int {
+	return len(strandedTaskSet(ctx, g, done))
+}
+
+// tagFilter is one FILTER BAR chip: an ANDed `tag=value` equality test over a
+// session's resolved tags (sessionTags). Composed by the operator through
+// separate key/value inputs (never a query string to type) but always
+// canonicalized to the `filter=key=value` URL shape (buildStatsURL), so the
+// FILTER BAR stays shareable/bookmarkable.
+type tagFilter struct {
+	Key, Value string
+}
+
+// filterChip is one rendered FILTER BAR entry: the chip's key/value plus the
+// href that removes JUST this chip — every OTHER active filter and the current
+// group-by selection carried through unchanged — so removing a chip is a
+// single plain link, no JS, no partial-state loss.
+type filterChip struct {
+	Key, Value string
+	RemoveHref string
+}
+
+// groupStat is one row of the /stats filter+group-by view: the resolved tag
+// VALUE for each key in the request's group-by key list (Values, aligned by
+// index with the top-level GroupBy key list the template renders as column
+// headers), plus the same delivered/honeybee/stranded figures the default
+// view shows — computed ONLY over sessions that pass every filter chip
+// (matchesFilters) and attributed to this row's exact tag tuple.
+type groupStat struct {
+	Values             []string
+	DeliveredTasks     int
+	Honeybees          int
+	Stranded           int
+	DeliveredPerBeePct float64
+}
+
+func (g *groupStat) derive() {
+	if g.Honeybees > 0 {
+		g.DeliveredPerBeePct = 100 * float64(g.DeliveredTasks) / float64(g.Honeybees)
+	}
+}
+
+// matchesFilters reports whether tags satisfies EVERY filter chip (AND, never
+// OR): a filter whose key is absent from tags reads as "" (sessionTags never
+// stores an empty value), so it fails any filter with a non-empty Value —
+// exactly the "unknown tag key or value yields an empty group" contract, with
+// no special-casing needed here.
+func matchesFilters(tags map[string]string, filters []tagFilter) bool {
+	for _, f := range filters {
+		if tags[f.Key] != f.Value {
+			return false
+		}
+	}
+	return true
+}
+
+// tagValues resolves keys against tags in order, "" for any key a session's
+// tag set omits — the group-by tuple a session is attributed to.
+func tagValues(tags map[string]string, keys []string) []string {
+	vals := make([]string, len(keys))
+	for i, k := range keys {
+		vals[i] = tags[k]
+	}
+	return vals
+}
+
+// computeGroupedStats computes the /stats filter+group-by view: delivered
+// ✅/honeybees 🐝/✅ per 🐝/stranded aggregated per DISTINCT group-by tag
+// tuple, over ONLY the sessions that pass every filter chip (ANDed equality on
+// sessionTags, matchesFilters). Sessions are pooled across EVERY submodule —
+// group-by is free to name `submodule` itself as one of its keys, so a global
+// comparison ("opus vs sonnet on reviews", group-by=model with no submodule
+// key) and a per-target breakdown (group-by=submodule,model) are the exact
+// same mechanism, just a different key list. groupBy may be empty: every
+// surviving session then collapses into the single "" tuple (a filtered
+// aggregate with no breakdown — the filter-only, no-group-by case). An unknown
+// tag key/value simply matches no session, yielding zero rows — never an
+// error.
+//
+// Task attribution mirrors computeStats' own by-model logic exactly, just
+// keyed by the resolved tuple instead of hardcoded to model: for each task,
+// find its LATEST (by epoch then pid) session that survives the filter, and
+// credit that task's delivered/stranded status to THAT session's tuple. A task
+// with no filter-surviving session is attributed nowhere (correctly absent
+// from a kind=review view if none of its sessions were review passes).
+func (s *Server) computeGroupedStats(ctx context.Context, filters []tagFilter, groupBy []string) ([]groupStat, error) {
+	sms, err := s.repo.Submodules()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return nil, err
+	}
+	type latest struct {
+		epoch, pid int
+		tuple      string
+	}
+	rows := map[string]*groupStat{}
+	var order []string
+	rowFor := func(vals []string) *groupStat {
+		key := strings.Join(vals, "\x1f")
+		gs, ok := rows[key]
+		if !ok {
+			gs = &groupStat{Values: append([]string(nil), vals...)}
+			rows[key] = gs
+			order = append(order, key)
+		}
+		return gs
+	}
+	for _, sm := range sms {
+		doneIDs := doneTaskIDs(sm)
+		done := make(map[string]bool, len(doneIDs))
+		for _, id := range doneIDs {
+			done[id] = true
+		}
+		stranded := strandedTaskSet(ctx, git.New(sm.RepoDir()), done)
+		taskLatest := map[string]latest{}
+		ents, rerr := os.ReadDir(sm.SessionsDir())
+		if rerr != nil {
+			continue
+		}
+		for _, e := range ents {
+			if !strings.HasSuffix(e.Name(), ".md") {
+				continue
+			}
+			stem := strings.TrimSuffix(e.Name(), ".md")
+			m := sessionNameRE.FindStringSubmatch(stem)
+			if m == nil {
+				continue
+			}
+			tags := s.sessionTags(sessionRef{submodule: sm.Name, path: filepath.Join(sm.SessionsDir(), e.Name())})
+			if !matchesFilters(tags, filters) {
+				continue
+			}
+			vals := tagValues(tags, groupBy)
+			rowFor(vals).Honeybees++
+			task := m[1]
+			epoch, _ := strconv.Atoi(m[2])
+			pid, _ := strconv.Atoi(m[3])
+			tuple := strings.Join(vals, "\x1f")
+			if cur, ok := taskLatest[task]; !ok || epoch > cur.epoch || (epoch == cur.epoch && pid > cur.pid) {
+				taskLatest[task] = latest{epoch, pid, tuple}
+			}
+		}
+		for task, l := range taskLatest {
+			row := rows[l.tuple]
+			if done[task] {
+				row.DeliveredTasks++
+			}
+			if stranded[task] {
+				row.Stranded++
+			}
+		}
+	}
+	out := make([]groupStat, 0, len(order))
+	for _, key := range order {
+		rows[key].derive()
+		out = append(out, *rows[key])
+	}
+	// Stable, deterministic render order: lexicographic by the tuple's own
+	// values (independent of submodule iteration/map order).
+	sort.Slice(out, func(i, j int) bool {
+		for k := range out[i].Values {
+			if out[i].Values[k] != out[j].Values[k] {
+				return out[i].Values[k] < out[j].Values[k]
+			}
+		}
+		return false
+	})
+	return out, nil
+}
+
+// parseFilters extracts every `filter=key=value` query param as an ANDed
+// FILTER BAR chip. A malformed chip (no `=`, or an empty key) is dropped
+// rather than erroring — there is no query-expression language, only
+// composable k=v equality chips.
+func parseFilters(r *http.Request) []tagFilter {
+	var out []tagFilter
+	for _, raw := range r.URL.Query()["filter"] {
+		i := strings.Index(raw, "=")
+		if i <= 0 {
+			continue
+		}
+		out = append(out, tagFilter{Key: raw[:i], Value: raw[i+1:]})
+	}
+	return out
+}
+
+// parseGroupBy extracts the GROUP-BY tag key list. It accepts both the
+// canonical single comma-separated param (`group-by=model,submodule`, the
+// shareable-URL shape from the docs example) and repeated params
+// (`group-by=model&group-by=submodule`, what a plain HTML checkbox group
+// posts with no JS) — either shape, or a mix of both, yields the same
+// ordered, de-duplicated key list.
+func parseGroupBy(r *http.Request) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, raw := range r.URL.Query()["group-by"] {
+		for _, k := range strings.Split(raw, ",") {
+			k = strings.TrimSpace(k)
+			if k == "" || seen[k] {
+				continue
+			}
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// buildStatsURL composes a /stats query string in the ONE canonical shape
+// every chip-removal link, group-by toggle, and add-filter redirect converges
+// on: one `filter=key=value` param per chip, one comma-joined `group-by` param
+// when non-empty. So the URL an operator bookmarks always has the exact shape
+// the docs example shows, regardless of which control produced it.
+func buildStatsURL(filters []tagFilter, groupBy []string) string {
+	q := url.Values{}
+	for _, f := range filters {
+		q.Add("filter", f.Key+"="+f.Value)
+	}
+	if len(groupBy) > 0 {
+		q.Set("group-by", strings.Join(groupBy, ","))
+	}
+	if len(q) == 0 {
+		return "/stats"
+	}
+	return "/stats?" + q.Encode()
+}
+
+// extraGroupBy returns the currently-active group-by keys that are NOT one of
+// the built-in checkbox options (i.e. a config-declared tag like `cohort` or
+// `tier`), comma-joined — prefilled into the group-by selector's free-text
+// "extra keys" input so resubmitting the built-in checkboxes never silently
+// drops a config-tag grouping the operator already set.
+func extraGroupBy(groupBy []string) string {
+	builtin := map[string]bool{}
+	for _, b := range builtinFacets {
+		builtin[b] = true
+	}
+	var extra []string
+	for _, k := range groupBy {
+		if !builtin[k] {
+			extra = append(extra, k)
+		}
+	}
+	return strings.Join(extra, ",")
+}
+
+// toSet is a plain slice->set conversion, used to drive the group-by
+// checkboxes' checked state from a template (`{{if index .GroupBySet "model"}}`).
+func toSet(keys []string) map[string]bool {
+	m := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		m[k] = true
+	}
+	return m
+}
+
+// stats renders /stats: the read-only honeybee-performance view. With no
+// `filter`/`group-by` query params it is byte-for-byte the pre-existing
+// per-submodule + total view (computeStats, unchanged — stats-filter-groupby's
+// "empty filter set + no group-by == today's default view" contract). Either
+// param present switches to the filter+group-by aggregation
+// (computeGroupedStats) instead: sessions surviving every filter chip,
+// aggregated per distinct group-by tuple.
+//
+// The add-filter control posts its two plain key/value inputs as fkey/fval
+// (composable chips, never a query string to type) rather than a pre-joined
+// `filter=k=v`; that request is canonicalized into the standard shape and
+// 303-redirected so the URL the operator lands on (and can bookmark) always
+// matches the one grammar buildStatsURL emits — no JS needed anywhere on this
+// page. The handler never writes anything: every branch below only reads.
+func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	if fkey := strings.TrimSpace(r.URL.Query().Get("fkey")); fkey != "" {
+		filters := append(parseFilters(r), tagFilter{Key: fkey, Value: strings.TrimSpace(r.URL.Query().Get("fval"))})
+		http.Redirect(w, r, buildStatsURL(filters, parseGroupBy(r)), http.StatusSeeOther)
 		return
 	}
-	s.render(w, "stats.html", map[string]interface{}{"Subs": subs, "Total": total})
+	filters := parseFilters(r)
+	groupBy := parseGroupBy(r)
+	filtered := len(filters) > 0 || len(groupBy) > 0
+
+	chips := make([]filterChip, len(filters))
+	for i, f := range filters {
+		rest := make([]tagFilter, 0, len(filters)-1)
+		for j, o := range filters {
+			if j != i {
+				rest = append(rest, o)
+			}
+		}
+		chips[i] = filterChip{Key: f.Key, Value: f.Value, RemoveHref: buildStatsURL(rest, groupBy)}
+	}
+
+	data := map[string]interface{}{
+		"Filters":      chips,
+		"GroupBy":      groupBy,
+		"GroupBySet":   toSet(groupBy),
+		"BuiltinTags":  builtinFacets,
+		"ExtraGroupBy": extraGroupBy(groupBy),
+		"Filtered":     filtered,
+	}
+	if !filtered {
+		subs, total, err := s.computeStats(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		data["Subs"] = subs
+		data["Total"] = total
+	} else {
+		rows, err := s.computeGroupedStats(r.Context(), filters, groupBy)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		data["Grouped"] = rows
+	}
+	s.render(w, "stats.html", data)
 }
