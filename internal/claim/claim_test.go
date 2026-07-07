@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,6 +148,118 @@ func TestRejectCounter(t *testing.T) {
 	if s, _ := c.Reject(ctx, "T1", 3); s != plan.NeedsHuman {
 		t.Fatalf("over limit status %s", s)
 	}
+}
+
+// TestStrandGuarded: Strand only applies to NEEDS-REVIEW; a TODO strand errors
+// and leaves the task untouched.
+func TestStrandGuarded(t *testing.T) {
+	c, ctx := setup(t)
+	if _, err := c.Strand(ctx, "T1", "origin unreachable", 3); err == nil {
+		t.Fatal("strand on TODO must error")
+	}
+}
+
+// TestStrandCounter mirrors TestRejectCounter: repeated strands recycle T1 to
+// TODO up to limit, then overflow to NEEDS-HUMAN carrying the concrete reason —
+// and, unlike Reject, does NOT publish (no Publish configured here would panic
+// otherwise; Strand must never call it).
+func TestStrandCounter(t *testing.T) {
+	c, ctx := setup(t)
+	setReview := func() {
+		p, _ := c.load()
+		p.Find("T1").Status = plan.NeedsReview
+		os.WriteFile(c.Sub.PlanPath(), []byte(p.String()), 0o644)
+		c.Git.Commit(ctx, "review")
+	}
+	for i := 0; i < 3; i++ {
+		setReview()
+		if s, err := c.Strand(ctx, "T1", "origin unreachable: dial tcp refused", 3); err != nil || s != plan.TODO {
+			t.Fatalf("attempt %d: status %s err %v", i, s, err)
+		}
+	}
+	setReview()
+	s, err := c.Strand(ctx, "T1", "origin unreachable: dial tcp refused", 3)
+	if err != nil || s != plan.NeedsHuman {
+		t.Fatalf("over limit status %s err %v", s, err)
+	}
+	p, _ := c.load()
+	if got := p.Find("T1").HumanReason(); got != "origin unreachable: dial tcp refused" {
+		t.Fatalf("human reason = %q", got)
+	}
+}
+
+// TestBounceUnreachablePublishesImmediately proves BounceUnreachable — unlike
+// Strand/Reject — commits AND publishes on its own (it runs standalone before
+// any turn loop, with no later finish() to piggyback on): the correction must
+// reach the given Publish func synchronously so a peer sees NEEDS-ARBITRATION
+// right away, never a review dispatched against it again.
+func TestBounceUnreachablePublishesImmediately(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+	g := git.New(root)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		g.Run(ctx, a...)
+	}
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= session=bee-A heartbeat=2026-01-01T00:00:00Z -->\ndo it\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	wt := filepath.Join(root, ".worktrees", "bee-a")
+	if err := g.WorktreeAdd(ctx, wt, "bee-a", "main"); err != nil {
+		t.Fatal(err)
+	}
+	rp, _ := repo.Open(wt)
+	subs, _ := rp.Submodules()
+	wg := git.New(wt)
+	published := false
+	c := &Claimer{
+		Repo: rp, Sub: subs[0], Git: wg, TTL: time.Hour, Session: "bee-a",
+		Publish: func(ctx context.Context) error {
+			published = true
+			return wg.PublishToMain(ctx, "")
+		},
+	}
+	if err := c.BounceUnreachable(ctx, "T1", "reviewable commit unreachable: implementer branch bee-T1 resolves nowhere"); err != nil {
+		t.Fatalf("bounce-unreachable: %v", err)
+	}
+	if !published {
+		t.Fatal("BounceUnreachable must publish immediately (no later finish() to rely on)")
+	}
+	// Read back from the ORIGINAL (main) checkout, proving the correction really
+	// reached main and not just the worktree branch.
+	mp, err := plan.Parse(mustRead(t, filepath.Join(sm, "PLAN.md")))
+	if err != nil {
+		t.Fatalf("parse main PLAN.md: %v", err)
+	}
+	tk := mp.Find("T1")
+	if tk.Status != plan.NeedsArb {
+		t.Fatalf("main status = %s, want NEEDS-ARBITRATION", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("bounce-unreachable must release the claim on main")
+	}
+	if joined := strings.Join(tk.Body, "\n"); !strings.Contains(joined, "reviewable commit unreachable") {
+		t.Fatalf("main PLAN.md missing bounce reason:\n%s", joined)
+	}
+}
+
+// TestBounceUnreachableGuarded: only legal from NEEDS-REVIEW.
+func TestBounceUnreachableGuarded(t *testing.T) {
+	c, ctx := setup(t)
+	if err := c.BounceUnreachable(ctx, "T1", "reason"); err == nil {
+		t.Fatal("bounce-unreachable on TODO must error")
+	}
+}
+
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 // TestPublishRaceOneWinner proves the publish-to-main conflict arbitrates a true

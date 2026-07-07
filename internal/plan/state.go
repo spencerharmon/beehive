@@ -88,6 +88,71 @@ func (t *Task) Reject(limit int, now time.Time) error {
 	return nil
 }
 
+// Strand demotes a task from NEEDS-REVIEW back to a workable status because its
+// implementer commit could not be durably pushed to the submodule's origin —
+// not even after reconciling a divergent dead orphan left by a prior GC'd
+// attempt (see git.Repo.PushBranchReconciled) — so the runner must never leave
+// it NEEDS-REVIEW pointing at a commit no reviewer can reach (session-audit-003
+// F-LIVE). Mirrors Reject's attempts/limit escalation (past limit -> NEEDS-HUMAN,
+// otherwise TODO for a fresh honeybee to redo the work and retry the push) but
+// carries the caller's own concrete reason instead of a generic rejection
+// message. Valid only from NEEDS-REVIEW. Releases the active claim.
+func (t *Task) Strand(reason string, limit int, now time.Time) error {
+	if t.Status != StatusReview {
+		return fmt.Errorf("plan: strand on non-NEEDS-REVIEW task %s (%s)", t.ID, t.Status)
+	}
+	reason = oneLine(reason)
+	if reason == "" {
+		return fmt.Errorf("plan: strand for %s requires a reason", t.ID)
+	}
+	t.Attempts++
+	t.Session = ""
+	t.Heartbeat = time.Time{}
+	if t.Attempts > limit {
+		t.Status = StatusHuman
+		t.setHumanReason(reason)
+	} else {
+		t.Status = StatusTODO
+		t.appendNote("Stranded (runner): " + reason)
+	}
+	return nil
+}
+
+// BounceUnreachable moves a NEEDS-REVIEW task straight to NEEDS-ARBITRATION,
+// deterministically and without ever spawning a review session, when its
+// implementer branch/commit is reachable nowhere this host can see (session-
+// audit-003 F-LIVE: a review pass against a phantom commit can only spelunk git
+// internals and idle-time-out, forever). reason is appended as a review note in
+// the same free-form "Review (verdict, who): ..." convention a rejecting
+// reviewer writes, so the Arbitration pass that picks this up next reads
+// exactly why it was bounced instead of judged. Valid only from NEEDS-REVIEW.
+// Releases the active claim.
+func (t *Task) BounceUnreachable(reason string) error {
+	if t.Status != StatusReview {
+		return fmt.Errorf("plan: bounce-unreachable on non-NEEDS-REVIEW task %s (%s)", t.ID, t.Status)
+	}
+	reason = oneLine(reason)
+	if reason == "" {
+		return fmt.Errorf("plan: bounce-unreachable for %s requires a reason", t.ID)
+	}
+	t.Status = StatusArb
+	t.Session = ""
+	t.Heartbeat = time.Time{}
+	t.appendNote("Review (bounced, runner): " + reason)
+	return nil
+}
+
+// appendNote appends line as a new task body line, inserting a blank-line
+// separator first when the body is non-empty and does not already end on a
+// blank line — the same spacing setHumanReason uses when it first adds its
+// field, so a freshly appended note never runs onto the previous line.
+func (t *Task) appendNote(line string) {
+	if len(t.Body) > 0 && strings.TrimSpace(t.Body[len(t.Body)-1]) != "" {
+		t.Body = append(t.Body, "")
+	}
+	t.Body = append(t.Body, line)
+}
+
 // RequestHuman moves a non-DONE task to NEEDS-HUMAN with an explicit reason and
 // releases its active claim. This is the first-class escalation path when a bee
 // hits a concrete blocker requiring operator input (credentials, calibration,

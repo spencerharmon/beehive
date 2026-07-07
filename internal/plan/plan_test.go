@@ -164,6 +164,91 @@ func TestRejectAttempts(t *testing.T) {
 	}
 }
 
+// TestStrandAttempts mirrors TestRejectAttempts: repeated strands recycle to
+// TODO (a fresh honeybee redoes the work and retries the push) up to limit,
+// then overflow to NEEDS-HUMAN carrying the caller's concrete reason verbatim
+// — never the generic reject-overflow message.
+func TestStrandAttempts(t *testing.T) {
+	now := time.Now()
+	tk := &Task{ID: "a", Status: StatusReview, Attempts: 0}
+	for i := 0; i < 3; i++ {
+		tk.Status = StatusReview
+		tk.Session, tk.Heartbeat = "bee-1", now
+		if err := tk.Strand("origin unreachable: dial tcp: connection refused", 3, now); err != nil {
+			t.Fatal(err)
+		}
+		if tk.Status != StatusTODO {
+			t.Fatalf("attempt %d status %s", i, tk.Status)
+		}
+		if tk.Session != "" || !tk.Heartbeat.IsZero() {
+			t.Fatalf("attempt %d: strand must release the claim", i)
+		}
+	}
+	tk.Status = StatusReview
+	if err := tk.Strand("origin unreachable: dial tcp: connection refused", 3, now); err != nil {
+		t.Fatal(err) // 4th > 3
+	}
+	if tk.Status != StatusHuman {
+		t.Fatalf("want NEEDS-HUMAN, got %s", tk.Status)
+	}
+	if got := tk.HumanReason(); got != "origin unreachable: dial tcp: connection refused" {
+		t.Fatalf("human reason = %q, want the caller's concrete reason verbatim", got)
+	}
+}
+
+// TestStrandGuardedAndRequiresReason: Strand only applies to NEEDS-REVIEW (never
+// NEEDS-ARBITRATION — that transition is Reject's, back after arbitration; and
+// never TODO/DONE), and always requires a concrete reason.
+func TestStrandGuardedAndRequiresReason(t *testing.T) {
+	now := time.Now()
+	for _, st := range []Status{StatusTODO, StatusArb, StatusDone, StatusHuman} {
+		if err := (&Task{ID: "a", Status: st}).Strand("reason", 3, now); err == nil {
+			t.Fatalf("strand allowed on %s", st)
+		}
+	}
+	if err := (&Task{ID: "a", Status: StatusReview}).Strand("  \t \n ", 3, now); err == nil {
+		t.Fatal("strand allowed with an empty/blank reason")
+	}
+}
+
+// TestBounceUnreachable locks the review-dispatch-side deterministic bounce:
+// NEEDS-REVIEW -> NEEDS-ARBITRATION with the reason recorded as a review note,
+// claim released, never touching Attempts (this is not a rejection verdict —
+// there was no review at all).
+func TestBounceUnreachable(t *testing.T) {
+	tk := &Task{ID: "a", Status: StatusReview, Session: "bee-1", Heartbeat: time.Now(), Attempts: 1}
+	if err := tk.BounceUnreachable("reviewable commit unreachable: implementer branch bee-a resolves nowhere"); err != nil {
+		t.Fatal(err)
+	}
+	if tk.Status != StatusArb {
+		t.Fatalf("status = %s, want NEEDS-ARBITRATION", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("bounce-unreachable must release the claim")
+	}
+	if tk.Attempts != 1 {
+		t.Fatalf("attempts = %d, want unchanged (1): bouncing is not a review rejection", tk.Attempts)
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if !strings.Contains(joined, "Review (bounced, runner): reviewable commit unreachable") {
+		t.Fatalf("body missing bounce note:\n%s", joined)
+	}
+}
+
+// TestBounceUnreachableGuardedAndRequiresReason: only legal from NEEDS-REVIEW,
+// and always requires a concrete reason (an empty bounce reason would leave the
+// next Arbitration pass with nothing to go on).
+func TestBounceUnreachableGuardedAndRequiresReason(t *testing.T) {
+	for _, st := range []Status{StatusTODO, StatusArb, StatusDone, StatusHuman} {
+		if err := (&Task{ID: "a", Status: st}).BounceUnreachable("reason"); err == nil {
+			t.Fatalf("bounce-unreachable allowed on %s", st)
+		}
+	}
+	if err := (&Task{ID: "a", Status: StatusReview}).BounceUnreachable(""); err == nil {
+		t.Fatal("bounce-unreachable allowed with an empty reason")
+	}
+}
+
 func TestRequestHuman(t *testing.T) {
 	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
 	tk := &Task{ID: "a", Status: StatusTODO, Session: "bee-1", Heartbeat: now, Body: []string{"do thing"}}

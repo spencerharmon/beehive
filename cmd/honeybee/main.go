@@ -201,7 +201,13 @@ func run() error {
 
 	runner := &swarm.Runner{
 		Repo: rp, Git: gitRepo, MaxTurns: eff.MaxTurns, MergeRetries: eff.MergeRetries, WallCap: ttl, TTL: ttl, Publish: publish,
-		Remote: remote, BaseMain: baseMain, Session: session,
+		// RejectLimit bounds how many times a Work task's implementer commit can
+		// fail to land on the submodule's origin (landSourceBranch/demoteUnpushed)
+		// before it escalates to NEEDS-HUMAN instead of recycling to TODO yet
+		// again — the same layered-config knob Claimer.Reject uses for a review/
+		// arbitration livelock.
+		RejectLimit: eff.RejectLimit,
+		Remote:      remote, BaseMain: baseMain, Session: session,
 		SessionGit: sessGit, SessionRoot: sessPath, SessionBranch: sessBranch,
 		SessionPublish: sessPublish, SessionPush: sessPush,
 		RestoreConfig:   restoreRemotes,

@@ -284,6 +284,122 @@ func (r *Repo) Push(ctx context.Context, remote, refspec string) error {
 	return err
 }
 
+// CommitReachable reports whether sha — the SPECIFIC commit a task's
+// implementer work is recorded at (e.g. the submodule pointer/gitlink a Work
+// pass bumped) — is present SOMEWHERE this repo can see: already in this
+// repo's own object database (CommitExists), or — when remote is non-empty —
+// after fetching branch (the ref that should carry it) from remote. false
+// means sha is reachable NOWHERE this host can look: the "reviewable commit
+// exists nowhere" defect a review pass cannot recover from (session-audit-003
+// F-LIVE).
+//
+// Checking the specific SHA (not just whether branch resolves to SOMETHING)
+// matters: the F-LIVE failure mode leaves branch resolving to the WRONG commit
+// — a dead orphan from a prior attempt — while the actually-recorded
+// implementer commit is what is missing, so a plain "does the branch exist"
+// check would miss it entirely.
+//
+// remote == "" (local-sharing / a shared checkout with no configured origin)
+// skips the fetch entirely instead of running a doomed `git fetch origin`
+// against a nonexistent remote (the exact "fatal: 'origin' does not appear to
+// be a git repository" fallback failure the F-LIVE finding names) — in that
+// mode every honeybee on the host shares the same object database, so a
+// reachable commit is already present locally, no fetch required.
+//
+// A remote fetch failure (network/auth/misconfigured origin, or the remote
+// simply lacking branch) is returned as a real error, never silently folded
+// into "unreachable": a transient blip must not falsely bounce a good task to
+// arbitration. Only "fetched fine, sha still absent" reports (false, nil).
+func (r *Repo) CommitReachable(ctx context.Context, remote, branch, sha string) (bool, error) {
+	if r.CommitExists(ctx, sha) {
+		return true, nil
+	}
+	if remote == "" {
+		return false, nil
+	}
+	if err := r.Fetch(ctx, remote, branch); err != nil {
+		if isRemoteRefMissing(err) || isCouldNotFindRemoteRef(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return r.CommitExists(ctx, sha), nil
+}
+
+// isCouldNotFindRemoteRef reports whether a fetch failed because the remote
+// simply has no such ref — git's "couldn't find remote ref <name>" — a
+// definitive, confirmed absence distinct from a network/auth failure talking
+// to the remote at all.
+func isCouldNotFindRemoteRef(err error) bool {
+	return strings.Contains(err.Error(), "couldn't find remote ref")
+}
+
+// reconcileOrphan supersedes a divergent "dead orphan" remote ref for branch
+// WITHOUT discarding it: it folds remote/branch's current tip in with git's
+// "ours" merge strategy — applied via plumbing (commit-tree + update-ref) so it
+// works from ANY worktree of this repo without ever checking branch out or
+// touching the working tree/index — producing a new commit whose TREE is
+// identical to branch's current tree but whose parents are [branch, the fetched
+// orphan tip]. The orphan therefore stays reachable as an ancestor instead of
+// being discarded by a force-push/delete, and the retried push that follows is
+// a genuine fast-forward (never a force-push). Assumes remote/branch has
+// already been fetched into the local object database.
+func (r *Repo) reconcileOrphan(ctx context.Context, remote, branch string) error {
+	ours, err := r.RevParse(ctx, branch)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", branch, err)
+	}
+	theirs, err := r.RevParse(ctx, remote+"/"+branch)
+	if err != nil {
+		return fmt.Errorf("resolve %s/%s: %w", remote, branch, err)
+	}
+	tree, err := r.Run(ctx, "rev-parse", ours+"^{tree}")
+	if err != nil {
+		return fmt.Errorf("resolve tree of %s: %w", ours, err)
+	}
+	msg := fmt.Sprintf("beehive: reconcile dead orphan %s/%s (%s) into %s (ours; supersedes, never discards)",
+		remote, branch, theirs, branch)
+	merged, err := r.Run(ctx, "commit-tree", tree, "-p", ours, "-p", theirs, "-m", msg)
+	if err != nil {
+		return fmt.Errorf("commit-tree merge of %s and %s: %w", ours, theirs, err)
+	}
+	if _, err := r.Run(ctx, "update-ref", "refs/heads/"+branch, merged, ours); err != nil {
+		return fmt.Errorf("update-ref %s to reconciled merge: %w", branch, err)
+	}
+	return nil
+}
+
+// PushBranchReconciled pushes the local branch to remote, non-destructively
+// reconciling a divergent "dead orphan" origin ref left by a prior GC'd attempt
+// of the SAME task (session-audit-003 F-LIVE): the unified claim protocol
+// guarantees only one live session works a task at a time, so a divergent
+// remote ref encountered here can only be a dead prior attempt, never a live
+// concurrent peer. On a plain push's non-fast-forward rejection it fetches the
+// remote branch and folds it in via reconcileOrphan (fetch + merge -s ours —
+// keeps our tree, keeps the orphan reachable as an ancestor) so the retried
+// push is a genuine fast-forward. NEVER force-pushes and never deletes the
+// remote ref. A non-nil return means the branch could not be made to land even
+// after reconciling; callers must not treat the commit as durably shared.
+func (r *Repo) PushBranchReconciled(ctx context.Context, remote, branch string) error {
+	err := r.Push(ctx, remote, branch)
+	if err == nil {
+		return nil
+	}
+	if !isNonFastForward(err) {
+		return err
+	}
+	if ferr := r.Fetch(ctx, remote, branch); ferr != nil {
+		return fmt.Errorf("fetch %s/%s to reconcile a dead orphan (push rejected: %v): %w", remote, branch, err, ferr)
+	}
+	if rerr := r.reconcileOrphan(ctx, remote, branch); rerr != nil {
+		return fmt.Errorf("reconcile dead orphan %s/%s (push rejected: %v): %w", remote, branch, err, rerr)
+	}
+	if perr := r.Push(ctx, remote, branch); perr != nil {
+		return fmt.Errorf("push %s after reconciling a dead orphan on %s (original rejection: %v): %w", branch, remote, err, perr)
+	}
+	return nil
+}
+
 // LsRemoteBranch returns the commit SHA the remote currently advertises for
 // branch, or "" when the remote has no such branch. It reads the remote's live
 // ref advertisement (git ls-remote --heads) without fetching, so a caller can
@@ -381,6 +497,21 @@ func (r *Repo) Show(ctx context.Context, ref, path string) (string, error) {
 // rendered as a whole-file deletion (because the base lacks it) is caught.
 func (r *Repo) Exists(ctx context.Context, ref, path string) bool {
 	_, err := r.Run(ctx, "show", ref+":"+path)
+	return err == nil
+}
+
+// CommitExists reports whether sha is present in this repo's OWN object
+// database as a commit — a pure local check (`git cat-file -e sha^{commit}`;
+// no fetch, no network) that succeeds for a commit reachable from ANY ref, or
+// even a dangling one not on any ref at all (not yet garbage-collected). Used
+// to verify a task's recorded implementer commit is reachable in the shared
+// module store before trusting it (session-audit-003 F-LIVE: a reviewer must
+// never be dispatched against a commit that exists nowhere).
+func (r *Repo) CommitExists(ctx context.Context, sha string) bool {
+	if strings.TrimSpace(sha) == "" {
+		return false
+	}
+	_, err := r.Run(ctx, "cat-file", "-e", sha+"^{commit}")
 	return err == nil
 }
 

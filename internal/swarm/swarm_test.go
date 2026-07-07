@@ -629,6 +629,177 @@ func TestReviewCompletesOnStatusChange(t *testing.T) {
 	}
 }
 
+// refusingClient fails the test if Open is EVER called — used to prove a
+// dispatch-time short-circuit (the F-LIVE review-dispatch reachability guard)
+// never spends a single agent turn.
+type refusingClient struct{ t *testing.T }
+
+func (c *refusingClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	c.t.Fatal("Client.Open called: a session must not be opened for this dispatch")
+	return nil, nil
+}
+
+// TestReviewDispatchBouncesUnreachableCommit is the F-LIVE review-dispatch-side
+// guard (session-audit-003): a task is NEEDS-REVIEW but the submodule pointer
+// (gitlink) recorded for it — the reviewable commit a Work pass bumps as part
+// of completing to NEEDS-REVIEW — is a PHANTOM sha that exists nowhere: not in
+// the submodule's object database, not on origin. This is the exact
+// "reviewable commit exists nowhere" shape that otherwise spawns a review pass
+// doomed to spelunk git internals and idle-time-out forever. Run() must bounce
+// the task straight to NEEDS-ARBITRATION with a concrete reason (naming the
+// unreachable sha) and NEVER open a session (asserted by refusingClient),
+// reporting Completed so the dispatch itself is not retried.
+func TestReviewDispatchBouncesUnreachableCommit(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	// The gitlink records a PHANTOM commit: the submodule pointer a Work pass
+	// would have bumped for this task, but the commit exists NOWHERE (never
+	// committed anywhere this test keeps; bee-orphan-x is never created either
+	// locally or on origin) — the exact F-LIVE shape.
+	phantom := strings.Repeat("f", 40)
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+phantom+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed phantom gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## orphan-x [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "orphan-x", Status: plan.NeedsReview}}
+
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a resolved dispatch-time bounce should report Completed, got %+v", res)
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("orphan-x")
+	if tk == nil {
+		t.Fatal("task orphan-x vanished from PLAN.md")
+	}
+	if tk.Status != plan.NeedsArb {
+		t.Fatalf("status = %s, want NEEDS-ARBITRATION", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("bounce must release the claim")
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if !contains(joined, "reviewable commit unreachable") || !contains(joined, phantom) {
+		t.Fatalf("plan body missing bounce reason naming the unreachable sha %s:\n%s", phantom, joined)
+	}
+}
+
+// TestReviewDispatchReachableLocalSharingUnchanged is BOTH the guard's happy
+// path AND the F-LIVE fetch-fallback fix: the submodule pointer recorded for
+// the task is bumped to a real implementer commit that lives ONLY as a local
+// ref in a submodule checkout with NO remote at all (local-sharing / a shared
+// checkout — the exact mode where the OLD "fetch origin" recovery used to
+// hard-fail with "origin does not appear to be a git repository"), and is
+// deliberately NOT the checkout's own checked-out HEAD (proving the check
+// resolves the SPECIFIC recorded sha, not just "whatever is checked out"). The
+// guard must find it reachable via the shared module store WITHOUT attempting
+// any fetch, and dispatch the review completely normally — a session opens and
+// completes the task, byte-identical to the pre-existing behavior.
+func TestReviewDispatchReachableLocalSharingUnchanged(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	sg := gitInit(t, repoDir) // a real checkout, deliberately NO remote (local-sharing)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("base\n"), 0o644)
+	if err := sg.Commit(ctx, "base"); err != nil {
+		t.Fatalf("submodule base commit: %v", err)
+	}
+	// The implementer's work: a real commit on branch bee-R1 — present as a
+	// plain LOCAL ref only, never pushed anywhere — exactly what a shared
+	// honeybee worktree of this SAME repo leaves behind in local-sharing mode.
+	// Checked out back to main afterward so the gitlink sha below is NOT
+	// repoDir's own checked-out HEAD.
+	if _, err := sg.Run(ctx, "checkout", "-q", "-b", "bee-R1"); err != nil {
+		t.Fatalf("checkout bee-R1: %v", err)
+	}
+	os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("work\n"), 0o644)
+	if err := sg.Commit(ctx, "feat: work"); err != nil {
+		t.Fatalf("commit work: %v", err)
+	}
+	implSHA, err := sg.RevParse(ctx, "bee-R1")
+	if err != nil {
+		t.Fatalf("rev-parse bee-R1: %v", err)
+	}
+	if _, err := sg.Run(ctx, "checkout", "-q", "main"); err != nil {
+		t.Fatalf("checkout main: %v", err)
+	}
+
+	// The beehive repo's gitlink is bumped to the implementer's commit (what a
+	// real Work-task completion does).
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+implSHA+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed bumped gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a reachable review should complete normally, got %+v", res)
+	}
+	if cl.sess.prompts == 0 {
+		t.Fatal("a reachable review must actually dispatch a session (not bounce)")
+	}
+	b, _ := os.ReadFile(planPath)
+	p, _ := plan.Parse(string(b))
+	if tk := p.Find("R1"); tk == nil || tk.Status != plan.Done {
+		t.Fatalf("status = %+v, want DONE (review dispatched and approved normally)", tk)
+	}
+}
+
 // gateClient/gateSession model a turn that is BUSY for a while before going idle:
 // Prompt signals it started, blocks until the test releases it, then produces the
 // completion artifacts and returns. Because ocSession.Prompt now blocks until the
@@ -2016,13 +2187,14 @@ func TestDeleteSourceBranch(t *testing.T) {
 	})
 }
 
-// TestPushSourceBranchClearsStaleRemote is the failsafe guard: when the bee
-// branch name on origin is occupied by a SUPERSEDED prior attempt (a divergent
-// orphan), a plain push of the new attempt is rejected non-fast-forward. Because
-// a bee branch is disposable (FF protection is for main only), pushSourceBranch
-// must delete the stale remote branch and re-push so the pointer never dangles.
-// Asserts no warning and that origin ends pointing at OUR tip.
-func TestPushSourceBranchClearsStaleRemote(t *testing.T) {
+// TestPushSourceBranchReconcilesDeadOrphan is the F-LIVE publish-side guard:
+// when the bee branch name on origin is occupied by a SUPERSEDED prior attempt
+// (a divergent dead orphan), a plain push of the new attempt is rejected
+// non-fast-forward. pushSourceBranch must land the new commit WITHOUT ever
+// force-pushing or deleting the orphan's ref: it reconciles (fetch + merge -s
+// ours) so the retried push is a genuine fast-forward, keeping the orphan
+// reachable as an ancestor instead of discarding it.
+func TestPushSourceBranchReconcilesDeadOrphan(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	g := gitInit(t, root)
@@ -2037,6 +2209,10 @@ func TestPushSourceBranchClearsStaleRemote(t *testing.T) {
 	os.WriteFile(filepath.Join(old, "old.txt"), []byte("old attempt\n"), 0o644)
 	if err := oldg.Commit(ctx, "old attempt"); err != nil {
 		t.Fatalf("old commit: %v", err)
+	}
+	orphanTip, err := oldg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse orphan HEAD: %v", err)
 	}
 	if _, err := oldg.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-T1"); err != nil {
 		t.Fatalf("push old bee-T1: %v", err)
@@ -2063,14 +2239,79 @@ func TestPushSourceBranchClearsStaleRemote(t *testing.T) {
 
 	r := &Runner{}
 	if w := r.pushSourceBranch(ctx, wg, "bee-T1"); w != "" {
-		t.Fatalf("pushSourceBranch over a stale remote branch warned: %q", w)
+		t.Fatalf("pushSourceBranch over a dead orphan warned: %q", w)
 	}
 	gotTip, err := git.New(origin).Run(ctx, "rev-parse", "refs/heads/bee-T1")
 	if err != nil {
 		t.Fatalf("origin rev-parse bee-T1: %v", err)
 	}
-	if strings.TrimSpace(gotTip) != strings.TrimSpace(wantTip) {
-		t.Fatalf("origin bee-T1 = %q, want our tip %q (delete+re-push did not land)", strings.TrimSpace(gotTip), strings.TrimSpace(wantTip))
+	gotTip = strings.TrimSpace(gotTip)
+	// Never force-pushed away: BOTH the new work and the orphan remain reachable
+	// ancestors of the reconciled tip landed on origin.
+	if ok, err := wg.IsAncestor(ctx, wantTip, gotTip); err != nil || !ok {
+		t.Fatalf("new work %s must be reachable from reconciled origin tip %s: ok=%v err=%v", wantTip, gotTip, ok, err)
+	}
+	if ok, err := wg.IsAncestor(ctx, orphanTip, gotTip); err != nil || !ok {
+		t.Fatalf("dead orphan %s must remain reachable from reconciled origin tip %s: ok=%v err=%v", orphanTip, gotTip, ok, err)
+	}
+}
+
+// TestLandSourceBranchNoOpsOutsideNeedsReview locks a narrow but important
+// correctness edge: if a push fails while the task's ACTUAL status is not (or
+// no longer) NEEDS-REVIEW — outside landSourceBranch/demoteUnpushed's owned
+// shape — the caller must still SEE the push-failure warning, but must NEVER be
+// told a demotion happened when none did (demoted must be false, and PLAN.md
+// must be untouched). Conflating "demoteUnpushed no-op'd" with "successfully
+// demoted" would wrongly strand a task's claim/Completed reporting on a status
+// this guard was never meant to touch.
+func TestLandSourceBranchNoOpsOutsideNeedsReview(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	wg := gitConfig(t, repoDir)
+	if _, err := wg.Run(ctx, "checkout", "-q", "-b", "bee-T1"); err != nil {
+		t.Fatalf("checkout bee-T1: %v", err)
+	}
+	os.WriteFile(filepath.Join(repoDir, "new.txt"), []byte("work\n"), 0o644)
+	if err := wg.Commit(ctx, "work"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	blockAllPushes(t, origin) // every push, including the reconciliation retry, fails
+
+	const planBody = "## T1 [DONE] <!-- attempts=0 deps= -->\ndo it\n"
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte(planBody), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.Done}}
+
+	r := &Runner{Repo: rp, Git: g, RejectLimit: 3}
+	w, demoted, err := r.landSourceBranch(ctx, sel, wg, "bee-T1")
+	if err != nil {
+		t.Fatalf("landSourceBranch: %v", err)
+	}
+	if w == "" {
+		t.Fatal("a genuine push failure must still surface a warning")
+	}
+	if demoted {
+		t.Fatal("demoted=true but the task was DONE, not NEEDS-REVIEW: demoteUnpushed must have no-op'd")
+	}
+	got, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	if string(got) != planBody {
+		t.Fatalf("PLAN.md was touched despite the no-op path:\n%s", got)
 	}
 }
 
@@ -2126,6 +2367,97 @@ func TestWorkCompletionKeepsUnmergedSourceBranch(t *testing.T) {
 	}
 	if res.Warning != "" {
 		t.Fatalf("keeping an unmerged branch must not warn, got %q", res.Warning)
+	}
+}
+
+// blockAllPushes installs a pre-receive hook on the bare origin that rejects
+// EVERY push (fetch/clone are unaffected — hooks only run receive-side), so a
+// completion push can be made to fail deterministically without depending on
+// filesystem permissions or a real network outage.
+func blockAllPushes(t *testing.T, origin string) {
+	t.Helper()
+	hooksDir := filepath.Join(origin, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hook := filepath.Join(hooksDir, "pre-receive")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\necho 'push blocked for test' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWorkCompletionDemotesWhenSourceBranchCannotLand is the F-LIVE publish-side
+// guard's failure path (session-audit-003): when a Work task's implementer
+// commit cannot be pushed to the submodule's origin at all — here every push is
+// rejected by a pre-receive hook — Run() must NOT report the task complete
+// pointing at NEEDS-REVIEW. It demotes the task back to a workable status
+// (TODO) and publishes that correction itself, so the runner never leaves a
+// task NEEDS-REVIEW at a commit no reviewer can reach.
+func TestWorkCompletionDemotesWhenSourceBranchCannotLand(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	// Every push (the completion push AND any reconciliation retry) is rejected
+	// from this point on; fetch/clone (syncWorktreeBase, above) already ran and
+	// is unaffected by a receive-side hook.
+	blockAllPushes(t, origin)
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(wtDir, "feature.txt"), []byte("work\n"), 0o644)
+		_ = git.New(wtDir).Commit(ctx, "feat: work")
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RejectLimit: 3}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("a task whose source branch cannot land must NOT report Completed, got %+v", res)
+	}
+	if res.Warning == "" || !contains(res.Warning, "could not be landed") {
+		t.Fatalf("warning missing/wrong: %q", res.Warning)
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("T1")
+	if tk == nil {
+		t.Fatal("task T1 vanished from PLAN.md")
+	}
+	if tk.Status != plan.TODO {
+		t.Fatalf("status = %s, want TODO (demoted back to workable instead of stranded NEEDS-REVIEW)", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("demotion must release the claim")
+	}
+	if tk.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", tk.Attempts)
 	}
 }
 

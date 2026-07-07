@@ -784,3 +784,212 @@ func TestSourceBranchReclaimVerbs(t *testing.T) {
 		t.Fatal("local branch bee-local still present after DeleteBranch")
 	}
 }
+
+// TestCommitExists locks the pure local object-store check PushBranchReconciled
+// and the review-dispatch reachability guard are built on: a real commit
+// resolves true, a well-formed-but-absent sha resolves false (not an error —
+// "not present" is the expected, common answer), and an empty sha is false
+// without ever shelling out.
+func TestCommitExists(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	sha := commitFile(t, r, "f", "v1\n", "v1")
+
+	if !r.CommitExists(ctx, sha) {
+		t.Fatalf("CommitExists(%s) = false, want true (real commit)", sha)
+	}
+	absent := strings.Repeat("a", 40)
+	if r.CommitExists(ctx, absent) {
+		t.Fatal("CommitExists on a well-formed but absent sha = true, want false")
+	}
+	if r.CommitExists(ctx, "") {
+		t.Fatal("CommitExists(\"\") = true, want false")
+	}
+}
+
+// TestPushBranchReconciledSupersedesDeadOrphan is the F-LIVE publish-side fix: a
+// prior GC'd attempt of the SAME task left a divergent orphan on
+// origin/bee-<taskid> (no shared ancestry with the new commit), so a plain push
+// of the new work is rejected non-fast-forward. PushBranchReconciled must land
+// the new commit WITHOUT force-pushing: it fetches the orphan, folds it in with
+// an ours-merge (never discarding it — the orphan stays reachable as an
+// ancestor), and the retried push is a genuine fast-forward.
+func TestPushBranchReconciledSupersedesDeadOrphan(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+
+	// The dead orphan: an earlier, now-abandoned attempt pushed its own commit to
+	// bee-x and was never merged/reclaimed.
+	old := cloneOf(t, origin, "old")
+	commitFile(t, old, "f", "base\n", "base")
+	if err := old.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("seed main: %v", err)
+	}
+	orphanTip := commitFile(t, old, "orphan.txt", "orphan attempt\n", "orphan attempt")
+	if _, err := old.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-x"); err != nil {
+		t.Fatalf("push orphan bee-x: %v", err)
+	}
+
+	// The new attempt: a FRESH checkout branched off main (not the orphan), with
+	// its own distinct work — a plain push is rejected non-fast-forward.
+	fresh := cloneOf(t, origin, "fresh")
+	if _, err := fresh.Run(ctx, "checkout", "-q", "-b", "bee-x", "origin/main"); err != nil {
+		t.Fatalf("checkout bee-x: %v", err)
+	}
+	newTip := commitFile(t, fresh, "new.txt", "new attempt\n", "new attempt")
+
+	if err := fresh.PushBranchReconciled(ctx, "origin", "bee-x"); err != nil {
+		t.Fatalf("PushBranchReconciled over a dead orphan: %v", err)
+	}
+
+	// Assert on a THIRD clone (never touched by the reconciliation) that origin
+	// now carries a commit descending from BOTH the orphan and the new work —
+	// never lost, never force-pushed away.
+	check := cloneOf(t, origin, "check")
+	if err := check.Fetch(ctx, "origin", "bee-x"); err != nil {
+		t.Fatalf("fetch bee-x: %v", err)
+	}
+	tip, err := check.RevParse(ctx, "origin/bee-x")
+	if err != nil {
+		t.Fatalf("rev-parse origin/bee-x: %v", err)
+	}
+	if ok, err := check.IsAncestor(ctx, orphanTip, tip); err != nil || !ok {
+		t.Fatalf("dead orphan %s must remain reachable as an ancestor of %s: ok=%v err=%v", orphanTip, tip, ok, err)
+	}
+	if ok, err := check.IsAncestor(ctx, newTip, tip); err != nil || !ok {
+		t.Fatalf("new work %s must be reachable from %s: ok=%v err=%v", newTip, tip, ok, err)
+	}
+	// The reconciled tree is OURS: the new work is present, the orphan's own file
+	// change is not (ours-merge keeps our tree; it records ancestry, not content).
+	if _, err := check.Run(ctx, "show", tip+":new.txt"); err != nil {
+		t.Fatalf("reconciled tip missing new.txt: %v", err)
+	}
+	if _, err := check.Run(ctx, "show", tip+":orphan.txt"); err == nil {
+		t.Fatal("reconciled tip must keep OUR tree (orphan.txt must not reappear)")
+	}
+	// Never a force-push: the tip's parents are exactly [our old tip, the orphan].
+	parents, err := check.Run(ctx, "log", "-1", "--format=%P", tip)
+	if err != nil {
+		t.Fatalf("log parents: %v", err)
+	}
+	if !strings.Contains(parents, newTip) || !strings.Contains(parents, orphanTip) {
+		t.Fatalf("reconciled merge parents = %q, want both %s and %s", parents, newTip, orphanTip)
+	}
+}
+
+// TestPushBranchReconciledHappyPathUnchanged proves the common case — a plain
+// push with no divergence — is untouched: a single fast-forward push, no fetch,
+// no merge commit synthesized.
+func TestPushBranchReconciledHappyPathUnchanged(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	if _, err := a.Run(ctx, "checkout", "-q", "-b", "bee-x"); err != nil {
+		t.Fatalf("checkout bee-x: %v", err)
+	}
+	tip := commitFile(t, a, "f", "v1\n", "v1")
+
+	if err := a.PushBranchReconciled(ctx, "origin", "bee-x"); err != nil {
+		t.Fatalf("PushBranchReconciled happy path: %v", err)
+	}
+	got, err := a.LsRemoteBranch(ctx, "origin", "bee-x")
+	if err != nil || got != tip {
+		t.Fatalf("origin bee-x = %q,%v want %s (plain fast-forward)", got, err, tip)
+	}
+}
+
+// TestCommitReachable covers the modes the review-dispatch reachability guard
+// and the F-LIVE fetch-fallback fix both rely on: a commit present in the
+// LOCAL object database resolves true without touching any remote (the
+// shared-checkout / local-sharing case — no origin needed); a commit absent
+// locally but present on a configured remote (via its branch) resolves true
+// after a fetch (remote-sharing, not yet pulled); a commit confirmed absent
+// everywhere — INCLUDING when its branch resolves to something else entirely,
+// the exact F-LIVE shape (a dead orphan superseding the real work at that
+// branch name) — resolves false, cleanly, never an error; and a fetch that
+// cannot even reach a configured remote is a real error, never folded into
+// "unreachable".
+func TestCommitReachable(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "f", "v1\n", "v1")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("seed main: %v", err)
+	}
+
+	t.Run("local-object-no-remote-needed", func(t *testing.T) {
+		if _, err := a.Run(ctx, "checkout", "-q", "-b", "bee-local"); err != nil {
+			t.Fatalf("checkout: %v", err)
+		}
+		sha := commitFile(t, a, "g", "local\n", "local work")
+		// remote == "" simulates a shared checkout with no configured origin: the
+		// commit is already a local object, so this must resolve true with NO
+		// fetch attempt (a doomed `fetch origin` would error in that mode).
+		ok, err := a.CommitReachable(ctx, "", "bee-local", sha)
+		if err != nil || !ok {
+			t.Fatalf("CommitReachable(local object, no remote) = %v,%v want true,nil", ok, err)
+		}
+	})
+
+	t.Run("remote-only-fetches", func(t *testing.T) {
+		b := cloneOf(t, origin, "b")
+		// Pushed straight to origin from a's history without b ever fetching it.
+		if _, err := a.Run(ctx, "push", "origin", "bee-local:refs/heads/bee-remote-only"); err != nil {
+			t.Fatalf("push bee-remote-only: %v", err)
+		}
+		sha, err := a.RevParse(ctx, "bee-local")
+		if err != nil {
+			t.Fatalf("rev-parse bee-local: %v", err)
+		}
+		ok, err := b.CommitReachable(ctx, "origin", "bee-remote-only", sha)
+		if err != nil || !ok {
+			t.Fatalf("CommitReachable(remote-only, fetch) = %v,%v want true,nil", ok, err)
+		}
+	})
+
+	t.Run("branch-resolves-to-wrong-commit-F-LIVE-shape", func(t *testing.T) {
+		// The exact F-LIVE bug shape: origin/bee-x exists (a dead orphan from a
+		// prior attempt), but the SPECIFIC recorded implementer commit is a
+		// different sha that was never pushed anywhere. A branch-existence check
+		// alone would misreport this as reachable; CommitReachable must not.
+		orphan := cloneOf(t, origin, "orphan-holder")
+		if _, err := orphan.Run(ctx, "checkout", "-q", "-b", "bee-x"); err != nil {
+			t.Fatalf("checkout bee-x: %v", err)
+		}
+		commitFile(t, orphan, "orphan.txt", "orphan\n", "orphan attempt")
+		if _, err := orphan.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-x"); err != nil {
+			t.Fatalf("push bee-x: %v", err)
+		}
+		phantom := strings.Repeat("d", 40) // never committed anywhere
+		b := cloneOf(t, origin, "checker")
+		ok, err := b.CommitReachable(ctx, "origin", "bee-x", phantom)
+		if err != nil {
+			t.Fatalf("CommitReachable(wrong-commit shape) returned an error, want (false,nil): %v", err)
+		}
+		if ok {
+			t.Fatal("CommitReachable must not be fooled by a branch that resolves to a DIFFERENT commit")
+		}
+	})
+
+	t.Run("confirmed-absent-everywhere", func(t *testing.T) {
+		b := cloneOf(t, origin, "c")
+		phantom := strings.Repeat("e", 40)
+		ok, err := b.CommitReachable(ctx, "origin", "bee-never-existed", phantom)
+		if err != nil {
+			t.Fatalf("CommitReachable(confirmed absent) returned an error, want (false,nil): %v", err)
+		}
+		if ok {
+			t.Fatal("CommitReachable(confirmed absent) = true, want false")
+		}
+	})
+
+	t.Run("absent-everywhere-no-remote", func(t *testing.T) {
+		b := cloneOf(t, origin, "d")
+		phantom := strings.Repeat("a", 40)
+		ok, err := b.CommitReachable(ctx, "", "bee-never-existed", phantom)
+		if err != nil || ok {
+			t.Fatalf("CommitReachable(absent, no remote) = %v,%v want false,nil", ok, err)
+		}
+	})
+}

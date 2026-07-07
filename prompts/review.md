@@ -8,9 +8,17 @@ What to read:
 - Your task card (with its `Review:` note naming the implementer branch, submodule commit, and
   change-doc path) is PROVIDED in the Context (`## Your task`) — do NOT open PLAN.md or ROI.md to read it.
 - The implementer's code on branch `bee-<taskid>` in the submodule checkout `submodules/<sm>/repo`
-  (read-only). Inspect via git, e.g. `git -C submodules/<sm>/repo log/show/diff bee-<taskid>`. If the
-  branch is not present locally, fetch it from the submodule origin first (`git -C submodules/<sm>/repo
-  fetch origin bee-<taskid>`).
+  (read-only). Inspect via git, e.g. `git -C submodules/<sm>/repo log/show/diff bee-<taskid>`. The runner
+  already verified this commit is reachable before dispatching you, so it should already be present. If it
+  is genuinely not present locally: when the submodule has a configured `origin` remote (remote-sharing),
+  fetch it from there (`git -C submodules/<sm>/repo fetch origin bee-<taskid>`); in a SHARED checkout with
+  no `origin` remote (local-sharing — `git -C submodules/<sm>/repo remote` prints nothing), there is
+  nothing to fetch: every honeybee on this host shares the same object store, so the branch is either
+  already a local ref or it genuinely does not exist here. Do not run `fetch origin` in that mode (it
+  fails with "does not appear to be a git repository") and do not spelunk git internals looking for it —
+  if it is absent from BOTH a local ref and (when configured) the fetched origin, this is a runner defect,
+  not something you can recover from by digging further: run `beehive task human <submodule> <task-id>
+  --reason "reviewable commit unreachable"` and end the turn.
 - The change doc at submodules/<sm>/docs/<branch>-<taskid>.md (read-only).
 
 Then decide and commit on main:

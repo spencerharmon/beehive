@@ -67,9 +67,15 @@ type Runner struct {
 	// runner has the agent resolve it, then retries the publish, up to this many
 	// attempts before deferring the task to a later honeybee. 0 -> default 8.
 	MergeRetries int
-	WallCap      time.Duration
-	TTL          time.Duration
-	Now          func() time.Time
+	// RejectLimit bounds how many times a Work task's implementer commit can fail
+	// to land on the submodule's origin (landSourceBranch/demoteUnpushed) before
+	// it is escalated to NEEDS-HUMAN instead of recycled to TODO yet again — the
+	// same "rejections before NEEDS-HUMAN" knob Claimer.Reject uses for a review/
+	// arbitration livelock. 0 -> default 3.
+	RejectLimit int
+	WallCap     time.Duration
+	TTL         time.Duration
+	Now         func() time.Time
 	// Concise is the ALWAYS-ON activity sink (os.Stderr on a real pass): a terse
 	// per-turn log — pass kind, turn boundaries, and abandon/GC warnings — so every
 	// scheduled `honeybee` pass is observable live via `journalctl -t honeybee`
@@ -576,6 +582,31 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 	}
 
+	// Review-dispatch-side reachability guard (session-audit-003 F-LIVE): before
+	// ever opening a session for a NEEDS-REVIEW task, verify its implementer
+	// branch/commit is reachable somewhere this host can see. A task set
+	// NEEDS-REVIEW whose commit is reachable nowhere can only spawn a review pass
+	// that spelunks git internals and idle-times-out — forever, since the runner
+	// just re-dispatches it next cycle. Bounce it straight to NEEDS-ARBITRATION
+	// with a concrete reason instead, deterministically, with zero agent turns
+	// spent. Fails OPEN (dispatches the review normally) on any uncertainty — a
+	// submodule this host cannot check out, or a remote fetch error — so a
+	// transient fault or a host that simply cannot verify never wrongly bounces a
+	// good task; only a POSITIVE, git-confirmed absence bounces.
+	if sel.Kind == selectt.Review {
+		bounced, berr := r.bounceIfUnreachable(ctx, sel, res.Branch, absRoot)
+		if berr != nil && r.Debug != nil {
+			fmt.Fprintf(r.Debug, "[honeybee] reachability pre-check for %s failed; dispatching review normally: %v\n", sel.Task.ID, berr)
+		}
+		if bounced {
+			res.Completed = true
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] %s implementer commit unreachable; bounced to NEEDS-ARBITRATION without spawning a review\n", sel.Task.ID)
+			}
+			return res, nil
+		}
+	}
+
 	// Only a main Work task edits the submodule repo and needs a worktree.
 	// Bootstrap/reconcile only touch beehive-layer files (PLAN.md, docs).
 	var wg *git.Repo
@@ -980,8 +1011,18 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						return res, nil
 					}
 					res.Completed = true
-					if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
+					w, demoted, lerr := r.landSourceBranch(ctx, sel, wg, res.Branch)
+					if lerr != nil {
+						cleanup()
+						return res, lerr
+					}
+					if w != "" {
 						res.Warning = w
+					}
+					if demoted {
+						res.Completed = false
+						cleanup()
+						return res, nil
 					}
 					// Delete a rejected attempt's orphan bee branch (see the mirror
 					// block in the done path): an arbitration -> TODO rework must clear
@@ -1158,8 +1199,18 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				return res, nil
 			}
 			res.Completed = true
-			if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
+			w, demoted, lerr := r.landSourceBranch(ctx, sel, wg, res.Branch)
+			if lerr != nil {
+				cleanup()
+				return res, lerr
+			}
+			if w != "" {
 				res.Warning = w
+			}
+			if demoted {
+				res.Completed = false
+				cleanup()
+				return res, nil
 			}
 			// Arbitration that sided with the reviewer sends the task back to TODO for
 			// rework. The rejected attempt's pushed bee-<taskid> branch is now a
@@ -1681,15 +1732,19 @@ func isSourceCheckout(ctx context.Context, dir string) bool {
 // worthless to peers. Best-effort: a missing remote is a no-op (local install),
 // and a push failure is returned as a warning, never a hard run failure.
 //
-// Failsafe for a stale-remote collision: bee-<taskid> is a disposable per-attempt
-// ref reused verbatim across attempts, so a prior attempt that pushed the branch
-// but never landed on main (a capped/abandoned pass, or one whose rejection
-// cleanup did not run) leaves the name occupied. The new attempt's push is then
-// rejected non-fast-forward and — because the pointer was already bumped — the
-// commit would dangle. Fast-forward protection is for MAIN only; a bee branch is
-// throwaway, so on a push rejection we delete the stale remote branch and re-push.
-// This is the backstop to deleteSourceBranch's eager cleanup on arbitration
-// reject: it also catches orphans that never passed through arbitration at all.
+// Reconciliation for a stale-remote collision (session-audit-003 F-LIVE):
+// bee-<taskid> is a disposable per-attempt ref reused verbatim across attempts,
+// so a prior attempt that pushed the branch but never landed on main (a
+// capped/abandoned pass, or one whose rejection cleanup did not run) leaves the
+// name occupied by a DEAD ORPHAN commit. The new attempt's plain push is then
+// rejected non-fast-forward. Never force-push and never delete the orphan
+// (HONEYBEE.md's no-force-push invariant, AND doing so would make the orphan's
+// commit unreachable for anyone who already recorded it): PushBranchReconciled
+// fetches the orphan and folds it in with an ours-merge (keeps our tree, keeps
+// the orphan reachable as an ancestor) so the retried push is a genuine
+// fast-forward. The caller (landSourceBranch) is responsible for demoting the
+// task when even reconciliation cannot land the commit — this function only
+// reports the warning.
 func (r *Runner) pushSourceBranch(ctx context.Context, wg *git.Repo, branch string) string {
 	if wg == nil {
 		return ""
@@ -1698,18 +1753,148 @@ func (r *Runner) pushSourceBranch(ctx context.Context, wg *git.Repo, branch stri
 	if err != nil || rem == "" {
 		return ""
 	}
-	if err := wg.Push(ctx, rem, branch); err != nil {
-		// Clear the stale remote branch (a superseded prior attempt) and retry. If
-		// the remote is simply unreachable, DeleteRemoteBranch fails too and the
-		// warning names both failures; nothing is lost — a bee branch is disposable.
-		if derr := wg.DeleteRemoteBranch(ctx, rem, branch); derr != nil {
-			return fmt.Sprintf("source branch %s push to %s failed (%v) and clearing the stale remote branch also failed (%v); the submodule pointer will dangle until pushed", branch, rem, err, derr)
-		}
-		if perr := wg.Push(ctx, rem, branch); perr != nil {
-			return fmt.Sprintf("source branch %s still could NOT be pushed to %s after clearing the stale remote branch (%v); the submodule pointer will dangle until pushed", branch, rem, perr)
-		}
+	if err := wg.PushBranchReconciled(ctx, rem, branch); err != nil {
+		return fmt.Sprintf("source branch %s could not be pushed to %s, even after reconciling a divergent dead orphan (%v); the submodule pointer will dangle until pushed", branch, rem, err)
 	}
 	return ""
+}
+
+// landSourceBranch pushes (reconciling any dead orphan; see pushSourceBranch)
+// the Work task's implementer commit to the submodule's origin. On success it
+// returns ("", false, nil): the caller proceeds to report the task complete
+// exactly as before. On a push that still cannot be made to land, it demotes
+// the task from NEEDS-REVIEW back to a workable status (TODO, or NEEDS-HUMAN
+// past the reject limit) and publishes that correction itself via
+// demoteUnpushed, returning (warning, true, nil) so the caller reports the pass
+// as NOT completed instead of a phantom done — the runner must never leave a
+// task NEEDS-REVIEW pointing at a commit no reviewer can reach (session-
+// audit-003 F-LIVE). A nil wg (Review/Arbitrate/Bootstrap/Reconcile;
+// pushSourceBranch's own no-op) returns ("", false, nil) same as a clean push.
+// A push failure on a task that is NOT (or no longer) NEEDS-REVIEW — outside
+// this guard's owned shape, e.g. an agent set a terminal status other than
+// NEEDS-REVIEW, or a peer already resolved it — returns (warning, false, nil):
+// the caller still SEES the warning but is never falsely told a demotion
+// happened when demoteUnpushed correctly no-op'd. Only a failure to even
+// DEMOTE a genuinely-NEEDS-REVIEW stranded task (expected to be exceedingly
+// rare — e.g. a filesystem or git-repository fault) is a hard error: falling
+// through to report the pass complete in that case would be the exact
+// phantom-done this guard exists to prevent.
+func (r *Runner) landSourceBranch(ctx context.Context, sel *selectt.Selection, wg *git.Repo, branch string) (warning string, demoted bool, err error) {
+	w := r.pushSourceBranch(ctx, wg, branch)
+	if w == "" {
+		return "", false, nil
+	}
+	reason := fmt.Sprintf("task %s's implementer commit could not be landed on the submodule origin: %s", taskID(sel), w)
+	ok, derr := r.demoteUnpushed(ctx, sel, reason)
+	if derr != nil {
+		return "", false, fmt.Errorf("%s; demoting the stranded task ALSO failed (task left NEEDS-REVIEW at an unreachable commit): %w", reason, derr)
+	}
+	if !ok {
+		return reason, false, nil
+	}
+	return reason + "; demoted back to a workable status instead of leaving it NEEDS-REVIEW at an unreachable commit", true, nil
+}
+
+// demoteUnpushed corrects a Work task this run just drove to NEEDS-REVIEW
+// (already published to main by finish()) back to a workable status when its
+// implementer commit could not be durably landed on the submodule's origin. It
+// commits AND publishes the correction itself via Claimer.Strand — finish()
+// already ran, so there is no LATER publish in this turn to piggyback on — so
+// main never keeps showing NEEDS-REVIEW at an unreachable commit past this one
+// correction. Returns demoted=false (no-op, no publish, nil error) when the
+// task is not (or no longer) NEEDS-REVIEW: the shape this guard owns; anything
+// else (e.g. a peer already resolved it) is left alone rather than fought —
+// the caller (landSourceBranch) uses this bool to tell a real demotion from a
+// no-op, never conflating the two.
+func (r *Runner) demoteUnpushed(ctx context.Context, sel *selectt.Selection, reason string) (demoted bool, err error) {
+	if st, err := r.taskStatus(sel); err != nil || st != plan.StatusReview {
+		return false, nil
+	}
+	cl := &claim.Claimer{
+		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
+		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
+	}
+	limit := r.RejectLimit
+	if limit <= 0 {
+		limit = 3
+	}
+	if _, err := cl.Strand(ctx, sel.Task.ID, reason, limit); err != nil {
+		return false, err
+	}
+	if err := r.publish(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// bounceIfUnreachable is the Review-dispatch-side half of the F-LIVE fix: it
+// verifies the task's REVIEWABLE COMMIT — the specific sha the submodule
+// pointer (gitlink) is recorded at, which a Work pass bumps as part of
+// completing to NEEDS-REVIEW — is reachable somewhere this host can see
+// (git.Repo.CommitReachable: already in the submodule's own object database,
+// or the bee-<taskid> branch fetched from a configured remote; never a doomed
+// `fetch origin` against a shared checkout with no remote). Checking the
+// SPECIFIC sha (not just whether bee-<taskid> resolves to SOMETHING) matters:
+// the F-LIVE failure mode leaves that branch name resolving to the WRONG
+// commit — a dead orphan from a prior attempt — while the actually-recorded
+// implementer commit is what is missing; a plain branch-existence check would
+// miss it. If unreachable, bounces the task straight to NEEDS-ARBITRATION with
+// a concrete reason via Claimer.BounceUnreachable (commits AND publishes
+// immediately — this runs before any session/turn loop exists). Returns
+// bounced=true only once that correction has actually landed. Any uncertainty
+// (no recorded gitlink to check, the submodule checkout cannot be initialized
+// here, or a configured remote errors reaching it) returns (false, err): the
+// caller falls back to dispatching the review normally rather than risk a
+// false bounce of a good task.
+func (r *Runner) bounceIfUnreachable(ctx context.Context, sel *selectt.Selection, branch, absRoot string) (bool, error) {
+	repoDir := sel.Submodule.RepoDir()
+	rel, err := filepath.Rel(absRoot, repoDir)
+	if err != nil {
+		return false, err
+	}
+	// The submodule pointer recorded on THIS honeybee's beehive worktree HEAD
+	// (freshly branched off the just-published main before any turn has run) is
+	// the reviewable commit: a Work pass bumps this gitlink, alongside the
+	// PLAN.md flip to NEEDS-REVIEW, as part of the SAME merge to main.
+	sha, err := r.Git.RevParse(ctx, "HEAD:"+rel)
+	if err != nil {
+		return false, fmt.Errorf("resolve submodule %s pointer: %w", sel.Submodule.Name, err)
+	}
+	if !isSourceCheckout(ctx, repoDir) {
+		if _, err := r.Git.Run(ctx, "submodule", "update", "--init", "--", rel); err != nil {
+			return false, err
+		}
+	}
+	if !isSourceCheckout(ctx, repoDir) {
+		return false, fmt.Errorf("submodule %s not checked out at %s", sel.Submodule.Name, repoDir)
+	}
+	sg := git.New(repoDir)
+	rem, err := sg.Remote(ctx)
+	if err != nil {
+		return false, err
+	}
+	reachable, err := sg.CommitReachable(ctx, rem, branch, sha)
+	if err != nil {
+		return false, err
+	}
+	if reachable {
+		return false, nil
+	}
+	where := "not present in the object database"
+	if rem != "" {
+		where = fmt.Sprintf("not present in the object database, and fetching %s/%s did not produce it either", rem, branch)
+	}
+	reason := fmt.Sprintf(
+		"reviewable commit unreachable: the submodule pointer %s (recorded for this task) is %s",
+		sha, where)
+	cl := &claim.Claimer{
+		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
+		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
+	}
+	if err := cl.BounceUnreachable(ctx, sel.Task.ID, reason); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // deleteSourceBranch unconditionally removes a task's bee-<taskid> branch from the

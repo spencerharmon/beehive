@@ -258,6 +258,69 @@ func (c *Claimer) Reject(ctx context.Context, taskID string, limit int) (plan.St
 	return t.Status, nil
 }
 
+// Strand demotes taskID from NEEDS-REVIEW back to a workable status (TODO, or
+// NEEDS-HUMAN past limit) because its implementer commit could not be durably
+// pushed to the submodule's origin — not even after reconciling a divergent
+// dead orphan (git.Repo.PushBranchReconciled) — so the runner must never leave
+// it NEEDS-REVIEW pointing at a commit no reviewer can reach (session-audit-003
+// F-LIVE). Commits the change but, like Reject, does NOT publish: the caller is
+// still mid-turn (this rides the same worktree-branch merge finish() performs
+// right after), so publishing here would be a redundant, separately-racing write.
+func (c *Claimer) Strand(ctx context.Context, taskID, reason string, limit int) (plan.Status, error) {
+	p, err := c.load()
+	if err != nil {
+		return "", err
+	}
+	t := p.Find(taskID)
+	if t == nil {
+		return "", fmt.Errorf("strand: task %q absent", taskID)
+	}
+	if err := t.Strand(reason, limit, c.now()); err != nil {
+		return "", err
+	}
+	if err := c.save(p); err != nil {
+		return "", err
+	}
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "strand"), c.planRel()); err != nil && err != git.ErrNothing {
+		return "", err
+	}
+	return t.Status, nil
+}
+
+// BounceUnreachable moves taskID from NEEDS-REVIEW straight to
+// NEEDS-ARBITRATION, deterministically and without ever spawning a review
+// session, when its implementer branch/commit is reachable nowhere this host
+// can see (session-audit-003 F-LIVE). Unlike Strand/Reject this commits AND
+// publishes immediately: it runs standalone, before any turn loop or session
+// exists (a dispatch-time short-circuit, mirroring Release), so there is no
+// later finish() to piggyback the publish on. A publish conflict is benign (a
+// peer already resolved this exact task) and is swallowed, matching Release.
+func (c *Claimer) BounceUnreachable(ctx context.Context, taskID, reason string) error {
+	p, err := c.load()
+	if err != nil {
+		return err
+	}
+	t := p.Find(taskID)
+	if t == nil {
+		return fmt.Errorf("bounce-unreachable: task %q absent", taskID)
+	}
+	if err := t.BounceUnreachable(reason); err != nil {
+		return err
+	}
+	if err := c.save(p); err != nil {
+		return err
+	}
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "bounce-unreachable"), c.planRel()); err != nil && err != git.ErrNothing {
+		return err
+	}
+	if c.Publish != nil {
+		if err := c.Publish(ctx); err != nil && !errors.Is(err, git.ErrConflict) {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- Singleton locks (bootstrap / reconcile) -------------------------------
 //
 // Bootstrap and ROI-reconcile operate on PLAN.md as a whole and carry no task
