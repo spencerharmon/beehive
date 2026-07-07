@@ -172,6 +172,18 @@ func (s *ocSession) Messages(ctx context.Context) ([]Message, error) {
 	return out, nil
 }
 
+// Abort asks the opencode server to stop the session's in-flight turn via POST
+// /session/{id}/abort. The runner calls it after the idle watchdog cancels a
+// wedged turn so the server-side generation (a hung upstream provider request
+// opencode has no read-timeout for) is torn down before the SAME session is
+// re-driven — otherwise a retry could race a still-running dead turn. Best-effort:
+// a server without the endpoint, or a transient error, returns non-nil and the
+// caller proceeds with the retry regardless (a fresh Prompt supersedes it). Bounded
+// by the passed ctx.
+func (s *ocSession) Abort(ctx context.Context) error {
+	return s.oc.post(ctx, "/session/"+s.id+"/abort", s.dir, map[string]any{}, nil)
+}
+
 // Prompt sends text and blocks until the assistant turn goes idle, returning the
 // assistant's concatenated text parts.
 //

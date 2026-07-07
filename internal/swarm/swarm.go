@@ -32,6 +32,15 @@ type Session interface {
 	Close() error
 }
 
+// aborter is an OPTIONAL Session capability: tear down the session's in-flight
+// turn server-side (opencode POST /session/{id}/abort). The turn loop uses it to
+// clear a wedged turn before re-driving the same session on an idle-stall retry.
+// A Session that does not implement it (test mocks) is simply not aborted — the
+// re-issued Prompt supersedes the dead turn anyway — so this stays additive.
+type aborter interface {
+	Abort(ctx context.Context) error
+}
+
 // Client opens opencode sessions. Open creates a session at cwd with the given
 // system prompt but sends no message yet, so callers can start recording before
 // the (often long) first turn runs.
@@ -113,6 +122,15 @@ type Runner struct {
 	// ErrTurnIdle, which the turn loop treats as a stalled-agent GC — distinct from
 	// the absolute TurnTimeout ceiling. 0 = watchdog disabled.
 	TurnIdleTimeout time.Duration
+
+	// TurnIdleRetries bounds how many times a single pass recovers in-place from an
+	// idle stall before abandoning the task for GC. On an idle stall with retries
+	// left (and wall budget remaining) the runner aborts the wedged turn server-side
+	// (Session Abort capability, best-effort) and re-drives the SAME session with a
+	// resume prompt, preserving the investigation instead of throwing the whole pass
+	// away to a transient upstream hang. 0 = the historical behavior: the first idle
+	// stall abandons immediately.
+	TurnIdleRetries int
 
 	// LeanInject trims the per-pass injected system prompt to only what this pass's
 	// kind acts on (trimProtocol) and defers the Work completion rule from the
@@ -765,6 +783,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// commits on its branch. Both are inert when StallTurns==0 (limit<=0 never
 	// trips) so the default single-model host is unaffected.
 	stall := &stallDetector{limit: r.StallTurns}
+	// idleRetriesUsed bounds in-place recovery from idle stalls across this pass (see
+	// Runner.TurnIdleRetries). Cumulative, not per-turn, so the total wall time a
+	// pass can burn re-waiting the idle window is bounded by retries × TurnIdleTimeout.
+	idleRetriesUsed := 0
 	var progressGit *git.Repo
 	if sel.Kind == selectt.Work && wtAbs != "" {
 		progressGit = git.New(wtAbs)
@@ -953,6 +975,29 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		timedOut := r.TurnTimeout > 0 && turnCtx.Err() == context.DeadlineExceeded
 		idleStalled := errors.Is(perr, ErrTurnIdle)
 		cancelTurn()
+		// In-place idle recovery: a wedged upstream turn (github-copilot holding the
+		// stream open with zero output, no error, and no opencode read-timeout) is
+		// probabilistic. With retry budget and wall time left, abort the dead turn
+		// server-side and re-drive the SAME session (its investigation is preserved)
+		// instead of abandoning the whole pass — which would restart from scratch and
+		// re-roll the same hang. res.Turns < MaxTurns guarantees a real turn slot
+		// remains after the loop's post-increment.
+		if idleStalled && idleRetriesUsed < r.TurnIdleRetries && res.Turns < r.MaxTurns && r.now().Before(deadline) {
+			idleRetriesUsed++
+			if ab, ok := sess.(aborter); ok {
+				abCtx, abCancel := context.WithTimeout(ctx, 15*time.Second)
+				_ = ab.Abort(abCtx)
+				abCancel()
+			}
+			fmt.Fprintf(os.Stderr, "honeybee: turn %d idle-stalled after %s; aborted the wedged turn, retrying in-place (%d/%d)\n",
+				res.Turns, r.TurnIdleTimeout, idleRetriesUsed, r.TurnIdleRetries)
+			if tc != nil {
+				prompt = r.leanContextPrompt(ctx, sess, tc, sel, res.Branch)
+			} else {
+				prompt = r.nextPrompt(sel, res.Branch)
+			}
+			continue
+		}
 		if perr != nil {
 			if timedOut || idleStalled {
 				res.GCMarked = true

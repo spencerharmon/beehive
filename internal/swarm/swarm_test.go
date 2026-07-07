@@ -780,6 +780,130 @@ func TestIdleTurnAbandonsForGC(t *testing.T) {
 		t.Fatalf("warning should name the idle timeout, got %q", res.Warning)
 	}
 }
+
+// fixedClient hands out a caller-supplied Session so a test can drive exact
+// Prompt/Abort behavior across turns.
+type fixedClient struct{ sess Session }
+
+func (c fixedClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	return c.sess, nil
+}
+
+// retryIdleSession always idles and counts Prompt/Abort calls; it implements the
+// optional aborter capability so the runner's in-place idle recovery exercises the
+// server-side abort before each retry.
+type retryIdleSession struct {
+	prompts int
+	aborts  int
+}
+
+func (s *retryIdleSession) Prompt(ctx context.Context, text string) (string, error) {
+	s.prompts++
+	return "", ErrTurnIdle
+}
+func (s *retryIdleSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+func (s *retryIdleSession) Close() error                                    { return nil }
+func (s *retryIdleSession) Abort(ctx context.Context) error                 { s.aborts++; return nil }
+
+// TestIdleRetryBoundThenAbandons proves that with a retry budget the runner
+// recovers in-place from an idle stall — aborting the wedged turn and re-driving
+// the SAME session — and only abandons for GC once the budget is exhausted. With
+// TurnIdleRetries=2 an always-idle session is prompted 3 times (1 + 2 retries),
+// aborted twice, and finally abandoned with the idle-timeout warning.
+func TestIdleRetryBoundThenAbandons(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	sess := &retryIdleSession{}
+	r := &Runner{
+		Repo: rp, Git: g, Client: fixedClient{sess: sess}, MaxTurns: 5,
+		WallCap: time.Hour, TTL: time.Hour,
+		TurnTimeout: time.Hour, TurnIdleTimeout: 15 * time.Minute, TurnIdleRetries: 2,
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("idle-retry abandon must not be fatal, got: %v", err)
+	}
+	if sess.prompts != 3 {
+		t.Fatalf("want 3 prompts (1 + 2 retries), got %d", sess.prompts)
+	}
+	if sess.aborts != 2 {
+		t.Fatalf("want 2 server-side aborts (one per retry), got %d", sess.aborts)
+	}
+	if !res.GCMarked {
+		t.Fatalf("want GCMarked once the retry budget is exhausted, got %+v", res)
+	}
+	if !contains(res.Warning, "idle timeout") {
+		t.Fatalf("warning should name the idle timeout, got %q", res.Warning)
+	}
+}
+
+// recoverIdleSession idles on its first turn, then on the second writes the
+// bootstrap PLAN.md and succeeds — modeling a transient upstream hang that clears
+// on retry.
+type recoverIdleSession struct {
+	prompts  int
+	aborts   int
+	planPath string
+}
+
+func (s *recoverIdleSession) Prompt(ctx context.Context, text string) (string, error) {
+	s.prompts++
+	if s.prompts == 1 {
+		return "", ErrTurnIdle
+	}
+	os.WriteFile(s.planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	return "", nil
+}
+func (s *recoverIdleSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+func (s *recoverIdleSession) Close() error                                    { return nil }
+func (s *recoverIdleSession) Abort(ctx context.Context) error                 { s.aborts++; return nil }
+
+// TestIdleRetryRecoversInPlace proves a single transient idle stall no longer
+// throws the pass away: after one abort+retry the re-driven session completes the
+// task, so the pass reports Completed (not GCMarked) and aborted exactly once.
+func TestIdleRetryRecoversInPlace(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	sess := &recoverIdleSession{planPath: filepath.Join(sm, "PLAN.md")}
+	r := &Runner{
+		Repo: rp, Git: g, Client: fixedClient{sess: sess}, MaxTurns: 5,
+		WallCap: time.Hour, TTL: time.Hour,
+		TurnTimeout: time.Hour, TurnIdleTimeout: 15 * time.Minute, TurnIdleRetries: 2,
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.GCMarked {
+		t.Fatalf("a recovered idle stall must not GC-abandon, got %+v", res)
+	}
+	if sess.aborts != 1 {
+		t.Fatalf("want exactly one abort (single stall), got %d", sess.aborts)
+	}
+	if !res.Completed {
+		t.Fatalf("want Completed after in-place recovery, got %+v", res)
+	}
+}
 func (blockingSession) Close() error { return nil }
 
 // TestTurnTimeoutAbandonsForGC proves a stalled agent turn is canceled at

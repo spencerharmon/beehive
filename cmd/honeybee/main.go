@@ -207,6 +207,10 @@ func run() error {
 		RestoreConfig:   restoreRemotes,
 		TurnTimeout:     time.Duration(c.TurnTimeoutMinutes) * time.Minute,
 		TurnIdleTimeout: time.Duration(eff.TurnIdleTimeoutMinutes) * time.Minute,
+		// In-place recovery budget for idle-stalled turns: abort the wedged upstream
+		// turn and re-drive the same session rather than abandoning the pass to a
+		// transient provider hang. From the layered config (default 2).
+		TurnIdleRetries: eff.TurnIdleRetries,
 		// Per-kind model routing from the layered config (honeybee-model-routing):
 		// a near-deterministic kind can run on a cheap model while code Work runs on
 		// the strong one. eff.ModelFor falls through to the single Model when a kind

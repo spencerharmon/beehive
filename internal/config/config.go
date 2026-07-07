@@ -94,6 +94,19 @@ type Config struct {
 	// (Opencode.IdleTimeout); the runner mirrors it only for the GC warning wording.
 	TurnIdleTimeoutMinutes int `yaml:"turn_idle_timeout_minutes"`
 
+	// TurnIdleRetries is how many times a single pass RECOVERS in-place from an idle
+	// stall before giving up. The idle watchdog catches a genuinely wedged upstream
+	// turn (github-copilot occasionally holds the streaming request open with zero
+	// output and no error, and opencode has no provider read-timeout), but these
+	// hangs are PROBABILISTIC: aborting the wedged turn server-side and re-driving
+	// the SAME session (its investigation/context is preserved) usually clears it,
+	// so a big task no longer loses a whole pass — and every retry from scratch — to
+	// one transient hang. Each retry costs up to TurnIdleTimeoutMinutes of wall time,
+	// so the total is bounded by both this count and the run WallCap/TTL. Only after
+	// this many cumulative idle stalls in a pass does it abandon the task for GC. 0 =
+	// the historical behavior (first idle stall abandons immediately).
+	TurnIdleRetries int `yaml:"turn_idle_retries"`
+
 	// BuildEnv is the host-specific Go build/test environment the runner OWNS so no
 	// honeybee re-derives it (audit session-audit-001 F1: e.g. a broken host cgo
 	// linker forces CGO_ENABLED=0, a quota-limited /tmp forces a root-fs GOTMPDIR/
@@ -127,6 +140,7 @@ func Defaults(dir string) Config {
 		RejectLimit:            3,
 		TurnTimeoutMinutes:     180,
 		TurnIdleTimeoutMinutes: 15,
+		TurnIdleRetries:        2,
 		SessionPullSeconds:     2,
 	}
 }
@@ -256,6 +270,9 @@ func merge(base, over Config) Config {
 	}
 	if over.TurnIdleTimeoutMinutes != 0 {
 		out.TurnIdleTimeoutMinutes = over.TurnIdleTimeoutMinutes
+	}
+	if over.TurnIdleRetries != 0 {
+		out.TurnIdleRetries = over.TurnIdleRetries
 	}
 	out.BuildEnv = mergeEnv(base.BuildEnv, over.BuildEnv)
 	if over.SessionPullSeconds != 0 {
