@@ -956,6 +956,36 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		return ferr
 	}
+	// durablyWarnPublishFailure records msg as a trailing "## ⚠️ warning" block on
+	// the already-sealed session transcript and re-streams it, using the SAME
+	// primitives finish() uses internally. finish() flushes+streams its "final"
+	// transcript (rec.snapshot → streamSession) BEFORE it attempts the
+	// publishWithResolution / finalizeSession steps whose failure it returns, so a
+	// publish- or main-advance failure discovered AFTER finish() returns can never
+	// reach the file finish just sealed — leaving the transcript byte-for-byte
+	// identical to an honest first-try success. internal/audit's entire anomaly
+	// surface (Aborted/LostRace/CompletionMiss) keys off exactly that trailing
+	// block, so without this the silently-dropped publish is invisible to the audit
+	// corpus and a future pass redoes the "already correct" work with no signal.
+	// Every post-finish GC-for-retry site therefore calls this with the SAME message
+	// it puts on res.Warning (carrying the literal ferr/failure text, not a generic
+	// phrase) so the durable record matches the stderr line and a future pass can
+	// data-mine the true trigger distribution. rec.appendWarning is safe here: the
+	// recorder goroutine has already stopped inside finish(). Best-effort — an
+	// append/stream error is logged to stderr but NEVER changes the GC-for-retry /
+	// no-phantom-DONE outcome the caller returns.
+	durablyWarnPublishFailure := func(msg string) {
+		if msg == "" {
+			return
+		}
+		if err := rec.appendWarning(msg); err != nil {
+			fmt.Fprintf(os.Stderr, "honeybee: WARNING could not append publish-failure warning to session transcript: %v\n", err)
+			return
+		}
+		if err := r.streamSession(ctx, sessionRel); err != nil {
+			fmt.Fprintf(os.Stderr, "honeybee: WARNING could not stream publish-failure warning to session transcript: %v\n", err)
+		}
+	}
 	cleanup := func() {
 		if wg != nil {
 			_ = wg.WorktreeRemove(ctx, wtAbs)
@@ -1038,6 +1068,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						res.Warning = fmt.Sprintf(
 							"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
 							sel.Task.ID, ferr)
+						durablyWarnPublishFailure(res.Warning)
 						return res, nil
 					}
 					res.Completed = true
@@ -1201,6 +1232,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				res.Warning = fmt.Sprintf(
 					"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
 					sel.Task.ID, ferr)
+				durablyWarnPublishFailure(res.Warning)
 				return res, nil
 			}
 			// Second publish-tree guard (bootstrap/reconcile): finish() published,
@@ -1226,6 +1258,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						"task %s reached completion locally but main did not advance after publish (no-op publish); left for retry",
 						taskID(sel))
 				}
+				durablyWarnPublishFailure(res.Warning)
 				return res, nil
 			}
 			res.Completed = true

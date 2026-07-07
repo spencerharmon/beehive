@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/audit"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -1664,6 +1665,141 @@ func TestRunPublishFailureBlocksCompletion(t *testing.T) {
 	if res.Warning == "" || !strings.Contains(res.Warning, "publishing to main failed") {
 		t.Fatalf("publish failure should be surfaced in the warning: %+v", res)
 	}
+}
+
+// TestRunPublishFailureRecordsDurableWarning is the regression guard for the
+// silent-drop defect: a pass that completes LOCALLY but whose finish-internal
+// publish fails builds a res.Warning that today reaches only stderr, never the
+// repository. finish() streams its "final" transcript BEFORE the publish it
+// attempts, so the failure never lands in the sealed file — leaving it byte-for-
+// byte identical to an honest success and invisible to internal/audit (whose
+// entire anomaly surface keys off a trailing "## ⚠️ warning" block). The fix
+// durably appends that SAME message (with the literal failure text) to the
+// transcript and re-streams it. This test asserts BOTH directions with NO
+// internal/audit change: a failed publish now yields a trailing warning block
+// that audit flags Aborted+CompletionMiss, and a clean publish yields none (no
+// false positive). The pre-existing GC-for-retry / no-phantom-DONE outcome is
+// unchanged (Completed stays false, GCMarked true) exactly as
+// TestRunPublishFailureBlocksCompletion asserts.
+func TestRunPublishFailureRecordsDurableWarning(t *testing.T) {
+	// run builds a fresh single-host hive (no session worktree, so streamSession is
+	// a no-op and the transcript is written straight to the on-disk sessions dir)
+	// and drives one Work pass to LOCAL completion. When publishFails the completion
+	// publish to main returns "publish boom" — the finish-internal
+	// publishWithResolution failure this task targets; otherwise it succeeds. It
+	// returns the pass Result and the on-disk session transcript path.
+	run := func(t *testing.T, publishFails bool) (Result, string) {
+		t.Helper()
+		root := t.TempDir()
+		g := gitInit(t, root)
+		repo.Init(root)
+		sm := filepath.Join(root, "submodules", "sm")
+		os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+		repoDir := filepath.Join(sm, "repo")
+		os.MkdirAll(repoDir, 0o755)
+		gitInit(t, repoDir)
+		os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+		git.New(repoDir).Commit(context.Background(), "base")
+		planPath := filepath.Join(sm, "PLAN.md")
+		os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+		g.Commit(context.Background(), "seed")
+
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+		// Agent drives the task terminal + writes the change doc (completion check
+		// passes). Gate the publish on [DONE] so the per-turn heartbeat (still
+		// IN-PROGRESS, pre-Prompt) succeeds; only the completion publish fails.
+		cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		}}}
+		r := &Runner{
+			Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+			Publish: func(ctx context.Context) error {
+				if publishFails {
+					if b, _ := os.ReadFile(planPath); strings.Contains(string(b), "[DONE]") {
+						return errors.New("publish boom")
+					}
+				}
+				return nil
+			},
+		}
+		res, err := r.Run(context.Background(), sel, "sys", "first")
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		return res, filepath.Join(subs[0].SessionsDir(), res.SessionID+".md")
+	}
+
+	const warnHeader = "## \u26a0\ufe0f warning"
+
+	t.Run("failed-publish-durably-warns", func(t *testing.T) {
+		res, sessionPath := run(t, true)
+		// Pre-existing GC-for-retry / no-phantom-DONE behaviour must be UNCHANGED.
+		if res.Completed {
+			t.Fatalf("publish failed — task must NOT report Completed: %+v", res)
+		}
+		if !res.GCMarked {
+			t.Fatalf("publish failed — run must mark GC for retry: %+v", res)
+		}
+		if !strings.Contains(res.Warning, "publishing to main failed") {
+			t.Fatalf("res.Warning missing failure text: %q", res.Warning)
+		}
+		// Regression target: the transcript now carries a trailing warning block
+		// with the LITERAL failure text, not just the stderr res.Warning line.
+		body, err := os.ReadFile(sessionPath)
+		if err != nil {
+			t.Fatalf("read session transcript: %v", err)
+		}
+		if !strings.Contains(string(body), warnHeader) {
+			t.Fatalf("transcript missing the trailing warning block:\n%s", body)
+		}
+		if !strings.Contains(string(body), "publish boom") {
+			t.Fatalf("warning block missing the LITERAL failure text 'publish boom':\n%s", body)
+		}
+		// internal/audit must now classify the dropped-publish pass as an anomaly
+		// with NO internal/audit change: a trailing warning block => Aborted, and a
+		// Work-kind abort => CompletionMiss.
+		s, err := audit.ParseFile(sessionPath)
+		if err != nil {
+			t.Fatalf("audit.ParseFile: %v", err)
+		}
+		if s.Kind != audit.KindWork {
+			t.Fatalf("session kind: got %q want %q", s.Kind, audit.KindWork)
+		}
+		if !s.Heuristics.Aborted {
+			t.Fatalf("audit must report Aborted for a durable publish-failure warning: %+v", s.Heuristics)
+		}
+		if !s.Heuristics.CompletionMiss {
+			t.Fatalf("audit must report CompletionMiss for a Work-kind abort: %+v", s.Heuristics)
+		}
+		if s.Heuristics.AbortReason == "" {
+			t.Fatalf("audit must extract an AbortReason from the warning block: %+v", s.Heuristics)
+		}
+	})
+
+	t.Run("clean-publish-writes-no-warning", func(t *testing.T) {
+		res, sessionPath := run(t, false)
+		if !res.Completed || res.GCMarked {
+			t.Fatalf("a clean publish must complete without GC: %+v", res)
+		}
+		body, err := os.ReadFile(sessionPath)
+		if err != nil {
+			t.Fatalf("read session transcript: %v", err)
+		}
+		if strings.Contains(string(body), warnHeader) {
+			t.Fatalf("a successful publish must NOT write a warning block (false positive):\n%s", body)
+		}
+		s, err := audit.ParseFile(sessionPath)
+		if err != nil {
+			t.Fatalf("audit.ParseFile: %v", err)
+		}
+		if s.Heuristics.Aborted || s.Heuristics.CompletionMiss {
+			t.Fatalf("a clean pass must not be flagged Aborted/CompletionMiss: %+v", s.Heuristics)
+		}
+	})
 }
 
 // TestWorkSyncsWorktreeBaseToTrackedTip proves the Work setup fetches and
