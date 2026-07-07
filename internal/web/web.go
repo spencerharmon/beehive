@@ -300,6 +300,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /stats", b((*Server).stats))
 	mux.HandleFunc("GET /submodule/{name}", b((*Server).explorer))
 	mux.HandleFunc("GET /submodule/{name}/branches", b((*Server).branches))
+	mux.HandleFunc("GET /submodule/{name}/commit/{sha}", b((*Server).commitView))
 	mux.HandleFunc("GET /submodule/{name}/doc/{file}", b((*Server).doc))
 	mux.HandleFunc("GET /submodule/{name}/plan", b((*Server).plan))
 	mux.HandleFunc("POST /submodule/{name}/plan/delete", b((*Server).planDelete))
@@ -702,8 +703,16 @@ func (s *Server) branches(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	// delivery-traceability half (a): for each row whose Beehive stamp names a
+	// DONE task, link to the hive commit that flipped it (buildDeliveries also
+	// covers half (b), but DocHref below already carries that unchanged).
+	deliveries := indexDeliveries(s.buildDeliveries(r.Context(), s.headSHA(r.Context()), sm, doneTaskIDs(sm)))
 	for i := range cs {
 		cs[i].DocHref = resolveDocHref(sm, cs[i].DocPath)
+		if d, ok := deliveries[cs[i].DocTask]; ok {
+			cs[i].FlipSHA = d.FlipSHA
+			cs[i].FlipHref = d.FlipHref
+		}
 	}
 	prev := off - lim
 	if prev < 0 {

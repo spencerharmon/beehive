@@ -1,0 +1,7 @@
+{{template "header"}}
+<p><a href="/submodule/{{.Name}}/branches">&larr; {{.Name}} commits</a></p>
+<h1>{{.Name}} <code>{{.SHA}}</code></h1>
+<p class="muted">{{.Subject}}</p>
+<p class="muted">{{.Author}} &middot; {{.Date}}</p>
+<pre class="diff">{{.Patch}}</pre>
+{{template "footer"}}
