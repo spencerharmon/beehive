@@ -993,3 +993,47 @@ func TestCommitReachable(t *testing.T) {
 		}
 	})
 }
+
+// TestLocalBranchExists covers the local-sharing-mode branch-existence probe the
+// review-already-merged guard uses (merged-guard-branch-gate): a present local
+// branch ref -> true, an absent one -> (false, nil) with no error, and the check
+// keys on the branch NAME resolving to refs/heads/<name>, not on whether the
+// commit exists (a dangling commit on no branch must still read as absent).
+func TestLocalBranchExists(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	commitFile(t, r, "f", "base\n", "base")
+
+	// A branch that exists resolves to true.
+	if _, err := r.Run(ctx, "branch", "bee-R1"); err != nil {
+		t.Fatalf("create bee-R1: %v", err)
+	}
+	ok, err := r.LocalBranchExists(ctx, "bee-R1")
+	if err != nil {
+		t.Fatalf("LocalBranchExists(present) errored: %v", err)
+	}
+	if !ok {
+		t.Fatal("LocalBranchExists(present) = false, want true")
+	}
+
+	// A branch that was never created resolves to (false, nil) — a confirmed
+	// absence, never an error.
+	ok, err = r.LocalBranchExists(ctx, "bee-never-existed")
+	if err != nil {
+		t.Fatalf("LocalBranchExists(absent) errored, want (false,nil): %v", err)
+	}
+	if ok {
+		t.Fatal("LocalBranchExists(absent) = true, want false")
+	}
+
+	// Existence keys on the ref NAME, not the commit: main's own tip commit is
+	// present in the object DB, but there is no branch literally named after the
+	// sha, so the probe must not be fooled into reporting it exists.
+	sha, err := r.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	if ok, err := r.LocalBranchExists(ctx, sha); err != nil || ok {
+		t.Fatalf("LocalBranchExists(commit-sha as name) = %v,%v want false,nil", ok, err)
+	}
+}

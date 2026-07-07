@@ -594,7 +594,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// OPEN (falls through to dispatch normally) on any uncertainty, exactly
 	// like bounceIfUnreachable.
 	if sel.Kind == selectt.Review {
-		finalized, ferr := r.finalizeIfAlreadyMerged(ctx, sel, absRoot)
+		finalized, ferr := r.finalizeIfAlreadyMerged(ctx, sel, res.Branch, absRoot)
 		if ferr != nil && r.Debug != nil {
 			fmt.Fprintf(r.Debug, "[honeybee] already-merged pre-check for %s failed; dispatching review normally: %v\n", sel.Task.ID, ferr)
 		}
@@ -1888,14 +1888,26 @@ func (r *Runner) demoteUnpushed(ctx context.Context, sel *selectt.Selection, rea
 // path) and commits AND publishes immediately, mirroring BounceUnreachable —
 // this runs before any session/turn loop exists.
 //
+// The ancestry shortcut is FIRST gated on bee-<taskid> actually having existed
+// as a real branch (merged-guard-branch-gate), via sourceBranchExists: an
+// ancestor-of-tracked-main pointer is trivially true for a ZERO-code-diff task
+// too (a diagnose-only Work pass never bumps the gitlink, so the recorded
+// pointer still EQUALS main's tip and `--is-ancestor A B` is true with A==B) —
+// so without this gate a whole task family (session-audit-NNN) would auto-DONE
+// with zero review turns, permanently bypassing the swarm's only QA gate. Only
+// a genuine interrupted review leaves an implementer branch behind; if
+// bee-<taskid> resolves nowhere (no remote head, no local ref) the guard
+// declines and the caller dispatches a normal review.
+//
 // Returns finalized=true only once that correction has actually landed. Any
 // uncertainty (no recorded gitlink to check, the submodule checkout cannot be
-// initialized here, a configured remote errors reaching it, or the ancestry
-// check itself errors — e.g. the recorded sha does not even exist locally,
-// bounceIfUnreachable's shape, not this guard's) returns (false, err): the
-// caller falls through to the reachability guard / normal dispatch rather than
-// risk a false finalize of a genuinely pending review.
-func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selection, absRoot string) (bool, error) {
+// initialized here, a configured remote errors reaching it or advertising
+// bee-<taskid>, or the ancestry check itself errors — e.g. the recorded sha
+// does not even exist locally, bounceIfUnreachable's shape, not this guard's)
+// returns (false, err): the caller falls through to the reachability guard /
+// normal dispatch rather than risk a false finalize of a genuinely pending
+// review.
+func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selection, branch, absRoot string) (bool, error) {
 	repoDir := sel.Submodule.RepoDir()
 	rel, err := filepath.Rel(absRoot, repoDir)
 	if err != nil {
@@ -1917,6 +1929,31 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 	rem, err := sg.Remote(ctx)
 	if err != nil {
 		return false, err
+	}
+	// Gate the ancestry shortcut on bee-<taskid> having actually EXISTED as a
+	// real branch (merged-guard-branch-gate): the IsAncestor(sha, tracked-main)
+	// check below is trivially true for a ZERO-code-diff task too. A
+	// diagnose-only Work pass (e.g. the session-audit-NNN family) never bumps
+	// the gitlink, so the recorded pointer still EQUALS tracked main's tip, and
+	// `git merge-base --is-ancestor A B` reports true whenever A==B — the
+	// ancestry is an artifact of the unmoved pointer, not evidence of any real
+	// merged review. CommitReachable (bounceIfUnreachable's check) is NOT
+	// enough to distinguish them: an unmoved pointer is trivially reachable too,
+	// the same triviality that defeats IsAncestor. Only a genuine interrupted
+	// review leaves an implementer branch behind — bee-<taskid> pushed to the
+	// submodule origin and unreclaimed (remote mode), or present as a local ref
+	// in the shared module store (local-sharing mode). If bee-<taskid> resolves
+	// NOWHERE, this is not an interrupted merge: return (false, nil) so the
+	// caller dispatches a normal review that actually judges the pass's
+	// deliverables, instead of an integrity-bypassing zero-turn auto-DONE. A
+	// remote query error surfaces as (false, err) so the caller fails OPEN
+	// (dispatch), never a false finalize.
+	branchSeen, err := r.sourceBranchExists(ctx, sg, rem, branch)
+	if err != nil {
+		return false, err
+	}
+	if !branchSeen {
+		return false, nil
 	}
 	tracked := r.trackedBranch(ctx, rel)
 	trackedRef := tracked
@@ -1958,6 +1995,33 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 		return false, err
 	}
 	return true, nil
+}
+
+// sourceBranchExists reports whether a task's bee-<taskid> source branch
+// resolves to a real ref anywhere this host can see it — the remote's live head
+// advertisement in remote mode (reusing reclaimSourceBranch's LsRemoteBranch
+// plumbing; ls-remote, no fetch), or a local branch ref in local-sharing mode
+// (no remote). It is the review-already-merged guard's proof that an "already
+// an ancestor of tracked main" pointer descends from a genuine implementer
+// branch (a real, possibly-interrupted review) rather than a ZERO-code-diff
+// task whose gitlink never moved off main's tip (merged-guard-branch-gate). In
+// remote mode a stale bee-<taskid> from a prior orphaned attempt still counts
+// as "existed" — that is fine: the guard additionally requires the recorded
+// pointer to already be an ancestor of tracked main, which a never-merged
+// orphan is not. A remote ls-remote error is surfaced (not folded into "does
+// not exist") so the caller fails OPEN — dispatching a normal review — instead
+// of risking a false finalize on a transient fault.
+func (r *Runner) sourceBranchExists(ctx context.Context, sg *git.Repo, rem, branch string) (bool, error) {
+	if rem != "" {
+		tip, err := sg.LsRemoteBranch(ctx, rem, branch)
+		if err != nil {
+			return false, err
+		}
+		if tip != "" {
+			return true, nil
+		}
+	}
+	return sg.LocalBranchExists(ctx, branch)
 }
 
 // bounceIfUnreachable is the Review-dispatch-side half of the F-LIVE fix: it

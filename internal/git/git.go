@@ -422,6 +422,27 @@ func (r *Repo) LsRemoteBranch(ctx context.Context, remote, branch string) (strin
 	return fields[0], nil
 }
 
+// LocalBranchExists reports whether a local branch ref refs/heads/<branch>
+// exists in this repo — the narrow "does this branch NAME resolve to a ref
+// here" question, distinct from CommitExists (any commit object, even a
+// dangling one on no ref at all) and LsRemoteBranch (a remote advertisement).
+// It is the local-sharing-mode (no remote) counterpart of LsRemoteBranch, used
+// by the review-already-merged guard to confirm a task's bee-<taskid> branch
+// was actually created before trusting an "already an ancestor of tracked main"
+// pointer as a genuine merged review. `git show-ref --verify --quiet` exits 0
+// when the ref exists and 1 when it does not; any other exit is a real error,
+// never silently folded into false.
+func (r *Repo) LocalBranchExists(ctx context.Context, branch string) (bool, error) {
+	if _, err := r.Run(ctx, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // IsAncestor reports whether commit maybe is contained in ref's history (an
 // ancestor of, or equal to, ref). It wraps `git merge-base --is-ancestor`, which
 // exits 0 for true and 1 for false; any other exit (e.g. a bad object) is a real
