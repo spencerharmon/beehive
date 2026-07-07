@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/audit"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -1663,6 +1664,249 @@ func TestRunPublishFailureBlocksCompletion(t *testing.T) {
 	}
 	if res.Warning == "" || !strings.Contains(res.Warning, "publishing to main failed") {
 		t.Fatalf("publish failure should be surfaced in the warning: %+v", res)
+	}
+}
+
+// TestRunPublishFailureRecordsDurableTranscriptWarning is the publish-fail-
+// durable-warning regression: finish() flushes+streams the "final" transcript
+// BEFORE attempting r.publishWithResolution, so a failure discovered only there
+// (the primary Work/Review/Arbitrate done path, ~swarm.go:1226) used to leave
+// ZERO trace in the session transcript — the file was byte-for-byte
+// indistinguishable from an honest first-try success, even though res.Warning
+// carried the real reason (which reached only cmd/honeybee/main.go's stderr,
+// never the repository). The fix must durably append a trailing "## ⚠️
+// warning" block carrying that same text, so internal/audit.ParseFile — which
+// keys Aborted/CompletionMiss exclusively off that block — reports the pass as
+// aborted instead of silently indistinguishable from success.
+func TestRunPublishFailureRecordsDurableTranscriptWarning(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Publish: func(ctx context.Context) error {
+			if b, _ := os.ReadFile(planPath); strings.Contains(string(b), "[DONE]") {
+				return errors.New("publish boom")
+			}
+			return nil
+		},
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed || !res.GCMarked {
+		t.Fatalf("sanity: want GC-marked, not completed, got %+v", res)
+	}
+	transcriptPath := filepath.Join(sm, "sessions", res.SessionID+".md")
+	body, rerr := os.ReadFile(transcriptPath)
+	if rerr != nil {
+		t.Fatalf("read transcript: %v", rerr)
+	}
+	if !strings.Contains(string(body), "## \u26a0\ufe0f warning") {
+		t.Fatalf("regression: transcript carries no trailing warning block despite the publish failure; got:\n%s", body)
+	}
+	if !strings.Contains(string(body), "publishing to main failed") {
+		t.Fatalf("warning block must carry the real failure text, got:\n%s", body)
+	}
+	s, aerr := audit.ParseFile(transcriptPath)
+	if aerr != nil {
+		t.Fatalf("audit.ParseFile: %v", aerr)
+	}
+	if !s.Heuristics.Aborted {
+		t.Fatalf("audit must classify this transcript as Aborted, got %+v", s.Heuristics)
+	}
+	if !s.Heuristics.CompletionMiss {
+		t.Fatalf("a Work-kind abort must set CompletionMiss, got %+v", s.Heuristics)
+	}
+	if !strings.Contains(s.Heuristics.AbortReason, "publishing to main failed") {
+		t.Fatalf("AbortReason must carry the real failure text, got %q", s.Heuristics.AbortReason)
+	}
+}
+
+// TestRunClaimResolvedPublishFailureRecordsDurableTranscriptWarning is the
+// publish-fail-durable-warning regression for the claim-resolved-mid-turn call
+// site (~swarm.go:1062): the task is ALREADY terminal (NEEDS-REVIEW, with its
+// doc present) the very first time this pass heartbeats — e.g. a peer or a
+// prior attempt resolved it between selection and this pass's first turn — so
+// the ErrResolved branch's own finish()+publish attempt runs before any prompt.
+// A publish failure discovered there must be just as durably recorded as the
+// primary done path's.
+func TestRunClaimResolvedPublishFailureRecordsDurableTranscriptWarning(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	// The task is ALREADY resolved to NEEDS-REVIEW (with its doc present) before
+	// Run() ever starts, while the selection still carries the TODO status this
+	// pass was dispatched with — so the very first heartbeat (turn 1, before any
+	// prompt) sees the mismatch and returns claim.ErrResolved.
+	os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	r := &Runner{
+		Repo: rp, Git: g, Client: &mockClient{sess: &mockSession{}}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Publish: func(ctx context.Context) error { return errors.New("publish boom") },
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed || !res.GCMarked {
+		t.Fatalf("sanity: want GC-marked, not completed, got %+v", res)
+	}
+	transcriptPath := filepath.Join(sm, "sessions", res.SessionID+".md")
+	s, aerr := audit.ParseFile(transcriptPath)
+	if aerr != nil {
+		t.Fatalf("audit.ParseFile: %v", aerr)
+	}
+	if !s.Heuristics.Aborted || !s.Heuristics.CompletionMiss {
+		t.Fatalf("want Aborted+CompletionMiss on the claim-resolved publish-failure path, got %+v", s.Heuristics)
+	}
+	if !strings.Contains(s.Heuristics.AbortReason, "publishing to main failed") {
+		t.Fatalf("AbortReason must carry the real failure text, got %q", s.Heuristics.AbortReason)
+	}
+}
+
+// TestRunNoOpPublishRecordsDurableTranscriptWarning is the publish-fail-
+// durable-warning regression for the mainAdvanced re-verification call site
+// (~swarm.go:1259, Bootstrap/Reconcile only): the agent leaves PLAN.md
+// uncommitted in its own worktree, so the local completion check is green but
+// the publish carries nothing and mainAdvanced reports main did NOT advance —
+// discovered AFTER finish() already ran successfully, so this is the "finish
+// itself never failed, only the post-finish re-verification did" shape.
+func TestRunNoOpPublishRecordsDurableTranscriptWarning(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\nbuild it\n"), 0o644)
+	g.Commit(context.Background(), "seed roi")
+
+	ctx := context.Background()
+	wtPath := filepath.Join(root, ".worktrees", "bee-noop")
+	if err := g.WorktreeAdd(ctx, wtPath, "bee-noop", "main"); err != nil {
+		t.Fatal(err)
+	}
+	wrp, _ := repo.Open(wtPath)
+	wg := git.New(wtPath)
+	subs, _ := wrp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	cl := &scriptClient{}
+	cl.onPrompt = func() {
+		// Written but deliberately never committed: the local os.Stat check goes
+		// green while the branch merge to main carries nothing.
+		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}
+	r := &Runner{
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Publish: func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed || !res.GCMarked {
+		t.Fatalf("sanity: want GC-marked, not completed, got %+v", res)
+	}
+	if !contains(res.Warning, "did not advance") {
+		t.Fatalf("warning should name the no-op publish, got %q", res.Warning)
+	}
+	transcriptPath := filepath.Join(wtPath, "submodules", "sm", "sessions", res.SessionID+".md")
+	s, aerr := audit.ParseFile(transcriptPath)
+	if aerr != nil {
+		t.Fatalf("audit.ParseFile: %v", aerr)
+	}
+	if !s.Heuristics.Aborted {
+		t.Fatalf("want Aborted on the no-op-publish path, got %+v", s.Heuristics)
+	}
+	if !strings.Contains(s.Heuristics.AbortReason, "did not advance") {
+		t.Fatalf("AbortReason must carry the real failure text, got %q", s.Heuristics.AbortReason)
+	}
+}
+
+// TestRunSuccessfulPublishLeavesNoTranscriptWarning is the no-false-positives
+// twin of the three durable-warning regressions above: an honest, uneventful
+// completion must NOT grow a warning block just because the machinery that
+// could append one now exists on the completion path.
+func TestRunSuccessfulPublishLeavesNoTranscriptWarning(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed || res.GCMarked {
+		t.Fatalf("sanity: want a clean completion, got %+v", res)
+	}
+	transcriptPath := filepath.Join(sm, "sessions", res.SessionID+".md")
+	body, rerr := os.ReadFile(transcriptPath)
+	if rerr != nil {
+		t.Fatalf("read transcript: %v", rerr)
+	}
+	if strings.Contains(string(body), "## \u26a0\ufe0f warning") {
+		t.Fatalf("false positive: a clean completion must not carry a warning block, got:\n%s", body)
+	}
+	s, aerr := audit.ParseFile(transcriptPath)
+	if aerr != nil {
+		t.Fatalf("audit.ParseFile: %v", aerr)
+	}
+	if s.Heuristics.Aborted || s.Heuristics.CompletionMiss {
+		t.Fatalf("false positive: audit must not classify a clean completion as aborted, got %+v", s.Heuristics)
 	}
 }
 
