@@ -1,0 +1,27 @@
+# Attaches beehive's jobs to check/gate — the ONLY pipelines flux:zuul's
+# tenant config is confirmed to define today (see flux's
+# docs/bee-zuul-zuul.md: "a minimal check/gate pipeline is enough to prove
+# the tenant loads. Add other projects later."). `name:` is deliberately
+# omitted — it defaults to the project this file is defined in (this repo),
+# which avoids hardcoding an assumption about exactly how the GitHub
+# connection names it.
+#
+# beehive is an untrusted project here (not flux's Zuul config-project), so
+# it cannot define a NEW `pipeline:` object itself — only attach jobs to
+# pipelines the config-project already defines. There is no dedicated
+# tag-triggered `release`/`post` pipeline yet, so
+# beehive-release-cross-compile runs as a check/gate job for now (it also
+# has standalone value as a gate: it catches a cross-platform static-build
+# break on every change, not only at tag time). Retargeting it to a
+# dedicated tag-triggered pipeline — where the live signing/publish/
+# verify-blob steps belong — is a follow-up once flux's tenant config grows
+# one; see docs/tasks/release-verify.md.
+- project:
+    check:
+      jobs:
+        - beehive-build-test
+        - beehive-release-cross-compile
+    gate:
+      jobs:
+        - beehive-build-test
+        - beehive-release-cross-compile
