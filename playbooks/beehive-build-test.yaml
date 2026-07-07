@@ -1,0 +1,43 @@
+- hosts: all
+  tasks:
+    - name: resolve the beehive checkout path
+      set_fact:
+        beehive_src: "{{ ansible_user_dir }}/{{ zuul.project.src_dir }}"
+
+    - name: gofmt (must report zero files)
+      shell: |
+        set -eu
+        out=$(gofmt -l .)
+        if [ -n "$out" ]; then
+          echo "$out" >&2
+          exit 1
+        fi
+      args:
+        chdir: "{{ beehive_src }}"
+        executable: /bin/sh
+
+    - name: go vet ./...
+      shell: go vet ./...
+      args:
+        chdir: "{{ beehive_src }}"
+        executable: /bin/sh
+
+    - name: CGO_ENABLED=0 go build ./...
+      shell: go build ./...
+      args:
+        chdir: "{{ beehive_src }}"
+        executable: /bin/sh
+      environment:
+        CGO_ENABLED: "0"
+
+    - name: go test -race -count=1 ./... (cgo intentionally left enabled — the race detector needs it)
+      shell: go test -race -count=1 ./...
+      args:
+        chdir: "{{ beehive_src }}"
+        executable: /bin/sh
+
+    - name: submodule selection/claim/worktree smoke test
+      shell: ./scripts/submodule-smoke.sh
+      args:
+        chdir: "{{ beehive_src }}"
+        executable: /bin/sh

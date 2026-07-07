@@ -1,0 +1,40 @@
+# Zuul job definitions for beehive's CI + release-artifact pipeline, run on
+# the self-hosted Zuul deployed by the flux submodule's `zuul` task — NOT
+# GitHub Actions. See docs/tasks/release-verify.md for the full rationale and
+# docs/bee-release-verify-release-verify.md (beehive layer) for what/why.
+#
+# Nodeset is deliberately OMITTED on every job below (each inherits whatever
+# nodeset the tenant's own base job defines): this Zuul tenant has no Nodepool
+# build-node provider configured yet (flux's own zuul task doc flags this
+# explicitly as unverified/deferred), so hardcoding a Nodepool label here
+# would be a guess this repo cannot confirm. Whatever node eventually runs
+# these jobs must provide: a POSIX shell, a `go` toolchain satisfying this
+# module's `go.mod` directive, and (for the static-link assertion on Linux
+# artifacts) the `file` utility.
+
+- job:
+    name: beehive-build-test
+    description: >
+      gofmt/vet/build/test plus the submodule-selection smoke test — the
+      non-release half of beehive's CI. Mirrors the build-test job already
+      running in .github/workflows/ci.yml (left in place; see the design doc
+      for why cutover is a separate, later step).
+    run: playbooks/beehive-build-test.yaml
+    timeout: 600
+
+- job:
+    name: beehive-release-cross-compile
+    description: >
+      Cross-compiles beehive/beehived/honeybee CGO_ENABLED=0 for
+      linux/darwin x amd64/arm64 (scripts/build-release-artifacts.sh), then
+      asserts every artifact is static — go version -m embeds
+      CGO_ENABLED=0 for all 12 binaries, and every linux/* artifact is
+      additionally confirmed `file`-statically-linked (darwin binaries are
+      CGO-free but always link libSystem, so the ELF static-link assertion
+      is linux-only, exactly as scripts/verify-release.sh documents) — and
+      SHA256SUMS-<os>-<arch> checksums verify. Runs with SKIP_COSIGN=1:
+      signing + publishing + `cosign verify-blob` happen live, on the
+      deployed Zuul / by the operator, once flux:zuul actually runs jobs —
+      never inside this static job definition.
+    run: playbooks/beehive-release-cross-compile.yaml
+    timeout: 900

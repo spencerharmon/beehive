@@ -1,0 +1,17 @@
+- hosts: all
+  tasks:
+    - name: resolve the beehive checkout path
+      set_fact:
+        beehive_src: "{{ ansible_user_dir }}/{{ zuul.project.src_dir }}"
+
+    - name: cross-compile static release binaries (beehive, beehived, honeybee)
+      shell: ./scripts/build-release-artifacts.sh dist
+      args:
+        chdir: "{{ beehive_src }}"
+        executable: /bin/sh
+
+    - name: assert static linkage + CGO_ENABLED=0 + checksums (SKIP_COSIGN — signing/publishing is live-only, never here)
+      shell: SKIP_COSIGN=1 ./scripts/verify-release.sh dist
+      args:
+        chdir: "{{ beehive_src }}"
+        executable: /bin/sh

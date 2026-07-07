@@ -11,20 +11,24 @@ certificate (`.pem`).
 
 ## Verify
 Keyless signatures need the certificate plus the signer identity + OIDC issuer
-(replace `<owner>/<repo>`):
+**for the pipeline that cut THIS release** — see that release's CI run for the
+exact values (GitHub Actions historically; self-hosted Zuul going forward per
+docs/tasks/release-verify.md — the two have different issuers/identities, so
+neither is hardcoded below):
 ```
 cosign verify-blob \
   --certificate SHA256SUMS-<os>-<arch>.pem \
   --signature   SHA256SUMS-<os>-<arch>.sig \
-  --certificate-identity-regexp '^https://github.com/<owner>/<repo>/[.]github/workflows/.+@refs/tags/v.+$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '<signer identity regexp — from this release's CI run>' \
+  --certificate-oidc-issuer '<OIDC issuer — from this release's CI run>' \
   SHA256SUMS-<os>-<arch>
 sha256sum -c SHA256SUMS-<os>-<arch>
 ```
 Or verify a whole download directory in one step (static-binary check +
 checksums + cosign — the same script CI runs before publishing):
 ```
-COSIGN_IDENTITY_REGEXP='^https://github.com/<owner>/<repo>/[.]github/workflows/.+@refs/tags/v.+$' \
+COSIGN_IDENTITY_REGEXP='<signer identity regexp>' \
+COSIGN_OIDC_ISSUER='<OIDC issuer>' \
   scripts/verify-release.sh .
 ```
 
