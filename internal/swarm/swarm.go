@@ -895,6 +895,17 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
 						res.Warning = w
 					}
+					// Delete a rejected attempt's orphan bee branch (see the mirror
+					// block in the done path): an arbitration -> TODO rework must clear
+					// the superseded remote branch so the next attempt's push is not
+					// walled non-fast-forward.
+					if sel.Kind == selectt.Arbitrate {
+						if st, serr := r.taskStatus(sel); serr == nil && st == plan.StatusTODO {
+							if w := r.deleteSourceBranch(ctx, sel.Submodule, res.Branch); w != "" && res.Warning == "" {
+								res.Warning = w
+							}
+						}
+					}
 					_ = cl.Release(ctx, sel.Task.ID)
 					cleanup()
 					reclaimBranch()
@@ -1038,6 +1049,20 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			res.Completed = true
 			if w := r.pushSourceBranch(ctx, wg, res.Branch); w != "" {
 				res.Warning = w
+			}
+			// Arbitration that sided with the reviewer sends the task back to TODO for
+			// rework. The rejected attempt's pushed bee-<taskid> branch is now a
+			// superseded orphan that reclaim never touches (unmerged + divergent) and
+			// that, because the name is reused, would block the next attempt's push
+			// non-fast-forward. Delete it here as a first-class step so the rework
+			// starts from a clean remote. Best-effort: a delete warning is recorded
+			// only when no warning is already set.
+			if sel.Kind == selectt.Arbitrate {
+				if st, serr := r.taskStatus(sel); serr == nil && st == plan.StatusTODO {
+					if w := r.deleteSourceBranch(ctx, sel.Submodule, res.Branch); w != "" && res.Warning == "" {
+						res.Warning = w
+					}
+				}
 			}
 			if hasTask(sel) {
 				_ = cl.Release(ctx, sel.Task.ID)
@@ -1544,6 +1569,16 @@ func isSourceCheckout(ctx context.Context, dir string) bool {
 // pointer naming a commit that lives only in this honeybee's local clone is
 // worthless to peers. Best-effort: a missing remote is a no-op (local install),
 // and a push failure is returned as a warning, never a hard run failure.
+//
+// Failsafe for a stale-remote collision: bee-<taskid> is a disposable per-attempt
+// ref reused verbatim across attempts, so a prior attempt that pushed the branch
+// but never landed on main (a capped/abandoned pass, or one whose rejection
+// cleanup did not run) leaves the name occupied. The new attempt's push is then
+// rejected non-fast-forward and — because the pointer was already bumped — the
+// commit would dangle. Fast-forward protection is for MAIN only; a bee branch is
+// throwaway, so on a push rejection we delete the stale remote branch and re-push.
+// This is the backstop to deleteSourceBranch's eager cleanup on arbitration
+// reject: it also catches orphans that never passed through arbitration at all.
 func (r *Runner) pushSourceBranch(ctx context.Context, wg *git.Repo, branch string) string {
 	if wg == nil {
 		return ""
@@ -1553,9 +1588,68 @@ func (r *Runner) pushSourceBranch(ctx context.Context, wg *git.Repo, branch stri
 		return ""
 	}
 	if err := wg.Push(ctx, rem, branch); err != nil {
-		return fmt.Sprintf("source branch %s was NOT pushed to %s (%v); the submodule pointer will dangle until pushed", branch, rem, err)
+		// Clear the stale remote branch (a superseded prior attempt) and retry. If
+		// the remote is simply unreachable, DeleteRemoteBranch fails too and the
+		// warning names both failures; nothing is lost — a bee branch is disposable.
+		if derr := wg.DeleteRemoteBranch(ctx, rem, branch); derr != nil {
+			return fmt.Sprintf("source branch %s push to %s failed (%v) and clearing the stale remote branch also failed (%v); the submodule pointer will dangle until pushed", branch, rem, err, derr)
+		}
+		if perr := wg.Push(ctx, rem, branch); perr != nil {
+			return fmt.Sprintf("source branch %s still could NOT be pushed to %s after clearing the stale remote branch (%v); the submodule pointer will dangle until pushed", branch, rem, perr)
+		}
 	}
 	return ""
+}
+
+// deleteSourceBranch unconditionally removes a task's bee-<taskid> branch from the
+// submodule origin (and drops any local ref). Unlike reclaimSourceBranch it does
+// NOT gate on the branch being merged — it exists to throw away a SUPERSEDED
+// attempt on purpose. An arbitration that sides with the reviewer sends the task
+// back to TODO for rework, orphaning the rejected attempt's pushed branch; because
+// the branch name is reused per attempt and reclaim only deletes MERGED branches,
+// leaving it would block the next attempt's push non-fast-forward (the exact wedge
+// this repairs). A bee branch is a disposable per-attempt ref, so deleting its
+// unmerged commit here is correct, not lossy. Best-effort: returns a warning
+// string, never a hard error; a host without the submodule checked out (so its
+// origin is unreachable — Review/Arbitrate hosts may lack it), a missing remote,
+// or an already-gone branch is a silent no-op (the push failsafe is the backstop).
+func (r *Runner) deleteSourceBranch(ctx context.Context, sub repo.Submodule, branch string) string {
+	repoDir := sub.RepoDir()
+	if !isSourceCheckout(ctx, repoDir) {
+		return "" // no checkout here to reach the submodule origin; next work attempt's push failsafe clears it
+	}
+	sg := git.New(repoDir)
+	rem, err := sg.Remote(ctx)
+	if err != nil || rem == "" {
+		return "" // no remote: nothing was ever pushed
+	}
+	if err := sg.DeleteRemoteBranch(ctx, rem, branch); err != nil {
+		return fmt.Sprintf("superseded source branch %s was NOT deleted on %s (%v); it will block the next attempt's push until reclaimed", branch, rem, err)
+	}
+	// The remote branch is gone; drop any lingering local ref so it does not accrue.
+	_ = sg.DeleteBranch(ctx, branch)
+	return ""
+}
+
+// taskStatus reads the selected task's current status from the (published)
+// PLAN.md. Used by the arbitration-reject cleanup to distinguish a rework
+// (-> TODO, orphan branch must be deleted) from an approval (-> DONE, whose merge
+// makes reclaimSourceBranch delete the branch instead). A task removed from the
+// plan returns "" (no cleanup; the removed-guard owns deletions).
+func (r *Runner) taskStatus(sel *selectt.Selection) (plan.Status, error) {
+	b, err := os.ReadFile(sel.Submodule.PlanPath())
+	if err != nil {
+		return "", err
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		return "", err
+	}
+	t := p.Find(sel.Task.ID)
+	if t == nil {
+		return "", nil
+	}
+	return t.Status, nil
 }
 
 // reclaimSourceBranch deletes a finished task's pushed bee-<taskid> source branch

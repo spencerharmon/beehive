@@ -1752,6 +1752,152 @@ func TestReclaimSourceBranchGuard(t *testing.T) {
 	})
 }
 
+// TestDeleteSourceBranch drives deleteSourceBranch directly: it deletes an
+// UNMERGED (divergent) branch on origin — the arbitration-reject case reclaim
+// deliberately refuses — is a silent no-op on an already-gone branch, and a
+// silent no-op on a checkout with no remote. None may surface a warning.
+func TestDeleteSourceBranch(t *testing.T) {
+	ctx := context.Background()
+
+	build := func(t *testing.T) (*Runner, repo.Submodule, string) {
+		t.Helper()
+		root := t.TempDir()
+		g := gitInit(t, root)
+		repo.Init(root)
+		sm := filepath.Join(root, "submodules", "sm")
+		os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+		origin := bareOriginSeeded(t, g)
+		repoDir := filepath.Join(sm, "repo")
+		if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+			t.Fatalf("clone submodule: %v", err)
+		}
+		gitConfig(t, repoDir)
+		g.Commit(ctx, "seed")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		return &Runner{Repo: rp, Git: g}, subs[0], origin
+	}
+
+	// pushDivergent pushes branch as main + 1 extra commit (unmerged / divergent).
+	pushDivergent := func(t *testing.T, g *git.Repo, origin, branch string) {
+		t.Helper()
+		sc := filepath.Join(t.TempDir(), "push-"+branch)
+		if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+			t.Fatalf("scratch clone: %v", err)
+		}
+		scg := gitConfig(t, sc)
+		os.WriteFile(filepath.Join(sc, branch+".txt"), []byte("work\n"), 0o644)
+		if err := scg.Commit(ctx, "work on "+branch); err != nil {
+			t.Fatalf("commit on %s: %v", branch, err)
+		}
+		if _, err := scg.Run(ctx, "push", "origin", "HEAD:refs/heads/"+branch); err != nil {
+			t.Fatalf("push %s: %v", branch, err)
+		}
+	}
+
+	t.Run("unmerged-deletes", func(t *testing.T) {
+		r, sub, origin := build(t)
+		pushDivergent(t, r.Git, origin, "bee-T1") // divergent: reclaim would KEEP it
+		if !originHasBranch(t, origin, "bee-T1") {
+			t.Fatal("precondition: bee-T1 should be on origin")
+		}
+		if w := r.deleteSourceBranch(ctx, sub, "bee-T1"); w != "" {
+			t.Fatalf("delete warned: %q", w)
+		}
+		if originHasBranch(t, origin, "bee-T1") {
+			t.Fatal("a superseded (unmerged) source branch must be deleted on origin")
+		}
+	})
+
+	t.Run("missing-noop", func(t *testing.T) {
+		r, sub, origin := build(t)
+		if w := r.deleteSourceBranch(ctx, sub, "bee-T1"); w != "" {
+			t.Fatalf("missing branch delete must be a silent no-op, warned: %q", w)
+		}
+		if originHasBranch(t, origin, "bee-T1") {
+			t.Fatal("missing case must not create bee-T1")
+		}
+	})
+
+	t.Run("no-remote-noop", func(t *testing.T) {
+		root := t.TempDir()
+		g := gitInit(t, root)
+		repo.Init(root)
+		sm := filepath.Join(root, "submodules", "sm")
+		os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+		repoDir := filepath.Join(sm, "repo")
+		os.MkdirAll(repoDir, 0o755)
+		gitInit(t, repoDir) // a real checkout but NO remote
+		os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+		git.New(repoDir).Commit(ctx, "base")
+		g.Commit(ctx, "seed")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		r := &Runner{Repo: rp, Git: g}
+		if w := r.deleteSourceBranch(ctx, subs[0], "bee-T1"); w != "" {
+			t.Fatalf("no-remote delete must be a silent no-op, warned: %q", w)
+		}
+	})
+}
+
+// TestPushSourceBranchClearsStaleRemote is the failsafe guard: when the bee
+// branch name on origin is occupied by a SUPERSEDED prior attempt (a divergent
+// orphan), a plain push of the new attempt is rejected non-fast-forward. Because
+// a bee branch is disposable (FF protection is for main only), pushSourceBranch
+// must delete the stale remote branch and re-push so the pointer never dangles.
+// Asserts no warning and that origin ends pointing at OUR tip.
+func TestPushSourceBranchClearsStaleRemote(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	origin := bareOriginSeeded(t, g)
+
+	// Old attempt: a divergent orphan on origin/bee-T1 (main + its own commit).
+	old := filepath.Join(t.TempDir(), "old")
+	if _, err := g.Run(ctx, "clone", "-q", origin, old); err != nil {
+		t.Fatalf("clone old: %v", err)
+	}
+	oldg := gitConfig(t, old)
+	os.WriteFile(filepath.Join(old, "old.txt"), []byte("old attempt\n"), 0o644)
+	if err := oldg.Commit(ctx, "old attempt"); err != nil {
+		t.Fatalf("old commit: %v", err)
+	}
+	if _, err := oldg.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-T1"); err != nil {
+		t.Fatalf("push old bee-T1: %v", err)
+	}
+
+	// New attempt: a fresh checkout on branch bee-T1 built off main with a
+	// DIFFERENT commit — not a descendant of the orphan, so a plain push is non-FF.
+	wt := filepath.Join(t.TempDir(), "new")
+	if _, err := g.Run(ctx, "clone", "-q", origin, wt); err != nil {
+		t.Fatalf("clone new: %v", err)
+	}
+	wg := gitConfig(t, wt)
+	if _, err := wg.Run(ctx, "checkout", "-q", "-b", "bee-T1", "origin/main"); err != nil {
+		t.Fatalf("checkout bee-T1: %v", err)
+	}
+	os.WriteFile(filepath.Join(wt, "new.txt"), []byte("new attempt\n"), 0o644)
+	if err := wg.Commit(ctx, "new attempt"); err != nil {
+		t.Fatalf("new commit: %v", err)
+	}
+	wantTip, err := wg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+
+	r := &Runner{}
+	if w := r.pushSourceBranch(ctx, wg, "bee-T1"); w != "" {
+		t.Fatalf("pushSourceBranch over a stale remote branch warned: %q", w)
+	}
+	gotTip, err := git.New(origin).Run(ctx, "rev-parse", "refs/heads/bee-T1")
+	if err != nil {
+		t.Fatalf("origin rev-parse bee-T1: %v", err)
+	}
+	if strings.TrimSpace(gotTip) != strings.TrimSpace(wantTip) {
+		t.Fatalf("origin bee-T1 = %q, want our tip %q (delete+re-push did not land)", strings.TrimSpace(gotTip), strings.TrimSpace(wantTip))
+	}
+}
+
 // TestWorkCompletionKeepsUnmergedSourceBranch is the end-to-end guard: a Work task
 // that completes to NEEDS-REVIEW pushes its bee-<taskid> source branch to the
 // submodule origin, but because that branch carries a commit not yet on the tracked
