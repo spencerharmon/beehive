@@ -333,6 +333,64 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
+// TestParseHeaderModel pins the producer/consumer schema-drift fix (commit
+// 248e967 appended a fourth "· model: <model>" field that the old three-field
+// anchored regex rejected outright, dropping every post-stamp session). The
+// header is now an ORDERED "·"-separated key:value list: submodule/kind/branch
+// are still required in that exact order, but any trailing extra field is
+// accepted (and a recognised one, "model", is captured) rather than rejecting
+// the whole line.
+func TestParseHeaderModel(t *testing.T) {
+	const withModel = "# x\n\nsubmodule: beehive \u00b7 kind: work \u00b7 branch: bee-x \u00b7 model: github-copilot/claude-opus-4.8\n"
+	s, err := parseTranscript("bee-x-5.md", []byte(withModel))
+	if err != nil {
+		t.Fatalf("model-header transcript: %v", err)
+	}
+	if s.Submodule != "beehive" || s.Kind != "work" || s.Branch != "bee-x" {
+		t.Errorf("sub/kind/branch=%q/%q/%q want beehive/work/bee-x", s.Submodule, s.Kind, s.Branch)
+	}
+	if s.Model != "github-copilot/claude-opus-4.8" {
+		t.Errorf("model=%q want github-copilot/claude-opus-4.8", s.Model)
+	}
+
+	// The legacy three-field header (no model tag at all, predating 248e967)
+	// still parses, with Model left at its zero value.
+	const legacy = "# x\n\nsubmodule: beehive \u00b7 kind: work \u00b7 branch: bee-x\n"
+	s2, err := parseTranscript("bee-x-5.md", []byte(legacy))
+	if err != nil {
+		t.Fatalf("legacy header: %v", err)
+	}
+	if s2.Model != "" {
+		t.Errorf("legacy header model=%q want \"\"", s2.Model)
+	}
+
+	// An unrecognised trailing field (a FUTURE header addition this parser does
+	// not yet know about) must still parse rather than rebreaking the consumer
+	// again the next time the producer grows the header.
+	const unknownTrailing = "# x\n\nsubmodule: beehive \u00b7 kind: work \u00b7 branch: bee-x \u00b7 host: runner-3\n"
+	s3, err := parseTranscript("bee-x-5.md", []byte(unknownTrailing))
+	if err != nil {
+		t.Fatalf("unknown trailing field: %v", err)
+	}
+	if s3.Submodule != "beehive" || s3.Kind != "work" || s3.Branch != "bee-x" || s3.Model != "" {
+		t.Errorf("unknown-trailing-field session=%+v want sub/kind/branch=beehive/work/bee-x, model=\"\"", s3)
+	}
+
+	// A header missing the required branch field is STILL rejected, model tag or
+	// not.
+	const missingBranch = "# x\n\nsubmodule: beehive \u00b7 kind: work \u00b7 model: github-copilot/claude-opus-4.8\n"
+	if _, err := parseTranscript("bee-x-5.md", []byte(missingBranch)); err == nil {
+		t.Errorf("expected error for header missing the required branch field")
+	}
+
+	// Fields out of order are STILL rejected — the ordered submodule/kind/branch
+	// requirement is unchanged, only trailing extras are new.
+	const outOfOrder = "# x\n\nsubmodule: beehive \u00b7 branch: bee-x \u00b7 kind: work \u00b7 model: github-copilot/claude-opus-4.8\n"
+	if _, err := parseTranscript("bee-x-5.md", []byte(outOfOrder)); err == nil {
+		t.Errorf("expected error for out-of-order header fields")
+	}
+}
+
 // TestParsePidSuffixName pins the live-runner naming fix: session files are now
 // "<branch>-<epoch>-<pid>.md" (internal/swarm.SessionID appends a per-process
 // suffix for fan-out). The epoch must be the FIRST numeric segment after the
@@ -382,6 +440,40 @@ func TestParsePidFixture(t *testing.T) {
 	}
 	if s.Bytes != 118274 || s.Turns != 37 || s.UserTurns != 1 {
 		t.Errorf("bytes=%d turns=%d userTurns=%d want 118274/37/1", s.Bytes, s.Turns, s.UserTurns)
+	}
+}
+
+// TestParseModelHeaderFixture parses a committed post-248e967 transcript (the
+// real four-field "· model: <model>" header the live runner now writes) and
+// asserts it parses cleanly with Model captured, proving the fix against actual
+// on-disk transcript bytes rather than just an inline string.
+func TestParseModelHeaderFixture(t *testing.T) {
+	path := filepath.Join("testdata", "model-header", "bee-audit-parse-model-header-1783408031.md")
+	s, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile model-header fixture: %v", err)
+	}
+	if s.Submodule != "beehive" || s.Kind != KindWork {
+		t.Errorf("sub=%q kind=%q want beehive/work", s.Submodule, s.Kind)
+	}
+	if s.Branch != "bee-audit-parse-model-header" || s.TaskID != "audit-parse-model-header" {
+		t.Errorf("branch=%q taskid=%q want bee-audit-parse-model-header/audit-parse-model-header", s.Branch, s.TaskID)
+	}
+	if s.Model != "github-copilot/claude-opus-4.8" {
+		t.Errorf("model=%q want github-copilot/claude-opus-4.8", s.Model)
+	}
+	if s.Epoch != 1783408031 {
+		t.Errorf("epoch=%d want 1783408031", s.Epoch)
+	}
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if s.Bytes != int64(len(data)) {
+		t.Errorf("bytes=%d want %d (actual file size)", s.Bytes, len(data))
+	}
+	if s.Turns != 2 || s.UserTurns != 1 {
+		t.Errorf("turns=%d userTurns=%d want 2/1", s.Turns, s.UserTurns)
 	}
 }
 

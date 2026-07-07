@@ -136,6 +136,25 @@ func TestCorpusFinalizedNotStubbed(t *testing.T) {
 	}
 }
 
+// TestParseDirCensusModelHeader is the binding acceptance for the
+// producer/consumer schema-drift fix: a directory holding ONLY a post-248e967
+// four-field "· model: <model>" transcript must classify it as one finalized
+// (mineable) session — NOT a parse error — with Model captured. Before the
+// fix, the old anchored three-field regex rejected this exact shape, so every
+// such session piled into Census.Errors and the corpus looked broken.
+func TestParseDirCensusModelHeader(t *testing.T) {
+	c, err := ParseDirCensus(filepath.Join("testdata", "model-header"))
+	if err != nil {
+		t.Fatalf("ParseDirCensus model-header fixture: %v", err)
+	}
+	if c.Finalized() != 1 || c.ErrorCount() != 0 || c.StubCount() != 0 {
+		t.Fatalf("finalized=%d errors=%d stubs=%d want 1/0/0 (%v)", c.Finalized(), c.ErrorCount(), c.StubCount(), c.Errors)
+	}
+	if got := c.Sessions[0].Model; got != "github-copilot/claude-opus-4.8" {
+		t.Errorf("model=%q want github-copilot/claude-opus-4.8", got)
+	}
+}
+
 // mkCensus builds a Census with the given counts (element identity is irrelevant
 // to the census math, which is purely count-based).
 func mkCensus(finalized, stubs, errs int) Census {

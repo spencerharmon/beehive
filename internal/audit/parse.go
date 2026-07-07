@@ -133,11 +133,11 @@ func parseTranscript(name string, data []byte) (*Session, error) {
 	// file name against it. The runner emits "<branch>-<epoch>[-<pid>].md"; only
 	// the header tells us where the branch ends and the epoch begins, so a greedy
 	// name-only split would mis-attribute the per-process suffix.
-	sub, kind, hdrBranch, err := parseHeader(data)
+	hdr, err := parseHeader(data)
 	if err != nil {
 		return nil, fmt.Errorf("audit: %s: %w", name, err)
 	}
-	stem, epoch, err := splitName(name, hdrBranch)
+	stem, epoch, err := splitName(name, hdr.Branch)
 	if err != nil {
 		return nil, err
 	}
@@ -148,10 +148,11 @@ func parseTranscript(name string, data []byte) (*Session, error) {
 	s := &Session{
 		ID:        stem,
 		Epoch:     epoch,
-		Submodule: sub,
-		Kind:      kind,
-		Branch:    hdrBranch,
-		TaskID:    strings.TrimPrefix(hdrBranch, "bee-"),
+		Submodule: hdr.Submodule,
+		Kind:      hdr.Kind,
+		Branch:    hdr.Branch,
+		TaskID:    strings.TrimPrefix(hdr.Branch, "bee-"),
+		Model:     hdr.Model,
 		Bytes:     int64(len(data)),
 		Turns:     turns,
 		UserTurns: userTurns,
@@ -160,7 +161,7 @@ func parseTranscript(name string, data []byte) (*Session, error) {
 		s.Heuristics.Aborted = true
 		s.Heuristics.AbortReason = firstNonEmptyLine(warn)
 		s.Heuristics.LostRace = lostRaceRe.MatchString(warn)
-		s.Heuristics.CompletionMiss = kind == KindWork
+		s.Heuristics.CompletionMiss = hdr.Kind == KindWork
 	}
 	return s, nil
 }
@@ -204,13 +205,27 @@ func splitName(name, branch string) (stem string, epoch int64, err error) {
 	return stem, epoch, nil
 }
 
-// headerRe captures the three fields of the transcript header line:
-// "submodule: <sm> · kind: <kind> · branch: <branch>". The separator is the
-// U+00B7 middle dot the recorder writes.
-var headerRe = regexp.MustCompile(`^submodule:\s*(\S+)\s*\x{00b7}\s*kind:\s*(\S+)\s*\x{00b7}\s*branch:\s*(\S+)\s*$`)
+// header is the parsed transcript metadata line: "submodule: <sm> · kind:
+// <kind> · branch: <branch>[ · <key>: <value> ...]".
+type header struct {
+	Submodule, Kind, Branch string
+	Model                   string // "model:" field (commit 248e967); "" if absent
+}
 
-// parseHeader finds and parses the "submodule: … · kind: … · branch: …" line.
-func parseHeader(data []byte) (sub, kind, branch string, err error) {
+// headerKeys are the REQUIRED leading "key: value" segments, in this exact
+// order — unchanged since the header's introduction. Any segment beyond them is
+// a trailing extra field (see parseHeaderLine).
+var headerKeys = []string{"submodule", "kind", "branch"}
+
+// headerFieldRe validates and captures a single "key: value" header segment
+// (already split on the U+00B7 middle-dot separator and trimmed of leading
+// space): a bare identifier key, a colon, and a whitespace-free value — the
+// same strictness the original three-field regex enforced per field.
+var headerFieldRe = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(\S+)$`)
+
+// parseHeader finds and parses the "submodule: … · kind: … · branch: …" line
+// (optionally followed by more "· key: value" fields).
+func parseHeader(data []byte) (header, error) {
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
@@ -218,16 +233,50 @@ func parseHeader(data []byte) (sub, kind, branch string, err error) {
 		if !strings.HasPrefix(line, "submodule:") {
 			continue
 		}
-		m := headerRe.FindStringSubmatch(line)
-		if m == nil {
-			return "", "", "", fmt.Errorf("malformed header line %q", line)
-		}
-		return m[1], m[2], m[3], nil
+		return parseHeaderLine(line)
 	}
 	if err := sc.Err(); err != nil {
-		return "", "", "", err
+		return header{}, err
 	}
-	return "", "", "", fmt.Errorf("no submodule/kind/branch header line")
+	return header{}, fmt.Errorf("no submodule/kind/branch header line")
+}
+
+// parseHeaderLine parses the header as an ORDERED "·"-separated key:value list.
+// The first three segments MUST be submodule/kind/branch, in that order — a
+// missing field or a reordering is still rejected as malformed, exactly as
+// before. Any segment beyond the third is a trailing extra field: it is
+// accepted (never rejected) so the producer can grow the header — e.g. commit
+// 248e967's "· model: <model>" — without ever rebreaking this consumer again;
+// a recognised extra key (currently only "model") is captured, an unrecognised
+// one is silently ignored.
+func parseHeaderLine(line string) (header, error) {
+	fields := strings.Split(line, "\u00b7")
+	if len(fields) < len(headerKeys) {
+		return header{}, fmt.Errorf("malformed header line %q", line)
+	}
+	var h header
+	vals := make([]string, len(headerKeys))
+	for i, raw := range fields {
+		m := headerFieldRe.FindStringSubmatch(strings.TrimSpace(raw))
+		if m == nil {
+			return header{}, fmt.Errorf("malformed header line %q", line)
+		}
+		key, val := m[1], m[2]
+		if i < len(headerKeys) {
+			if key != headerKeys[i] {
+				return header{}, fmt.Errorf("malformed header line %q", line)
+			}
+			vals[i] = val
+			continue
+		}
+		if key == "model" {
+			h.Model = val
+		}
+		// Any other trailing key is a future field this parser does not yet know
+		// about: ignore it, do not reject the line.
+	}
+	h.Submodule, h.Kind, h.Branch = vals[0], vals[1], vals[2]
+	return h, nil
 }
 
 // scanBody counts assistant and user turns by the PINNED exact-line rule and

@@ -37,7 +37,8 @@
 package audit
 
 // Session kinds, mirroring internal/swarm selection kinds as written into the
-// transcript header line "submodule: <sm> · kind: <kind> · branch: <branch>".
+// transcript header line "submodule: <sm> · kind: <kind> · branch: <branch>[
+// · model: <model>]".
 const (
 	KindBootstrap   = "bootstrap"
 	KindWork        = "work"
@@ -56,6 +57,7 @@ type Session struct {
 	Kind      string // header "kind:" field
 	Branch    string // header "branch:" field (authoritative; the file name's prefix)
 	TaskID    string // Branch minus the "bee-" prefix (the -<pid> suffix is never folded in)
+	Model     string // header "model:" field (commit 248e967); "" for a legacy/unstamped session
 	Bytes     int64  // file size in bytes
 	Turns     int    // count of "## assistant" lines (PINNED turn rule)
 	UserTurns int    // count of "## user" lines (informational)
