@@ -163,13 +163,24 @@ func (c Census) MineableFraction() float64 {
 // 96%-corpus-loss defect) is caught.
 const LowMineableFraction = 0.5
 
-// CorpusBroken reports the "unfinalized, not rested" defect: unfinalized stubs
-// exist AND either the mineable audit window is empty (nothing to mine, yet the
-// corpus is NOT actually rested) or the mineable fraction has fallen below
-// LowMineableFraction (the corpus is mostly unfinalized). A fully-finalized
-// corpus (zero stubs) is never broken, so a healthy rested swarm — its window
-// empty only because everything was audited — stays byte-for-byte silent.
+// CorpusBroken reports the "broken, not rested" defect across BOTH integrity
+// classes it guards: unfinalized stubs (stubs exist AND either the mineable
+// audit window is empty — nothing to mine, yet the corpus is NOT actually
+// rested — or the mineable fraction has fallen below LowMineableFraction, i.e.
+// the corpus is mostly unfinalized) OR genuinely malformed files (ErrorCount() >
+// 0). A malformed file is a parser/producer defect that must self-announce
+// unconditionally — independent of windowEmpty and the stub fraction — so a
+// malformed-header regression can never hide behind an otherwise stub-free
+// corpus (the exact silent-starvation collapse this guards against: once the
+// legacy stubs this guard was written against are gone, a malformed-only window
+// would otherwise be byte-for-byte indistinguishable from a rest). A corpus with
+// zero stubs AND zero errors is never broken, so a healthy rested swarm — its
+// window empty only because everything was audited — stays byte-for-byte
+// silent.
 func (c Census) CorpusBroken(windowEmpty bool) bool {
+	if c.ErrorCount() > 0 {
+		return true
+	}
 	if len(c.Stubs) == 0 {
 		return false
 	}
@@ -177,23 +188,39 @@ func (c Census) CorpusBroken(windowEmpty bool) bool {
 }
 
 // CorpusWarning returns the loud, human-facing "corpus broken, not a rest" banner
-// when the census+window is the unfinalized-not-rested defect (per CorpusBroken),
-// or "" when the corpus is healthy. It is byte-stable: a fully-finalized corpus
-// yields exactly zero bytes, so a caller can print the result unconditionally and
-// a healthy pass stays silent. Reporting only — it names the defect and points at
-// finalization; it does not finalize anything.
+// when the census+window is broken (per CorpusBroken), or "" when the corpus is
+// healthy. It is byte-stable: a corpus with zero stubs and zero errors yields
+// exactly zero bytes, so a caller can print the result unconditionally and a
+// healthy pass stays silent. Stubs and malformed files are distinct defects with
+// distinct fixes, so the banner names each class it finds and steers to its own
+// fix independently — a stub line pointing at session-transcript-finalize, a
+// malformed line pointing at audit-parse-model-header — rather than crediting a
+// malformed spike to the unrelated finalize path (or vice versa). Reporting
+// only — it names the defect(s); it does not finalize a stub or parse a
+// malformed file.
 func (c Census) CorpusWarning(windowEmpty bool) string {
 	if !c.CorpusBroken(windowEmpty) {
 		return ""
 	}
 	var b strings.Builder
 	b.WriteString("================ CORPUS BROKEN, NOT A REST ================\n")
-	fmt.Fprintf(&b, "audit: %d of %d session files are UNFINALIZED stubs (mineable fraction %.2f, threshold %.2f).\n",
-		c.StubCount(), c.Total(), c.MineableFraction(), LowMineableFraction)
-	if windowEmpty {
-		b.WriteString("The audit window is EMPTY because the corpus is unfinalized, NOT because the swarm rested.\n")
+	if len(c.Stubs) > 0 {
+		fmt.Fprintf(&b, "audit: %d of %d session files are UNFINALIZED stubs (mineable fraction %.2f, threshold %.2f).\n",
+			c.StubCount(), c.Total(), c.MineableFraction(), LowMineableFraction)
 	}
-	b.WriteString("Do NOT read this as 'nothing to audit'. Finalize the streaming sessions so their transcripts become mineable (session-transcript-finalize).\n")
+	if c.ErrorCount() > 0 {
+		fmt.Fprintf(&b, "audit: %d of %d session files are MALFORMED (unparseable header/body).\n",
+			c.ErrorCount(), c.Total())
+	}
+	if windowEmpty {
+		b.WriteString("The audit window is EMPTY because the corpus is broken, NOT because the swarm rested.\n")
+	}
+	if len(c.Stubs) > 0 {
+		b.WriteString("Do NOT read this as 'nothing to audit'. Finalize the streaming sessions so their transcripts become mineable (session-transcript-finalize).\n")
+	}
+	if c.ErrorCount() > 0 {
+		b.WriteString("Do NOT read this as 'nothing to audit'. Fix the parser/schema drift producing malformed session files (audit-parse-model-header).\n")
+	}
 	b.WriteString("===========================================================\n")
 	return b.String()
 }

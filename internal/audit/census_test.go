@@ -228,6 +228,47 @@ func TestCorpusBroken(t *testing.T) {
 	}
 }
 
+// TestCorpusBrokenMalformed pins the malformed-class fold-in: a corpus with any
+// malformed files is broken regardless of window state or stub fraction — a
+// parser/producer regression must self-announce even with zero stubs to blame
+// it on (the stub short-circuit used to return false before ever consulting
+// ErrorCount(), the exact silent-starvation regression audit-malformed-
+// visibility exists to close) and even when the window is non-empty and
+// finalized sessions still exist to mine.
+func TestCorpusBrokenMalformed(t *testing.T) {
+	cases := []struct {
+		name        string
+		fin, errs   int
+		windowEmpty bool
+	}{
+		{"errors-only-empty-window", 0, 3, true},                // the exact regression case: stubs==0
+		{"errors-with-finalized-nonempty-window", 20, 3, false}, // "still flags" despite work left to mine
+		{"single-malformed-file", 5, 1, false},
+	}
+	for _, tc := range cases {
+		c := mkCensus(tc.fin, 0, tc.errs)
+		if !c.CorpusBroken(tc.windowEmpty) {
+			t.Errorf("%s: CorpusBroken(windowEmpty=%v)=false want true (fin=%d errs=%d)",
+				tc.name, tc.windowEmpty, tc.fin, tc.errs)
+		}
+	}
+}
+
+// TestCorpusCleanNeverBroken guards the regression direction: zero stubs AND
+// zero errors must never flag broken in any window state, so a healthy rested
+// swarm stays byte-for-byte silent (CorpusWarning == "").
+func TestCorpusCleanNeverBroken(t *testing.T) {
+	c := mkCensus(42, 0, 0)
+	for _, windowEmpty := range []bool{true, false} {
+		if c.CorpusBroken(windowEmpty) {
+			t.Errorf("clean corpus CorpusBroken(windowEmpty=%v)=true want false", windowEmpty)
+		}
+		if w := c.CorpusWarning(windowEmpty); w != "" {
+			t.Errorf("clean corpus CorpusWarning(windowEmpty=%v)=%q want \"\" (byte-stable)", windowEmpty, w)
+		}
+	}
+}
+
 // TestCorpusFractionThreshold pins the low-fraction boundary: just below
 // LowMineableFraction fires, exactly at/above it is silent and byte-stable.
 func TestCorpusFractionThreshold(t *testing.T) {
@@ -277,5 +318,49 @@ func TestCorpusWarningByteStable(t *testing.T) {
 	w2 := mkCensus(1, 2, 0).CorpusWarning(false)
 	if w2 == "" || strings.Contains(w2, "window is EMPTY") {
 		t.Errorf("low-fraction non-empty warning=%q want fired without the empty-window line", w2)
+	}
+}
+
+// TestCorpusWarningNamesMalformed is the binding acceptance for the malformed
+// class: Errors>0 with zero stubs names the malformed count and steers to
+// audit-parse-model-header — NOT session-transcript-finalize, the stub fix.
+// This line was silently missing before this task: CorpusWarning short-
+// circuited via CorpusBroken's stub-only check before ever consulting
+// ErrorCount(), so this exact case (regression: session-audit-004's 10 new
+// malformed files) rendered "" instead of the loud banner.
+func TestCorpusWarningNamesMalformed(t *testing.T) {
+	c := mkCensus(0, 0, 10)
+	w := c.CorpusWarning(true)
+	if w == "" {
+		t.Fatal("malformed-only warning empty, want the loud corpus-broken banner (regression: was silent)")
+	}
+	for _, want := range []string{"CORPUS BROKEN, NOT A REST", "10 of 10", "MALFORMED", "audit-parse-model-header"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("malformed warning missing %q:\n%s", want, w)
+		}
+	}
+	// Must NOT credit the defect to the stub fix — the two classes have
+	// different causes and different remedies.
+	if strings.Contains(w, "UNFINALIZED") || strings.Contains(w, "session-transcript-finalize") {
+		t.Errorf("malformed-only warning wrongly names the stub fix:\n%s", w)
+	}
+}
+
+// TestCorpusWarningMixedNamesBoth pins the mixed-corpus acceptance (stubs>0 AND
+// errors>0, as session-audit-004 actually observed): the banner must name BOTH
+// classes, each with its own distinct fix, never collapsing one into the other.
+func TestCorpusWarningMixedNamesBoth(t *testing.T) {
+	c := mkCensus(805, 99, 10) // mirrors the observed pass: finalized/stubs/malformed
+	w := c.CorpusWarning(false)
+	if w == "" {
+		t.Fatal("mixed corpus warning empty, want the loud banner")
+	}
+	for _, want := range []string{
+		"UNFINALIZED", "session-transcript-finalize",
+		"MALFORMED", "audit-parse-model-header",
+	} {
+		if !strings.Contains(w, want) {
+			t.Errorf("mixed warning missing %q:\n%s", want, w)
+		}
 	}
 }
