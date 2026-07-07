@@ -220,13 +220,16 @@ func printCensus(c audit.Census) {
 func printWindow(w []audit.Session) {
 	fmt.Println("# window (N-2, un-audited)")
 	fmt.Println(strings.Join([]string{
-		"session_id", "epoch", "kind", "taskid", "bytes", "turns",
+		"session_id", "epoch", "kind", "taskid", "model", "bytes", "turns",
 		"aborted", "lost_race", "completion_miss", "reconcile_loop",
 	}, "\t"))
 	for _, s := range w {
 		h := s.Heuristics
 		fmt.Println(strings.Join([]string{
-			s.ID, strconv.FormatInt(s.Epoch, 10), s.Kind, s.TaskID,
+			// s.Model is already the parsed header "model:" field (internal/audit,
+			// commit 248e967); a legacy/pre-header session leaves it "" and prints
+			// a clean empty column, not an error.
+			s.ID, strconv.FormatInt(s.Epoch, 10), s.Kind, s.TaskID, s.Model,
 			strconv.FormatInt(s.Bytes, 10), strconv.Itoa(s.Turns),
 			strconv.FormatBool(h.Aborted), strconv.FormatBool(h.LostRace),
 			strconv.FormatBool(h.CompletionMiss), strconv.FormatBool(h.ReconcileLoop),
