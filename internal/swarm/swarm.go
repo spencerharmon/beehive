@@ -592,9 +592,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// a whole second review would only re-discover the already-landed merge.
 	// Finalize deterministically instead, with zero agent turns spent. Fails
 	// OPEN (falls through to dispatch normally) on any uncertainty, exactly
-	// like bounceIfUnreachable.
+	// like bounceIfUnreachable. Gated (session-audit-007 Finding #1) on
+	// bee-<taskid> actually existing somewhere first: a ZERO-code-diff work
+	// pass (every session-audit-NNN task) never creates or pushes that branch
+	// at all, yet leaves the recorded pointer trivially an ancestor of tracked
+	// main since it was never moved — see finalizeIfAlreadyMerged/
+	// sourceBranchExists.
 	if sel.Kind == selectt.Review {
-		finalized, ferr := r.finalizeIfAlreadyMerged(ctx, sel, absRoot)
+		finalized, ferr := r.finalizeIfAlreadyMerged(ctx, sel, res.Branch, absRoot)
 		if ferr != nil && r.Debug != nil {
 			fmt.Fprintf(r.Debug, "[honeybee] already-merged pre-check for %s failed; dispatching review normally: %v\n", sel.Task.ID, ferr)
 		}
@@ -1870,18 +1875,31 @@ func (r *Runner) demoteUnpushed(ctx context.Context, sel *selectt.Selection, rea
 // Resolves the task's recorded submodule pointer identically to
 // bounceIfUnreachable (`git rev-parse HEAD:submodules/<sm>/repo` on this
 // honeybee's own freshly branched worktree — the exact commit a Work pass
-// bumped the gitlink to), then checks git.Repo.IsAncestor against the
-// submodule's tracked branch: origin/<branch> in remote mode (fetched fresh),
-// or the local <branch> ref directly in local-sharing mode (a shared checkout
-// with no remote — no mode flag, derived from remotes exactly like
-// bounceIfUnreachable/CommitReachable). Submodule main only ever advances via
-// an APPROVED review merge, so ancestry-of-main can only follow a prior
-// approval: auto-finalizing is safe — it completes interrupted bookkeeping, it
-// never approves anything itself, and it never fires on genuinely pending work
-// (not yet an ancestor). On a positive match it syncs THIS pass's own private
-// submodule checkout to the tracked branch's current tip (git.Repo.HardReset,
-// mirroring syncWorktreeBase) and transitions the task straight to DONE with a
-// terse note via Claimer.FinalizeAlreadyMerged, whose CommitPaths bumps the
+// bumped the gitlink to), then — before trusting ancestry at all — confirms
+// branch (bee-<taskid>) is a REAL, resolvable ref: reclaimSourceBranch's own
+// sg.LsRemoteBranch (a live ls-remote query, no fetch) in remote mode, or a
+// direct local-ref lookup (sg.RevParse("refs/heads/"+branch), the same idiom
+// sweep.go's resolveRef uses) in local-sharing mode. This gate matters because
+// a ZERO-code-diff work pass (every session-audit-NNN task, by design — a
+// diagnose-only pass never bumps the gitlink) never creates or pushes
+// bee-<taskid> at all, yet leaves the recorded pointer identical to (hence
+// trivially an ancestor of) tracked main — sg.CommitReachable
+// (bounceIfUnreachable's check) cannot rule this out either, since an unmoved
+// pointer is trivially "reachable" too: the exact triviality that also defeats
+// IsAncestor. Only once branch resolves somewhere does this check
+// git.Repo.IsAncestor against the submodule's tracked branch: origin/<branch>
+// in remote mode (fetched fresh), or the local <branch> ref directly in
+// local-sharing mode (a shared checkout with no remote — no mode flag, derived
+// from remotes exactly like bounceIfUnreachable/CommitReachable). Submodule
+// main only ever advances via an APPROVED review merge, so ancestry-of-main
+// (once bee-<taskid> is confirmed real) can only follow a prior approval:
+// auto-finalizing is safe — it completes interrupted bookkeeping, it never
+// approves anything itself, and it never fires on genuinely pending work (not
+// yet an ancestor) NOR on a task whose implementer branch never existed. On a
+// positive match it syncs THIS pass's own private submodule checkout to the
+// tracked branch's current tip (git.Repo.HardReset, mirroring
+// syncWorktreeBase) and transitions the task straight to DONE with a terse
+// note via Claimer.FinalizeAlreadyMerged, whose CommitPaths bumps the
 // beehive-layer gitlink by reading that now-synced checkout HEAD (a gitlink
 // staged any other way, e.g. `update-index --cacheinfo` without moving the
 // checkout, is silently overwritten the moment anything re-`git add`s the
@@ -1890,12 +1908,14 @@ func (r *Runner) demoteUnpushed(ctx context.Context, sel *selectt.Selection, rea
 //
 // Returns finalized=true only once that correction has actually landed. Any
 // uncertainty (no recorded gitlink to check, the submodule checkout cannot be
-// initialized here, a configured remote errors reaching it, or the ancestry
-// check itself errors — e.g. the recorded sha does not even exist locally,
-// bounceIfUnreachable's shape, not this guard's) returns (false, err): the
-// caller falls through to the reachability guard / normal dispatch rather than
-// risk a false finalize of a genuinely pending review.
-func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selection, absRoot string) (bool, error) {
+// initialized here, a configured remote errors reaching it, bee-<taskid>
+// resolves nowhere, or the ancestry check itself errors — e.g. the recorded
+// sha does not even exist locally, bounceIfUnreachable's shape, not this
+// guard's) returns (false, err) or, for a plain absent branch, (false, nil):
+// the caller falls through to the reachability guard / normal dispatch rather
+// than risk a false finalize of a genuinely pending — or never attempted —
+// review.
+func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selection, branch, absRoot string) (bool, error) {
 	repoDir := sel.Submodule.RepoDir()
 	rel, err := filepath.Rel(absRoot, repoDir)
 	if err != nil {
@@ -1916,6 +1936,10 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 	sg := git.New(repoDir)
 	rem, err := sg.Remote(ctx)
 	if err != nil {
+		return false, err
+	}
+	exists, err := r.sourceBranchExists(ctx, sg, rem, branch)
+	if err != nil || !exists {
 		return false, err
 	}
 	tracked := r.trackedBranch(ctx, rel)
@@ -1958,6 +1982,34 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 		return false, err
 	}
 	return true, nil
+}
+
+// sourceBranchExists reports whether branch (bee-<taskid>) is a REAL,
+// resolvable ref for this task's OWN attempt — the gate finalizeIfAlreadyMerged
+// applies before ever trusting IsAncestor. A genuine (if interrupted) review
+// merge always has a real bee-<taskid> ref behind it (a Work pass's worktree
+// branch, pushed to origin in remote mode); a ZERO-code-diff work pass (every
+// session-audit-NNN task, by design) never creates or pushes one at all, yet
+// leaves the recorded gitlink identical to — hence trivially an ancestor of —
+// tracked main. Mirrors reclaimSourceBranch's mode split: remote mode reuses
+// its exact sg.LsRemoteBranch plumbing (a live ls-remote query, no fetch);
+// local-sharing mode (rem == "", every honeybee on the host sharing one
+// checkout) looks the ref up directly via sg.RevParse("refs/heads/"+branch) —
+// the same idiom sweep.go's resolveRef closure uses — since a real source
+// branch there is always a plain local ref, never something a fetch could
+// produce. Returns (false, nil) — never an error — for a branch that simply
+// does not exist either way, so the caller treats "never existed" exactly like
+// "not yet merged": fall through to normal dispatch.
+func (r *Runner) sourceBranchExists(ctx context.Context, sg *git.Repo, rem, branch string) (bool, error) {
+	if rem == "" {
+		_, err := sg.RevParse(ctx, "refs/heads/"+branch)
+		return err == nil, nil
+	}
+	tip, err := sg.LsRemoteBranch(ctx, rem, branch)
+	if err != nil {
+		return false, err
+	}
+	return tip != "", nil
 }
 
 // bounceIfUnreachable is the Review-dispatch-side half of the F-LIVE fix: it

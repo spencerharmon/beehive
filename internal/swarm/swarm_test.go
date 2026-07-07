@@ -935,8 +935,10 @@ func TestReviewDispatchFinalizesAlreadyMergedRemote(t *testing.T) {
 // submodule checkout with NO remote at all): the recorded pointer is already an
 // ancestor of the LOCAL tracked main branch, resolved directly with no fetch —
 // the same shared-module-store contract CommitReachable's local fast path
-// relies on (no mode flag; derived from remotes). Must finalize without ever
-// dispatching a session.
+// relies on (no mode flag; derived from remotes). A real local bee-R1 ref
+// (merged-guard-branch-gate's own gate: sourceBranchExists) sits at that same
+// commit, exactly what a genuine fast-forward merge leaves behind. Must
+// finalize without ever dispatching a session.
 func TestReviewDispatchFinalizesAlreadyMergedLocalSharing(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -961,6 +963,17 @@ func TestReviewDispatchFinalizesAlreadyMergedLocalSharing(t *testing.T) {
 	implSHA, err := sg.RevParse(ctx, "main")
 	if err != nil {
 		t.Fatalf("rev-parse main: %v", err)
+	}
+	// The implementer's source branch is a real local ref too — a genuine
+	// interrupted review always has one behind it (a Work pass's own worktree
+	// branch, per WorktreeAdd), left in place because reclaimSourceBranch only
+	// deletes it once the task actually reaches DONE, which never happened
+	// here. Sitting at the same commit as tracked main's tip is exactly what
+	// a fast-forward merge leaves behind — the merged-guard-branch-gate fix
+	// must finalize on this shape (a real, if now-redundant, ref), never
+	// mistake it for the branch having never existed.
+	if _, err := sg.Run(ctx, "branch", "bee-R1", implSHA); err != nil {
+		t.Fatalf("create bee-R1 local ref: %v", err)
 	}
 
 	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+implSHA+",submodules/sm/repo"); err != nil {
@@ -1012,6 +1025,171 @@ func TestReviewDispatchFinalizesAlreadyMergedLocalSharing(t *testing.T) {
 	}
 	if !contains(out, implSHA) {
 		t.Fatalf("gitlink = %q, want bumped to (fast-forward) tip %s", out, implSHA)
+	}
+}
+
+// TestReviewDispatchDoesNotFinalizeWithoutSourceBranchRemote is the
+// merged-guard-branch-gate regression (session-audit-007 Finding #1): a
+// ZERO-code-diff work pass (every session-audit-NNN task, by design — a
+// diagnose-only pass never bumps the gitlink) leaves the recorded submodule
+// pointer IDENTICAL to the submodule's tracked origin/main tip — trivially an
+// "ancestor" of it, the exact triviality `git merge-base --is-ancestor A B`
+// reports true for whenever A==B — yet bee-R1 (this task's own would-be
+// implementer branch) was never created anywhere: no local ref, no remote
+// ref, since there was no code change to commit or push. Before
+// sourceBranchExists gated finalizeIfAlreadyMerged on that branch actually
+// being real, this trivial self-ancestry alone was read as proof of a prior
+// interrupted review and auto-DONE'd with ZERO agent turns — the live
+// session-audit-006 defect this task fixes (confirmed firing in production:
+// claimed WORK, flipped NEEDS-REVIEW, then finalized DONE 2 seconds into its
+// REVIEW claim with no session transcript ever recorded). Must now fall
+// through to a completely normal review dispatch instead (a session opens and
+// completes the task exactly as mockClient drives it).
+func TestReviewDispatchDoesNotFinalizeWithoutSourceBranchRemote(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+	rg := git.New(repoDir)
+	mainTip, err := rg.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatalf("rev-parse submodule main: %v", err)
+	}
+
+	// The gitlink records the CURRENT tracked tip verbatim — a diagnose-only
+	// work pass's gitlink is never bumped — and bee-R1 (this task's would-be
+	// implementer branch) is never created anywhere: no local ref, no remote
+	// ref, matching the zero-diff shape exactly.
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+mainTip+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed unmoved gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a normal review should complete, got %+v", res)
+	}
+	if cl.sess.prompts == 0 {
+		t.Fatal("a task whose source branch never existed must dispatch a REAL review session, not a zero-turn auto-finalize")
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("R1")
+	if tk == nil || tk.Status != plan.Done {
+		t.Fatalf("status = %+v, want DONE (via normal review, not auto-finalize)", tk)
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if contains(joined, "already merged into tracked") {
+		t.Fatalf("task was wrongly runner-finalized instead of reviewed: body:\n%s", joined)
+	}
+}
+
+// TestReviewDispatchDoesNotFinalizeWithoutSourceBranchLocalSharing mirrors
+// TestReviewDispatchDoesNotFinalizeWithoutSourceBranchRemote in local-sharing
+// mode (a submodule checkout with NO remote at all): the recorded pointer is
+// identical to the LOCAL tracked main tip (the zero-diff shape) and bee-R1 was
+// never created as a local ref either — unlike
+// TestReviewDispatchFinalizesAlreadyMergedLocalSharing's genuine (if now
+// redundant) bee-R1 ref sitting at that same commit. Must dispatch a
+// completely normal review, never a zero-turn auto-finalize.
+func TestReviewDispatchDoesNotFinalizeWithoutSourceBranchLocalSharing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	sg := gitInit(t, repoDir) // a real checkout, deliberately NO remote (local-sharing)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("base\n"), 0o644)
+	if err := sg.Commit(ctx, "base"); err != nil {
+		t.Fatalf("submodule base commit: %v", err)
+	}
+	mainTip, err := sg.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatalf("rev-parse main: %v", err)
+	}
+	// No bee-R1 ref anywhere — the zero-diff shape: a diagnose-only work pass
+	// never created (let alone bumped) an implementer branch at all.
+
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+mainTip+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed unmoved gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a normal review should complete, got %+v", res)
+	}
+	if cl.sess.prompts == 0 {
+		t.Fatal("a task whose source branch never existed must dispatch a REAL review session, not a zero-turn auto-finalize")
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("R1")
+	if tk == nil || tk.Status != plan.Done {
+		t.Fatalf("status = %+v, want DONE (via normal review, not auto-finalize)", tk)
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if contains(joined, "already merged into tracked") {
+		t.Fatalf("task was wrongly runner-finalized instead of reviewed: body:\n%s", joined)
 	}
 }
 
