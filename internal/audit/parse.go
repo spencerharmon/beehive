@@ -113,6 +113,39 @@ func sortStubs(s []Stub) {
 	sort.Slice(s, func(i, j int) bool { return s[i].SID < s[j].SID })
 }
 
+// BranchResolver resolves a stub's stream branch to the ref it currently
+// exists at (e.g. "refs/heads/<branch>" or "refs/remotes/<remote>/<branch>"),
+// or "" when the branch resolves nowhere. It mirrors, in shape and resolution
+// order, internal/swarm/sweep.go's private resolveRef closure (refs/heads
+// first, then refs/remotes/<remote>) against the PRIMARY coordination repo —
+// session branches live in the same repo as submodules/<sm>/sessions/, never a
+// target's repo/ checkout — so cmd/beehive/cmd_audit.go's caller-supplied,
+// *git.Repo-backed implementation must walk the identical two candidates in
+// the identical order (never drift on what counts as a gone branch between
+// the finalize sweep and the audit census). Keeping this a plain function type
+// rather than a git.Repo dependency is what keeps internal/audit
+// dependency-light and lets tests supply a func literal with no git repo at
+// all.
+type BranchResolver func(branch string) (ref string)
+
+// ClassifyStubs sets GoneBranch on every stub in c.Stubs (in place): a stub is
+// GoneBranch when resolve reports its stream branch resolves nowhere (""). It
+// is reporting only — it never removes a stub from the list or touches
+// Sessions/Errors; see Stub.GoneBranch and Census.CorpusBroken, which is the
+// only thing the classification changes. A nil resolve is a safe no-op (every
+// stub keeps its zero-value GoneBranch == false), so a caller with no
+// coordination-repo access — or a test constructing a Census by hand — can
+// skip classification and CorpusBroken behaves exactly as it did before this
+// field existed.
+func ClassifyStubs(c *Census, resolve BranchResolver) {
+	if resolve == nil {
+		return
+	}
+	for i := range c.Stubs {
+		c.Stubs[i].GoneBranch = resolve(c.Stubs[i].Branch) == ""
+	}
+}
+
 // ParseFile reads and parses a single transcript file. Bytes is the file size.
 func ParseFile(path string) (*Session, error) {
 	data, err := os.ReadFile(path)

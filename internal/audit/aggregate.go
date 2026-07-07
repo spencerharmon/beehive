@@ -113,6 +113,19 @@ func DeliveredFromPlan(p *plan.Plan) map[string]bool {
 type Stub struct {
 	SID    string // session id == the file stem (name without the ".md")
 	Branch string // the live branch the stub points to
+	// GoneBranch is true when Branch is CONFIRMED to resolve nowhere in the
+	// coordination repo (neither refs/heads/<Branch> nor
+	// refs/remotes/<remote>/<Branch> — the same two-step resolution
+	// internal/swarm/sweep.go's resolveRef uses to decide a stub's transcript
+	// is unrecoverable). Such a stub can never be finalized by
+	// session-transcript-finalize's sweep, so it is a permanently inert file,
+	// not a live or growing defect. Set by ClassifyStubs; the zero value
+	// (false) applies until then, so a Census built without classification
+	// (as most existing callers/tests do) behaves exactly as before this field
+	// existed. Reporting only: it is never used to prune or hide the stub —
+	// Census.Stubs keeps listing it — it only exempts it from
+	// Census.CorpusBroken's window/fraction math.
+	GoneBranch bool
 }
 
 // Census is the corpus-integrity summary of a sessions directory: how many files
@@ -137,6 +150,24 @@ func (c Census) Finalized() int { return len(c.Sessions) }
 
 // StubCount is the number of unfinalized stub files.
 func (c Census) StubCount() int { return len(c.Stubs) }
+
+// NonGoneStubCount is the stub count EXCLUDING those classified GoneBranch: a
+// stub whose stream branch is confirmed permanently gone can never be
+// finalized, so — unlike StubCount, which keeps every stub visible for
+// reporting — this is the count CorpusBroken's window/fraction math uses, so
+// the legacy-gone-stub class can never trip the alarm on a genuinely rested
+// future window purely because the dead files still exist. Equal to
+// StubCount() until ClassifyStubs runs (every stub's GoneBranch is false), so
+// a caller that never classifies sees no behavior change.
+func (c Census) NonGoneStubCount() int {
+	n := 0
+	for _, s := range c.Stubs {
+		if !s.GoneBranch {
+			n++
+		}
+	}
+	return n
+}
 
 // ErrorCount is the number of genuinely malformed files.
 func (c Census) ErrorCount() int { return len(c.Errors) }
@@ -164,27 +195,39 @@ func (c Census) MineableFraction() float64 {
 const LowMineableFraction = 0.5
 
 // CorpusBroken reports the "broken, not rested" defect across BOTH integrity
-// classes it guards: unfinalized stubs (stubs exist AND either the mineable
-// audit window is empty — nothing to mine, yet the corpus is NOT actually
-// rested — or the mineable fraction has fallen below LowMineableFraction, i.e.
-// the corpus is mostly unfinalized) OR genuinely malformed files (ErrorCount() >
-// 0). A malformed file is a parser/producer defect that must self-announce
-// unconditionally — independent of windowEmpty and the stub fraction — so a
-// malformed-header regression can never hide behind an otherwise stub-free
-// corpus (the exact silent-starvation collapse this guards against: once the
-// legacy stubs this guard was written against are gone, a malformed-only window
-// would otherwise be byte-for-byte indistinguishable from a rest). A corpus with
-// zero stubs AND zero errors is never broken, so a healthy rested swarm — its
+// classes it guards: unfinalized LIVE stubs (see NonGoneStubCount — live stubs
+// exist AND either the mineable audit window is empty — nothing to mine, yet
+// the corpus is NOT actually rested — or the live-only mineable fraction has
+// fallen below LowMineableFraction, i.e. the corpus is mostly unfinalized) OR
+// genuinely malformed files (ErrorCount() > 0). A malformed file is a
+// parser/producer defect that must self-announce unconditionally —
+// independent of windowEmpty and the stub fraction — so a malformed-header
+// regression can never hide behind an otherwise stub-free corpus (the exact
+// silent-starvation collapse this guards against: once the legacy stubs this
+// guard was written against are gone, a malformed-only window would otherwise
+// be byte-for-byte indistinguishable from a rest). A corpus with zero LIVE
+// stubs AND zero errors is never broken, so a healthy rested swarm — its
 // window empty only because everything was audited — stays byte-for-byte
 // silent.
+//
+// A stub classified GoneBranch (its stream branch is CONFIRMED to resolve
+// nowhere — see Stub.GoneBranch) is excluded from both the "stubs exist" gate
+// and the fraction, computed here as Finalized/(Finalized+live) rather than
+// Census.MineableFraction's whole-corpus Finalized/Total: it is permanently
+// un-finalizable by construction, not a live or growing defect, so it must
+// never be able to fire this alarm on a future genuinely-rested window purely
+// because the dead file still exists. It stays fully visible in Census.Stubs —
+// this changes only the reporting math, nothing is pruned or hidden.
 func (c Census) CorpusBroken(windowEmpty bool) bool {
 	if c.ErrorCount() > 0 {
 		return true
 	}
-	if len(c.Stubs) == 0 {
+	live := c.NonGoneStubCount()
+	if live == 0 {
 		return false
 	}
-	return windowEmpty || c.MineableFraction() < LowMineableFraction
+	total := c.Finalized() + live
+	return windowEmpty || float64(c.Finalized())/float64(total) < LowMineableFraction
 }
 
 // CorpusWarning returns the loud, human-facing "corpus broken, not a rest" banner
