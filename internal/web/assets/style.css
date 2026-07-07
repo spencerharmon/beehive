@@ -625,6 +625,41 @@ details.inline-edit[open] > summary { margin-bottom: var(--space-2); }
 details.inline-edit[open] > summary::before { content: "\2715"; }
 details.inline-edit > form { margin-top: 0; }
 
+/* /stats filter + group-by (stats-filter-groupby) ------------------------- *
+ * The FILTER BAR renders active filters as removable chips — a plain link
+ * carrying an × affordance, no JS — plus a two-field add-filter form; the
+ * group-by selector is a row of checkboxes (built-in tag keys) plus a
+ * free-text input for config-declared tags. Every control is a plain GET, so
+ * the resulting view is always a shareable/bookmarkable URL (no SPA). */
+.filter-bar h2 { margin-top: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-bottom: var(--space-3); }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0.12em 0.4em 0.12em 0.7em;
+  font-size: var(--text-sm);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+}
+.chip code { background: transparent; border: none; padding: 0; }
+.chip a {
+  color: var(--text-muted);
+  font-weight: 700;
+  line-height: 1;
+  padding: 0 0.35em;
+  border-radius: 50%;
+}
+.chip a:hover { color: #fff; background: var(--danger); text-decoration: none; }
+.groupby-form label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  font-size: var(--text-sm);
+  font-weight: 400;
+}
+
 /* Secrets list: key + its inline edit affordance per row. */
 ul.secrets { list-style: none; padding: 0; margin: var(--space-4) 0; }
 ul.secrets > li {

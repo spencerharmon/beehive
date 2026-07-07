@@ -10,6 +10,52 @@ attributed to the model of a done task's most-recent session). Expand
 <b>deliveries</b> to trace a DONE task to (a) the hive commit that flipped its PLAN
 status and (b) its submodule change doc — "why is this DONE" in one click across
 both repos. See <code>docs/conflict-resolution.md</code>.</p>
+
+<section class="card filter-bar">
+<h2>filter &amp; group by</h2>
+<p class="muted">Chips are ANDed (every filter must match) — no query language, just
+composable <code>tag=value</code> chips. Group by one or more tag keys to compare
+models, kinds, submodules, or any config-declared tag side by side. State lives in
+the URL, so a filtered/grouped view is shareable and bookmarkable. An unknown tag key
+or value simply yields no rows, never an error.</p>
+
+<div class="chips">
+{{range .Filters}}<span class="chip"><code>{{.Key}}={{.Value}}</code> <a href="{{.RemoveHref}}" title="remove this filter" aria-label="remove filter {{.Key}}={{.Value}}">&times;</a></span>{{end}}
+{{if not .Filters}}<span class="muted">no filters — every session is in scope</span>{{end}}
+</div>
+
+<form method="get" action="/stats" class="filter-add">
+{{range .Filters}}<input type="hidden" name="filter" value="{{.Key}}={{.Value}}">{{end}}
+{{range .GroupBy}}<input type="hidden" name="group-by" value="{{.}}">{{end}}
+<input name="fkey" list="tag-keys" placeholder="tag key (e.g. kind)">
+<input name="fval" placeholder="value (e.g. review)">
+<button type="submit">+ add filter</button>
+</form>
+<datalist id="tag-keys">{{range .BuiltinTags}}<option value="{{.}}">{{end}}</datalist>
+
+<form method="get" action="/stats" class="groupby-form">
+{{range .Filters}}<input type="hidden" name="filter" value="{{.Key}}={{.Value}}">{{end}}
+<span class="muted">group by:</span>
+{{$gb := .GroupBySet}}
+{{range .BuiltinTags}}<label><input type="checkbox" name="group-by" value="{{.}}"{{if index $gb .}} checked{{end}}> {{.}}</label>{{end}}
+<input name="group-by" placeholder="extra tag keys, comma-separated" value="{{.ExtraGroupBy}}">
+<button type="submit">apply</button>
+</form>
+{{if .Filtered}}<p class="muted"><a href="/stats">&larr; reset (clear filters &amp; group-by)</a></p>{{end}}
+</section>
+
+{{if .Filtered}}
+<table>
+<tr>{{range .GroupBy}}<th>{{.}}</th>{{end}}<th>delivered tasks ✅</th><th>honeybees 🐝</th><th>✅/🐝</th><th>stranded</th></tr>
+{{range .Grouped}}<tr>
+  {{range .Values}}<td>{{if .}}{{.}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>{{end}}
+  <td>{{.DeliveredTasks}}</td>
+  <td>{{.Honeybees}}</td>
+  <td>{{printf "%.1f%%" .DeliveredPerBeePct}}</td>
+  <td>{{if .Stranded}}<span class="state danger">{{.Stranded}}</span>{{else}}0{{end}}</td>
+</tr>{{else}}<tr><td colspan="12" class="muted">no sessions match every filter (an unknown tag key or value yields no rows)</td></tr>{{end}}
+</table>
+{{else}}
 <table>
 <tr><th>submodule</th><th>delivered tasks ✅</th><th>honeybees 🐝</th><th>✅/🐝</th><th>stranded</th></tr>
 {{range .Subs}}<tr>
@@ -62,4 +108,5 @@ both repos. See <code>docs/conflict-resolution.md</code>.</p>
   </details>
 </td></tr>{{end}}
 </table>
+{{end}}
 {{template "footer"}}

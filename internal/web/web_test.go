@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"html/template"
 	"net/http"
 	"net/http/httptest"
@@ -3281,5 +3282,291 @@ func TestSessionTags(t *testing.T) {
 	}
 	if got := s.sessionTags(sessionRef{submodule: "alpha", path: filepath.Join(sessDir, "bee-bad-300-3.md")}); len(got) != 0 {
 		t.Fatalf("unparsable transcript must yield no tags, got %v", got)
+	}
+}
+
+// writeSubTranscript is writeTranscript generalized to an ARBITRARY submodule
+// name (writeTranscript itself is hardwired to "alpha") — stats-filter-groupby
+// needs multiple submodules in scope at once so `group-by=submodule` and a
+// `filter=submodule=...` chip have more than one distinct value to prove out.
+func writeSubTranscript(t *testing.T, root, sub, stem, kind, model string) {
+	t.Helper()
+	dir := filepath.Join(root, "submodules", sub, "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	branch := stem
+	if m := sessionNameRE.FindStringSubmatch(stem); m != nil {
+		branch = "bee-" + m[1]
+	}
+	tag := ""
+	if model != "" {
+		tag = " · model: " + model
+	}
+	body := "# session " + stem + "\n\nsubmodule: " + sub + " · kind: " + kind +
+		" · branch: " + branch + tag + "\n\n## turn 1\nwork\n"
+	if err := os.WriteFile(filepath.Join(dir, stem+".md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeStatsPlan overwrites sub's PLAN.md with one task per (id, status) pair
+// — writeHivePlan's single-task form doesn't fit stats-filter-groupby's tests,
+// which need several DONE/TODO tasks in the same submodule at once.
+func writeStatsPlan(t *testing.T, root, sub string, tasks [][2]string) {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("<!-- Beehive-ROI: abc123 -->\n# Plan\n\n")
+	for _, kv := range tasks {
+		b.WriteString("## " + kv[0] + " [" + kv[1] + "] <!-- attempts=0 deps= weight=1 -->\nbuild it\nDoc: bee-" + kv[0] + ".md\n\n")
+	}
+	dir := filepath.Join(root, "submodules", sub)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, repo.PlanFile), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStatsGroupedFilterAndGroupByModel is stats-filter-groupby's core
+// acceptance case: GET /stats?filter=kind=review&group-by=model computes each
+// metric over ONLY kind=review sessions, one row per distinct model. A
+// kind=work session on the same submodule (opus) must NOT be counted, proving
+// the filter — not just the group-by — actually restricts the session pool.
+func TestStatsGroupedFilterAndGroupByModel(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+	const sonnet = "github-copilot/claude-sonnet-5"
+
+	writeStatsPlan(t, root, "alpha", [][2]string{{"r1", "DONE"}, {"r2", "DONE"}, {"w1", "TODO"}})
+	writeSubTranscript(t, root, "alpha", "bee-r1-100-1", "review", opus)
+	writeSubTranscript(t, root, "alpha", "bee-r2-200-2", "review", sonnet)
+	// Same submodule, kind=work: must be excluded by filter=kind=review even
+	// though it shares the opus model with r1.
+	writeSubTranscript(t, root, "alpha", "bee-w1-300-3", "work", opus)
+
+	filters := []tagFilter{{Key: "kind", Value: "review"}}
+	rows, err := s.computeGroupedStats(context.Background(), filters, []string{"model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("want 2 rows (opus, sonnet), got %d: %+v", len(rows), rows)
+	}
+	byModel := map[string]groupStat{}
+	for _, row := range rows {
+		byModel[row.Values[0]] = row
+	}
+	if got := byModel[opus]; got.Honeybees != 1 || got.DeliveredTasks != 1 {
+		t.Fatalf("opus row: %+v, want Honeybees=1 Delivered=1 (the work session must be filtered out)", got)
+	}
+	if got := byModel[sonnet]; got.Honeybees != 1 || got.DeliveredTasks != 1 {
+		t.Fatalf("sonnet row: %+v, want Honeybees=1 Delivered=1", got)
+	}
+	if got := byModel[opus].DeliveredPerBeePct; got != 100 {
+		t.Fatalf("opus yield: got %.1f want 100", got)
+	}
+
+	// End-to-end over the real handler + template.
+	w := get(t, s, "/stats?filter=kind=review&group-by=model")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /stats?filter=kind=review&group-by=model: code=%d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{opus, sonnet, "kind=review"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("response missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestStatsGroupedTwoFilterAND checks that two filter chips AND (never OR):
+// filter=kind=review&filter=submodule=alpha must intersect to alpha's review
+// sessions only — excluding alpha's work session AND beta's review session,
+// each of which matches only ONE of the two chips.
+func TestStatsGroupedTwoFilterAND(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+
+	writeStatsPlan(t, root, "alpha", [][2]string{{"a-review", "DONE"}, {"a-work", "TODO"}})
+	writeSubTranscript(t, root, "alpha", "bee-a-review-100-1", "review", opus)
+	writeSubTranscript(t, root, "alpha", "bee-a-work-200-2", "work", opus) // matches submodule=alpha but NOT kind=review
+
+	writeStatsPlan(t, root, "beta", [][2]string{{"b-review", "DONE"}})
+	writeSubTranscript(t, root, "beta", "bee-b-review-300-3", "review", opus) // matches kind=review but NOT submodule=alpha
+
+	filters := []tagFilter{{Key: "kind", Value: "review"}, {Key: "submodule", Value: "alpha"}}
+	rows, err := s.computeGroupedStats(context.Background(), filters, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want exactly 1 aggregate row (no group-by), got %d: %+v", len(rows), rows)
+	}
+	if got := rows[0]; got.Honeybees != 1 || got.DeliveredTasks != 1 {
+		t.Fatalf("AND-filtered row: %+v, want Honeybees=1 Delivered=1 (only alpha's review session)", got)
+	}
+}
+
+// TestStatsGroupedTwoKeyGroupBy checks group-by over MULTIPLE keys
+// (model,submodule): one row per distinct (model, submodule) TUPLE, not one
+// row per key.
+func TestStatsGroupedTwoKeyGroupBy(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+	const sonnet = "github-copilot/claude-sonnet-5"
+
+	writeStatsPlan(t, root, "alpha", [][2]string{{"t1", "DONE"}})
+	writeSubTranscript(t, root, "alpha", "bee-t1-100-1", "work", opus)
+	writeStatsPlan(t, root, "beta", [][2]string{{"t2", "DONE"}, {"t3", "TODO"}})
+	writeSubTranscript(t, root, "beta", "bee-t2-200-2", "work", opus)
+	writeSubTranscript(t, root, "beta", "bee-t3-300-3", "work", sonnet)
+
+	rows, err := s.computeGroupedStats(context.Background(), nil, []string{"model", "submodule"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3 distinct (model, submodule) tuples: (opus,alpha) (opus,beta) (sonnet,beta).
+	if len(rows) != 3 {
+		t.Fatalf("want 3 tuples, got %d: %+v", len(rows), rows)
+	}
+	tuples := map[string]groupStat{}
+	for _, row := range rows {
+		tuples[strings.Join(row.Values, "/")] = row
+	}
+	if got := tuples[opus+"/alpha"]; got.Honeybees != 1 || got.DeliveredTasks != 1 {
+		t.Fatalf("opus/alpha: %+v", got)
+	}
+	if got := tuples[opus+"/beta"]; got.Honeybees != 1 || got.DeliveredTasks != 1 {
+		t.Fatalf("opus/beta: %+v", got)
+	}
+	if got := tuples[sonnet+"/beta"]; got.Honeybees != 1 || got.DeliveredTasks != 0 {
+		t.Fatalf("sonnet/beta: %+v, want Delivered=0 (t3 is still TODO)", got)
+	}
+
+	w := get(t, s, "/stats?group-by=model,submodule")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /stats?group-by=model,submodule: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestStatsDefaultUnchanged locks stats-filter-groupby's "empty filter set + no
+// group-by == today's default view (unchanged)" contract: with no query
+// params, /stats must still serve the exact pre-existing per-submodule+total
+// view (computeStats), not the new grouped aggregation.
+func TestStatsDefaultUnchanged(t *testing.T) {
+	s, root := setup(t)
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	os.MkdirAll(sessDir, 0o755)
+	for _, n := range []string{"bee-t1-100-1.md", "bee-t1-200-2.md", "bee-t3-300-3.md"} {
+		os.WriteFile(filepath.Join(sessDir, n), []byte("x"), 0o644)
+	}
+	subs, total, err := s.computeStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := get(t, s, "/stats")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /stats: code=%d", w.Code)
+	}
+	body := w.Body.String()
+	// The pre-existing per-submodule table (delivered/honeybees exactly as
+	// computeStats reports) must still render.
+	if !strings.Contains(body, fmt.Sprintf(">%d<", subs[0].DeliveredTasks)) {
+		t.Fatalf("default view missing subs[0].DeliveredTasks=%d:\n%s", subs[0].DeliveredTasks, body)
+	}
+	if !strings.Contains(body, fmt.Sprintf("<b>%d</b>", total.Honeybees)) {
+		t.Fatalf("default view missing total honeybees=%d:\n%s", total.Honeybees, body)
+	}
+	// The FILTER BAR always renders (it is the entry point for filtering), but
+	// with zero active chips, and the grouped-view's empty-result copy must be
+	// ABSENT (that only ever renders once a filter/group-by is actually active).
+	if !strings.Contains(body, "no filters") {
+		t.Fatalf("filter bar must render even in the default view:\n%s", body)
+	}
+	if strings.Contains(body, "no sessions match every filter") {
+		t.Fatalf("grouped-view empty-state copy must not render in the default view:\n%s", body)
+	}
+}
+
+// TestStatsGroupedUnknownTagFilter is stats-filter-groupby's negative control:
+// an unknown tag=value filter must yield an EMPTY result set with NO error —
+// never a 500, never a Go error return.
+func TestStatsGroupedUnknownTagFilter(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+	writeStatsPlan(t, root, "alpha", [][2]string{{"t1", "DONE"}})
+	writeSubTranscript(t, root, "alpha", "bee-t1-100-1", "work", opus)
+
+	rows, err := s.computeGroupedStats(context.Background(), []tagFilter{{Key: "submodule", Value: "doesnotexist"}}, []string{"model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("unknown submodule filter must yield zero rows, got %+v", rows)
+	}
+	// Same for an unknown KEY entirely (not just an unknown value).
+	rows, err = s.computeGroupedStats(context.Background(), []tagFilter{{Key: "no-such-tag", Value: "x"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("unknown tag key must yield zero rows, got %+v", rows)
+	}
+
+	w := get(t, s, "/stats?filter=submodule=doesnotexist")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /stats?filter=submodule=doesnotexist: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "no sessions match every filter") {
+		t.Fatalf("empty grouped result must render its no-match copy, not an error:\n%s", w.Body.String())
+	}
+}
+
+// TestParseFiltersAndGroupBy unit-tests the query-param parsing directly: a
+// malformed filter chip (no `=`) is dropped rather than erroring, and
+// group-by accepts EITHER the canonical single comma-separated param or
+// repeated params (a plain HTML checkbox group's shape), de-duplicated.
+func TestParseFiltersAndGroupBy(t *testing.T) {
+	r := httptest.NewRequest("GET", "/stats?filter=kind=review&filter=malformed&filter=submodule=alpha", nil)
+	got := parseFilters(r)
+	want := []tagFilter{{Key: "kind", Value: "review"}, {Key: "submodule", Value: "alpha"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseFilters: got %+v want %+v", got, want)
+	}
+
+	r = httptest.NewRequest("GET", "/stats?group-by=model,submodule", nil)
+	if got := parseGroupBy(r); !reflect.DeepEqual(got, []string{"model", "submodule"}) {
+		t.Fatalf("parseGroupBy (csv): got %v", got)
+	}
+	r = httptest.NewRequest("GET", "/stats?group-by=model&group-by=submodule&group-by=model", nil)
+	if got := parseGroupBy(r); !reflect.DeepEqual(got, []string{"model", "submodule"}) {
+		t.Fatalf("parseGroupBy (repeated, deduped): got %v", got)
+	}
+}
+
+// TestStatsAddFilterRedirect checks the add-filter control's canonicalization:
+// posting the two plain fkey/fval inputs (never a pre-joined query string)
+// 303-redirects to the SAME `filter=key=value` URL shape a hand-built link or
+// a chip removal would use, preserving any already-active filter/group-by.
+func TestStatsAddFilterRedirect(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/stats?filter=kind=review&group-by=model&fkey=submodule&fval=alpha")
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("add-filter: code=%d, want %d", w.Code, http.StatusSeeOther)
+	}
+	loc := w.Header().Get("Location")
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := u.Query()["filter"]
+	want := []string{"kind=review", "submodule=alpha"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("redirect filter params: got %v want %v (location=%q)", got, want, loc)
+	}
+	if got := u.Query().Get("group-by"); got != "model" {
+		t.Fatalf("redirect must preserve group-by=model, got %q (location=%q)", got, loc)
 	}
 }
