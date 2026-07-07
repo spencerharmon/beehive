@@ -341,6 +341,36 @@ func isSessionTranscriptError(err error) bool {
 	return errors.As(err, &st)
 }
 
+// recordPublishFailureWarning durably records msg — an already-constructed
+// GC-for-retry warning — into the session transcript AFTER finish() has
+// returned. It exists because finish() flushes+streams the "final" transcript
+// (rec.snapshot then r.streamSession) BEFORE attempting r.publishWithResolution
+// (line ~941): a failure discovered only there, or in the mainAdvanced
+// re-verification after finish() has already succeeded, can never land in the
+// file finish already sealed. Without this, such a pass's transcript is
+// byte-for-byte indistinguishable from an honest first-try success and
+// internal/audit's Aborted/CompletionMiss detection — which keys exclusively
+// off a trailing "## ⚠️ warning" block (parse.go:scanBody) — never fires.
+//
+// Uses the EXACT primitives finish already uses internally, in the same order,
+// so the resulting block is identical in shape to any other abort warning:
+// rec.appendWarning(msg) (safe to call again here — it is documented as safe
+// whenever the recorder goroutine has stopped, which every call site of this
+// helper guarantees since finish() already did recStop+<-recDone before
+// returning) followed by r.streamSession to push the amended file. Best-effort:
+// a failure to durably record the warning is reported to stderr, never
+// escalated — a cosmetic transcript-write problem must never turn an
+// already-decided GC-for-retry outcome into something worse.
+func (r *Runner) recordPublishFailureWarning(ctx context.Context, rec *recorder, sessionRel, msg string) {
+	if err := rec.appendWarning(msg); err != nil {
+		fmt.Fprintf(os.Stderr, "honeybee: WARNING failed to durably record publish-failure warning to session transcript: %v\n", err)
+		return
+	}
+	if err := r.streamSession(ctx, sessionRel); err != nil {
+		fmt.Fprintf(os.Stderr, "honeybee: WARNING failed to stream amended publish-failure transcript: %v\n", err)
+	}
+}
+
 func (r *Runner) publish(ctx context.Context) error {
 	if r.Publish == nil {
 		return nil
@@ -1038,6 +1068,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						res.Warning = fmt.Sprintf(
 							"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
 							sel.Task.ID, ferr)
+						r.recordPublishFailureWarning(ctx, rec, sessionRel, res.Warning)
 						return res, nil
 					}
 					res.Completed = true
@@ -1201,6 +1232,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				res.Warning = fmt.Sprintf(
 					"task %s reached completion locally but publishing to main failed: %v; left unreleased for retry",
 					sel.Task.ID, ferr)
+				r.recordPublishFailureWarning(ctx, rec, sessionRel, res.Warning)
 				return res, nil
 			}
 			// Second publish-tree guard (bootstrap/reconcile): finish() published,
@@ -1226,6 +1258,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						"task %s reached completion locally but main did not advance after publish (no-op publish); left for retry",
 						taskID(sel))
 				}
+				r.recordPublishFailureWarning(ctx, rec, sessionRel, res.Warning)
 				return res, nil
 			}
 			res.Completed = true
