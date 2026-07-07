@@ -9,19 +9,25 @@ import (
 
 // writeTranscript drops a session transcript with the runner's header format into
 // alpha's sessions dir. model=="" omits the stamp (models the pre-stamp history
-// the stats page must default to opus).
+// the stats page must default to opus). The header branch is derived from the
+// stem ("bee-<task>") so it AGREES with the file name — the file-name cross-check
+// audit.ParseFile (which sessionTags reuses) enforces on a real finalized session.
 func writeTranscript(t *testing.T, root, stem, kind, model string) {
 	t.Helper()
 	dir := filepath.Join(root, "submodules", "alpha", "sessions")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	branch := stem
+	if m := sessionNameRE.FindStringSubmatch(stem); m != nil {
+		branch = "bee-" + m[1] // "bee-<task>", the prefix of "<branch>-<epoch>-<pid>"
+	}
 	tag := ""
 	if model != "" {
 		tag = " · model: " + model
 	}
 	body := "# session " + stem + "\n\nsubmodule: alpha · kind: " + kind +
-		" · branch: bee-x" + tag + "\n\n## turn 1\nwork\n"
+		" · branch: " + branch + tag + "\n\n## turn 1\nwork\n"
 	if err := os.WriteFile(filepath.Join(dir, stem+".md"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}

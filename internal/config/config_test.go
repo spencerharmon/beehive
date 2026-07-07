@@ -350,6 +350,76 @@ models:
 	}
 }
 
+// TestResolveTagsLayering checks the config-declared session-tag map
+// (stats-tag-model): it deep-merges THREE levels down (facet -> facet-value ->
+// tag-key), so a more specific layer overrides a single leaf label while its
+// siblings fall through, a facet/value present in only one layer survives, and a
+// blank leaf never overrides a lower layer (zero == unset) — the same layering
+// discipline as Models/BuildEnv, one level deeper.
+func TestResolveTagsLayering(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+
+	// Host: a cohort+region on submodule x, and a tier on one model.
+	write(t, filepath.Join(hostDir, "config.yaml"), `
+tags:
+  submodule:
+    x:
+      cohort: host
+      region: us
+  model:
+    strong/model:
+      tier: frontier
+`)
+	// Global: override the cohort leaf (region untouched -> host shows through),
+	// and add a tier for a different model value.
+	write(t, filepath.Join(root, "config.yaml"), `
+tags:
+  submodule:
+    x:
+      cohort: global
+  model:
+    cheap/model:
+      tier: budget
+`)
+	// Submodule (most specific): add a squad leaf, and a BLANK region that must
+	// NOT wipe the host's value (zero == unset).
+	write(t, filepath.Join(root, "submodules", "x", "config.yaml"), `
+tags:
+  submodule:
+    x:
+      squad: red
+      region: ""
+`)
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := c.Tags["submodule"]["x"]
+	// global wins for the cohort leaf (over host)
+	if sub["cohort"] != "global" {
+		t.Errorf("tags submodule.x.cohort = %q, want global (global over host)", sub["cohort"])
+	}
+	// region set only at host, blanked at submodule: survives (key-by-key merge +
+	// zero == unset)
+	if sub["region"] != "us" {
+		t.Errorf("tags submodule.x.region = %q, want us (host survives; blank leaf never overrides)", sub["region"])
+	}
+	// squad set only at the submodule layer
+	if sub["squad"] != "red" {
+		t.Errorf("tags submodule.x.squad = %q, want red", sub["squad"])
+	}
+	// A facet/value present in only one layer each survives the merge.
+	if got := c.Tags["model"]["strong/model"]["tier"]; got != "frontier" {
+		t.Errorf("tags model.strong/model.tier = %q, want frontier (host only)", got)
+	}
+	if got := c.Tags["model"]["cheap/model"]["tier"]; got != "budget" {
+		t.Errorf("tags model.cheap/model.tier = %q, want budget (global only)", got)
+	}
+}
+
 // TestModelForInert confirms the inert defaults: an empty config routes nothing
 // ("" for every kind — the runner keeps the client's own model), and a host that
 // set only a single Model resolves every kind to it (single-model host unchanged).

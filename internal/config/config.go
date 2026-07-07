@@ -125,6 +125,25 @@ type Config struct {
 	// session panes so many open viewers make at most one `git pull --ff-only` per
 	// interval. 0 = the 2s default. Ignored on a single-host repo (no remote).
 	SessionPullSeconds int `yaml:"session_pull_seconds"`
+
+	// Tags DECLARES config-driven session tags for the /stats tag model
+	// (stats-tag-model): extra key->value labels attached, on read, to any session
+	// whose built-in FACET matches. It is an OPEN, three-level map
+	//
+	//	facet -> facet-value -> (tag-key -> tag-value)
+	//
+	// e.g. Tags["submodule"]["frontend"]["cohort"] = "A" tags every session in the
+	// frontend submodule cohort=A, and
+	// Tags["model"]["github-copilot/claude-opus-4.8"]["tier"] = "frontier" tags every
+	// opus session tier=frontier. The facet is any BUILT-IN tag key (submodule,
+	// kind, branch, model, or a future built-in); the tag key and value are
+	// arbitrary — nothing is a fixed schema, so an operator marks cohorts/experiments
+	// with no code change. Merged three levels DEEP across config layers (see
+	// mergeTags): a more specific layer adds or overrides a single leaf label while
+	// the rest fall through. Inert (nil) by default so an install that declares no
+	// tags is unaffected. Adding a map field keeps Config non-comparable with ==;
+	// callers/tests use reflect.DeepEqual.
+	Tags map[string]map[string]map[string]string `yaml:"tags"`
 }
 
 // Defaults are the lowest layer, applied when no file sets a field.
@@ -278,6 +297,7 @@ func merge(base, over Config) Config {
 	if over.SessionPullSeconds != 0 {
 		out.SessionPullSeconds = over.SessionPullSeconds
 	}
+	out.Tags = mergeTags(base.Tags, over.Tags)
 	return out
 }
 
@@ -314,6 +334,53 @@ func mergeEnv(base, over map[string]string) map[string]string {
 			continue // zero == unset: don't override a lower layer with a blank
 		}
 		merged[k] = v
+	}
+	return merged
+}
+
+// mergeTags deep-merges the config-declared session-tag map three levels down —
+// facet -> facet-value -> (tag-key -> tag-value) — so a more specific layer adds
+// or overrides a single LEAF label without restating the rest. over's non-empty
+// leaves win, base leaves fall through, and an empty leaf value is treated as
+// unset (never overrides a lower layer), mirroring the "zero == unset" rule used
+// for every scalar and for mergeEnv. When over contributes it returns a FRESH
+// nested map (base is deep-copied), so no lower layer's map is mutated; when over
+// is empty it returns base unchanged (fall-through), keeping the inert-nil default.
+func mergeTags(base, over map[string]map[string]map[string]string) map[string]map[string]map[string]string {
+	if len(over) == 0 {
+		return base
+	}
+	merged := make(map[string]map[string]map[string]string, len(base)+len(over))
+	for facet, vals := range base {
+		fm := make(map[string]map[string]string, len(vals))
+		for val, kv := range vals {
+			inner := make(map[string]string, len(kv))
+			for k, v := range kv {
+				inner[k] = v
+			}
+			fm[val] = inner
+		}
+		merged[facet] = fm
+	}
+	for facet, vals := range over {
+		fm := merged[facet]
+		if fm == nil {
+			fm = make(map[string]map[string]string, len(vals))
+			merged[facet] = fm
+		}
+		for val, kv := range vals {
+			inner := fm[val]
+			if inner == nil {
+				inner = make(map[string]string, len(kv))
+				fm[val] = inner
+			}
+			for k, v := range kv {
+				if v == "" {
+					continue // zero == unset: a blank leaf never overrides a lower layer
+				}
+				inner[k] = v
+			}
+		}
 	}
 	return merged
 }
