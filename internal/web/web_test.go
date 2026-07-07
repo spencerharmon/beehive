@@ -3213,3 +3213,73 @@ func TestSecretsNoKeyringFailsLoudly(t *testing.T) {
 		t.Fatal("setSecret with empty gpgHome must fail loudly")
 	}
 }
+
+// TestSessionTags locks the stateless session->tag accessor (stats-tag-model): the
+// built-in tags {submodule,kind,branch,model} are derived from git ALONE — the
+// transcript header, cross-checked against the file name, reusing the SAME
+// audit.ParseFile the audit engine uses — and config-declared tags layer on by
+// facet value. It also pins the two behaviours the by-model stats view depends on:
+// an absent model header OMITS `model` (the accessor never guesses a default), and
+// a config tag keyed on an absent facet value simply does not attach.
+func TestSessionTags(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+
+	// Config tags keyed off two DIFFERENT built-in facets, proving the schema is
+	// open (arbitrary facet + label keys, no fixed set): a cohort keyed on the
+	// submodule facet, a tier keyed on the model facet. Set white-box (same
+	// package) — the layering itself is covered in config's own test.
+	s.cfg.Tags = map[string]map[string]map[string]string{
+		"submodule": {"alpha": {"cohort": "A"}},
+		"model":     {opus: {"tier": "frontier"}},
+	}
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+
+	// Fully-stamped session: header carries submodule/kind/branch + model and the
+	// file name agrees with the branch, so every built-in derives and both config
+	// tags attach.
+	writeTranscript(t, root, "bee-tagme-100-1", "work", opus)
+	got := s.sessionTags(sessionRef{submodule: "alpha", path: filepath.Join(sessDir, "bee-tagme-100-1.md")})
+	want := map[string]string{
+		"submodule": "alpha",
+		"kind":      "work",
+		"branch":    "bee-tagme",
+		"model":     opus,
+		"cohort":    "A",        // config tag keyed on submodule=alpha
+		"tier":      "frontier", // config tag keyed on model=opus
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("full session tags:\n got %v\nwant %v", got, want)
+	}
+
+	// Negative control: no model header. `model` is omitted (NOT defaulted — that
+	// policy lives in computeStats, not the accessor), and so is the tier tag
+	// keyed on it; the submodule-keyed cohort still attaches.
+	writeTranscript(t, root, "bee-nomodel-200-2", "review", "")
+	got = s.sessionTags(sessionRef{submodule: "alpha", path: filepath.Join(sessDir, "bee-nomodel-200-2.md")})
+	want = map[string]string{
+		"submodule": "alpha",
+		"kind":      "review",
+		"branch":    "bee-nomodel",
+		"cohort":    "A",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("no-model session tags:\n got %v\nwant %v", got, want)
+	}
+	if _, ok := got["model"]; ok {
+		t.Fatal("model must be OMITTED when the header carries none (no default in the accessor)")
+	}
+	if _, ok := got["tier"]; ok {
+		t.Fatal("a config tag keyed on an absent facet value must not attach")
+	}
+
+	// Stateless: a malformed/headerless transcript that fails the audit parse
+	// derives no built-ins and attaches no facet-keyed config tags (empty set, no
+	// error/panic) — the leniency the rest of /stats relies on.
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-bad-300-3.md"), []byte("no header here\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.sessionTags(sessionRef{submodule: "alpha", path: filepath.Join(sessDir, "bee-bad-300-3.md")}); len(got) != 0 {
+		t.Fatalf("unparsable transcript must yield no tags, got %v", got)
+	}
+}

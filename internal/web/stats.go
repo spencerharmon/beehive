@@ -65,30 +65,10 @@ const defaultModel = "github-copilot/claude-opus-4.8"
 // id (1) and the epoch (2) / pid (3) that order a task's repeated attempts.
 var sessionNameRE = regexp.MustCompile(`^bee-(.+)-(\d+)-(\d+)$`)
 
-// modelStampRE pulls the model out of the transcript header's metadata line
-// ("submodule: … · kind: … · branch: … · model: <model>").
-var modelStampRE = regexp.MustCompile(`· model: (\S+)`)
-
 func (st *subStat) derive() {
 	if st.Honeybees > 0 {
 		st.DeliveredPerBeePct = 100 * float64(st.DeliveredTasks) / float64(st.Honeybees)
 	}
-}
-
-// sessionModel reads a transcript's header (bounded — the stamp is on line 3) and
-// returns the model it ran on, or defaultModel when unstamped/unreadable.
-func sessionModel(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return defaultModel
-	}
-	defer f.Close()
-	buf := make([]byte, 512)
-	n, _ := f.Read(buf)
-	if m := modelStampRE.FindSubmatch(buf[:n]); m != nil {
-		return string(m[1])
-	}
-	return defaultModel
 }
 
 // computeStats returns per-submodule figures plus a total row.
@@ -137,7 +117,15 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 					continue
 				}
 				st.Honeybees++
-				model := sessionModel(filepath.Join(sm.SessionsDir(), e.Name()))
+				// Model for the by-model breakdown comes from the session's
+				// BUILT-IN `model` TAG (sessionTags — the extensible, git-derived
+				// tag model), single-sourcing the model parse with the rest of the
+				// tag set. sessionTags OMITS an absent model; the by-model view's
+				// own policy credits that unstamped history to opus (defaultModel).
+				model := s.sessionTags(sessionRef{submodule: sm.Name, path: filepath.Join(sm.SessionsDir(), e.Name())})["model"]
+				if model == "" {
+					model = defaultModel
+				}
 				bees[model]++
 				task := m[1]
 				epoch, _ := strconv.Atoi(m[2])
