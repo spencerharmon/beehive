@@ -20,7 +20,12 @@ func setup(t *testing.T) (*Claimer, context.Context) {
 	root := t.TempDir()
 	ctx := context.Background()
 	g := git.New(root)
-	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+	// gc.auto=0 + maintenance.auto=false stop the `git commit`s below from
+	// spawning a DETACHED background gc/maintenance process. That process keeps
+	// writing into .git after git returns and races t.TempDir()'s RemoveAll
+	// cleanup ("unlinkat .../.git: directory not empty"), an env-load-dependent
+	// flake that fails the whole `go test ./...` gate with no assertion at fault.
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "gc.auto", "0"}, {"config", "maintenance.auto", "false"}} {
 		if _, err := g.Run(ctx, a...); err != nil {
 			t.Fatal(err)
 		}
@@ -198,7 +203,7 @@ func TestBounceUnreachablePublishesImmediately(t *testing.T) {
 	root := t.TempDir()
 	ctx := context.Background()
 	g := git.New(root)
-	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "gc.auto", "0"}, {"config", "maintenance.auto", "false"}} {
 		g.Run(ctx, a...)
 	}
 	repo.Init(root)
@@ -270,7 +275,7 @@ func TestFinalizeAlreadyMergedPublishesImmediately(t *testing.T) {
 	root := t.TempDir()
 	ctx := context.Background()
 	g := git.New(root)
-	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "gc.auto", "0"}, {"config", "maintenance.auto", "false"}} {
 		g.Run(ctx, a...)
 	}
 	repo.Init(root)
@@ -302,7 +307,7 @@ func TestFinalizeAlreadyMergedPublishesImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 	sg := git.New(repoDir)
-	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "gc.auto", "0"}, {"config", "maintenance.auto", "false"}} {
 		if _, err := sg.Run(ctx, a...); err != nil {
 			t.Fatalf("init synced checkout %v: %v", a, err)
 		}
@@ -382,7 +387,7 @@ func TestPublishRaceOneWinner(t *testing.T) {
 	root := t.TempDir()
 	ctx := context.Background()
 	g := git.New(root)
-	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "gc.auto", "0"}, {"config", "maintenance.auto", "false"}} {
 		g.Run(ctx, a...)
 	}
 	repo.Init(root)
@@ -431,7 +436,7 @@ func TestClaimLockSingleton(t *testing.T) {
 	root := t.TempDir()
 	ctx := context.Background()
 	g := git.New(root)
-	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"config", "gc.auto", "0"}, {"config", "maintenance.auto", "false"}} {
 		g.Run(ctx, a...)
 	}
 	repo.Init(root)
