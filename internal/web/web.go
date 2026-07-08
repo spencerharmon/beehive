@@ -104,6 +104,11 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The publishing editor (internal/editor) seeds each session's system prompt
+	// with the target's per-file editing rules (chat-diff-file-context), so an
+	// "edit with AI" link that now opens the editor keeps the SAME ownership/format
+	// guidance the retired chat-diff surface used to inject.
+	em.Context = resolveFileContext
 	g := git.New(r.Root)
 	// The chat-diff editor drives its own opencode client (same server/model as
 	// the single-file editor); it opens a per-edit ROOT worktree and awaits each
@@ -336,10 +341,12 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /skills", b((*Server).skillsPage))
 	mux.HandleFunc("POST /skills/{name}/plan", b((*Server).skillPlanHandler))
 	mux.HandleFunc("POST /skills/{name}/apply", b((*Server).skillApplyHandler))
-	// AI editor chat (browser): one worktree branch per session.
+	// AI editor chat (browser): one worktree branch per session. The "edit with
+	// AI" links (GET/POST /edit?path=) open the PUBLISHING editor (/editor/{id}),
+	// whose approved change lands on main. The /edit/{id}/* routes remain for the
+	// bootstrap setup agent, which drives the propose-then-apply chat surface.
 	mux.HandleFunc("GET /edit", b((*Server).editEntry))
-	mux.HandleFunc("POST /edit", b((*Server).chatOpen))
-	mux.HandleFunc("GET /edit/{id}", b((*Server).chatPage))
+	mux.HandleFunc("POST /edit", b((*Server).editEntry))
 	mux.HandleFunc("GET /edit/{id}/panel", b((*Server).chatPanel))
 	mux.HandleFunc("POST /edit/{id}/message", b((*Server).chatMessage))
 	mux.HandleFunc("POST /edit/{id}/approve", b((*Server).chatApprove))
@@ -556,7 +563,7 @@ func optionalFileLinks(sm repo.Submodule) []fileLink {
 // set repo.RootInstructionFiles (AGENTS.md, HONEYBEE.md, BOOTSTRAP.md, LOCALS.md).
 // It is the root analogue of fileLink: the index is driven by that SET, not the
 // directory listing, so an absent file renders a discoverable create link (into
-// the chat-diff editor's empty-base create path, seeded per file via
+// the publishing editor's empty-base create path, seeded per file via
 // chat-diff-file-context) instead of being invisible (root-instruction-file-
 // links). File is the basename and the template composes the repo-ROOT editor path
 // /edit?path=<File> (no submodules/<name>/ prefix — these live at the repo root).

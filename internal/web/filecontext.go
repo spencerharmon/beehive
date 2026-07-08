@@ -6,16 +6,17 @@ import (
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
-// chat-diff-file-context: per-file editing rules injected into a chat-edit
-// session's system prompt so an edit stays correctly formatted and
-// protocol-safe. The generic chat-diff surface (chat-diff-editor-core) edits ANY
-// repo path, but ROI.md, PLAN.md, RULES.md, and the typed artifact files each
-// carry strict formats/ownership rules; without the right preamble the agent
-// would happily break the PLAN.md line format or propose an edit to the
-// human-owned ROI.md. Both the per-file edit links and the generic edit window
-// open through chatManager.open (-> chatSystemPrompt -> the opencode session's
-// system seed), so seeding the resolved context there applies the SAME rules to
-// a given target no matter how the session was started.
+// chat-diff-file-context: per-file editing rules injected into an edit session's
+// system prompt so an edit stays correctly formatted and protocol-safe. ROI.md,
+// PLAN.md, RULES.md, and the typed artifact files each carry strict
+// formats/ownership rules; without the right preamble the agent would happily
+// break the PLAN.md line format or propose an edit to the human-owned ROI.md.
+//
+// The resolver has two consumers, both keyed off the SAME table so a given target
+// gets identical rules no matter which surface opens it: the publishing editor
+// (internal/editor, wired via Manager.Context = resolveFileContext in web.New),
+// which every "edit with AI" link now opens; and the bootstrap setup agent
+// (chatSystemPrompt -> the LOCALS.md preamble) in the chat-diff surface.
 //
 // The mapping is data-driven: a table matched by basename, not a switch
 // hardcoded per call site. A basename key means the ROI.md rule applies to

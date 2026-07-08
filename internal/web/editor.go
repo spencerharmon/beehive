@@ -8,18 +8,6 @@ import (
 	"github.com/spencerharmon/beehive/internal/editor"
 )
 
-// editNew opens a fresh editor session for ?file=<repo-relative> and redirects
-// to its chat page. The "edit with AI" links across the UI point here.
-func (s *Server) editNew(w http.ResponseWriter, r *http.Request) {
-	file := r.URL.Query().Get("file")
-	sess, err := s.editors.Open(r.Context(), file)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	http.Redirect(w, r, "/editor/"+sess.ID, http.StatusSeeOther)
-}
-
 // editorPage is the chat shell; its panel auto-refreshes via HTMX so the diff and
 // state update live as the agent edits.
 func (s *Server) editorPage(w http.ResponseWriter, r *http.Request) {

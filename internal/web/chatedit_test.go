@@ -299,9 +299,9 @@ func TestCleanRepoPathRejectsTraversal(t *testing.T) {
 	}
 }
 
-// TestChatOpenHandlerRejectsTraversal: the HTTP entrypoint maps a bad path to 400
-// (no worktree, no session).
-func TestChatOpenHandlerRejectsTraversal(t *testing.T) {
+// TestEditEntryRejectsTraversal: the HTTP entrypoint maps a traversal path to 400
+// (editor.Open -> ValidateFile), so no worktree or session is created.
+func TestEditEntryRejectsTraversal(t *testing.T) {
 	s, _ := chatFixture(t, "")
 	req := httptest.NewRequest("POST", "/edit", strings.NewReader("path=../evil"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -312,27 +312,38 @@ func TestChatOpenHandlerRejectsTraversal(t *testing.T) {
 	}
 }
 
-// TestChatOpenHandlerRedirects: GET /edit?path= opens a session and redirects to
-// its page; the page and panel then render.
-func TestChatOpenHandlerRedirects(t *testing.T) {
+// TestEditEntryOpensPublishingEditor: GET /edit?path=<editable> opens a PUBLISHING
+// editor session (internal/editor) and redirects to its /editor/ page, whose shell
+// renders the target. This is the routing that replaced the retired chat-diff
+// surface, so an approved edit publishes to main instead of stranding on a
+// throwaway branch.
+func TestEditEntryOpensPublishingEditor(t *testing.T) {
 	s, _ := chatFixture(t, "")
-	w := get(t, s, "/edit?path=submodules/alpha/notes.md")
+	w := get(t, s, "/edit?path=submodules/alpha/ROI.md")
 	if w.Code != http.StatusSeeOther {
-		t.Fatalf("open should redirect (303), got %d", w.Code)
+		t.Fatalf("edit entry should redirect (303), got %d", w.Code)
 	}
 	loc := w.Header().Get("Location")
-	if !strings.HasPrefix(loc, "/edit/edit-") {
-		t.Fatalf("unexpected redirect target %q", loc)
+	if !strings.HasPrefix(loc, "/editor/edit-") {
+		t.Fatalf("edit link must open the publishing editor (/editor/...), got %q", loc)
 	}
-	if page := get(t, s, loc).Body.String(); !strings.Contains(page, "chat-edit · submodules/alpha/notes.md") {
-		t.Fatalf("chat page did not render: %s", page)
+	if page := get(t, s, loc).Body.String(); !strings.Contains(page, "submodules/alpha/ROI.md") {
+		t.Fatalf("editor page did not render the target file: %s", page)
 	}
 	panel := get(t, s, loc+"/panel")
 	if panel.Code != http.StatusOK {
-		t.Fatalf("panel status %d", panel.Code)
+		t.Fatalf("editor panel status %d", panel.Code)
 	}
-	if !strings.Contains(panel.Body.String(), "No pending proposal") {
-		t.Fatalf("panel should show no-proposal state:\n%s", panel.Body.String())
+}
+
+// TestEditEntryRejectsNonEditable: a path that is not an editable coordination
+// file (an arbitrary repo file) is a 400 — the publishing editor only edits the
+// declared coordination set, so no session or worktree is created.
+func TestEditEntryRejectsNonEditable(t *testing.T) {
+	s, _ := chatFixture(t, "")
+	w := get(t, s, "/edit?path=submodules/alpha/notes.md")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("non-editable path should be 400, got %d", w.Code)
 	}
 }
 

@@ -200,18 +200,19 @@ func TestChatEditPlanRoundTrips(t *testing.T) {
 	}
 }
 
-// TestPerFileEditLinksRouteToChatDiff: the per-file "edit with AI" links (the ROI
-// human editor and the dashboard ROI/infrastructure links) route into the generic
-// chat-diff handler (/edit?path=), not the legacy single-file editor (/edit?file=).
-func TestPerFileEditLinksRouteToChatDiff(t *testing.T) {
+// TestPerFileEditLinksRouteToPublishingEditor: the per-file "edit with AI" links
+// (the ROI human editor and the dashboard ROI/infrastructure links) route through
+// the /edit?path= entrypoint — which now opens the PUBLISHING editor whose approved
+// change lands on main — and never the legacy single-file ?file= form.
+func TestPerFileEditLinksRouteToPublishingEditor(t *testing.T) {
 	s, _ := setup(t)
 
 	roi := get(t, s, "/roi/alpha").Body.String()
 	if !strings.Contains(roi, `/edit?path=submodules/alpha/ROI.md`) {
-		t.Errorf("roi editor should link into the chat-diff handler (?path=):\n%s", roi)
+		t.Errorf("roi editor should link into the /edit?path= entrypoint:\n%s", roi)
 	}
 	if strings.Contains(roi, `/edit?file=`) {
-		t.Errorf("roi editor still routes a per-file link to the legacy editor (?file=):\n%s", roi)
+		t.Errorf("roi editor still routes a per-file link to the legacy ?file= form:\n%s", roi)
 	}
 
 	dash := get(t, s, "/").Body.String()
@@ -220,11 +221,32 @@ func TestPerFileEditLinksRouteToChatDiff(t *testing.T) {
 		`/edit?path=INFRASTRUCTURE.md`,
 	} {
 		if !strings.Contains(dash, want) {
-			t.Errorf("dashboard missing chat-diff link %q:\n%s", want, dash)
+			t.Errorf("dashboard missing edit link %q:\n%s", want, dash)
 		}
 	}
 	if strings.Contains(dash, `/edit?file=`) {
-		t.Errorf("dashboard still routes a per-file link to the legacy editor (?file=):\n%s", dash)
+		t.Errorf("dashboard still routes a per-file link to the legacy ?file= form:\n%s", dash)
+	}
+}
+
+// TestEditorManagerSeededWithFileContext: New wires the publishing editor's
+// per-file context resolver to resolveFileContext, so a session opened for a
+// coordination file is seeded with that file's rules (an ROI.md edit is told it is
+// human-owned intent). This is the editor-side counterpart of the chat surface's
+// chatSystemPrompt seeding, and what keeps per-file rules alive now that the edit
+// links open the publishing editor.
+func TestEditorManagerSeededWithFileContext(t *testing.T) {
+	s, _ := setup(t)
+	if s.editors.Context == nil {
+		t.Fatal("publishing editor Manager.Context not wired (per-file rules would be lost)")
+	}
+	roi := s.editors.Context("submodules/alpha/ROI.md")
+	if !strings.Contains(roi, "FORBIDDEN") || !strings.Contains(roi, "human-owned") {
+		t.Errorf("editor context for ROI.md missing its human-owned rules:\n%s", roi)
+	}
+	// The resolver is file-specific: a different class yields different rules.
+	if roi == s.editors.Context("submodules/alpha/PLAN.md") {
+		t.Error("editor context should be file-specific (ROI.md and PLAN.md must differ)")
 	}
 }
 

@@ -30,12 +30,26 @@ type agentClient interface {
 // "ask the agent to merge" and clicking Merge converge to the same git state.
 const mergeMarker = "<<<MERGE>>>"
 
-// editableBasenames are the human-owned coordination files an editor session may
-// touch. Everything else (PLAN.md, AGENTS.md, secrets, code) is off limits.
-var editableBasenames = map[string]bool{
-	repo.ROIFile:   true,
-	repo.InfraFile: true,
-	repo.LinksFile: true,
+// editableBasenames are the coordination files an editor session may touch. It is
+// the union of the repo's DECLARED editable sets — the per-submodule optional
+// files (repo.OptionalFiles: ROI/INFRASTRUCTURE/RULES/ARTIFACTS/AGENTS), the
+// repo-ROOT instruction files (repo.RootInstructionFiles: AGENTS/HONEYBEE/
+// BOOTSTRAP/LOCALS) and the submodule-links registry (repo.LinksFile) — so the
+// publishing editor accepts exactly the files the UI renders "edit with AI" links
+// for and no more. PLAN.md (honeybee-owned), secrets and code are deliberately
+// absent. Deriving it from the repo constants (not a private literal) keeps it in
+// lockstep with those sets as they evolve.
+var editableBasenames = buildEditableBasenames()
+
+func buildEditableBasenames() map[string]bool {
+	m := map[string]bool{repo.LinksFile: true}
+	for _, f := range repo.OptionalFiles {
+		m[f] = true
+	}
+	for _, f := range repo.RootInstructionFiles {
+		m[f.File] = true
+	}
+	return m
 }
 
 // ErrDeleteNeedsConfirm is returned by Merge when the pending proposal would
@@ -109,6 +123,13 @@ type Manager struct {
 	cfg     config.Config
 	primary *git.Repo
 	client  agentClient
+
+	// Context, when set, returns the per-file editing preamble to append to a
+	// session's system prompt (the web layer wires it to resolveFileContext so an
+	// ROI.md edit is told it is human-owned intent, a PLAN-adjacent file keeps its
+	// format, etc.). Optional: nil yields a bare prompt, so the editor stays usable
+	// without the web layer's file-context table (and tests need not set it).
+	Context func(file string) string
 
 	store *store           // persisted session state (survives restart)
 	ttl   time.Duration    // staleness cutoff for startup prune
@@ -221,7 +242,7 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 		client:   m.client,
 		wt:       git.New(wtPath),
 		mgr:      m,
-		sys:      systemPrompt(file),
+		sys:      m.promptFor(file),
 		activity: m.now(),
 	}
 	m.mu.Lock()
@@ -479,7 +500,7 @@ func (m *Manager) restore(ctx context.Context, w git.Worktree, rec sessionRecord
 		client:   m.client,
 		wt:       git.New(w.Path),
 		mgr:      m,
-		sys:      systemPrompt(file),
+		sys:      m.promptFor(file),
 		log:      log,
 		activity: activity,
 	}
@@ -712,8 +733,24 @@ func slugFile(file string) string {
 	return strings.Trim(r.Replace(file), "-")
 }
 
-func systemPrompt(file string) string {
-	return fmt.Sprintf(`You are a collaborative editor for ONE file in a git repository: %s.
+// promptFor builds the system prompt for a session editing file, appending the
+// manager's per-file editing context (Context) when one is configured. Context is
+// optional (nil in tests / when the web file-context table is not wired), so
+// promptFor is total and falls back to the bare editor prompt.
+func (m *Manager) promptFor(file string) string {
+	fileContext := ""
+	if m.Context != nil {
+		fileContext = m.Context(file)
+	}
+	return systemPrompt(file, fileContext)
+}
+
+// systemPrompt is the editor agent's system seed for one file. fileContext, when
+// non-empty, is appended as the file-specific editing rules (its ownership and
+// format constraints) so an in-place edit stays protocol-safe; an empty
+// fileContext yields the bare prompt.
+func systemPrompt(file, fileContext string) string {
+	prompt := fmt.Sprintf(`You are a collaborative editor for ONE file in a git repository: %s.
 
 Rules:
 - ONLY edit %s. Never touch any other file. Never run git, never commit; the system commits and merges for you.
@@ -722,4 +759,8 @@ Rules:
 - Ask a brief clarifying question only if the request is genuinely ambiguous.
 - When, and ONLY when, the user explicitly approves merging/publishing the change, end your reply with a final line containing exactly: %s`,
 		file, file, file, mergeMarker)
+	if strings.TrimSpace(fileContext) != "" {
+		prompt += "\n\nFile-specific rules for " + file + ":\n" + fileContext
+	}
+	return prompt
 }

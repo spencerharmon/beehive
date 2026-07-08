@@ -389,42 +389,25 @@ func seedPrompt(path, current, msg string) string {
 
 // ---- HTTP handlers ----
 
-// editEntry dispatches GET /edit. The generic chat-diff editor is selected by
-// ?path=<repo-relative>; the legacy single-file editor's ?file= links still reach
-// their handler, so both coexist during the migration.
+// editEntry dispatches GET/POST /edit: it opens a PUBLISHING editor session
+// (internal/editor) over the target given by ?path= (or the legacy ?file=) and
+// redirects to its page. Every "edit with AI" link across the UI reaches here, so
+// an approved edit is committed in a worktree and PUBLISHED to main — never
+// stranded on a throwaway branch, the silent-data-loss the retired chat-diff
+// surface caused. A non-editable or traversal target is a 400 (editor.Open ->
+// ValidateFile), and an absent coordination file opens on an empty base to be
+// created on approval.
 func (s *Server) editEntry(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("path") != "" {
-		s.chatOpen(w, r)
-		return
+	target := r.FormValue("path")
+	if target == "" {
+		target = r.FormValue("file")
 	}
-	s.editNew(w, r)
-}
-
-// chatOpen handles GET/POST /edit?path=<repo-relative>: it opens a chat-edit
-// session and redirects to its page. Path validation failures are a 400.
-func (s *Server) chatOpen(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		path = r.FormValue("path")
-	}
-	sess, err := s.chat.open(r.Context(), path)
+	sess, err := s.editors.Open(r.Context(), target)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/edit/"+sess.ID, http.StatusSeeOther)
-}
-
-// chatPage is the chat shell; its panel loads once via HTMX and then re-renders
-// on each synchronous message/approve/reject response (no background poll needed,
-// since a turn is awaited before the panel is returned).
-func (s *Server) chatPage(w http.ResponseWriter, r *http.Request) {
-	sess, ok := s.chat.get(r.PathValue("id"))
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	s.render(w, "chatedit.html", map[string]interface{}{"ID": sess.ID, "Path": sess.Path})
+	http.Redirect(w, r, "/editor/"+sess.ID, http.StatusSeeOther)
 }
 
 // chatPanel renders the live chat log, diff and proposal controls.

@@ -591,3 +591,58 @@ func TestReloadEmptyIsNoop(t *testing.T) {
 		t.Fatalf("want 0 sessions after empty reload, got %d", n)
 	}
 }
+
+// TestSystemPromptIncludesFileContext: a non-empty fileContext is appended as the
+// file-specific rules, and an empty one yields the bare prompt (no dangling
+// rules section). This is the seam the web layer uses to keep an "edit with AI"
+// session carrying the target's ownership/format guidance.
+func TestSystemPromptIncludesFileContext(t *testing.T) {
+	file := "submodules/sm/ROI.md"
+	withCtx := systemPrompt(file, "SPECIAL-FILE-RULES-XYZ")
+	if !strings.Contains(withCtx, file) {
+		t.Errorf("prompt missing the file path:\n%s", withCtx)
+	}
+	if !strings.Contains(withCtx, "SPECIAL-FILE-RULES-XYZ") {
+		t.Errorf("prompt missing the file context:\n%s", withCtx)
+	}
+	if !strings.Contains(withCtx, mergeMarker) {
+		t.Errorf("prompt missing the merge marker:\n%s", withCtx)
+	}
+	bare := systemPrompt(file, "")
+	if strings.Contains(bare, "File-specific rules") {
+		t.Errorf("empty context must not add a rules section:\n%s", bare)
+	}
+	if !strings.Contains(bare, mergeMarker) {
+		t.Errorf("bare prompt missing the merge marker:\n%s", bare)
+	}
+}
+
+// TestManagerContextSeedsSessionPrompt: when a Manager has a Context resolver, an
+// opened session's system prompt carries the resolved per-file rules; with no
+// resolver (the default) the prompt is bare. This locks the wiring the web layer
+// relies on (Manager.Context = resolveFileContext) end-to-end at the editor.
+func TestManagerContextSeedsSessionPrompt(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	file := "submodules/sm/ROI.md"
+
+	// No resolver: bare prompt.
+	plain, err := newTestManager(t, root, &fakeClient{reply: "ok"}).Open(ctx, file)
+	if err != nil {
+		t.Fatalf("open (no context): %v", err)
+	}
+	if strings.Contains(plain.sys, "File-specific rules") {
+		t.Fatalf("session without a resolver should have a bare prompt:\n%s", plain.sys)
+	}
+
+	// With a resolver: the resolved rules are seeded into the session prompt.
+	m := newTestManager(t, root, &fakeClient{reply: "ok"})
+	m.Context = func(f string) string { return "CTX(" + f + ")" }
+	sess, err := m.Open(ctx, file)
+	if err != nil {
+		t.Fatalf("open (with context): %v", err)
+	}
+	if !strings.Contains(sess.sys, "CTX("+file+")") {
+		t.Fatalf("session prompt not seeded with the manager context:\n%s", sess.sys)
+	}
+}

@@ -47,13 +47,30 @@ func TestRenderDiffEscapesHTML(t *testing.T) {
 }
 
 func TestValidateFile(t *testing.T) {
-	ok := []string{"submodules/x/ROI.md", "INFRASTRUCTURE.md", "submodules/y/SUBMODULE-LINKS.yaml"}
+	// The editable set is the union of the repo's declared coordination-file sets:
+	// the per-submodule optional files (ROI/INFRASTRUCTURE/RULES/ARTIFACTS/AGENTS),
+	// the repo-ROOT instruction files (AGENTS/HONEYBEE/BOOTSTRAP/LOCALS) and the
+	// submodule-links registry — both submodule-qualified and root-level.
+	ok := []string{
+		"submodules/x/ROI.md",
+		"INFRASTRUCTURE.md",
+		"submodules/y/SUBMODULE-LINKS.yaml",
+		"submodules/x/RULES.md",
+		"submodules/x/ARTIFACTS.md",
+		"submodules/x/AGENTS.md",
+		"AGENTS.md",
+		"HONEYBEE.md",
+		"BOOTSTRAP.md",
+		"LOCALS.md",
+	}
 	for _, f := range ok {
 		if err := ValidateFile(f); err != nil {
 			t.Errorf("want ok for %q: %v", f, err)
 		}
 	}
-	bad := []string{"PLAN.md", "AGENTS.md", "../etc/passwd", "submodules/x/../../escape/ROI.md.x", "submodules/x/secret.txt"}
+	// PLAN.md is honeybee-owned (reconcile writes it); secrets and code are off
+	// limits; traversal must be rejected.
+	bad := []string{"PLAN.md", "SECRETS.yaml.gpg", "../etc/passwd", "submodules/x/../../escape/ROI.md.x", "submodules/x/secret.txt"}
 	for _, f := range bad {
 		if err := ValidateFile(f); err == nil {
 			t.Errorf("want error for %q", f)

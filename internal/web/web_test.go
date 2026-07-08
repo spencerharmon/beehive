@@ -1075,9 +1075,12 @@ func TestExplorerOptionalFileLinks(t *testing.T) {
 }
 
 // TestExplorerAbsentFileEmptyBaseCreate locks the absent-member create path: the
-// optional-file link opens the chat-diff editor on an EMPTY base, seeded with the
+// an absent optional file opens the chat-diff (propose-then-approve) engine — the
+// surface bootstrap's setup agent now drives — on an EMPTY base, seeded with the
 // file's rules (chat-diff-file-context), and the new file is written ONLY on
-// approval (never auto-generated).
+// approval (never auto-generated). The optional-file edit LINKS themselves now open
+// the publishing editor (TestEditEntryOpensPublishingEditor); this locks the
+// engine's empty-base create behavior directly.
 func TestExplorerAbsentFileEmptyBaseCreate(t *testing.T) {
 	fc := &fakeChatClient{reply: proposeReply("Drafted infra.", "# Infra\nActive: blue")}
 	s, _ := chatFixtureClient(t, fc)
@@ -1114,9 +1117,11 @@ func TestExplorerAbsentFileEmptyBaseCreate(t *testing.T) {
 }
 
 // TestExplorerROICreateThroughEditorNoAutogen locks ROI ownership: the explorer
-// routes ROI.md's create/edit through the chat-diff editor (not an auto-
-// generator), the seeded context marks it human-owned / honeybee-FORBIDDEN, and a
-// proposed ROI change is NEVER written without explicit human approval.
+// exposes ROI.md create/edit as an approval-gated edit LINK (never an auto-generate
+// button), and the propose-then-approve engine seeds a ROI-class path human-owned /
+// honeybee-FORBIDDEN and NEVER writes a proposed ROI change without explicit human
+// approval. (The link now dispatches to the publishing editor — see
+// TestEditorManagerSeededWithFileContext — whose ROI seeding this mirrors.)
 func TestExplorerROICreateThroughEditorNoAutogen(t *testing.T) {
 	s0, _ := setup(t)
 	body := get(t, s0, "/submodule/alpha").Body.String()
