@@ -25,11 +25,12 @@
   <div class="card-meta">
     <span class="badge{{if eq .State "active"}} live{{end}}" title="swarm status">{{.State}}</span>
     {{if .Env}}<span class="badge {{.EnvClass}}" title="active deploy env">{{.Env}}</span>{{end}}
+    <span class="badge bees{{if .Working}} bees-live{{end}}" title="honeybees actively working this submodule (fresh session+heartbeat claims)">🐝 {{.Bees}}</span>
     <span class="badge" title="tasks not DONE">pending {{.Pending}}</span>
     {{if .Human}}<a class="badge human" href="/human" title="tasks needing a human">needs-human {{.Human}}</a>{{end}}
   </div>
-  <p class="muted small">stamp: <code>{{if .Stamp}}{{.Stamp}}{{else}}&mdash;{{end}}</code></p>
-  <div class="card-links"><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">branches</a> · <a href="/submodule/{{.Name}}/docs">docs</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <a href="/roi/{{.Name}}">roi</a> · <a href="/edit?path=submodules/{{.Name}}/ROI.md">edit roi (AI)</a></div>
+  <p class="muted small card-stamp">stamp: <code{{if .Stamp}} title="{{.Stamp}}"{{end}}>{{if .Stamp}}{{.Stamp}}{{else}}&mdash;{{end}}</code></p>
+  <div class="card-links"><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">commits</a> · <a href="/submodule/{{.Name}}/docs">docs</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <span class="roi-links">roi <a href="/roi/{{.Name}}">view</a> / <a href="/edit?path=submodules/{{.Name}}/ROI.md">edit</a></span></div>
 </div>{{else}}<p>no submodules</p>{{end}}
 </div>
 <div class="cards">{{template "hygiene-widget" .Hygiene}}</div>

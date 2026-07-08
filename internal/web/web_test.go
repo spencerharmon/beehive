@@ -209,6 +209,11 @@ func TestDashboardCards(t *testing.T) {
 	if !a.Working {
 		t.Errorf("alpha Working = false, want true (t1 claim fresh at now)")
 	}
+	// Bees is the COUNT of fresh claims (honeybees on the card): alpha has exactly
+	// one (t1); it must equal Working > 0.
+	if a.Bees != 1 {
+		t.Errorf("alpha Bees = %d, want 1 (t1 claim fresh; t2/t3 unclaimed)", a.Bees)
+	}
 	// Stamp rides the same cached PLAN.md parse (p.ROIStamp), not a second
 	// ROIStamp() disk read: alpha's PLAN.md carries `Beehive-ROI: abc123`.
 	if a.Stamp != "abc123" {
@@ -224,6 +229,9 @@ func TestDashboardCards(t *testing.T) {
 	if got := by["bravo"].Pending; got != 0 {
 		t.Errorf("bravo Pending = %d, want 0 (no PLAN)", got)
 	}
+	if got := by["bravo"].Bees; got != 0 {
+		t.Errorf("bravo Bees = %d, want 0 (no PLAN, no claims)", got)
+	}
 	if got := by["charlie"].State; got != "dormant" {
 		t.Errorf("charlie State = %q, want dormant", got)
 	}
@@ -238,18 +246,103 @@ func TestDashboardCards(t *testing.T) {
 		if v.Name == "alpha" && v.Working {
 			t.Errorf("alpha Working = true at now+48h, want false (claim stale past TTL)")
 		}
+		if v.Name == "alpha" && v.Bees != 0 {
+			t.Errorf("alpha Bees = %d at now+48h, want 0 (claim stale past TTL)", v.Bees)
+		}
 	}
 
 	// Rendered card grid: the env badge, the NEEDS-HUMAN count linking /human, the
-	// swarm-state badges, and the pending count are all present in the HTML.
+	// swarm-state badges, the pending count, and the honeybee count are all present
+	// in the HTML. This body is rendered at real time.Now(), where the fixture's
+	// 2026-06-30 claim is long stale, so every card reads "🐝 0" (the badge renders
+	// its count regardless of liveness; the live count is asserted off subViews with
+	// the fixed now above, and the lit-bee markup in TestDashboardCardPolish).
 	body := get(t, s, "/").Body.String()
 	for _, want := range []string{
 		"card-meta", "green", "needs-human 1", `href="/human"`,
-		"bootstrap", "dormant", "pending 2",
+		"bootstrap", "dormant", "pending 2", "🐝 0",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard HTML missing %q:\n%s", want, body)
 		}
+	}
+}
+
+// TestDashboardCardPolish locks the dashboard-card-polish refinements on top of
+// dashboard-cards: every card shows a 🐝 honeybee count (the live claim count,
+// teal-lit when bees are working); the commit/branch-graph link reads "commits",
+// not "branches"; the ROI links are ONE labelled view/edit pair per card (no
+// duplicate roi links); and the ROI stamp is rendered in a truncating cell whose
+// full value stays reachable via the code's title (so a long sha never overflows
+// the card). It reuses the setup fixture (alpha, stamp abc123) and drives the
+// idle vs live-bee states via the on-disk claim heartbeat (real time.Now()).
+func TestDashboardCardPolish(t *testing.T) {
+	s, root := setup(t)
+
+	// IDLE: the fixture's t1 heartbeat (2026-06-30) is long stale at real now, so
+	// alpha has no live bee. The 🐝 count still renders (as 0) and must NOT carry
+	// the lit "bees-live" modifier.
+	idle := get(t, s, "/").Body.String()
+	if !strings.Contains(idle, "🐝 0") {
+		t.Errorf("idle dashboard missing the 🐝 honeybee count (should render 0 for a stale claim):\n%s", idle)
+	}
+	if strings.Contains(idle, "bees-live") {
+		t.Errorf("idle dashboard lit the bee badge with no fresh claim:\n%s", idle)
+	}
+
+	// The commit/branch-graph link reads "commits" (the branch view titles itself
+	// "<name> commits"), and the old "branches" label is gone.
+	if !strings.Contains(idle, `/submodule/alpha/branches">commits</a>`) {
+		t.Errorf("dashboard commit link does not read \"commits\":\n%s", idle)
+	}
+	if strings.Contains(idle, ">branches</a>") {
+		t.Errorf("dashboard still shows the old \"branches\" link label:\n%s", idle)
+	}
+
+	// Exactly ONE ROI view/edit link pair per card: one /roi/alpha view link and
+	// one ROI.md edit link, consolidated in a .roi-links span, with no leftover
+	// duplicate "edit roi (AI)" link.
+	if n := strings.Count(idle, `href="/roi/alpha">view</a>`); n != 1 {
+		t.Errorf("alpha ROI view link count = %d, want exactly 1:\n%s", n, idle)
+	}
+	if n := strings.Count(idle, `href="/edit?path=submodules/alpha/ROI.md">edit</a>`); n != 1 {
+		t.Errorf("alpha ROI edit link count = %d, want exactly 1:\n%s", n, idle)
+	}
+	if strings.Contains(idle, "edit roi (AI)") {
+		t.Errorf("dashboard still shows the old duplicate \"edit roi (AI)\" link:\n%s", idle)
+	}
+	if !strings.Contains(idle, `class="roi-links"`) {
+		t.Errorf("dashboard ROI links are not consolidated into a single roi-links pair:\n%s", idle)
+	}
+
+	// ROI stamp overflow fix: the stamp renders in the truncating .card-stamp cell
+	// with its full value carried on the code's title (hover), so a long sha never
+	// overflows the card body. alpha's stamp is abc123.
+	if !strings.Contains(idle, "card-stamp") {
+		t.Errorf("dashboard stamp is not in the truncating card-stamp cell:\n%s", idle)
+	}
+	if !strings.Contains(idle, `title="abc123"`) {
+		t.Errorf("dashboard stamp does not expose its full value via the code title (hover):\n%s", idle)
+	}
+
+	// LIVE: rewrite alpha's PLAN.md so t1 carries a heartbeat fresh at real now
+	// (well within the 60m TTL). alpha now has exactly one live bee, so its card
+	// shows "🐝 1" with the teal "bees-live" modifier. The no-commit fixture has an
+	// empty HEAD, so planView bypasses the cache and re-reads this on next render.
+	fresh := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	if err := os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.PlanFile), []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## t1 [TODO] <!-- attempts=0 deps=t0 weight=16 session=bee-1 heartbeat="+fresh+" -->\n"+
+			"build the thing\nFiles: a.go\nDoc: br-t1.md\nAccept: works\n\n"+
+			"## t2 [NEEDS-HUMAN] <!-- attempts=4 deps= -->\nstuck task\nDoc: br-t2.md\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	live := get(t, s, "/").Body.String()
+	if !strings.Contains(live, "🐝 1") {
+		t.Errorf("live dashboard missing the 🐝 1 honeybee count for the working alpha card:\n%s", live)
+	}
+	if !strings.Contains(live, "badge bees bees-live") {
+		t.Errorf("live dashboard missing the teal bees-live modifier on the working alpha card:\n%s", live)
 	}
 }
 

@@ -217,6 +217,14 @@ small, .small { font-size: var(--text-sm); }
 .card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); }
 .card-meta a { text-decoration: none; }
 .card-links { font-size: var(--text-sm); }
+/* ROI stamp cell: the sha can be long (a full 40-char hash), so the <code> is a
+   flex item that ELLIPSIZES within the card (min-width:0 lets it shrink below its
+   content) instead of overflowing the card body; the full value stays reachable
+   via the code's title (hover), which the template sets only when a stamp exists. */
+.card-stamp { display: flex; align-items: baseline; gap: 0.35em; max-width: 100%; }
+.card-stamp > code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ROI links consolidated to ONE labelled view/edit pair; keep the pair cohesive. */
+.card-links .roi-links { white-space: nowrap; }
 
 /* Badges (neutral pills; .live = success) -------------------------------- */
 .badge {
@@ -242,6 +250,12 @@ small, .small { font-size: var(--text-sm); }
 .badge.env-blue { background: var(--accent); border-color: transparent; color: var(--accent-contrast); }
 .badge.env-green { background: var(--success); border-color: transparent; color: #fff; }
 .badge.human { background: hsl(var(--hue-human) 60% 45%); border-color: transparent; color: #fff; }
+/* Honeybee count (dashboard cards): how many honeybees hold a fresh claim on the
+   submodule. Idle (0 bees) is a neutral badge; .bees-live takes the teal "actively
+   worked" hue (matching the .active overlay) so live swarm work reads at a glance.
+   Tabular figures keep the count from jittering the badge width as it changes. */
+.badge.bees { font-variant-numeric: tabular-nums; }
+.badge.bees.bees-live { background: hsl(var(--hue-active) 62% 42%); border-color: transparent; color: #fff; }
 /* Instruction-file drift (managed root files vs the binary's embedded default):
    clean -> success (in sync), drift -> amber (customized/stale), missing -> danger
    (absent). Shown only on managed files; the site-authored LOCALS.md has none. */
