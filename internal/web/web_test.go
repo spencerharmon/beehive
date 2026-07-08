@@ -209,6 +209,11 @@ func TestDashboardCards(t *testing.T) {
 	if !a.Working {
 		t.Errorf("alpha Working = false, want true (t1 claim fresh at now)")
 	}
+	// Bees is the honeybee COUNT backing the Working overlay: alpha has exactly
+	// one fresh claim (t1); t2 (NEEDS-HUMAN) and t3 (DONE) are both unclaimed.
+	if a.Bees != 1 {
+		t.Errorf("alpha Bees = %d, want 1 (only t1 carries a fresh claim)", a.Bees)
+	}
 	// Stamp rides the same cached PLAN.md parse (p.ROIStamp), not a second
 	// ROIStamp() disk read: alpha's PLAN.md carries `Beehive-ROI: abc123`.
 	if a.Stamp != "abc123" {
@@ -224,12 +229,19 @@ func TestDashboardCards(t *testing.T) {
 	if got := by["bravo"].Pending; got != 0 {
 		t.Errorf("bravo Pending = %d, want 0 (no PLAN)", got)
 	}
+	if got := by["bravo"].Bees; got != 0 {
+		t.Errorf("bravo Bees = %d, want 0 (no PLAN, so no claims)", got)
+	}
 	if got := by["charlie"].State; got != "dormant" {
 		t.Errorf("charlie State = %q, want dormant", got)
 	}
+	if got := by["charlie"].Bees; got != 0 {
+		t.Errorf("charlie Bees = %d, want 0 (dormant, no PLAN)", got)
+	}
 
-	// A claim well past the TTL must NOT read as Working (the card's live overlay
-	// is derived from claim freshness, not a status).
+	// A claim well past the TTL must NOT read as Working, and must NOT count
+	// towards Bees (the card's live overlay/count are derived from claim
+	// freshness, not a status).
 	stale, err := s.subViews(context.Background(), now.Add(48*time.Hour), time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -238,18 +250,138 @@ func TestDashboardCards(t *testing.T) {
 		if v.Name == "alpha" && v.Working {
 			t.Errorf("alpha Working = true at now+48h, want false (claim stale past TTL)")
 		}
+		if v.Name == "alpha" && v.Bees != 0 {
+			t.Errorf("alpha Bees = %d at now+48h, want 0 (claim stale past TTL)", v.Bees)
+		}
 	}
 
 	// Rendered card grid: the env badge, the NEEDS-HUMAN count linking /human, the
-	// swarm-state badges, and the pending count are all present in the HTML.
+	// swarm-state badges, the pending count, the 🐝 honeybee-count badge, the
+	// consolidated single roi view/edit link, the "commits" (not "branches")
+	// label, and a bounded+titled stamp are all present in the HTML.
 	body := get(t, s, "/").Body.String()
 	for _, want := range []string{
 		"card-meta", "green", "needs-human 1", `href="/human"`,
 		"bootstrap", "dormant", "pending 2",
+		"🐝", `class="stamp"`, ">commits</a>", "/roi/alpha",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard HTML missing %q:\n%s", want, body)
 		}
+	}
+	if strings.Contains(body, ">branches</a>") {
+		t.Errorf("dashboard HTML still labels the commit-history link \"branches\":\n%s", body)
+	}
+}
+
+// cardHTML isolates one dashboard submodule card's rendered fragment from the
+// full page body, so a card's link/text assertions can't accidentally be
+// satisfied by a SIBLING card (every card renders the same plan/commits/
+// sessions/roi link shapes). Cards are delimited by the per-card `<h3><a
+// href="/submodule/<name>">` marker dashboard.html emits exactly once per
+// submodule right at the top of its card — NOT the enclosing `<div
+// class="card...">`, which is ambiguous: it is a PREFIX of the nested `<div
+// class="card-meta">`/`card-links` markers inside the very same card, so
+// splitting on it shreds a single card into pieces instead of isolating one.
+func cardHTML(t *testing.T, body, name string) string {
+	t.Helper()
+	const marker = `<h3><a href="/submodule/`
+	for _, c := range strings.Split(body, marker) {
+		if strings.HasPrefix(c, name+`">`) {
+			return c
+		}
+	}
+	t.Fatalf("no dashboard card found for submodule %q in:\n%s", name, body)
+	return ""
+}
+
+// TestDashboardCardPolish is the core of dashboard-card-polish: each card
+// surfaces a 🐝 honeybee COUNT (not just the pre-existing Working boolean
+// overlay) reflecting how many of ITS tasks currently carry a fresh
+// session+heartbeat claim regardless of their individual status; the ROI
+// links are exactly one view/edit PAIR — one link to read the rendered ROI,
+// one to the ROI editor/chat-diff surface, no duplicate of either; the
+// commit-history link reads "commits", never "branches"; and the ROI stamp is
+// bounded so a full-length sha cannot overflow the card, with the full value
+// still reachable via the native `title` tooltip.
+//
+// Heartbeats are computed relative to time.Now() (not a hardcoded date) so
+// freshness/staleness holds regardless of when the test runs — the dashboard
+// handler itself is not parameterizable with an injected clock (unlike
+// subViews), so this drives the real HTTP path with a clock-relative fixture
+// instead of asserting through subViews directly (already covered by
+// TestDashboardCards).
+func TestDashboardCardPolish(t *testing.T) {
+	s, root := setup(t)
+
+	// delta: two INDEPENDENTLY fresh claims (two honeybees concurrently on two
+	// different tasks, in two different statuses — Bees counts claim freshness,
+	// not status), one STALE claim (past the default 60m TTL — GC-reclaimable,
+	// must not count), and one wholly unclaimed task (must not count either).
+	delta := filepath.Join(root, "submodules", "delta")
+	if err := os.MkdirAll(delta, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(delta, repo.ROIFile), []byte("# delta\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fresh := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+	stale := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
+	const fullSHA = "0123456789abcdef0123456789abcdef01234567"
+	plan := "<!-- Beehive-ROI: " + fullSHA + " -->\n# Plan\n\n" +
+		"## d1 [TODO] <!-- attempts=0 deps= session=bee-x heartbeat=" + fresh + " -->\nwork one\nDoc: d1.md\n\n" +
+		"## d2 [NEEDS-REVIEW] <!-- attempts=0 deps= session=bee-y heartbeat=" + fresh + " -->\nwork two\nDoc: d2.md\n\n" +
+		"## d3 [NEEDS-ARBITRATION] <!-- attempts=1 deps= session=bee-z heartbeat=" + stale + " -->\nwork three\nDoc: d3.md\n\n" +
+		"## d4 [TODO] <!-- attempts=0 deps= -->\nunclaimed\nDoc: d4.md\n"
+	if err := os.WriteFile(filepath.Join(delta, repo.PlanFile), []byte(plan), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body := get(t, s, "/").Body.String()
+	d := cardHTML(t, body, "delta")
+
+	// Honeybee count: exactly 2 (d1+d2 fresh); d3 stale and d4 unclaimed don't
+	// count, and it is a NUMBER, not the pre-existing boolean overlay.
+	if !strings.Contains(d, "🐝 2") {
+		t.Errorf("delta card missing honeybee count \"🐝 2\" (2 fresh claims; 1 stale + 1 unclaimed must not count):\n%s", d)
+	}
+	if strings.Contains(d, "🐝 3") || strings.Contains(d, "🐝 4") {
+		t.Errorf("delta card overcounts honeybees (stale/unclaimed tasks must not count):\n%s", d)
+	}
+
+	// Exactly one ROI view/edit link PAIR per card: one link to read the
+	// rendered ROI (/roi/<name>) and one to the ROI editor/chat-diff surface
+	// (/edit?path=...ROI.md) — no duplicate view links, no duplicate edit
+	// links, and no third/redundant ROI-related link.
+	if n := strings.Count(d, `href="/roi/delta"`); n != 1 {
+		t.Errorf("delta card has %d view-roi links, want exactly 1 (no duplicates):\n%s", n, d)
+	}
+	if n := strings.Count(d, `href="/edit?path=submodules/delta/ROI.md"`); n != 1 {
+		t.Errorf("delta card has %d edit-roi links, want exactly 1 (no duplicates):\n%s", n, d)
+	}
+
+	// The commit/branch-graph link reads "commits", never "branches" (that view
+	// is a commit log, not a branch list).
+	if !strings.Contains(d, ">commits</a>") {
+		t.Errorf("delta card commit-history link does not read \"commits\":\n%s", d)
+	}
+	if strings.Contains(d, ">branches</a>") {
+		t.Errorf("delta card still labels the commit-history link \"branches\":\n%s", d)
+	}
+
+	// The ROI stamp cannot overflow the card: it carries a bounding class and
+	// the FULL value rides the native `title` tooltip so nothing is lost.
+	if !strings.Contains(d, `class="stamp"`) {
+		t.Errorf("delta card stamp missing its bounding class:\n%s", d)
+	}
+	if !strings.Contains(d, `title="`+fullSHA+`"`) {
+		t.Errorf("delta card stamp missing the full sha via title:\n%s", d)
+	}
+	// The visible stamp text is the SAME full value (CSS truncates visually via
+	// text-overflow, not a server-side character cut — Go's html/template
+	// escaping means this is a plain substring check, not a pixel measurement).
+	if !strings.Contains(d, ">"+fullSHA+"<") {
+		t.Errorf("delta card stamp does not carry the full value in its text:\n%s", d)
 	}
 }
 

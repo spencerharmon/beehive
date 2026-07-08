@@ -217,6 +217,21 @@ small, .small { font-size: var(--text-sm); }
 .card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); }
 .card-meta a { text-decoration: none; }
 .card-links { font-size: var(--text-sm); }
+/* ROI stamp row: the stamp is a full-length commit sha, which does not fit the
+   card's fixed width. .stamp bounds it to one line with an ellipsis, keeping the
+   card's own layout intact; the full value rides the native `title` tooltip
+   (hover) so nothing is lost, just deferred behind a hover instead of always
+   rendered. cursor:help signals there's more to see on hover. */
+.stamp-row { overflow: hidden; }
+.stamp {
+  display: inline-block;
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  cursor: help;
+}
 
 /* Badges (neutral pills; .live = success) -------------------------------- */
 .badge {

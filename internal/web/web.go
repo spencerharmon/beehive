@@ -391,13 +391,17 @@ func (s *Server) submodule(name string) (repo.Submodule, error) {
 // match what the runner/selector see; Env is the submodule's active blue/green
 // deploy env from the typed artifacts model ("" when it has no
 // INFRASTRUCTURE.md); Working is true when a task is actively claimed (a fresh
-// session+heartbeat), driving the card's live overlay.
+// session+heartbeat), driving the card's live overlay; Bees is the COUNT of
+// tasks carrying that same fresh claim (the number of honeybees concurrently
+// working this submodule right now) — Working is just Bees > 0 surfaced as the
+// card's live-overlay boolean, Bees is the number itself for the 🐝 counter.
 type subView struct {
 	Name    string
 	State   string
 	Stamp   string
 	Pending int
 	Human   int
+	Bees    int
 	Env     string
 	Working bool
 }
@@ -454,10 +458,11 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 // (active/dormant/bootstrap), the ROI Stamp, the Pending/Human task counts from
 // the unified parser (internal/plan via planView — the same parse the
 // runner/selector use), the active blue/green Env from the submodule's own
-// INFRASTRUCTURE.md via the typed artifacts model, and Working (a task carrying a
-// fresh session+heartbeat claim). now/ttl are passed in so the claim-freshness
-// derivation is deterministically testable; the handler supplies time.Now() and
-// the resolved TTL.
+// INFRASTRUCTURE.md via the typed artifacts model, and Working/Bees (a task
+// carrying a fresh session+heartbeat claim: Working is any such claim present,
+// Bees is how many — the live honeybee count). now/ttl are passed in so the
+// claim-freshness derivation is deterministically testable; the handler
+// supplies time.Now() and the resolved TTL.
 //
 // The PLAN.md read+parse is memoized per repo HEAD via planView, but the swarm
 // status stays current: the counts and Working flag are re-projected against
@@ -489,10 +494,12 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 		// task not DONE, Human = NEEDS-HUMAN only. A NEEDS-HUMAN task is BOTH
 		// pending and human — the two counters legitimately overlap, but each task
 		// increments each counter at most once (never double-counted within a
-		// counter). Working = any task with a fresh claim (session+heartbeat within
-		// the TTL). A parse error leaves this submodule's stamp/counts empty rather
-		// than failing the whole dashboard (mirrors the pre-existing per-submodule
-		// resilience).
+		// counter). Working/Bees = tasks with a fresh claim (session+heartbeat
+		// within the TTL): Working flips true on the first one (drives the card's
+		// live-overlay class), Bees counts every one of them (the 🐝 counter — how
+		// many honeybees are on this submodule right now). A parse error leaves
+		// this submodule's stamp/counts empty rather than failing the whole
+		// dashboard (mirrors the pre-existing per-submodule resilience).
 		if p, err := s.planView(head, sm.PlanPath(), now, ttl); err == nil {
 			v.Stamp = p.ROIStamp
 			for _, it := range p.Items {
@@ -504,6 +511,7 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 				}
 				if it.Active {
 					v.Working = true
+					v.Bees++
 				}
 			}
 		}
