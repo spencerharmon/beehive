@@ -4,8 +4,14 @@
 <div id="session-body"
      hx-get="/submodule/{{.Name}}/session/{{.Branch}}/body"
      hx-trigger="load, every 2s"
-     hx-swap="innerHTML">
-  <p id="session-loading">loading…</p>
+     hx-swap="innerHTML"
+     role="status" aria-live="polite">
+  <div id="session-loading">
+    <div class="skeleton-block" aria-hidden="true">
+      <span class="skeleton-bar"></span><span class="skeleton-bar"></span><span class="skeleton-bar"></span><span class="skeleton-bar"></span>
+    </div>
+    <span class="sr-only">loading transcript…</span>
+  </div>
 </div>
 {{if .Live}}
 <script>

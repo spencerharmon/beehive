@@ -689,3 +689,66 @@ ul.secrets > li > code {
   font-size: var(--text-sm);
 }
 ul.secrets details.inline-edit { margin: 0; }
+
+/* Loading skeletons (poll-pane-loading-skeletons) -------------------------- *
+ * Every htmx-polled pane's INITIAL shell (before its first swap lands) shows
+ * one of the two shapes below instead of a bare "loading…" text node, so a
+ * sighted user sees a placeholder sized to the eventual content instead of a
+ * plain-text flash. The bars are purely decorative (aria-hidden); each
+ * skeleton also carries a visually-hidden .sr-only label so a screen-reader
+ * user still gets a "busy" cue on first paint. The polled container itself
+ * additionally carries role="status" aria-live="polite" (see the templates),
+ * so once the bars are replaced by real content that swap is announced too —
+ * the actual fix for "no notification when the swap lands". Bars pulse via
+ * `bee-skeleton`, gated behind prefers-reduced-motion exactly like the
+ * `.active` overlay above. Two shapes cover every polled pane:
+ *   .skeleton-rows  — a handful of list rows (session_list.html)
+ *   .skeleton-block — a transcript/chat-shaped paragraph of bars
+ *                     (session_view, editor, human_resolve,
+ *                     bootstrap_agent/bootstrap_banner) */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.skeleton-bar {
+  display: block;
+  height: 0.85em;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--border);
+  animation: bee-skeleton 1.6s ease-in-out infinite;
+}
+@keyframes bee-skeleton {
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-bar { animation: none; opacity: 0.7; }
+}
+/* Shape 1: list rows — mirrors ul.sessions li's link + status badge +
+   trailing timestamp. */
+.skeleton-rows { margin: var(--space-4) 0; }
+.skeleton-rows .skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-bottom: var(--border-width) solid var(--border);
+}
+.skeleton-rows .skeleton-bar.sk-name { width: 40%; max-width: 14rem; }
+.skeleton-rows .skeleton-bar.sk-badge { width: 3.5rem; border-radius: var(--radius-pill); }
+.skeleton-rows .skeleton-bar.sk-ago { width: 4rem; margin-left: auto; }
+/* Shape 2: a transcript/chat-shaped block — stacked paragraph-style bars of
+   varying width so it reads as prose, not a rigid grid. */
+.skeleton-block { margin: var(--space-4) 0; }
+.skeleton-block .skeleton-bar { width: 92%; margin-bottom: var(--space-3); }
+.skeleton-block .skeleton-bar:nth-child(2) { width: 78%; }
+.skeleton-block .skeleton-bar:nth-child(3) { width: 85%; }
+.skeleton-block .skeleton-bar:nth-child(4) { width: 60%; margin-bottom: 0; }

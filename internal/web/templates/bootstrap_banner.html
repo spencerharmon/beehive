@@ -6,8 +6,11 @@
   <ul class="bootstrap-steps">
     {{range .Unmet}}<li><b>{{.Title}}</b> &mdash; {{.Detail}}</li>{{end}}
   </ul>
-  <div id="bootstrap-agent" hx-get="/bootstrap" hx-trigger="load" hx-swap="innerHTML">
-    <p class="muted">loading setup assistant&hellip;</p>
+  <div id="bootstrap-agent" hx-get="/bootstrap" hx-trigger="load" hx-swap="innerHTML" role="status" aria-live="polite">
+    <div class="skeleton-block" aria-hidden="true">
+      <span class="skeleton-bar"></span><span class="skeleton-bar"></span><span class="skeleton-bar"></span><span class="skeleton-bar"></span>
+    </div>
+    <span class="sr-only">loading setup assistant…</span>
   </div>
 </section>
 {{end}}

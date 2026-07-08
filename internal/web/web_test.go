@@ -2632,6 +2632,144 @@ func TestAssetsStyleHtmxPolish(t *testing.T) {
 	}
 }
 
+// TestAssetsStyleSkeleton locks the poll-pane-loading-skeletons CSS contract:
+// the embedded stylesheet defines the two skeleton shapes (rows/block) and
+// their shared bar on design-system surface/border tokens, the .sr-only
+// utility backing each skeleton's accessible label, and gates the pulse
+// animation behind prefers-reduced-motion exactly like the .active overlay.
+// Kept separate from TestAssetsStyleServed/TestAssetsStyleHtmxPolish so each
+// task owns its own assertions.
+func TestAssetsStyleSkeleton(t *testing.T) {
+	s, _ := setup(t)
+	body := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		".skeleton-bar",
+		".skeleton-rows",
+		".skeleton-row",
+		".skeleton-block",
+		"bee-skeleton",
+		".sr-only",
+		"var(--surface-2)",
+		"prefers-reduced-motion",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("style.css missing skeleton rule %q", want)
+		}
+	}
+	// Lock the SPECIFIC override, not just the media query's presence (already
+	// covered by htmx-polish's own reduced-motion rule).
+	if !strings.Contains(body, ".skeleton-bar { animation: none;") {
+		t.Fatalf("style.css must disable .skeleton-bar animation under prefers-reduced-motion:\n%s", body)
+	}
+}
+
+// TestPollPaneLoadingSkeletons is the core of poll-pane-loading-skeletons: every
+// htmx-polled pane's initial shell renders a SHAPED skeleton placeholder instead
+// of a bare "loading…" text node, and the polled container itself carries
+// role="status" aria-live="polite" so the eventual swap-in is announced to
+// screen readers. Subtests cover all six touched templates: session_list,
+// session_view, editor, human_resolve, bootstrap_agent (GET /bootstrap) and
+// bootstrap_banner (the unbootstrapped dashboard).
+func TestPollPaneLoadingSkeletons(t *testing.T) {
+	t.Run("session_list", func(t *testing.T) {
+		s, _ := setup(t)
+		body := get(t, s, "/submodule/alpha/sessions").Body.String()
+		if strings.Contains(body, `<p>loading…</p>`) {
+			t.Fatalf("session_list.html still ships the bare loading text:\n%s", body)
+		}
+		for _, want := range []string{
+			`id="session-list"`, `role="status"`, `aria-live="polite"`,
+			`class="skeleton-rows"`, `class="skeleton-row"`, "sr-only",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("session_list.html missing %q:\n%s", want, body)
+			}
+		}
+	})
+
+	t.Run("session_view", func(t *testing.T) {
+		s, _ := setup(t)
+		body := get(t, s, "/submodule/alpha/session/bee-x").Body.String()
+		if strings.Contains(body, `<p id="session-loading">loading…</p>`) {
+			t.Fatalf("session_view.html still ships the bare loading text:\n%s", body)
+		}
+		for _, want := range []string{
+			`id="session-body"`, `role="status"`, `aria-live="polite"`,
+			`id="session-loading"`, `class="skeleton-block"`, "sr-only",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("session_view.html missing %q:\n%s", want, body)
+			}
+		}
+	})
+
+	t.Run("editor", func(t *testing.T) {
+		s, root := setup(t)
+		commitAndNormalizeMain(t, root)
+		id := openEditorSession(t, s, "submodules/alpha/"+repo.ROIFile)
+		body := get(t, s, "/editor/"+id).Body.String()
+		if strings.Contains(body, `<p>loading…</p>`) {
+			t.Fatalf("editor.html still ships the bare loading text:\n%s", body)
+		}
+		for _, want := range []string{
+			`id="editor"`, `role="status"`, `aria-live="polite"`,
+			`class="skeleton-block"`, "sr-only",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("editor.html missing %q:\n%s", want, body)
+			}
+		}
+	})
+
+	t.Run("human_resolve", func(t *testing.T) {
+		s, _, _ := humanFixture(t, "")
+		body := get(t, s, "/human/alpha/needs-token").Body.String()
+		if strings.Contains(body, `<p>loading…</p>`) {
+			t.Fatalf("human_resolve.html still ships the bare loading text:\n%s", body)
+		}
+		for _, want := range []string{
+			`id="resolve"`, `role="status"`, `aria-live="polite"`,
+			`class="skeleton-block"`, "sr-only",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("human_resolve.html missing %q:\n%s", want, body)
+			}
+		}
+	})
+
+	t.Run("bootstrap_agent", func(t *testing.T) {
+		s, _ := chatFixture(t, "")
+		body := get(t, s, "/bootstrap").Body.String()
+		if strings.Contains(body, `<p class="muted">loading setup assistant&hellip;</p>`) {
+			t.Fatalf("bootstrap_agent.html still ships the bare loading text:\n%s", body)
+		}
+		for _, want := range []string{
+			`id="chatedit"`, `role="status"`, `aria-live="polite"`,
+			`class="skeleton-block"`, "sr-only",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("bootstrap_agent.html missing %q:\n%s", want, body)
+			}
+		}
+	})
+
+	t.Run("bootstrap_banner", func(t *testing.T) {
+		s, _ := setup(t)
+		body := get(t, s, "/").Body.String()
+		if strings.Contains(body, `<p class="muted">loading setup assistant&hellip;</p>`) {
+			t.Fatalf("bootstrap_banner.html still ships the bare loading text:\n%s", body)
+		}
+		for _, want := range []string{
+			`id="bootstrap-agent"`, `role="status" aria-live="polite"`,
+			`class="skeleton-block"`, "sr-only",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("bootstrap_banner.html missing %q:\n%s", want, body)
+			}
+		}
+	})
+}
+
 // hygGit runs git in dir, failing the test on error. Used to seed cruft and to
 // snapshot repo state for the read-only assertion.
 func hygGit(t *testing.T, dir string, args ...string) string {

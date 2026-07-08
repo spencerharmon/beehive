@@ -4,7 +4,13 @@
      data-scroll-preserve
      hx-get="/submodule/{{.Name}}/sessions/body"
      hx-trigger="load, every 2s"
-     hx-swap="innerHTML">
-  <p>loading…</p>
+     hx-swap="innerHTML"
+     role="status" aria-live="polite">
+  <div class="skeleton-rows" aria-hidden="true">
+    <div class="skeleton-row"><span class="skeleton-bar sk-name"></span><span class="skeleton-bar sk-badge"></span><span class="skeleton-bar sk-ago"></span></div>
+    <div class="skeleton-row"><span class="skeleton-bar sk-name"></span><span class="skeleton-bar sk-badge"></span><span class="skeleton-bar sk-ago"></span></div>
+    <div class="skeleton-row"><span class="skeleton-bar sk-name"></span><span class="skeleton-bar sk-badge"></span><span class="skeleton-bar sk-ago"></span></div>
+  </div>
+  <span class="sr-only">loading sessions…</span>
 </div>
 {{template "footer"}}
