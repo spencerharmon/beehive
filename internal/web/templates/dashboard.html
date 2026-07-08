@@ -1,7 +1,7 @@
 {{template "header"}}
 {{template "bootstrap-banner" .Bootstrap}}
 <h1>Submodules</h1>
-<p>Active env: <b>{{.Env.Active}}</b> · <a href="/edit?path=INFRASTRUCTURE.md">edit infrastructure with AI</a></p>
+<p><a href="/edit?path=INFRASTRUCTURE.md">edit repo-wide infrastructure with AI</a> · deploy env is per-submodule (see each card)</p>
 <nav class="file-index" aria-label="repo instruction files">
   <h2>Repo instruction files</h2>
   <ul class="file-links">
@@ -24,7 +24,7 @@
   <h3><a href="/submodule/{{.Name}}">{{.Name}}</a></h3>
   <div class="card-meta">
     <span class="badge{{if eq .State "active"}} live{{end}}" title="swarm status">{{.State}}</span>
-    {{if .Env}}<span class="badge {{.EnvClass}}" title="active deploy env">{{.Env}}</span>{{end}}
+    {{if .Env}}<a class="badge {{.EnvClass}}" title="active deploy env — manage this submodule's blue/green" href="/submodule/{{.Name}}/env">{{.Env}}</a>{{end}}
     <span class="badge" title="tasks not DONE">pending {{.Pending}}</span>
     {{if .Human}}<a class="badge human" href="/human" title="tasks needing a human">needs-human {{.Human}}</a>{{end}}
   </div>

@@ -1,11 +1,12 @@
 {{template "header"}}
 <div id="env-panel">
-<h1>Environments</h1>
+<h1>Environments — {{.Name}}</h1>
+<p><a href="/submodule/{{.Name}}">&larr; {{.Name}}</a></p>
 <p>active: <b>{{.Env.Active}}</b></p>
-<form method="post" action="/env/deploy"
-      hx-post="/env/deploy" hx-target="#env-panel" hx-select="#env-panel" hx-swap="outerHTML"
+<form method="post" action="/submodule/{{.Name}}/env/deploy"
+      hx-post="/submodule/{{.Name}}/env/deploy" hx-target="#env-panel" hx-select="#env-panel" hx-swap="outerHTML"
       hx-indicator="#htmx-progress"
-      hx-confirm="Switch the active environment to the selected target?">
+      hx-confirm="Switch {{.Name}}'s active environment to the selected target?">
   <select name="target">{{range .Env.Envs}}<option>{{.}}</option>{{end}}</select>
   <button>deploy</button>
 </form>
