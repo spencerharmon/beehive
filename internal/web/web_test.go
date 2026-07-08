@@ -4958,3 +4958,155 @@ func TestBadgeContrastHelpersKnownValues(t *testing.T) {
 		t.Errorf("pure red vs white = %.4f, want ~3.998", got)
 	}
 }
+
+// titleOf extracts a response body's <title>...</title> text, failing the
+// test if the tag is missing — every full-page response must carry one.
+func titleOf(t *testing.T, body string) string {
+	t.Helper()
+	i := strings.Index(body, "<title>")
+	j := strings.Index(body, "</title>")
+	if i < 0 || j < 0 || j < i {
+		t.Fatalf("no <title>...</title> in body:\n%s", body)
+	}
+	return body[i+len("<title>") : j]
+}
+
+// TestPageTitleHelper unit-tests pageTitle in isolation: non-empty parts join
+// innermost-first with " · " and the site name always trails; empty parts are
+// dropped rather than leaving a stray separator; no parts at all still yields
+// the bare site name (the same string layout.html's own {{if .Title}} falls
+// back to when a handler omits Title entirely).
+func TestPageTitleHelper(t *testing.T) {
+	cases := []struct {
+		parts []string
+		want  string
+	}{
+		{nil, "beehive"},
+		{[]string{""}, "beehive"},
+		{[]string{"plan", "alpha"}, "plan · alpha · beehive"},
+		{[]string{"", "alpha", ""}, "alpha · beehive"},
+	}
+	for _, c := range cases {
+		if got := pageTitle(c.parts...); got != c.want {
+			t.Errorf("pageTitle(%v) = %q, want %q", c.parts, got, c.want)
+		}
+	}
+}
+
+// TestPageTitlesDistinctPerRoute is the core of page-chrome-title-favicon:
+// layout.html hardcoded <title>beehive</title> for every route (the "header"
+// template took no data at all, and no page threaded a Title), so every open
+// tab read identically regardless of which page it showed. Each full-page
+// handler now composes a distinct, meaningful Title via pageTitle; the
+// dashboard is the one page that renders NO Title, proving layout.html's
+// {{if .Title}}...{{else}}beehive{{end}} fallback still holds for it.
+func TestPageTitlesDistinctPerRoute(t *testing.T) {
+	s, root := setup(t)
+	// A real (finished) session file so /session/bee-t1 renders a realistic
+	// page rather than the "waiting for output" placeholder.
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-t1.md"), []byte("# final\ndone\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dashboard := titleOf(t, get(t, s, "/").Body.String())
+	plan := titleOf(t, get(t, s, "/submodule/alpha/plan").Body.String())
+	session := titleOf(t, get(t, s, "/submodule/alpha/session/bee-t1").Body.String())
+	stats := titleOf(t, get(t, s, "/stats").Body.String())
+
+	if dashboard != "beehive" {
+		t.Errorf("dashboard <title> = %q, want the bare fallback %q", dashboard, "beehive")
+	}
+	if want := "plan · alpha · beehive"; plan != want {
+		t.Errorf("plan <title> = %q, want %q", plan, want)
+	}
+	if want := "bee-t1 · alpha · beehive"; session != want {
+		t.Errorf("session <title> = %q, want %q", session, want)
+	}
+	if want := "stats · beehive"; stats != want {
+		t.Errorf("stats <title> = %q, want %q", stats, want)
+	}
+
+	seen := map[string]bool{}
+	for _, title := range []string{dashboard, plan, session, stats} {
+		if seen[title] {
+			t.Fatalf("<title> %q repeated — dashboard/plan/session/stats must each render a DISTINCT title", title)
+		}
+		seen[title] = true
+	}
+}
+
+// TestFaviconEmbeddedAndServed is the favicon half of page-chrome-title-
+// favicon: internal/web/assets held only htmx.min.js + style.css, so every
+// page load probed the browser's default /favicon.ico and got a 404. The SVG
+// now ships embedded (single-binary, no CDN) and is reachable both at its
+// natural /assets/ path and at the conventional /favicon.ico some clients
+// (and tab-restore/bookmark tooling) probe directly regardless of
+// layout.html's own <link rel="icon"> hint.
+func TestFaviconEmbeddedAndServed(t *testing.T) {
+	s, _ := setup(t)
+
+	asset := get(t, s, "/assets/favicon.svg")
+	if asset.Code != 200 {
+		t.Fatalf("/assets/favicon.svg status %d", asset.Code)
+	}
+	if ct := asset.Header().Get("Content-Type"); !strings.Contains(ct, "svg") {
+		t.Fatalf("/assets/favicon.svg content-type = %q, want image/svg+xml", ct)
+	}
+	if !strings.Contains(asset.Body.String(), "<svg") {
+		t.Fatalf("/assets/favicon.svg does not look like an SVG:\n%s", asset.Body.String())
+	}
+
+	ico := get(t, s, "/favicon.ico")
+	if ico.Code != 200 {
+		t.Fatalf("/favicon.ico status %d — a bare favicon probe must not 404", ico.Code)
+	}
+	if ct := ico.Header().Get("Content-Type"); !strings.Contains(ct, "svg") {
+		t.Fatalf("/favicon.ico content-type = %q, want image/svg+xml", ct)
+	}
+	if ico.Body.String() != asset.Body.String() {
+		t.Fatalf("/favicon.ico must serve the SAME embedded asset as /assets/favicon.svg — one source, not a second embed")
+	}
+
+	// layout.html links it so a browser that DOES honor <link rel="icon">
+	// never needs the /favicon.ico fallback at all.
+	page := get(t, s, "/").Body.String()
+	if !strings.Contains(page, `<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">`) {
+		t.Fatalf("layout does not link the embedded favicon:\n%s", page)
+	}
+}
+
+// TestNavAriaCurrentOptional is the (optional, Finding #11) half-step this
+// task invites alongside the title/favicon fix: the top-nav link matching the
+// current top-level section carries aria-current="page" and no other link
+// does. It is a distinct <nav> landmark from breadcrumb-nav-trail's own
+// aria-current on its trail's terminal crumb, so the two never collide on the
+// same element. A submodule-scoped page (not one of the 7 top-nav routes)
+// marks no top-nav link current at all.
+func TestNavAriaCurrentOptional(t *testing.T) {
+	s, _ := setup(t)
+	dashboard := get(t, s, "/").Body.String()
+	if !strings.Contains(dashboard, `<a href="/" aria-current="page">dashboard</a>`) {
+		t.Fatalf("dashboard nav link missing aria-current:\n%s", dashboard)
+	}
+	if strings.Contains(dashboard, `aria-current="page">stats</a>`) {
+		t.Fatalf("dashboard should not mark stats current:\n%s", dashboard)
+	}
+
+	stats := get(t, s, "/stats").Body.String()
+	if !strings.Contains(stats, `<a href="/stats" aria-current="page">stats</a>`) {
+		t.Fatalf("stats nav link missing aria-current:\n%s", stats)
+	}
+	if strings.Contains(stats, `href="/" aria-current="page"`) {
+		t.Fatalf("stats should not mark dashboard current:\n%s", stats)
+	}
+
+	// A submodule-scoped page is not one of the 7 top-nav routes: none light up.
+	plan := get(t, s, "/submodule/alpha/plan").Body.String()
+	if strings.Contains(plan, `aria-current="page"`) {
+		t.Fatalf("plan page should not mark any top-nav link current:\n%s", plan)
+	}
+}

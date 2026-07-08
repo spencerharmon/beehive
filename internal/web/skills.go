@@ -545,7 +545,7 @@ func (s *Server) skillsPage(w http.ResponseWriter, r *http.Request) {
 	for _, sk := range s.skills().list() {
 		panels = append(panels, newSkillPanel(sk))
 	}
-	s.render(w, "skills.html", map[string]interface{}{"Skills": panels})
+	s.render(w, "skills.html", map[string]interface{}{"Skills": panels, "Title": pageTitle("skills"), "Nav": "skills"})
 }
 
 // skillPlanHandler runs a skill's deterministic dry-run and renders its panel with

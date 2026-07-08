@@ -1,4 +1,4 @@
-{{template "header"}}
+{{template "header" .}}
 <div id="merge-panel">
 <h1>Merge to main</h1>
 {{if .Merged}}<p class="banner ok">Merged <code>{{.Branch}}</code> into <code>{{.Tracked}}</code> for {{.Selected}} — pushed to origin and advanced the beehive pointer.</p>{{end}}

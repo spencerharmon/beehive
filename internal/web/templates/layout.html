@@ -1,11 +1,22 @@
+{{/* header: the shared page shell. Dot is the page's own data (whatever map/
+   struct the handler passed to s.render), so every full-page template must
+   invoke it as {{template "header" .}} (never bare) for .Title/.Nav to reach
+   here. Title renders the browser <title>; a handler that omits it (or sets
+   "") falls back to the bare site name — the dashboard's default, since the
+   root page needs no extra context. Nav (optional) names which top-nav link
+   is the current section ("dashboard"/"stats"/"secrets"/"merge"/"human"/
+   "hygiene"/"skills"); only handlers routed straight off one of those 7 links
+   set it, so a submodule-scoped page (plan/session/explorer/...) leaves every
+   nav link unmarked rather than guessing a parent section. */}}
 {{define "header"}}<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>beehive</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{if .Title}}{{.Title}}{{else}}beehive{{end}}</title>
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 <script src="/assets/htmx.min.js"></script>
 <link rel="stylesheet" href="/assets/style.css"></head>
 <body>
 <div id="htmx-progress" class="htmx-indicator" role="status" aria-live="polite" aria-label="working"><span class="bar"></span><span class="spin" aria-hidden="true"></span></div>
 <div id="htmx-toast" role="alert" aria-live="assertive" hidden></div>
-<header class="topbar"><nav class="nav"><a class="brand" href="/">beehive</a><span class="nav-links"><a href="/">dashboard</a><a href="/stats">stats</a><a href="/secrets">secrets</a><a href="/merge">merge</a><a href="/human">human</a><a href="/hygiene">hygiene</a><a href="/skills">skills</a></span></nav></header>
+<header class="topbar"><nav class="nav"><a class="brand" href="/">beehive</a><span class="nav-links"><a href="/"{{if eq .Nav "dashboard"}} aria-current="page"{{end}}>dashboard</a><a href="/stats"{{if eq .Nav "stats"}} aria-current="page"{{end}}>stats</a><a href="/secrets"{{if eq .Nav "secrets"}} aria-current="page"{{end}}>secrets</a><a href="/merge"{{if eq .Nav "merge"}} aria-current="page"{{end}}>merge</a><a href="/human"{{if eq .Nav "human"}} aria-current="page"{{end}}>human</a><a href="/hygiene"{{if eq .Nav "hygiene"}} aria-current="page"{{end}}>hygiene</a><a href="/skills"{{if eq .Nav "skills"}} aria-current="page"{{end}}>skills</a></span></nav></header>
 <main class="container">{{end}}
 {{define "footer"}}</main>
 <script>

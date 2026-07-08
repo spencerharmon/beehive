@@ -37,6 +37,50 @@ var assetFS embed.FS
 // remote can legitimately take longer than a local commit.
 const submoduleAddTimeout = 2 * time.Minute
 
+// faviconPath is the embedded favicon's location under assetFS, served both at
+// its natural /assets/ path (via the shared FileServer below) and again at the
+// conventional /favicon.ico (faviconICO) so a browser that probes the latter
+// regardless of the page's <link rel=icon> never 404s.
+const faviconPath = "assets/favicon.svg"
+
+// faviconICO serves the SAME embedded SVG bytes at /favicon.ico. Most browsers
+// honor layout.html's <link rel="icon"> and never request /favicon.ico at all,
+// but some (and any tooling that skips the DOM, e.g. a bookmark/tab-restore
+// probe) still fetch it directly regardless of that hint. A browser keys off
+// the response's Content-Type, not the URL's extension, so re-serving the one
+// embedded SVG here — rather than shipping a second raster asset — keeps a
+// single favicon source (single-binary embed, no CDN) while ensuring that path
+// is never a failed request.
+func faviconICO(w http.ResponseWriter, r *http.Request) {
+	b, err := assetFS.ReadFile(faviconPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Write(b)
+}
+
+// pageTitle composes a page's browser <title> from innermost-first context
+// parts (e.g. pageTitle("session", branch, sm.Name)), joined with " · " and
+// always suffixed with the site name, so every open tab reads distinctly at a
+// glance while still identifying as beehive. It is the ONE place a page title
+// is assembled, keeping the scheme uniform across every handler. Empty parts
+// are dropped (a caller can pass a possibly-blank value with no special
+// casing); a handler that wants the bare site name (the dashboard's root page)
+// simply omits "Title" from its render data instead of calling this — that
+// same fallback lives in layout.html's {{if .Title}}.
+func pageTitle(parts ...string) string {
+	out := make([]string, 0, len(parts)+1)
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	out = append(out, "beehive")
+	return strings.Join(out, " · ")
+}
+
 // Server holds the parsed templates and the repo it serves.
 type Server struct {
 	repo    *repo.Repo
@@ -366,6 +410,10 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/editor/{id}/merge", b((*Server).apiEditorMerge))
 	mux.HandleFunc("GET /api/editor/{id}/diff", b((*Server).apiEditorDiff))
 	mux.Handle("GET /assets/", http.FileServer(http.FS(assetFS)))
+	// Conventional favicon path: some clients request it directly regardless of
+	// layout.html's <link rel="icon">. Unbound like /assets/ above — the asset is
+	// baked into the binary and identical for every registered repo.
+	mux.HandleFunc("GET /favicon.ico", faviconICO)
 	// Multi-repo selection: switch the active repo for subsequent requests. Only
 	// registered in multi-repo mode, so a single-repo daemon keeps today's flat
 	// routes with no extra endpoint.
@@ -482,7 +530,10 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
 	}
 	rootFiles := s.rootFileLinks()
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": rootFiles, "RootFilesDrift": rootFilesDrift(rootFiles)})
+	// No "Title": the dashboard is the root page, and layout.html's own
+	// {{if .Title}} falls back to the bare site name — the one page that
+	// demonstrates the fallback rather than composing one via pageTitle.
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": rootFiles, "RootFilesDrift": rootFilesDrift(rootFiles), "Nav": "dashboard"})
 }
 
 // subViews builds the dashboard card data for every submodule: State
@@ -723,6 +774,7 @@ func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 		"Name":  sm.Name,
 		"Docs":  docs,
 		"Files": optionalFileLinks(sm),
+		"Title": pageTitle(sm.Name),
 	})
 }
 
@@ -762,6 +814,7 @@ func (s *Server) branches(w http.ResponseWriter, r *http.Request) {
 		"HasPrev":  off > 0,
 		"Next":     off + lim,
 		"HasNext":  len(cs) == lim, // a full page may have more
+		"Title":    pageTitle("commits", sm.Name),
 	})
 }
 
@@ -792,6 +845,7 @@ func (s *Server) doc(w http.ResponseWriter, r *http.Request) {
 	}
 	s.render(w, "doc_view.html", map[string]interface{}{
 		"Name": sm.Name, "File": file, "Body": renderMarkdown(string(b)),
+		"Title": pageTitle(file, sm.Name),
 	})
 }
 
@@ -819,6 +873,7 @@ func (s *Server) docExplorer(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "doc_explorer.html", map[string]interface{}{
 		"Name":     sm.Name,
 		"Sections": sectionDocs(entries),
+		"Title":    pageTitle("docs", sm.Name),
 	})
 }
 
@@ -849,7 +904,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 			p.Items[i].DocHref = resolveDocHref(sm, p.Items[i].Doc)
 		}
 	}
-	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p})
+	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p, "Title": pageTitle("plan", sm.Name)})
 }
 
 // planDelete removes a submodule's PLAN.md and publishes the deletion, so the
@@ -943,6 +998,7 @@ func (s *Server) roiGet(w http.ResponseWriter, r *http.Request) {
 	// preview renders the same source to sanitized HTML for reading.
 	s.render(w, "roi_editor.html", map[string]interface{}{
 		"Name": sm.Name, "Body": string(b), "Rendered": renderMarkdown(string(b)),
+		"Title": pageTitle("roi", sm.Name),
 	})
 }
 
@@ -961,7 +1017,7 @@ func (s *Server) roiPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.render(w, "roi_editor.html", map[string]interface{}{"Name": sm.Name, "Body": body, "Saved": true, "Rendered": renderMarkdown(body)})
+	s.render(w, "roi_editor.html", map[string]interface{}{"Name": sm.Name, "Body": body, "Saved": true, "Rendered": renderMarkdown(body), "Title": pageTitle("roi", sm.Name)})
 }
 
 // secretsGet lists the ACTIVE repo's secret KEYS (never values). s is the
@@ -974,7 +1030,7 @@ func (s *Server) secretsGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.render(w, "secrets_panel.html", map[string]interface{}{"Keys": keys})
+	s.render(w, "secrets_panel.html", map[string]interface{}{"Keys": keys, "Title": pageTitle("secrets"), "Nav": "secrets"})
 }
 
 // secretsPost writes one key into the ACTIVE repo's SECRETS.yaml.gpg. Like
@@ -1016,6 +1072,8 @@ func (s *Server) renderMerge(w http.ResponseWriter, data map[string]interface{})
 	}
 	subs, _ := s.repo.Submodules()
 	data["Subs"] = subs
+	data["Title"] = pageTitle("merge")
+	data["Nav"] = "merge"
 	s.render(w, "merge_panel.html", data)
 }
 
@@ -1189,7 +1247,7 @@ func (s *Server) envGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	env, _ := parseEnv(filepath.Join(sm.Path, repo.InfraFile))
-	s.render(w, "env_panel.html", map[string]interface{}{"Name": sm.Name, "Env": env})
+	s.render(w, "env_panel.html", map[string]interface{}{"Name": sm.Name, "Env": env, "Title": pageTitle("env", sm.Name)})
 }
 
 // envDeploy switches ONE submodule's active env, writing only that submodule's
@@ -1234,7 +1292,7 @@ func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.render(w, "human.html", map[string]interface{}{"Rows": rows})
+	s.render(w, "human.html", map[string]interface{}{"Rows": rows, "Title": pageTitle("human"), "Nav": "human"})
 }
 
 // hygiene renders the standalone read-only hive-hygiene page: a full scan of the
@@ -1247,7 +1305,7 @@ func (s *Server) hygiene(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
 	}
-	s.render(w, "hygiene_panel.html", map[string]interface{}{"Hygiene": hyg})
+	s.render(w, "hygiene_panel.html", map[string]interface{}{"Hygiene": hyg, "Title": pageTitle("hygiene"), "Nav": "hygiene"})
 }
 
 // ttl is the resolved claim heartbeat TTL: a task's session+heartbeat is "active"

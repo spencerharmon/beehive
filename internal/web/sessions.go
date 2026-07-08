@@ -35,7 +35,7 @@ func (s *Server) sessionsList(w http.ResponseWriter, r *http.Request) {
 	// Follow off-box runs: fast-forward local main so an agent's sessions on
 	// another host are visible on first paint, not only after the body poll.
 	s.followMain(r.Context(), time.Now())
-	s.render(w, "session_list.html", map[string]interface{}{"Name": sm.Name})
+	s.render(w, "session_list.html", map[string]interface{}{"Name": sm.Name, "Title": pageTitle("sessions", sm.Name)})
 }
 
 // sessionsListBody returns just the <ul>, read live from the sessions dir.
@@ -71,6 +71,7 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 		"Name":   sm.Name,
 		"Branch": branch,
 		"Live":   s.sessionLive(r.Context(), sm.SessionsDir(), branch),
+		"Title":  pageTitle(branch, sm.Name),
 	})
 }
 
