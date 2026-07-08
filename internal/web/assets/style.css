@@ -70,6 +70,20 @@
   --hue-human: 286;         /* violet: needs a human */
   --hue-active: 174;        /* teal: actively worked */
 
+  /* Solid-fill badge backgrounds (opaque single-hue pill, white foreground
+     text): .badge.live/.env-green/.drift-clean/.drift-drift/.drift-missing and
+     .state.live/.dirty need their OWN light/dark-tuned lightness, decoupled
+     from --success/--danger (which ALSO drive plain text-on-surface and a
+     dark-mode near-black-text button fill at lightness values that do not
+     clear 4.5:1 against WHITE text here — the two uses want opposite lightness
+     movement). Hue matches --hue-done / --hue-arbitration so the green/red
+     identity stays identical to the .status-done / .status-needs-arbitration
+     pills; only lightness is retuned, to clear the WCAG AA 4.5:1 normal-text
+     contrast threshold against white in BOTH modes (status-badge-contrast-fix;
+     ratios computed + locked by TestBadgeSolidFillsMeetWCAGAA). */
+  --badge-solid-green: hsl(var(--hue-done) 58% 32%);
+  --badge-solid-red: hsl(var(--hue-arbitration) 68% 48%);
+
   /* Pill rendering tokens (light). Slug classes only swap the hue. -------- */
   --pill-s: 70%;
   --pill-bg-l: 93%;
@@ -102,6 +116,12 @@
     --accent-contrast: hsl(220 30% 8%);
     --success: hsl(146 50% 52%);
     --danger: hsl(2 72% 60%);
+    /* Darker than --success/--danger above on purpose: a solid white-text pill
+       needs a LOW-luminance fill even in dark mode, the opposite of most dark
+       tokens (which go lighter). See the :root definition for the full
+       rationale. */
+    --badge-solid-green: hsl(var(--hue-done) 50% 34%);
+    --badge-solid-red: hsl(var(--hue-arbitration) 72% 50%);
     --shadow: 0 1px 2px hsl(0 0% 0% / 0.3), 0 2px 10px hsl(0 0% 0% / 0.35);
 
     --pill-s: 48%;
@@ -240,15 +260,17 @@ small, .small { font-size: var(--text-sm); }
   vertical-align: baseline;
 }
 .badge.live {
-  background: hsl(var(--hue-done) 58% 40%);
+  background: hsl(var(--hue-done) 58% 32%);
   border-color: transparent;
   color: #fff;
 }
-/* Env deploy badge (dashboard cards): blue -> accent, green -> success, so the
-   badge tracks the light/dark tokens. Any other env value stays a neutral
-   badge. .badge.human tints the NEEDS-HUMAN count with the human status hue. */
+/* Env deploy badge (dashboard cards): blue -> accent, green -> the dedicated
+   --badge-solid-green fill (NOT --success — see its :root definition), so the
+   badge tracks the light/dark tokens while keeping WCAG AA contrast with its
+   white text. Any other env value stays a neutral badge. .badge.human tints
+   the NEEDS-HUMAN count with the human status hue. */
 .badge.env-blue { background: var(--accent); border-color: transparent; color: var(--accent-contrast); }
-.badge.env-green { background: var(--success); border-color: transparent; color: #fff; }
+.badge.env-green { background: var(--badge-solid-green); border-color: transparent; color: #fff; }
 .badge.human { background: hsl(var(--hue-human) 60% 45%); border-color: transparent; color: #fff; }
 /* Honeybee count (dashboard cards): how many honeybees hold a fresh claim on the
    submodule. Idle (0 bees) is a neutral badge; .bees-live takes the teal "actively
@@ -257,11 +279,13 @@ small, .small { font-size: var(--text-sm); }
 .badge.bees { font-variant-numeric: tabular-nums; }
 .badge.bees.bees-live { background: hsl(var(--hue-active) 62% 42%); border-color: transparent; color: #fff; }
 /* Instruction-file drift (managed root files vs the binary's embedded default):
-   clean -> success (in sync), drift -> amber (customized/stale), missing -> danger
-   (absent). Shown only on managed files; the site-authored LOCALS.md has none. */
-.badge.drift-clean { background: var(--success); border-color: transparent; color: #fff; }
-.badge.drift-drift { background: hsl(var(--hue-review) 70% 42%); border-color: transparent; color: #fff; }
-.badge.drift-missing { background: var(--danger); border-color: transparent; color: #fff; }
+   clean -> the dedicated --badge-solid-green fill (in sync), drift -> amber
+   (customized/stale), missing -> the dedicated --badge-solid-red fill (absent,
+   NOT --danger — see its :root definition). Shown only on managed files; the
+   site-authored LOCALS.md has none. */
+.badge.drift-clean { background: var(--badge-solid-green); border-color: transparent; color: #fff; }
+.badge.drift-drift { background: hsl(var(--hue-review) 70% 34%); border-color: transparent; color: #fff; }
+.badge.drift-missing { background: var(--badge-solid-red); border-color: transparent; color: #fff; }
 .ago { color: var(--text-muted); font-size: var(--text-xs); }
 .ok { color: var(--success); font-weight: 600; }
 .muted { color: var(--text-muted); }
@@ -487,8 +511,11 @@ section { margin: var(--space-5) 0; }
 
 .statusbar { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
 .state { padding: 0.12em 0.6em; border-radius: var(--radius-pill); font-weight: 700; font-size: var(--text-xs); }
-.state.dirty { background: var(--danger); color: #fff; }
-.state.live { background: var(--success); color: #fff; }
+/* Solid white-text fills: the dedicated --badge-solid-* tokens (NOT --danger/
+   --success directly — see their :root definitions), same as the equivalent
+   .badge.drift-missing / .badge.drift-clean / .badge.env-green pills. */
+.state.dirty { background: var(--badge-solid-red); color: #fff; }
+.state.live { background: var(--badge-solid-green); color: #fff; }
 
 pre.diff {
   background: var(--surface);
