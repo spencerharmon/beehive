@@ -42,16 +42,35 @@ your manual edit is just one more participant in that protocol. Three cases:
   `submodules/<sm>/worktrees/<branch>/` (never `submodules/<sm>/repo/`); land it on
   the tracked branch (`git push origin HEAD:main`); then
   `beehive submodule sync <sm>` and `beehive submodule worktree rm <sm> <branch>`.
-- **Beehive-layer / superproject files** — the root instruction files (incl. this
-  one), `INFRASTRUCTURE.md`, `SUBMODULE-LINKS.yaml`, and a submodule's
-  `INFRASTRUCTURE.md` / `ARTIFACTS.md` / `docs/`:
+- **Beehive-layer / superproject files** — `INFRASTRUCTURE.md`, `SUBMODULE-LINKS.yaml`,
+  `LOCALS.md`, and a submodule's `INFRASTRUCTURE.md` / `ARTIFACTS.md` / `docs/`:
   `beehive worktree add <branch>`; edit under `.worktrees/<branch>/`; publish with
   `git -C .worktrees/<branch> push . HEAD:main` (local-only hive with
   `updateInstead`; push to `origin/main` if the hive has a remote); then
-  `beehive worktree rm <branch>`.
+  `beehive worktree rm <branch>`. The root instruction files (`AGENTS.md` incl. this
+  one, `HONEYBEE.md`, `BOOTSTRAP.md`, `skills/*.md`) look like they belong in this
+  case too but don't — they're GENERATED; see the note right after this list.
 - **`ROI.md`** — human-owned: prefer the `beehived` editor UI. Agents are hook-
   blocked from committing it under the honeybee identity; operator-directed edits go
   through the editor or the worktree process. See `skills/modify-roi.md`.
+
+**Managed root files are generated — a durable fix edits the submodule source, not
+the root copy.** `AGENTS.md` (this file), `HONEYBEE.md`, `BOOTSTRAP.md`, and every
+`skills/*.md` are rendered from the `beehive` submodule's `prompts/<name>.md` (the
+binary's `//go:embed` default): `beehive instruction update` overwrites the root
+copy from that default, and `beehive init` seeds a brand-new install straight from
+the binary — neither ever reads a root edit. So editing the root file via the
+beehive-layer case above is cosmetic: the next `instruction update` reverts it, and
+no other install ever sees it. The durable edit is a **Submodule CODE** change (the
+first case above) to the source template: `beehive submodule worktree add beehive
+<branch>`, edit `prompts/<name>.md`, commit + push, bump the gitlink. Source
+mapping — `AGENTS.md` ← `prompts/AGENTS.md`; `HONEYBEE.md` ← `prompts/HONEYBEE.md`;
+`BOOTSTRAP.md` ← `prompts/bootstrap_guide.md` (**not** `prompts/bootstrap.md`, the
+unrelated per-pass bootstrap-task runtime prompt); `skills/<n>.md` ←
+`prompts/skills/<n>.md`. After the pointer bump lands, confirm with `beehive
+instruction list` (reports `clean`/`modified`/`missing` per managed file).
+`LOCALS.md` is the one exception: it is **not** generated (no `prompts/` source
+exists for it), so it genuinely is edited in place via the beehive-layer case above.
 
 Never `git reset`/`checkout`/`stash` the live primary tree to "make room" — you race
 in-flight publishes. Always remove your worktree + branch when done.
