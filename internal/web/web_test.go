@@ -139,6 +139,144 @@ func TestScrollPreserveWiring(t *testing.T) {
 	}
 }
 
+// TestSessionBodyRendersTurnsAndTOC is session-transcript-rendered-toc's core
+// acceptance: a multi-turn transcript renders each turn as SANITIZED HTML (not
+// a raw text/`<pre>` dump), a table-of-contents overlay lists one entry per
+// turn with a working anchor/jump link, and poll-scroll-preserve's pane
+// contract (id="session-transcript" + data-scroll-preserve + data-scroll-pin)
+// is unchanged — proving the new structured markup composes with, rather than
+// replaces, the Priority-1 scroll fix.
+func TestSessionBodyRendersTurnsAndTOC(t *testing.T) {
+	s, root := setup(t)
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A real-shaped transcript: header, one user turn (bold markdown to prove
+	// rendering), one assistant turn embedding its OWN "## Notes" heading (the
+	// exact-line, not "## "-prefix, turn-boundary rule) plus a raw <script> tag
+	// (must be sanitized, exactly like editor-markdown-render's other VIEW panes).
+	body := "# session bee-toc-demo\n\n" +
+		"submodule: alpha \u00b7 kind: work \u00b7 branch: bee-toc-demo\n\n" +
+		"## user\n\nplease **add** tests for the new feature\n\n" +
+		"## assistant\n\nWorking on it. See my notes:\n\n" +
+		"## Notes\n\nAll done; <script>alert(1)</script> was NOT executed.\n"
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-toc-demo-100.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := get(t, s, "/submodule/alpha/session/bee-toc-demo-100/body")
+	if w.Code != 200 {
+		t.Fatalf("session body status %d: %s", w.Code, w.Body)
+	}
+	out := w.Body.String()
+
+	// Rendered, sanitized HTML — not a raw text dump.
+	for _, want := range []string{
+		"<strong>add</strong>",       // **add** rendered
+		"<h2>Notes</h2>",             // the embedded "## Notes" heading rendered in place
+		`id="turn-1"`, `id="turn-2"`, // exactly two turns: the embedded heading did NOT split a third
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("session body missing %q (want rendered HTML, not a raw dump):\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "<script>") {
+		t.Errorf("session body must sanitize embedded HTML like any other VIEW pane:\n%s", out)
+	}
+	if strings.Contains(out, "## assistant") || strings.Contains(out, "## user") {
+		t.Errorf("session body must not leak the raw turn-marker lines (not a raw text dump):\n%s", out)
+	}
+
+	// TOC overlay: one entry per turn, with a working anchor/jump link, plus the
+	// prev/next jump controls.
+	for _, want := range []string{
+		`id="session-toc"`,
+		`href="#turn-1"`, `href="#turn-2"`,
+		"Runner", "Agent", // reader-facing labels for user/assistant
+		"toc-jump-prev", "toc-jump-next",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("session body missing TOC element %q:\n%s", want, out)
+		}
+	}
+
+	// poll-scroll-preserve's pane contract is UNCHANGED: same id + both
+	// attributes still present (see TestScrollPreserveWiring, which locks the
+	// same three substrings for the legacy flat-Body fallback shape).
+	for _, want := range []string{`id="session-transcript"`, "data-scroll-preserve", "data-scroll-pin"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("session body missing scroll-preserve wiring %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestSessionStreamRendersSameTurnHTMLAsPoll is the no-path-specific-
+// rendering-drift acceptance: the SSE stream (sessionStream) and the htmx poll
+// (sessionBody) must produce the IDENTICAL turn/TOC HTML for the same
+// transcript, since both execute the same "transcript_turns" template — never
+// two independent renderers that could silently diverge.
+func TestSessionStreamRendersSameTurnHTMLAsPoll(t *testing.T) {
+	s, root := setup(t)
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "# session bee-parity\n\nsubmodule: alpha \u00b7 kind: work \u00b7 branch: bee-parity\n\n" +
+		"## user\n\nplease investigate\n\n## assistant\n\nfound it, fixing now\n"
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-parity-200.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pollOut := get(t, s, "/submodule/alpha/session/bee-parity-200/body").Body.String()
+
+	// bee-parity-200 is a finished (non-stub) transcript, so the stream reads
+	// once, sends the rendered frame, emits `event: end`, and returns promptly —
+	// safe to drive synchronously through a buffered recorder (same premise as
+	// TestSessionStreamEndsForFinishedSession).
+	streamRaw := get(t, s, "/submodule/alpha/session/bee-parity-200/stream").Body.String()
+	streamHTML := firstSSEData(t, streamRaw)
+
+	want, err := s.renderString("transcript_turns", map[string]interface{}{
+		"Body": body, "Turns": buildTranscriptTurns(body),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamHTML != want {
+		t.Fatalf("SSE frame != transcript_turns render:\nSSE:  %q\nwant: %q", streamHTML, want)
+	}
+	if !strings.Contains(pollOut, want) {
+		t.Fatalf("poll body does not contain the SAME transcript_turns render the SSE frame carries:\npoll: %s\nwant substring: %s", pollOut, want)
+	}
+}
+
+// firstSSEData reconstructs the FIRST SSE message's data payload from a raw
+// text/event-stream response body, exactly as a browser's EventSource does:
+// each "data: <line>" field's line is rejoined with "\n", stopping at the
+// blank line that terminates the message (a truly empty raw line — a
+// payload's OWN blank line is still "data: " prefixed, never bare).
+func firstSSEData(t *testing.T, raw string) string {
+	t.Helper()
+	var data []string
+	for _, ln := range strings.Split(raw, "\n") {
+		ln = strings.TrimRight(ln, "\r")
+		if ln == "" {
+			if len(data) > 0 {
+				break
+			}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(ln, "data: "):
+			data = append(data, strings.TrimPrefix(ln, "data: "))
+		case ln == "data:":
+			data = append(data, "")
+		}
+	}
+	return strings.Join(data, "\n")
+}
+
 func TestDashboard(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/")

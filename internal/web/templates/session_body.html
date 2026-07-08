@@ -1,2 +1,31 @@
+{{/* session-transcript-rendered-toc: the transcript pane is rendered, structured
+     turns (markdown -> sanitized HTML via renderMarkdown), not a flat text dump,
+     plus a table-of-contents overlay + prev/next jump controls
+     (session_view.html) for moving between agent outputs and runner replies.
+     "transcript_turns" is the SHARED fragment both this htmx-polled body AND the
+     SSE stream (sessionStream, via Server.renderString) execute, so the two
+     transcript delivery paths (agent-output-streaming) can never render
+     different HTML for the same transcript. #session-transcript keeps its
+     STABLE id + data-scroll-preserve/data-scroll-pin no matter which branch
+     below fires, so poll-scroll-preserve's save/restore keeps working
+     unmodified: it only ever keys off the id + those two attributes, never the
+     tag name or children (see internal/web/templates/layout.html). */}}
+{{define "transcript_turns"}}{{if .Turns}}<details class="toc" id="session-toc" open>
+  <summary>Contents <span class="muted">({{len .Turns}} turns)</span></summary>
+  <div class="toc-jumpbar">
+    <button type="button" class="toc-jump toc-jump-prev">&uarr; Prev turn</button>
+    <button type="button" class="toc-jump toc-jump-next">&darr; Next turn</button>
+  </div>
+  <ol class="toc-list">
+    {{range .Turns}}<li><a class="toc-link turn-{{.Role}}" href="#{{.Anchor}}">Turn {{.Index}} &middot; {{.Label}}</a></li>{{end}}
+  </ol>
+</details>
+<div class="session" id="session-transcript" data-scroll-preserve data-scroll-pin>
+{{range .Turns}}  <section id="{{.Anchor}}" class="turn turn-{{.Role}}">
+    <p class="turn-head"><a class="turn-jump" href="#{{.Anchor}}">Turn {{.Index}} &middot; {{.Label}}</a></p>
+    <div class="markdown">{{.HTML}}</div>
+  </section>
+{{end}}</div>
+{{else}}<pre class="session" id="session-transcript" data-scroll-preserve data-scroll-pin>{{.Body}}</pre>{{end}}{{end}}
 {{with .Sync}}<p id="session-sync" class="sync-status{{if .Err}} stale{{end}}">followed {{.Ago}} ago{{if .Err}} · pull stalled: {{.Err}}{{end}}</p>{{end}}
-<pre class="session" id="session-transcript" data-scroll-preserve data-scroll-pin>{{.Body}}</pre>
+<div id="session-transcript-wrap">{{template "transcript_turns" .}}</div>

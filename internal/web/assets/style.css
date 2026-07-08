@@ -83,6 +83,10 @@
   --msg-agent-bg: hsl(146 52% 92%);
   --msg-err-bg: hsl(2 84% 95%);
 
+  /* Session transcript TOC link hues (light; session-transcript-rendered-toc) */
+  --toc-user-fg: hsl(215 60% 40%);
+  --toc-agent-fg: hsl(146 52% 32%);
+
   /* Diff line backgrounds (light) ---------------------------------------- */
   --diff-add-bg: hsl(146 58% 90%);
   --diff-del-bg: hsl(2 78% 93%);
@@ -113,6 +117,9 @@
     --msg-user-bg: hsl(215 48% 24%);
     --msg-agent-bg: hsl(146 32% 20%);
     --msg-err-bg: hsl(2 46% 26%);
+
+    --toc-user-fg: hsl(215 78% 74%);
+    --toc-agent-fg: hsl(146 48% 68%);
 
     --diff-add-bg: hsl(146 38% 22%);
     --diff-del-bg: hsl(2 44% 28%);
@@ -448,6 +455,67 @@ pre {
   overflow: auto;
 }
 section { margin: var(--space-5) 0; }
+
+/* Session transcript turns + TOC (session-transcript-rendered-toc) ------- *
+ * The transcript pane (.session, #session-transcript) now holds one <section
+ * class="turn"> per rendered turn instead of a flat text dump; .toc is the
+ * collapsible table-of-contents/jump-button overlay above it. Both the htmx
+ * poll and the SSE stream render this from the SAME "transcript_turns"
+ * template, so no separate styling path is needed per delivery mechanism. */
+.toc {
+  margin-bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+.toc summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: var(--text-sm);
+}
+.toc-jumpbar { display: flex; gap: var(--space-2); margin: var(--space-2) 0; }
+.toc-jump {
+  background: var(--surface);
+  color: var(--text);
+  border: var(--border-width) solid var(--border);
+  font-size: var(--text-xs);
+  padding: 0.2em 0.6em;
+}
+.toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 12rem;
+  overflow: auto;
+}
+.toc-list li { margin: var(--space-1) 0; }
+.toc-link {
+  font-size: var(--text-sm);
+  text-decoration: none;
+}
+.toc-link:hover { text-decoration: underline; }
+.toc-link.turn-assistant { color: var(--toc-agent-fg); }
+.toc-link.turn-user { color: var(--toc-user-fg); }
+
+.turn {
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  scroll-margin-top: var(--space-3);
+}
+.turn.turn-user { background: var(--msg-user-bg); }
+.turn.turn-assistant { background: var(--msg-agent-bg); }
+.turn .turn-head {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.turn .turn-jump { color: var(--text-muted); text-decoration: none; }
+.turn .turn-jump:hover { text-decoration: underline; }
+.turn .markdown > :last-child { margin-bottom: 0; }
 
 /* AI editor -------------------------------------------------------------- */
 .editor-grid { display: flex; gap: var(--space-4); align-items: flex-start; }

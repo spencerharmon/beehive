@@ -110,18 +110,23 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.render(w, "session_body.html", map[string]interface{}{"Body": body, "Sync": sync})
+	s.render(w, "session_body.html", map[string]interface{}{
+		"Body": body, "Sync": sync, "Turns": buildTranscriptTurns(body),
+	})
 }
 
 // sessionStream pushes the session transcript to the browser over server-sent
 // events, re-reading it on a short cadence and sending it whenever it changes,
 // until the session ends or the client disconnects. It surfaces agent output
-// token-by-token instead of in the 2s poll jumps, and carries the SAME
-// file-derived transcript sessionBody renders (git/disk, never opencode) — so the
-// htmx poll is an interchangeable fallback: the page cancels the poll while this
-// stream is live and resumes it on the "end" event (which also fetches the
-// authoritative final transcript). Because the live page cancels the poll, this
-// loop OWNS following off-box (remote-host) sessions: sessionTranscript
+// token-by-token instead of in the 2s poll jumps, and renders the SAME
+// file-derived transcript sessionBody renders (git/disk, never opencode) through
+// the IDENTICAL "transcript_turns" template, so the htmx poll and this stream
+// can never disagree on the turn/TOC markup for a given transcript
+// (session-transcript-rendered-toc). That makes the htmx poll an
+// interchangeable fallback: the page cancels the poll while this stream is
+// live and resumes it on the "end" event (which also fetches the
+// authoritative final transcript). Because the live page cancels the poll,
+// this loop OWNS following off-box (remote-host) sessions: sessionTranscript
 // fast-forwards local main every tick and the staleness banner is pushed as a
 // `sync` event so it stays fresh under the EventSource. A ResponseWriter that
 // cannot flush (no streaming) is reported so the client keeps polling.
@@ -175,7 +180,18 @@ func (s *Server) sessionStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if first || body != last {
-			writeSSEData(w, body)
+			html, rerr := s.renderString("transcript_turns", map[string]interface{}{
+				"Body": body, "Turns": buildTranscriptTurns(body),
+			})
+			if rerr != nil {
+				// Headers are already committed (200): end the stream and let the
+				// htmx poll fallback surface the real error, same as a transcript
+				// read error above.
+				writeSSEEvent(w, "end", "")
+				fl.Flush()
+				return
+			}
+			writeSSEData(w, html)
 			fl.Flush()
 			last = body
 			first = false

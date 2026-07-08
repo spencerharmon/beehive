@@ -11,15 +11,18 @@
 <script>
 /* session-stream: while a honeybee runs, stream its transcript over SSE so agent
    output appears token-by-token instead of in the 2s poll jumps. The stream
-   carries the SAME file-derived transcript the htmx poll renders (git/disk, never
-   opencode), so it is a drop-in live channel: we cancel the poll while the stream
-   is connected and fall back to it on error or when the browser lacks
+   carries the SAME rendered turn/TOC markup the htmx poll renders — the
+   "transcript_turns" template, executed server-side (session-transcript-
+   rendered-toc) — so it is a drop-in live channel: we cancel the poll while the
+   stream is connected and fall back to it on error or when the browser lacks
    EventSource. A `sync` event carries the off-box follow staleness banner so it
    stays fresh while the poll (which normally refreshes it) is cancelled. On the
    stream's "end" event (session finished) we close it and do one authoritative
    poll for the durable final transcript. A bottom-pinned reader keeps following
-   new output; a scrolled-back reader's position is held. No external libraries
-   (single-binary embed, no CDN). */
+   new output; a scrolled-back reader's position is held — this pane is a manual
+   innerHTML swap (not an htmx swap), so it save/restores scroll itself instead
+   of relying on layout.html's htmx:beforeSwap/afterSwap pair. No external
+   libraries (single-binary embed, no CDN). */
 (function () {
   var body = document.getElementById('session-body');
   if (!body || !window.EventSource) return; // no SSE support: htmx poll is the sole path
@@ -32,21 +35,28 @@
     if (window.__sseLive && e.detail && e.detail.elt === body) e.preventDefault();
   });
 
-  function render(text) {
-    var pre = document.getElementById('session-transcript');
-    if (!pre) { // the poll hasn't rendered the container yet: create it ourselves
+  function render(html) {
+    var wrap = document.getElementById('session-transcript-wrap');
+    if (!wrap) { // the poll hasn't rendered the container yet: create it ourselves
       var lp = document.getElementById('session-loading');
       if (lp) lp.remove();
-      pre = document.createElement('pre');
-      pre.className = 'session';
-      pre.id = 'session-transcript';
-      pre.setAttribute('data-scroll-preserve', '');
-      pre.setAttribute('data-scroll-pin', '');
-      body.appendChild(pre);
+      wrap = document.createElement('div');
+      wrap.id = 'session-transcript-wrap';
+      body.appendChild(wrap);
     }
-    var pinned = pre.scrollHeight - pre.scrollTop - pre.clientHeight <= SLACK;
-    pre.textContent = text;
-    if (pinned) pre.scrollTop = pre.scrollHeight; // follow new output at the bottom
+    // Save the CURRENT pane's scroll state (whatever tag it is — <pre> or the
+    // structured <div>, both carry the same id) before replacing it, exactly
+    // like layout.html's shared script, just triggered manually since this
+    // innerHTML assignment fires no htmx:beforeSwap/afterSwap events.
+    var old = document.getElementById('session-transcript');
+    var pinned = false, top = 0;
+    if (old) {
+      pinned = old.scrollHeight - old.scrollTop - old.clientHeight <= SLACK;
+      top = old.scrollTop;
+    }
+    wrap.innerHTML = html;
+    var neu = document.getElementById('session-transcript');
+    if (neu) neu.scrollTop = pinned ? neu.scrollHeight : top;
   }
 
   function renderSync(st) {
@@ -80,4 +90,39 @@
 })();
 </script>
 {{end}}
+<script>
+/* session-toc-jump (session-transcript-rendered-toc): lightweight prev/next
+   stepping between a rendered transcript's turn sections, moving the reader
+   between agent outputs and runner replies without hand-scrolling. Delegated
+   off `document` — so it keeps working across every htmx poll swap AND the SSE
+   stream's own manual re-render above, neither of which re-attach per-node
+   listeners — and unconditional (unlike the SSE script) since prev/next apply
+   equally to an ENDED session's poll-only transcript. A click on a .toc-jump
+   button finds which .turn section's top edge is at or above the pane's own
+   top edge (via getBoundingClientRect, so it needs no assumption about the
+   pane's CSS position/offsetParent) and jumps to the next/previous one via
+   scrollIntoView, which follows a nested overflow:auto ancestor correctly in
+   every evergreen browser — no extra scroll-preserve wiring needed, since a
+   fragment jump is just another scrollTop change the NEXT poll's
+   htmx:beforeSwap captures like any manual scroll. No external libraries
+   (single-binary embed, no CDN). */
+(function () {
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest && e.target.closest('.toc-jump');
+    if (!btn) return;
+    var pane = document.getElementById('session-transcript');
+    if (!pane) return;
+    var list = pane.querySelectorAll('.turn');
+    if (!list.length) return;
+    var paneTop = pane.getBoundingClientRect().top;
+    var idx = 0;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].getBoundingClientRect().top - paneTop <= 4) idx = i;
+    }
+    var dir = btn.className.indexOf('toc-jump-next') !== -1 ? 1 : -1;
+    var target = list[Math.min(list.length - 1, Math.max(0, idx + dir))];
+    if (target) target.scrollIntoView({ block: 'start' });
+  });
+})();
+</script>
 {{template "footer"}}
