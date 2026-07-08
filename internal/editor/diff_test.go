@@ -47,13 +47,20 @@ func TestRenderDiffEscapesHTML(t *testing.T) {
 }
 
 func TestValidateFile(t *testing.T) {
-	ok := []string{"submodules/x/ROI.md", "INFRASTRUCTURE.md", "submodules/y/SUBMODULE-LINKS.yaml"}
+	// The allowlist is built from repo.OptionalFiles + repo.RootInstructionFiles
+	// (ai-edit-publish-to-main): every file the frontend actually renders an
+	// edit-with-AI link for, at both the repo root and inside a submodule.
+	ok := []string{
+		"submodules/x/ROI.md", "INFRASTRUCTURE.md", "submodules/y/SUBMODULE-LINKS.yaml",
+		"submodules/x/AGENTS.md", "AGENTS.md", "HONEYBEE.md", "BOOTSTRAP.md", "LOCALS.md",
+		"submodules/x/RULES.md", "submodules/x/ARTIFACTS.md",
+	}
 	for _, f := range ok {
 		if err := ValidateFile(f); err != nil {
 			t.Errorf("want ok for %q: %v", f, err)
 		}
 	}
-	bad := []string{"PLAN.md", "AGENTS.md", "../etc/passwd", "submodules/x/../../escape/ROI.md.x", "submodules/x/secret.txt"}
+	bad := []string{"PLAN.md", "submodules/x/PLAN.md", "../etc/passwd", "submodules/x/../../escape/ROI.md.x", "submodules/x/secret.txt"}
 	for _, f := range bad {
 		if err := ValidateFile(f); err == nil {
 			t.Errorf("want error for %q", f)

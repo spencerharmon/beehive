@@ -1872,6 +1872,166 @@ func TestEditorDeleteGuardConfirmButton(t *testing.T) {
 	}
 }
 
+// commitAndNormalizeMain gives root an initial commit of whatever setup(t) (or
+// the caller) has already written, on a branch normalized to "main" regardless
+// of the host's init.defaultBranch — the precondition internal/editor.Manager.
+// Open needs (it resolves a "main" ref) that plain setup(t) does not provide.
+func commitAndNormalizeMain(t *testing.T, root string) {
+	t.Helper()
+	commitAll(t, root, "seed")
+	hygGit(t, root, "branch", "-M", "main")
+}
+
+// openEditorSession drives GET /edit?path=file exactly as an "edit with AI"
+// link does, and returns the opened session's id (== its worktree branch) so a
+// test can simulate an agent's edit directly in that worktree.
+func openEditorSession(t *testing.T, s *Server, file string) (id string) {
+	t.Helper()
+	w := get(t, s, "/edit?path="+file)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("open %q %d: %s", file, w.Code, w.Body)
+	}
+	loc := w.Header().Get("Location")
+	if !strings.HasPrefix(loc, "/editor/") {
+		t.Fatalf("edit-with-AI must open the publish-capable /editor surface, got redirect %q", loc)
+	}
+	return strings.TrimPrefix(loc, "/editor/")
+}
+
+// writeInSession overwrites file's content directly in an opened session's
+// worktree — standing in for what a real agent turn would write via
+// editor.Session.Chat/StartChat — so a test can drive Merge without an opencode
+// backend. The worktree lives at .worktrees/<id> off root (Manager.Open's own
+// layout), which the test can compute because Session.ID/Branch and root are
+// both already in hand.
+func writeInSession(t *testing.T, root, id, file, content string) {
+	t.Helper()
+	p := filepath.Join(root, ".worktrees", id, filepath.FromSlash(file))
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatalf("write in session worktree: %v", err)
+	}
+}
+
+// TestEditEntryOpensPublishCapableEditor is the routing half of
+// ai-edit-publish-to-main: an edit-with-AI request carrying a coordination-file
+// path (?path=, exactly what every real link in the UI sends) opens through
+// editNew (internal/editor.Manager) and lands on the /editor/{id} page — the
+// SAME publish-capable surface merge-button-wire/publish-main-writes wired a
+// real Merge button onto — never chatManager's throwaway /edit/{id} chat page.
+func TestEditEntryOpensPublishCapableEditor(t *testing.T) {
+	s, root := setup(t)
+	commitAndNormalizeMain(t, root)
+
+	id := openEditorSession(t, s, "submodules/alpha/"+repo.ROIFile)
+	page := get(t, s, "/editor/"+id).Body.String()
+	if !strings.Contains(page, "edit · submodules/alpha/"+repo.ROIFile) {
+		t.Fatalf("editor page did not render for the opened session:\n%s", page)
+	}
+	// A stale/never-registered chatManager-style id must not resolve here —
+	// this really is the internal/editor Manager's session table, not
+	// chatManager's.
+	if w := get(t, s, "/editor/edit-bogus-1"); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown /editor id should 404, got %d", w.Code)
+	}
+}
+
+// TestChatManagerEditRoutesRetired locks the "gone/redirected" half of the
+// accept contract: the OLD generic per-path HTTP entry into chatManager
+// (POST /edit -> chatOpen, GET /edit/{id} -> chatPage — the publish-less
+// approve dead end) no longer exists. Only GET /edit remains, and it is
+// editEntry (-> editNew), never chatOpen.
+func TestChatManagerEditRoutesRetired(t *testing.T) {
+	s, _ := setup(t)
+	if w := postForm(t, s, "/edit", url.Values{"path": {"submodules/alpha/" + repo.ROIFile}}); w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /edit (the retired chatManager open) should be gone, got %d: %s", w.Code, w.Body)
+	}
+	if w := get(t, s, "/edit/some-id"); w.Code != http.StatusNotFound {
+		t.Fatalf("GET /edit/{id} (the retired chatManager page) should be gone, got %d: %s", w.Code, w.Body)
+	}
+}
+
+// TestEditEntryRejectsNonCoordinationFile proves the consolidated edit-with-AI
+// entry point is NOT chatManager: chatManager edited any repo path, but
+// internal/editor (what editEntry now always opens) only ever touches the
+// declared coordination-file allowlist. A plain repo file 400s instead of
+// silently opening a session that could never publish anyway.
+func TestEditEntryRejectsNonCoordinationFile(t *testing.T) {
+	s, _ := setup(t)
+	if w := get(t, s, "/edit?path=submodules/alpha/notes.md"); w.Code != http.StatusBadRequest {
+		t.Fatalf("an arbitrary non-coordination file must be rejected, got %d: %s", w.Code, w.Body)
+	}
+}
+
+// TestEditWithAIMergePublishesToOrigin is the core ai-edit-publish-to-main
+// acceptance: approving an edit-with-AI session (opened exactly as the
+// dashboard/explorer/roi_editor links do, via GET /edit?path=) and merging it
+// through the HTTP /editor/{id}/merge endpoint lands the change on LOCAL main
+// (the primary checkout's working tree advances) AND on the repo-own remote
+// (origin main carries it) — never stranding it on a dangling edit-* branch.
+// This is a genuine negative control: if the merge/publish step were ever
+// dropped, main would stay at its old content and this test would fail — a
+// green run is not just a 200 status code.
+func TestEditWithAIMergePublishesToOrigin(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	s, root := setup(t)
+	origin := seedRootOrigin(t, root)
+	file := "submodules/alpha/" + repo.ROIFile
+
+	id := openEditorSession(t, s, file)
+	writeInSession(t, root, id, file, "# alpha\n\npublished intent\n")
+
+	if w := postForm(t, s, "/editor/"+id+"/merge", url.Values{}); w.Code != http.StatusOK {
+		t.Fatalf("merge %d: %s", w.Code, w.Body)
+	}
+
+	// Local main advanced: the primary checkout's working tree carries it.
+	got, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(file)))
+	if err != nil || !strings.Contains(string(got), "published intent") {
+		t.Fatalf("approved edit did not land on local main: content=%q err=%v", got, err)
+	}
+	// Pushed to the repo-own remote — not a dangling edit-* branch main (and
+	// every other host's honeybees) never sees.
+	if got := hygGit(t, origin, "show", "main:"+file); !strings.Contains(got, "published intent") {
+		t.Fatalf("approved edit did not reach the repo-own remote main: %q", got)
+	}
+	assertOriginAtLocalHead(t, root, origin)
+}
+
+// TestEditWithAIMergeDeleteGuardHolds proves the editor-safety guards survive
+// the new routing end to end over HTTP: a whole-file deletion of the
+// human-owned ROI.md opened via the ordinary edit-with-AI entry point is
+// default-BLOCKED on plain Merge (main/origin untouched) and requires the
+// separate, explicit confirm=delete before it can land.
+func TestEditWithAIMergeDeleteGuardHolds(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	s, root := setup(t)
+	origin := seedRootOrigin(t, root)
+	file := "submodules/alpha/" + repo.ROIFile
+
+	id := openEditorSession(t, s, file)
+	writeInSession(t, root, id, file, "") // wipes a non-empty base: the guarded shape
+
+	blocked := postForm(t, s, "/editor/"+id+"/merge", url.Values{})
+	if blocked.Code != http.StatusOK {
+		t.Fatalf("a blocked merge still renders the panel (200 w/ Error), got %d", blocked.Code)
+	}
+	if !strings.Contains(blocked.Body.String(), "human-owned") {
+		t.Fatalf("panel must surface the delete-guard block:\n%s", blocked.Body)
+	}
+	if got := hygGit(t, origin, "show", "main:"+file); !strings.Contains(got, "# alpha") {
+		t.Fatalf("blocked merge must not reach origin main: %q", got)
+	}
+
+	confirmed := postForm(t, s, "/editor/"+id+"/merge", url.Values{"confirm": {"delete"}})
+	if confirmed.Code != http.StatusOK {
+		t.Fatalf("confirmed merge %d: %s", confirmed.Code, confirmed.Body)
+	}
+	if got := hygGit(t, origin, "show", "main:"+file); strings.TrimSpace(got) != "" {
+		t.Fatalf("confirmed deletion should empty the file on origin main, got %q", got)
+	}
+	assertOriginAtLocalHead(t, root, origin)
+}
+
 // TestSessionLivenessBranchGone is the regression for sessions that kept showing
 // "running" / "(waiting for session output…)" long after the honeybee exited. A
 // stub whose stream branch is gone is an ended session (its finalize never

@@ -336,10 +336,16 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /skills", b((*Server).skillsPage))
 	mux.HandleFunc("POST /skills/{name}/plan", b((*Server).skillPlanHandler))
 	mux.HandleFunc("POST /skills/{name}/apply", b((*Server).skillApplyHandler))
-	// AI editor chat (browser): one worktree branch per session.
+	// AI editor chat (browser): one worktree branch per session. GET /edit is
+	// the ONE entry point for every edit-with-AI link (dashboard/explorer/
+	// roi_editor) and always opens the publish-capable internal/editor Manager
+	// (editEntry -> editNew), never chatManager (ai-edit-publish-to-main). The
+	// /edit/{id}/panel|message|approve|reject fragments remain registered
+	// because they ALSO back the bootstrap wizard's embedded agent (its own
+	// fixed LOCALS.md session, opened only via GET /bootstrap) — chatManager's
+	// generic, never-published full-page /edit/{id} view and its POST /edit
+	// open are retired along with it.
 	mux.HandleFunc("GET /edit", b((*Server).editEntry))
-	mux.HandleFunc("POST /edit", b((*Server).chatOpen))
-	mux.HandleFunc("GET /edit/{id}", b((*Server).chatPage))
 	mux.HandleFunc("GET /edit/{id}/panel", b((*Server).chatPanel))
 	mux.HandleFunc("POST /edit/{id}/message", b((*Server).chatMessage))
 	mux.HandleFunc("POST /edit/{id}/approve", b((*Server).chatApprove))
@@ -363,6 +369,24 @@ func (s *Server) Routes() *http.ServeMux {
 		mux.HandleFunc("POST /repo/{name}", s.repoSwitch)
 	}
 	return mux
+}
+
+// editEntry (GET /edit) is the ONE HTTP entry point every edit-with-AI link
+// reaches (dashboard's "edit infrastructure with AI"/"edit roi (AI)", the
+// explorer's per-file view/edit/create links, roi_editor's "edit with AI
+// chat") — it always opens through editNew, the publish-capable
+// internal/editor Manager (internal/web/editor.go), whose Merge lands an
+// approved change on main (ai-edit-publish-to-main). Before this fix a
+// path-carrying request (every real link passes one, e.g. ?path=ROI.md) was
+// dispatched to chatManager instead: that surface's approve committed to a
+// throwaway edit-* branch and had no publish step at all, so the change never
+// reached main and, for a submodule ROI.md, the PLAN's Beehive-ROI stamp never
+// advanced past it — silently discarding the edit. chatManager is not
+// reachable from here anymore; its one surviving caller is the bootstrap
+// wizard's fixed LOCALS.md session, opened directly by openBootstrap
+// (bootstrap.go) via GET /bootstrap, never through this entry point.
+func (s *Server) editEntry(w http.ResponseWriter, r *http.Request) {
+	s.editNew(w, r)
 }
 
 func (s *Server) render(w http.ResponseWriter, name string, data interface{}) {

@@ -30,12 +30,28 @@ type agentClient interface {
 // "ask the agent to merge" and clicking Merge converge to the same git state.
 const mergeMarker = "<<<MERGE>>>"
 
-// editableBasenames are the human-owned coordination files an editor session may
-// touch. Everything else (PLAN.md, AGENTS.md, secrets, code) is off limits.
-var editableBasenames = map[string]bool{
-	repo.ROIFile:   true,
-	repo.InfraFile: true,
-	repo.LinksFile: true,
+// editableBasenames are the beehive coordination-file basenames an editor
+// session may touch: every member of the per-submodule optional-file set
+// (repo.OptionalFiles) and the repo-ROOT instruction-file set
+// (repo.RootInstructionFiles) — the exact set the frontend renders an
+// edit-with-AI link for (dashboard/explorer/roi_editor,
+// ai-edit-publish-to-main) — plus the beehive-owned links file. Building the
+// set from those two canonical declarations, rather than a hand-maintained
+// list, keeps it in lockstep with every file a real "edit with AI" link ever
+// targets. PLAN.md, secrets, and submodule CODE stay categorically off
+// limits: they are honeybee/swarm-owned or security-sensitive and are never
+// reachable through this editor.
+var editableBasenames = buildEditableBasenames()
+
+func buildEditableBasenames() map[string]bool {
+	m := map[string]bool{repo.LinksFile: true}
+	for _, f := range repo.OptionalFiles {
+		m[f] = true
+	}
+	for _, f := range repo.RootInstructionFiles {
+		m[f.File] = true
+	}
+	return m
 }
 
 // ErrDeleteNeedsConfirm is returned by Merge when the pending proposal would

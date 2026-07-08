@@ -8,16 +8,37 @@ import (
 	"github.com/spencerharmon/beehive/internal/editor"
 )
 
-// editNew opens a fresh editor session for ?file=<repo-relative> and redirects
-// to its chat page. The "edit with AI" links across the UI point here.
+// editNew opens a fresh, publish-capable editor session for the requested
+// coordination file and redirects to its chat page. Every edit-with-AI link
+// across the UI (dashboard/explorer/roi_editor) passes the file as ?path=; a
+// bare ?file= is accepted too (the older param name, and any direct/API
+// caller). This is the ONE HTTP entry point every edit-with-AI request reaches
+// (ai-edit-publish-to-main) — see editEntry in web.go.
 func (s *Server) editNew(w http.ResponseWriter, r *http.Request) {
-	file := r.URL.Query().Get("file")
-	sess, err := s.editors.Open(r.Context(), file)
+	sess, err := s.editors.Open(r.Context(), requestedFile(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	http.Redirect(w, r, "/editor/"+sess.ID, http.StatusSeeOther)
+}
+
+// requestedFile resolves the repo-relative file a GET /edit request names,
+// preferring the query string (every template link is a plain GET anchor with
+// ?path=) and falling back to a form value, so a POST body or a future ?file=
+// caller resolves the same way with no separate code path. path= is checked
+// before the older file= from either source.
+func requestedFile(r *http.Request) string {
+	if v := r.URL.Query().Get("path"); v != "" {
+		return v
+	}
+	if v := r.URL.Query().Get("file"); v != "" {
+		return v
+	}
+	if v := r.FormValue("path"); v != "" {
+		return v
+	}
+	return r.FormValue("file")
 }
 
 // editorPage is the chat shell; its panel auto-refreshes via HTMX so the diff and

@@ -17,15 +17,28 @@ import (
 )
 
 // chat-diff-editor-core: a generic chat-diff surface over ANY repo file. Unlike
-// the single-file editor (internal/editor, restricted to human-owned
-// coordination files that the agent edits in place), a chat-edit session opens an
-// opencode session in a per-edit worktree of the beehive ROOT repo and drives a
-// propose-then-apply loop: the agent replies with the COMPLETE proposed file
-// contents wrapped in markers, beehived holds that proposal in memory and renders
-// it as a unified diff against the worktree's current state, and NOTHING is
-// written or committed until the human approves. Approve writes the proposal and
-// commits it in the edit worktree (never published to main here); reject drops it
-// (a pure no-op). This is the foundation the downstream chat-diff tasks build on.
+// the single-file editor (internal/editor, restricted to the beehive
+// coordination-file allowlist), a chat-edit session opens an opencode session in
+// a per-edit worktree of the beehive ROOT repo and drives a propose-then-apply
+// loop: the agent replies with the COMPLETE proposed file contents wrapped in
+// markers, beehived holds that proposal in memory and renders it as a unified
+// diff against the worktree's current state, and NOTHING is written or committed
+// until the human approves. Approve writes the proposal and commits it in the
+// edit worktree; nothing here publishes that commit to main.
+//
+// ai-edit-publish-to-main retired this as a GENERAL edit-with-AI surface: every
+// real edit-with-AI link (dashboard/explorer/roi_editor) carries a path and
+// reaches internal/editor's publish-capable Manager instead (editEntry, in
+// web.go), whose Merge lands an approved change on main — this manager's
+// approve-and-stop had no such step, so a path-carrying request would silently
+// dead-end on a throwaway branch main never advances to. What remains here is
+// ONE consumer: the bootstrap wizard's singleton session over the fixed path
+// LOCALS.md (bootstrap.go's openBootstrap, surfaced only via GET /bootstrap),
+// which is deliberately a slow, conversational draft-then-approve loop an
+// operator drives to completion before anything needs to land on main. Its
+// chat/approve/reject panel fragments (/edit/{id}/panel|message|approve|reject)
+// stay wired for that one caller; the GENERIC per-path HTTP entry (a POST /edit
+// open and the /edit/{id} full-page view) is gone — see web.go's editEntry.
 
 // proposeOpen/proposeClose bracket the full proposed file contents in the agent's
 // reply. They are deliberately unlikely to appear in real file content; a reply
@@ -388,44 +401,10 @@ func seedPrompt(path, current, msg string) string {
 }
 
 // ---- HTTP handlers ----
-
-// editEntry dispatches GET /edit. The generic chat-diff editor is selected by
-// ?path=<repo-relative>; the legacy single-file editor's ?file= links still reach
-// their handler, so both coexist during the migration.
-func (s *Server) editEntry(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("path") != "" {
-		s.chatOpen(w, r)
-		return
-	}
-	s.editNew(w, r)
-}
-
-// chatOpen handles GET/POST /edit?path=<repo-relative>: it opens a chat-edit
-// session and redirects to its page. Path validation failures are a 400.
-func (s *Server) chatOpen(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		path = r.FormValue("path")
-	}
-	sess, err := s.chat.open(r.Context(), path)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	http.Redirect(w, r, "/edit/"+sess.ID, http.StatusSeeOther)
-}
-
-// chatPage is the chat shell; its panel loads once via HTMX and then re-renders
-// on each synchronous message/approve/reject response (no background poll needed,
-// since a turn is awaited before the panel is returned).
-func (s *Server) chatPage(w http.ResponseWriter, r *http.Request) {
-	sess, ok := s.chat.get(r.PathValue("id"))
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	s.render(w, "chatedit.html", map[string]interface{}{"ID": sess.ID, "Path": sess.Path})
-}
+//
+// editEntry (GET /edit, every edit-with-AI link's entry point) and the generic
+// per-path open (POST /edit -> chatOpen) and full-page view (GET /edit/{id} ->
+// chatPage) are gone; see web.go's editEntry and the file-header note above.
 
 // chatPanel renders the live chat log, diff and proposal controls.
 func (s *Server) chatPanel(w http.ResponseWriter, r *http.Request) {

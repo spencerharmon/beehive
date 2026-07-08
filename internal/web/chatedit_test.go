@@ -2,8 +2,6 @@ package web
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -299,42 +297,14 @@ func TestCleanRepoPathRejectsTraversal(t *testing.T) {
 	}
 }
 
-// TestChatOpenHandlerRejectsTraversal: the HTTP entrypoint maps a bad path to 400
-// (no worktree, no session).
-func TestChatOpenHandlerRejectsTraversal(t *testing.T) {
-	s, _ := chatFixture(t, "")
-	req := httptest.NewRequest("POST", "/edit", strings.NewReader("path=../evil"))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w := httptest.NewRecorder()
-	s.Routes().ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("traversal path should be 400, got %d", w.Code)
-	}
-}
-
-// TestChatOpenHandlerRedirects: GET /edit?path= opens a session and redirects to
-// its page; the page and panel then render.
-func TestChatOpenHandlerRedirects(t *testing.T) {
-	s, _ := chatFixture(t, "")
-	w := get(t, s, "/edit?path=submodules/alpha/notes.md")
-	if w.Code != http.StatusSeeOther {
-		t.Fatalf("open should redirect (303), got %d", w.Code)
-	}
-	loc := w.Header().Get("Location")
-	if !strings.HasPrefix(loc, "/edit/edit-") {
-		t.Fatalf("unexpected redirect target %q", loc)
-	}
-	if page := get(t, s, loc).Body.String(); !strings.Contains(page, "chat-edit · submodules/alpha/notes.md") {
-		t.Fatalf("chat page did not render: %s", page)
-	}
-	panel := get(t, s, loc+"/panel")
-	if panel.Code != http.StatusOK {
-		t.Fatalf("panel status %d", panel.Code)
-	}
-	if !strings.Contains(panel.Body.String(), "No pending proposal") {
-		t.Fatalf("panel should show no-proposal state:\n%s", panel.Body.String())
-	}
-}
+// The GET/POST /edit HTTP entry point once redirected any ?path= straight into
+// this package's chatManager (TestChatOpenHandlerRedirects /
+// TestChatOpenHandlerRejectsTraversal, since removed): ai-edit-publish-to-main
+// retired that entry — GET /edit now always opens through the publish-capable
+// internal/editor Manager (editEntry in web.go; see
+// TestEditEntryOpensPublishCapableEditor and friends in web_test.go). What
+// remains here (chatManager.open/chat/approve/reject, exercised directly below)
+// is the still-live engine backing the bootstrap wizard's LOCALS.md session.
 
 // TestChatPanelWiring locks the scroll-preserve/pin contract on the polled chat
 // pane and the diff pane (mirrors the editor_panel wiring test).
