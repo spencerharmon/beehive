@@ -2,11 +2,15 @@ package web
 
 import (
 	"context"
+	"errors"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/editor"
@@ -38,6 +42,78 @@ func (s *fakeChatSession) Prompt(ctx context.Context, text string) (string, erro
 }
 func (s *fakeChatSession) Messages(ctx context.Context) ([]swarm.Message, error) { return nil, nil }
 func (s *fakeChatSession) Close() error                                          { return nil }
+
+// blockingChatSession is a swarm.Session whose Prompt blocks until the test
+// closes unblock, so a test can deterministically observe the busy/connecting/
+// live-parts window of an in-flight turn without a fixed sleep. started is
+// closed the first time Prompt is entered, so a test can wait for the
+// background turn to actually begin before asserting on it. Messages returns a
+// fixed, in-flight-looking assistant message (parts) throughout — the live
+// preview a real opencode session would report while a turn runs.
+type blockingChatSession struct {
+	reply string
+	parts []swarm.Part
+
+	startOnce sync.Once
+	started   chan struct{}
+	unblock   chan struct{}
+}
+
+func newBlockingChatSession(reply string, parts []swarm.Part) *blockingChatSession {
+	return &blockingChatSession{reply: reply, parts: parts, started: make(chan struct{}), unblock: make(chan struct{})}
+}
+
+func (s *blockingChatSession) Prompt(ctx context.Context, text string) (string, error) {
+	s.startOnce.Do(func() { close(s.started) })
+	select {
+	case <-s.unblock:
+		return s.reply, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (s *blockingChatSession) Messages(ctx context.Context) ([]swarm.Message, error) {
+	return []swarm.Message{{ID: "asst-1", Role: "assistant", Parts: s.parts}}, nil
+}
+
+func (s *blockingChatSession) Close() error { return nil }
+
+// blockingChatClient is a swarm.Client whose Open blocks until openGate is
+// closed (nil = connect immediately), so a test can observe the "connecting"
+// window deterministically before the underlying session becomes reachable.
+type blockingChatClient struct {
+	openGate chan struct{}
+	sess     swarm.Session
+}
+
+func (c *blockingChatClient) Open(ctx context.Context, cwd, system string) (swarm.Session, error) {
+	if c.openGate != nil {
+		select {
+		case <-c.openGate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return c.sess, nil
+}
+
+// waitForTrue polls cond until it reports true or timeout passes, so a test can
+// await an async goroutine's progress deterministically instead of a fixed
+// sleep (mirrors swarm's waitForContains bounded-poll pattern).
+func waitForTrue(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !cond() {
+		t.Fatalf("condition not met within %s", timeout)
+	}
+}
 
 // proposeReply builds an agent reply carrying a full-file proposal: a one-line
 // message followed by content wrapped in the propose markers.
@@ -314,6 +390,274 @@ func TestChatPanelWiring(t *testing.T) {
 	for _, want := range []string{`id="chatedit-chat"`, `id="chatedit-diff"`, "data-scroll-preserve", "data-scroll-pin"} {
 		if !strings.Contains(panel, want) {
 			t.Fatalf("chatedit_panel.html missing %q:\n%s", want, panel)
+		}
+	}
+}
+
+// ---- chat-editor-snappy-polish ----
+
+// TestChatConnStateLifecycle proves the connecting -> connected transition
+// happens on its own, at session-open time (prewarm), never gated on the user
+// sending a message: right after open the connect is still gated (openGate),
+// so connState reads "connecting"; once the gate releases, it converges to
+// "connected" without any turn ever having been sent.
+func TestChatConnStateLifecycle(t *testing.T) {
+	gate := make(chan struct{})
+	client := &blockingChatClient{openGate: gate, sess: newBlockingChatSession("hi", nil)}
+	s, _ := chatFixtureClient(t, client)
+	ctx := context.Background()
+
+	sess, err := s.chat.open(ctx, "submodules/alpha/notes.md")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if got := sess.connState(); got != "connecting" {
+		t.Fatalf("connState = %q before the gated connect completes, want connecting", got)
+	}
+	close(gate)
+	waitForTrue(t, 2*time.Second, func() bool { return sess.connState() == "connected" })
+}
+
+// TestChatConnStateError proves a failed connect surfaces as an explicit
+// "error" state (with the failure text available) rather than leaving the
+// panel stuck silently on "connecting" forever.
+func TestChatConnStateError(t *testing.T) {
+	s, _ := chatFixtureClient(t, erroringChatClient{})
+	ctx := context.Background()
+
+	sess, err := s.chat.open(ctx, "submodules/alpha/notes.md")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	waitForTrue(t, 2*time.Second, func() bool { return sess.connState() == "error" })
+	if sess.connectError() == "" {
+		t.Fatal("connectError should be populated once connState is error")
+	}
+}
+
+// erroringChatClient always fails to connect (simulates an unreachable
+// opencode server).
+type erroringChatClient struct{}
+
+var errFakeUnreachable = errors.New("fake opencode server unreachable")
+
+func (erroringChatClient) Open(ctx context.Context, cwd, system string) (swarm.Session, error) {
+	return nil, errFakeUnreachable
+}
+
+// TestChatStartChatIsAsyncWithLiveParts proves startChat returns immediately
+// with the user's message already recorded and Busy visible — before the
+// (gated) turn ever settles — and that the panel's LiveParts surface the
+// in-flight assistant message's reasoning/tool-call breakdown with live status
+// while busy. Once unblocked, the turn settles, the proposal is parsed, and the
+// FINAL chatTurn carries the same structured parts for persistent history.
+func TestChatStartChatIsAsyncWithLiveParts(t *testing.T) {
+	liveParts := []swarm.Part{
+		{ID: "r1", Type: "reasoning", Text: "thinking about gamma"},
+		{ID: "t1", Type: "tool", Tool: "bash", Status: "running", Title: "run tests"},
+	}
+	bs := newBlockingChatSession(proposeReply("I appended gamma.", "alpha\nbeta\ngamma"), liveParts)
+	s, _ := chatFixtureClient(t, &blockingChatClient{sess: bs})
+	ctx := context.Background()
+	path := "submodules/alpha/notes.md"
+
+	sess, err := s.chat.open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := sess.startChat("add a gamma line"); err != nil {
+		t.Fatalf("startChat: %v", err)
+	}
+	// Immediately visible, before the turn is unblocked: the message and busy.
+	log := sess.logCopy()
+	if len(log) != 1 || log[0].Role != "user" || log[0].Text != "add a gamma line" {
+		t.Fatalf("user message not recorded synchronously by startChat: %+v", log)
+	}
+	if !sess.isBusy() {
+		t.Fatal("session should be busy immediately after startChat, before the turn settles")
+	}
+
+	select {
+	case <-bs.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background turn never reached Prompt")
+	}
+
+	data := s.chatPanelData(ctx, sess)
+	if data["Busy"] != true {
+		t.Fatal("panel should report Busy while the turn is in flight")
+	}
+	live, _ := data["LiveParts"].([]swarm.Part)
+	if len(live) != 2 || live[0].Type != "reasoning" || live[1].Status != "running" {
+		t.Fatalf("panel should surface the live in-flight parts: %+v", live)
+	}
+
+	close(bs.unblock)
+	waitForTrue(t, 2*time.Second, func() bool { return !sess.isBusy() })
+
+	log = sess.logCopy()
+	if len(log) != 2 || log[1].Role != "agent" {
+		t.Fatalf("agent turn not recorded after settling: %+v", log)
+	}
+	if len(log[1].Parts) != 2 || log[1].Parts[1].Status != "running" {
+		t.Fatalf("final turn should carry the structured parts breakdown: %+v", log[1].Parts)
+	}
+	if _, ok := sess.pending(); !ok {
+		t.Fatal("expected a pending proposal once the turn settles")
+	}
+}
+
+// TestChatMessageHandlerReturnsBeforeTurnSettles drives the real HTTP handler
+// (chatMessage) end to end: the POST must return the panel with the message
+// already rendered and a "working" state WITHOUT waiting for the gated turn to
+// finish, proving the handler itself is non-blocking (not just the underlying
+// session methods).
+func TestChatMessageHandlerReturnsBeforeTurnSettles(t *testing.T) {
+	bs := newBlockingChatSession("no proposal, just an answer", nil)
+	s, _ := chatFixtureClient(t, &blockingChatClient{sess: bs})
+	ctx := context.Background()
+	sess, err := s.chat.open(ctx, "submodules/alpha/notes.md")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	w := postForm(t, s, "/edit/"+sess.ID+"/message", url.Values{"message": {"hello"}})
+	if w.Code != 200 {
+		t.Fatalf("POST /edit/{id}/message = %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "hello") {
+		t.Fatalf("response should already render the user's message:\n%s", body)
+	}
+	if !strings.Contains(body, "working") {
+		t.Fatalf("response should show the working state while the turn is in flight:\n%s", body)
+	}
+	close(bs.unblock)
+	waitForTrue(t, 2*time.Second, func() bool { return !sess.isBusy() })
+}
+
+// TestChatPanelRendersConnAndAgentParts locks the new panel markup: distinct
+// connecting/connected/working/error badges, and every agent-output part
+// (reasoning + tool call) rendered as an expandable <details> with a live
+// status badge, for both the DURING-the-turn preview (LiveParts) and settled
+// per-turn history (Log[i].Parts).
+func TestChatPanelRendersConnAndAgentParts(t *testing.T) {
+	s, _ := chatFixture(t, "")
+
+	connecting := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{
+		"ID": "c1", "Path": "submodules/alpha/notes.md", "ConnState": "connecting",
+	})
+	if !strings.Contains(connecting, `state connecting`) {
+		t.Fatalf("panel missing the connecting state:\n%s", connecting)
+	}
+
+	errPanel := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{
+		"ID": "c1", "Path": "submodules/alpha/notes.md", "ConnState": "error", "ConnectError": "dial tcp: refused",
+	})
+	if !strings.Contains(errPanel, `state error`) || !strings.Contains(errPanel, "dial tcp: refused") {
+		t.Fatalf("panel missing the error state/detail:\n%s", errPanel)
+	}
+
+	working := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{
+		"ID": "c1", "Path": "submodules/alpha/notes.md", "ConnState": "connected", "Busy": true,
+		"LiveParts": []swarm.Part{
+			{Type: "reasoning", Text: "considering the change"},
+			{Type: "tool", Tool: "bash", Status: "running", Title: "run go test", Input: map[string]any{"cmd": "go test ./..."}},
+		},
+	})
+	for _, want := range []string{
+		"state working", "<details", "considering the change", "run go test",
+		`class="part-status running"`, "cmd", "go test ./...",
+	} {
+		if !strings.Contains(working, want) {
+			t.Fatalf("working panel missing %q:\n%s", want, working)
+		}
+	}
+
+	settled := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{
+		"ID": "c1", "Path": "submodules/alpha/notes.md", "ConnState": "connected", "Busy": false,
+		"Log": []chatTurn{
+			{Role: "agent", Text: "Done.", Parts: []swarm.Part{
+				{Type: "tool", Tool: "write", Status: "completed", Title: "write notes.md", Output: "wrote 3 lines"},
+			}},
+		},
+	})
+	for _, want := range []string{"state connected", "write notes.md", `class="part-status completed"`, "wrote 3 lines"} {
+		if !strings.Contains(settled, want) {
+			t.Fatalf("settled panel missing %q:\n%s", want, settled)
+		}
+	}
+	// "working" must NOT appear once the turn has settled and nothing is busy.
+	if strings.Contains(settled, "state working") {
+		t.Fatalf("settled panel must not show the working state:\n%s", settled)
+	}
+}
+
+// TestChatPanelDataColorizesRecognizedLanguage proves chatPanelData renders the
+// diff through RenderDiffFile (language/markdown syntax highlighting) using the
+// session's own path, not the plain RenderDiff.
+func TestChatPanelDataColorizesRecognizedLanguage(t *testing.T) {
+	s, _ := chatFixture(t, proposeReply("Added main.", "package main\n\nfunc main() {}\n"))
+	ctx := context.Background()
+	path := "submodules/alpha/main.go"
+
+	sess, err := s.chat.open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := sess.chat(ctx, "create main.go"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	data := s.chatPanelData(ctx, sess)
+	rows := data["Rows"].([]editor.DiffRow)
+	var gotTok bool
+	for _, r := range rows {
+		if strings.Contains(string(r.HTML), `class="tok-`) {
+			gotTok = true
+			break
+		}
+	}
+	if !gotTok {
+		t.Fatalf("expected a syntax-highlighted (tok-*) row for a .go file: %+v", rows)
+	}
+}
+
+// TestChatStartChatRejectsWhileBusy proves a turn already in flight rejects a
+// second startChat with errBusy instead of queuing or clobbering it, matching
+// the previous synchronous chat's one-turn-at-a-time contract.
+func TestChatStartChatRejectsWhileBusy(t *testing.T) {
+	bs := newBlockingChatSession("ok", nil)
+	s, _ := chatFixtureClient(t, &blockingChatClient{sess: bs})
+	ctx := context.Background()
+	sess, err := s.chat.open(ctx, "submodules/alpha/notes.md")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := sess.startChat("first"); err != nil {
+		t.Fatalf("startChat: %v", err)
+	}
+	if err := sess.startChat("second"); err != errBusy {
+		t.Fatalf("startChat while busy = %v, want errBusy", err)
+	}
+	close(bs.unblock)
+	waitForTrue(t, 2*time.Second, func() bool { return !sess.isBusy() })
+}
+
+// TestBootstrapAgentOptimisticSendWiring locks the client-side markup that
+// makes the user's own message appear immediately on send: a stable form id,
+// the polling trigger on #chatedit (so progress/completion are picked up with
+// no further user action), and the optimistic-echo script wired to it.
+func TestBootstrapAgentOptimisticSendWiring(t *testing.T) {
+	s, _ := chatFixture(t, "")
+	body := renderTmpl(t, s, "bootstrap_agent.html", map[string]interface{}{"ID": "c1", "Path": "LOCALS.md"})
+	for _, want := range []string{
+		`id="chatedit-form"`,
+		`hx-trigger="load, every 1500ms"`,
+		"getElementById('chatedit-form')",
+		"getElementById('chatedit-chat')",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("bootstrap_agent.html missing %q:\n%s", want, body)
 		}
 	}
 }

@@ -9,6 +9,9 @@ package editor
 import (
 	"html/template"
 	"strings"
+
+	"github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/lexers"
 )
 
 // diffOp is one step of the line-level edit script.
@@ -178,6 +181,95 @@ func RenderDiff(old, new string) []DiffRow {
 		}
 	}
 	return rows
+}
+
+// RenderDiffFile is RenderDiff plus per-line syntax highlighting for a language
+// recognized from filename (matched by extension/basename against chroma's
+// lexer set, e.g. "x.go", "x.py", "README.md", "Makefile" — chat-editor-snappy-
+// polish). Each row's text is colorized by tokenizing the WHOLE old/new source
+// (so multi-line constructs like block comments lex correctly) and slicing the
+// result back into per-line HTML fragments that line up with the same
+// line-level diff (diffLines) RenderDiff uses; the add/del/eq line coloring is
+// unchanged. A recognized language replaces the intra-line "chg" replace-column
+// highlighting with token colors instead of layering both (avoids overlapping
+// span nesting). Falls back to RenderDiff's plain rendering — unchanged,
+// including its "chg" spans — whenever no lexer matches filename, or the lexer's
+// line count cannot be lined up 1:1 with the plain split (a defensive fallback
+// so a lexer quirk on unusual input degrades to today's rendering instead of
+// ever mis-rendering or panicking).
+func RenderDiffFile(old, new, filename string) []DiffRow {
+	lex := lexers.Match(filename)
+	if lex == nil {
+		return RenderDiff(old, new)
+	}
+	oldLines := splitLines(old)
+	newLines := splitLines(new)
+	oldColored, ok := tokenizeLines(lex, old, len(oldLines))
+	if !ok {
+		return RenderDiff(old, new)
+	}
+	newColored, ok := tokenizeLines(lex, new, len(newLines))
+	if !ok {
+		return RenderDiff(old, new)
+	}
+	ops := diffLines(oldLines, newLines)
+	var rows []DiffRow
+	oi, ni := 0, 0
+	for _, op := range ops {
+		switch op.kind {
+		case 'e':
+			rows = append(rows, DiffRow{"eq", oldColored[oi]})
+			oi++
+			ni++
+		case '-':
+			rows = append(rows, DiffRow{"del", oldColored[oi]})
+			oi++
+		case '+':
+			rows = append(rows, DiffRow{"add", newColored[ni]})
+			ni++
+		}
+	}
+	return rows
+}
+
+// tokenizeLines tokenizes src with lex and renders each source line as an HTML
+// fragment (escaped text, with a `tok-<class>` span per non-trivial token; see
+// chroma.StandardTypes for the short class names). ok is false whenever the
+// tokenizer errors or its line count disagrees with wantLines, so the caller can
+// safely fall back to the plain renderer instead of indexing out of range or
+// silently misaligning rows with the wrong source line.
+func tokenizeLines(lex chroma.Lexer, src string, wantLines int) (out []template.HTML, ok bool) {
+	it, err := chroma.Coalesce(lex).Tokenise(nil, src)
+	if err != nil {
+		return nil, false
+	}
+	lines := chroma.SplitTokensIntoLines(it.Tokens())
+	if len(lines) != wantLines {
+		return nil, false
+	}
+	out = make([]template.HTML, len(lines))
+	for i, toks := range lines {
+		var b strings.Builder
+		for _, t := range toks {
+			v := strings.TrimSuffix(t.Value, "\n")
+			if v == "" {
+				continue
+			}
+			esc := template.HTMLEscapeString(v)
+			cls := chroma.StandardTypes[t.Type]
+			if cls == "" {
+				b.WriteString(esc)
+				continue
+			}
+			b.WriteString(`<span class="tok-`)
+			b.WriteString(cls)
+			b.WriteString(`">`)
+			b.WriteString(esc)
+			b.WriteString(`</span>`)
+		}
+		out[i] = template.HTML(b.String())
+	}
+	return out, true
 }
 
 func splitLines(s string) []string {

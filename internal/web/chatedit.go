@@ -55,10 +55,15 @@ var (
 )
 
 // chatTurn is one message in a session's log ("user", "agent", or "system").
+// Parts is the reasoning/tool-call breakdown behind an agent turn's flattened
+// Text (nil for user/system turns, and for a client with no structured history —
+// see swarm.Session.Messages): each is rendered expandable, inline, alongside
+// the turn (chat-editor-snappy-polish "show ALL agent output").
 type chatTurn struct {
-	Role string
-	Text string
-	At   time.Time
+	Role  string
+	Text  string
+	At    time.Time
+	Parts []swarm.Part
 }
 
 // chatManager owns the active chat-edit sessions and the per-edit worktrees
@@ -102,8 +107,12 @@ func newChatManager(root string, client swarm.Client) *chatManager {
 }
 
 // chatSession is one propose-then-apply edit of a single repo file on its own
-// throwaway worktree branch. The opencode session is opened lazily on the first
-// turn; the pending proposal lives only in memory until approved.
+// throwaway worktree branch. The opencode session is opened EAGERLY in the
+// background as soon as the session is created (see prewarm) rather than on the
+// first turn, so the panel's connecting -> connected transition (connState)
+// happens on its own instead of waiting on the user's first message — a session
+// that sits open and unused still tells the human it is reachable. The pending
+// proposal lives only in memory until approved.
 type chatSession struct {
 	ID     string
 	Path   string // repo-relative, slash form (any file, e.g. submodules/x/notes.md)
@@ -113,12 +122,20 @@ type chatSession struct {
 	mgr    *chatManager
 	wt     *git.Repo // the per-edit worktree
 
-	mu       sync.Mutex
-	oc       swarm.Session // lazy: opened on first turn
-	log      []chatTurn
-	proposal *string // pending full-file proposal, nil when none
-	busy     bool
-	errMsg   string
+	// openMu serializes opencode session creation: the background prewarm and the
+	// user's first real turn can both reach ensureOpen concurrently, and this
+	// guarantees exactly one of them calls the client's Open while the other
+	// reuses its result.
+	openMu sync.Mutex
+
+	mu         sync.Mutex
+	oc         swarm.Session // set once ensureOpen succeeds (prewarm, or lazily)
+	connectErr string        // set when the initial connect attempt failed
+	seeded     bool          // whether the first turn's file-content seed has been sent
+	log        []chatTurn
+	proposal   *string // pending full-file proposal, nil when none
+	busy       bool
+	errMsg     string
 }
 
 // open validates rawPath, cuts a fresh worktree/branch off local main, and
@@ -155,6 +172,7 @@ func (m *chatManager) openWith(ctx context.Context, clean, sys string) (*chatSes
 	m.mu.Lock()
 	m.byID[s.ID] = s
 	m.mu.Unlock()
+	go s.prewarm()
 	return s, nil
 }
 
@@ -168,29 +186,71 @@ func (m *chatManager) get(id string) (*chatSession, bool) {
 
 // chat runs one turn synchronously: it records the user message, awaits the
 // assistant turn (opencode-turn-poll, via swarm.Session.Prompt), parses any
-// proposal out of the reply, and records the agent message. Holding the turn
-// synchronous means the panel that renders after this call already carries the
-// proposed diff — the human never sees a half-finished turn. One turn at a time.
+// proposal out of the reply, and records the agent message. Used directly by
+// callers (and tests) that want to block for the result; the HTTP path uses the
+// asynchronous startChat instead (chat-editor-snappy-polish) so the panel that
+// renders after a POST never blocks on the whole, often-slow turn. One turn at a
+// time either way.
 func (s *chatSession) chat(ctx context.Context, msg string) error {
+	if err := s.beginTurn(msg); err != nil {
+		return err
+	}
+	return s.runTurn(ctx, msg)
+}
+
+// startChat records the user message and runs the turn in the BACKGROUND, so the
+// caller (the HTTP handler) returns immediately with the message already in the
+// log and a busy/"working" state visible — the human is never stranded on a bare
+// spinner waiting for the whole agent turn before anything happens on screen.
+// Mirrors resolveSession.startChat's sync/async split. One turn at a time.
+func (s *chatSession) startChat(msg string) error {
+	if err := s.beginTurn(msg); err != nil {
+		return err
+	}
+	go s.runTurn(context.Background(), msg)
+	return nil
+}
+
+// beginTurn claims the busy flag and records the user's message, rejecting a
+// turn already in progress. Split out of chat/startChat so both the
+// synchronous and background paths record the message identically and
+// IMMEDIATELY — the part of "the user's own message appears immediately on
+// send" that happens before any network call, and before the caller decides
+// whether to await the rest of the turn or return right away.
+func (s *chatSession) beginTurn(msg string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.busy {
-		s.mu.Unlock()
 		return errBusy
 	}
 	s.busy = true
 	s.errMsg = ""
 	s.log = append(s.log, chatTurn{Role: "user", Text: msg, At: s.mgr.now()})
-	s.mu.Unlock()
+	return nil
+}
 
+// runTurn drives the assistant turn to completion and records its outcome: the
+// pending proposal (if any), the flattened display text, and — when the client
+// exposes structured history — the reasoning/tool-call parts behind that reply,
+// captured AFTER the turn settles so the persisted history shows the final
+// status of every part (see chatPanelData, which calls lastAssistantParts again
+// while Busy for the DURING-the-turn view of the same parts).
+func (s *chatSession) runTurn(ctx context.Context, msg string) error {
 	reply, err := s.prompt(ctx, msg)
+	if err != nil {
+		s.mu.Lock()
+		s.busy = false
+		s.errMsg = err.Error()
+		s.mu.Unlock()
+		return err
+	}
+	// Fetched before taking s.mu below: it issues its own HTTP call (via the
+	// opencode session) and must never run while holding the session lock.
+	parts := s.lastAssistantParts(ctx)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.busy = false
-	if err != nil {
-		s.errMsg = err.Error()
-		return err
-	}
 	display, proposed, ok := extractProposal(reply)
 	if ok {
 		if strings.TrimSpace(display) == "" {
@@ -199,29 +259,122 @@ func (s *chatSession) chat(ctx context.Context, msg string) error {
 		p := proposed
 		s.proposal = &p
 	}
-	s.log = append(s.log, chatTurn{Role: "agent", Text: display, At: s.mgr.now()})
+	s.log = append(s.log, chatTurn{Role: "agent", Text: display, At: s.mgr.now(), Parts: parts})
 	return nil
 }
 
-// prompt opens the opencode session on first use (seeding the system prompt and,
-// on that first turn, the current file contents so the agent can return a full
-// proposed file) and reuses it for later turns. Never called under s.mu.
-func (s *chatSession) prompt(ctx context.Context, msg string) (string, error) {
+// prewarmTimeout bounds the background connect kicked off at session-open (see
+// prewarm), so a wedged/unreachable opencode server can never leak the goroutine
+// past a bounded window. It does not gate anything else: a slow or failed
+// prewarm never blocks the user's first real message, which retries the connect
+// itself via ensureOpen.
+const prewarmTimeout = 30 * time.Second
+
+// prewarm eagerly opens the underlying opencode session as soon as a chat
+// session is created, instead of waiting for the user's first message, so the
+// panel's connecting -> connected transition (connState) happens on its own —
+// the point of showing "connecting" right at session-open time rather than only
+// after the human has already typed something.
+func (s *chatSession) prewarm() {
+	ctx, cancel := context.WithTimeout(context.Background(), prewarmTimeout)
+	defer cancel()
+	_, _ = s.ensureOpen(ctx)
+}
+
+// ensureOpen opens the opencode session on first use and reuses it afterward.
+// openMu serializes a background prewarm racing the user's first real turn, so
+// exactly one caller invokes the client's Open and the other reuses its result
+// (or its failure) instead of opening a second, orphaned session.
+func (s *chatSession) ensureOpen(ctx context.Context) (swarm.Session, error) {
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
 	s.mu.Lock()
 	oc := s.oc
 	s.mu.Unlock()
 	if oc != nil {
-		return oc.Prompt(ctx, msg)
+		return oc, nil
 	}
 	sess, err := s.mgr.client.Open(ctx, s.wtPath, s.sys)
+	s.mu.Lock()
+	if err != nil {
+		s.connectErr = err.Error()
+	} else {
+		s.oc = sess
+		s.connectErr = ""
+	}
+	s.mu.Unlock()
+	return sess, err
+}
+
+// connState reports the session's connection lifecycle for the panel:
+// "connecting" before the opencode session is established (prewarm still in
+// flight, or never attempted), "connected" once it is open, or "error" when the
+// connect attempt failed — surfaced explicitly instead of silently waiting
+// forever (chat-editor-snappy-polish: never strand the user on a bare spinner).
+func (s *chatSession) connState() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.oc != nil {
+		return "connected"
+	}
+	if s.connectErr != "" {
+		return "error"
+	}
+	return "connecting"
+}
+
+// connectError returns the last connect failure, "" when none (or connected).
+func (s *chatSession) connectError() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connectErr
+}
+
+// lastAssistantParts returns the most recent assistant message's parts from the
+// live opencode session — the reasoning/tool-call breakdown behind a reply, used
+// both for the DURING-the-turn live preview (busy) and the persisted per-turn
+// history once it settles (runTurn). Returns nil before the session has
+// connected, on a Messages error, or when the client exposes no structured
+// history (Messages returning nil, nil — true of every test double that does
+// not opt in).
+func (s *chatSession) lastAssistantParts(ctx context.Context) []swarm.Part {
+	s.mu.Lock()
+	oc := s.oc
+	s.mu.Unlock()
+	if oc == nil {
+		return nil
+	}
+	msgs, err := oc.Messages(ctx)
+	if err != nil {
+		return nil
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			return msgs[i].Parts
+		}
+	}
+	return nil
+}
+
+// prompt ensures the opencode session is open — reusing a prewarm's connect
+// when it already completed, or connecting now (and retrying on a prior prewarm
+// failure) — then sends msg, seeding the current file contents into exactly the
+// first REAL turn (tracked by s.seeded, independent of when the connect itself
+// happened) so the agent can return a full proposed file on that turn.
+func (s *chatSession) prompt(ctx context.Context, msg string) (string, error) {
+	oc, err := s.ensureOpen(ctx)
 	if err != nil {
 		return "", err
 	}
 	s.mu.Lock()
-	s.oc = sess
+	seeded := s.seeded
+	s.seeded = true
 	s.mu.Unlock()
+	if seeded {
+		return oc.Prompt(ctx, msg)
+	}
 	base, _ := s.base(ctx)
-	return sess.Prompt(ctx, seedPrompt(s.Path, base, msg))
+	return oc.Prompt(ctx, seedPrompt(s.Path, base, msg))
 }
 
 // base is the file's current content in the edit worktree (git show HEAD:path).
@@ -416,9 +569,13 @@ func (s *Server) chatPanel(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "chatedit_panel.html", s.chatPanelData(r.Context(), sess))
 }
 
-// chatMessage runs one synchronous turn and returns the refreshed panel (carrying
-// any newly proposed diff). A turn error is recorded on the session and surfaced
-// in the panel, so the request itself still renders.
+// chatMessage starts the turn in the BACKGROUND (startChat) and returns the
+// panel immediately: the user's message and a "working" state are already in
+// it, well before the (often slow) agent turn finishes — the panel's own
+// polling (hx-trigger="load, every ...") picks up progress and the final reply
+// as they happen. A prior busy turn (errBusy) is simply not started again; the
+// message is dropped rather than queued, matching the previous synchronous
+// behavior's one-turn-at-a-time contract.
 func (s *Server) chatMessage(w http.ResponseWriter, r *http.Request) {
 	sess, ok := s.chat.get(r.PathValue("id"))
 	if !ok {
@@ -426,7 +583,7 @@ func (s *Server) chatMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg := strings.TrimSpace(r.FormValue("message")); msg != "" {
-		_ = sess.chat(r.Context(), msg)
+		_ = sess.startChat(msg)
 	}
 	s.render(w, "chatedit_panel.html", s.chatPanelData(r.Context(), sess))
 }
@@ -459,7 +616,12 @@ func (s *Server) chatReject(w http.ResponseWriter, r *http.Request) {
 
 // chatPanelData projects a session into the panel template model. With no pending
 // proposal the diff renders base against itself (the current file as context);
-// with one, base against the proposed content highlights the change.
+// with one, base against the proposed content highlights the change. The diff is
+// colorized by RenderDiffFile using sess.Path to pick a language (falling back to
+// RenderDiff's plain rendering when none matches). ConnState/ConnectError surface
+// the connecting/connected/error lifecycle (connState) and LiveParts is the
+// in-flight assistant turn's reasoning/tool-call breakdown while Busy, so the
+// panel never strands the human on a bare spinner (chat-editor-snappy-polish).
 func (s *Server) chatPanelData(ctx context.Context, sess *chatSession) map[string]interface{} {
 	base, _ := sess.base(ctx)
 	proposed, has := sess.pending()
@@ -467,13 +629,21 @@ func (s *Server) chatPanelData(ctx context.Context, sess *chatSession) map[strin
 	if has {
 		right = proposed
 	}
+	busy := sess.isBusy()
+	var live []swarm.Part
+	if busy {
+		live = sess.lastAssistantParts(ctx)
+	}
 	return map[string]interface{}{
-		"ID":          sess.ID,
-		"Path":        sess.Path,
-		"Log":         sess.logCopy(),
-		"Rows":        editor.RenderDiff(base, right),
-		"HasProposal": has,
-		"Busy":        sess.isBusy(),
-		"Error":       sess.errText(),
+		"ID":           sess.ID,
+		"Path":         sess.Path,
+		"Log":          sess.logCopy(),
+		"Rows":         editor.RenderDiffFile(base, right, sess.Path),
+		"HasProposal":  has,
+		"Busy":         busy,
+		"Error":        sess.errText(),
+		"ConnState":    sess.connState(),
+		"ConnectError": sess.connectError(),
+		"LiveParts":    live,
 	}
 }

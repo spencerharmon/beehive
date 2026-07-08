@@ -88,6 +88,15 @@
   --diff-del-bg: hsl(2 78% 93%);
   --diff-chg-bg: hsl(45 100% 74%);
   --diff-chg-del-bg: hsl(2 88% 78%);
+
+  /* Syntax token colours (light) — chat-editor-snappy-polish ------------- */
+  --tok-keyword: hsl(286 55% 44%);
+  --tok-string:  hsl(18 65% 42%);
+  --tok-number:  hsl(174 55% 32%);
+  --tok-comment: hsl(215 12% 50%);
+  --tok-name:    hsl(214 70% 42%);
+  --tok-op:      hsl(215 14% 40%);
+  --tok-heading: hsl(214 82% 40%);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -118,6 +127,14 @@
     --diff-del-bg: hsl(2 44% 28%);
     --diff-chg-bg: hsl(45 64% 34%);
     --diff-chg-del-bg: hsl(2 52% 40%);
+
+    --tok-keyword: hsl(286 70% 74%);
+    --tok-string:  hsl(18 80% 68%);
+    --tok-number:  hsl(174 55% 62%);
+    --tok-comment: hsl(215 12% 60%);
+    --tok-name:    hsl(214 90% 74%);
+    --tok-op:      hsl(215 14% 68%);
+    --tok-heading: hsl(212 90% 72%);
   }
 }
 
@@ -484,6 +501,17 @@ section { margin: var(--space-5) 0; }
   margin-right: var(--space-2);
 }
 .msg.busy .spinner { color: var(--text-muted); font-style: italic; }
+.msg.optimistic { opacity: 0.65; }
+
+/* Connection/turn state badge (chat-editor-snappy-polish): a session is always
+   in exactly one of connecting -> connected -> working (a turn in flight), or
+   error, shown above the chat log so the human is never left guessing whether
+   anything is happening. */
+.conn-status { margin-bottom: var(--space-2); }
+.state.connecting { background: var(--surface-2); color: var(--text-muted); border: var(--border-width) solid var(--border); }
+.state.connected { background: var(--success); color: #fff; }
+.state.working { background: hsl(var(--hue-active) 70% 42%); color: #fff; }
+.state.error { background: var(--danger); color: #fff; cursor: help; }
 
 .statusbar { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
 .state { padding: 0.12em 0.6em; border-radius: var(--radius-pill); font-weight: 700; font-size: var(--text-xs); }
@@ -502,6 +530,75 @@ pre.diff .ln.del { background: var(--diff-del-bg); text-decoration: line-through
 pre.diff .ln.eq { background: transparent; }
 pre.diff .chg { background: var(--diff-chg-bg); border-radius: 2px; }
 pre.diff .ln.del .chg { background: var(--diff-chg-del-bg); }
+
+/* Syntax token colours (chat-editor-snappy-polish): chroma's short pygments-
+ * style class names (e.g. .tok-k for a keyword, .tok-s1 for a single-quoted
+ * string — see chroma.StandardTypes), prefixed tok- and grouped by category so
+ * every lexer's fine-grained sub-types share one color regardless of language,
+ * including markdown's generic tokens (headings, emphasis, inserted/deleted). */
+.tok-k, .tok-kc, .tok-kd, .tok-kn, .tok-kp, .tok-kr, .tok-kt { color: var(--tok-keyword); font-weight: 600; }
+.tok-s, .tok-sa, .tok-sb, .tok-sc, .tok-dl, .tok-sd, .tok-s2, .tok-se, .tok-sh, .tok-si, .tok-sx, .tok-sr, .tok-s1, .tok-ss { color: var(--tok-string); }
+.tok-m, .tok-mb, .tok-mf, .tok-mh, .tok-mi, .tok-il, .tok-mo { color: var(--tok-number); }
+.tok-c, .tok-ch, .tok-cm, .tok-cp, .tok-cpf, .tok-c1, .tok-cs { color: var(--tok-comment); font-style: italic; }
+.tok-na, .tok-nc, .tok-nd, .tok-ne, .tok-nf, .tok-fm, .tok-nl, .tok-nn, .tok-py, .tok-nt, .tok-nv, .tok-vc, .tok-vg, .tok-vi, .tok-vm, .tok-no, .tok-bp, .tok-ni { color: var(--tok-name); }
+.tok-o, .tok-ow, .tok-p { color: var(--tok-op); }
+.tok-gh, .tok-gu { color: var(--tok-heading); font-weight: 700; }
+.tok-ge { font-style: italic; }
+.tok-gs { font-weight: 700; }
+.tok-gd { color: var(--danger); }
+.tok-gi { color: var(--success); }
+.tok-gr, .tok-err { color: var(--danger); }
+
+/* Expandable agent output (chat-editor-snappy-polish): every reasoning/tool-
+ * call part behind an agent turn, shown inline via a lightweight <details> (no
+ * JS) so a busy chat log doesn't sprawl — collapsed by default, one click to
+ * inspect. Reused identically for the settled per-turn history and the live,
+ * DURING-the-turn preview (see the "agent-parts" template block). */
+details.agent-part { margin: var(--space-2) 0 0; }
+details.agent-part > summary {
+  cursor: pointer;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  list-style: none;
+  user-select: none;
+}
+details.agent-part > summary::-webkit-details-marker { display: none; }
+details.agent-part > summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 0.35em;
+  transition: transform 120ms ease;
+}
+details.agent-part[open] > summary::before { transform: rotate(90deg); }
+.part-status {
+  display: inline-block;
+  padding: 0.05em 0.55em;
+  margin-left: 0.4em;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+.part-status.pending { background: var(--surface-2); color: var(--text-muted); }
+.part-status.running { background: hsl(var(--hue-active) 70% 42%); color: #fff; }
+.part-status.completed { background: var(--success); color: #fff; }
+.part-status.error { background: var(--danger); color: #fff; }
+pre.tool-io {
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  margin: var(--space-1) 0 0;
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+pre.tool-io.err { border-color: var(--danger); color: var(--danger); }
+dl.tool-input { margin: var(--space-1) 0 0; font-size: var(--text-xs); }
+dl.tool-input dt { font-weight: 600; color: var(--text-muted); float: left; clear: left; margin-right: 0.4em; }
+dl.tool-input dd { margin: 0 0 0.2em var(--space-4); word-break: break-word; }
 
 /* Narrow screens: stack the editor panes --------------------------------- */
 @media (max-width: 48rem) {

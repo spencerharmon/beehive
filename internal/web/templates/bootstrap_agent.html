@@ -1,13 +1,55 @@
 <div class="bootstrap-agent">
   <div id="chatedit"
        hx-get="/edit/{{.ID}}/panel"
-       hx-trigger="load"
+       hx-trigger="load, every 1500ms"
        hx-swap="innerHTML">
     <p class="muted">loading setup assistant&hellip;</p>
   </div>
-  <form hx-post="/edit/{{.ID}}/message" hx-target="#chatedit" hx-swap="innerHTML"
+  <form id="chatedit-form" hx-post="/edit/{{.ID}}/message" hx-target="#chatedit" hx-swap="innerHTML"
         hx-on::after-request="this.reset()">
     <input name="message" placeholder="Ask the setup guide, or say &ldquo;draft LOCALS.md&rdquo;&hellip;" autocomplete="off" style="width:70%">
     <button>send</button>
   </form>
 </div>
+<script>
+/* chatedit-optimistic-send (chat-editor-snappy-polish): sending a message must
+   render it immediately, client-side, before the (often slow) agent turn
+   replies — the panel's own poll (#chatedit above) now starts the turn in the
+   BACKGROUND and shows a "working" state, but even that first round trip is
+   latency the human shouldn't have to wait through to see their own words. This
+   listens on the form's native "submit", which fires on the form itself before
+   htmx's document-level delegated handler runs the actual request (target-phase
+   listeners precede bubbling ancestor ones for the same event), and appends a
+   plain, HTML-escaped-by-construction (textContent/createTextNode, never
+   innerHTML) message bubble straight into the chat log. It only ever READS the
+   input's value — never clears or otherwise mutates the form — so htmx still
+   submits the real message; the authoritative panel render that follows
+   moments later carries that SAME message from the session log, so this
+   optimistic bubble is simply superseded on the next swap, never duplicated.
+   Wired once (bootstrap_agent.html is not itself re-swapped by #chatedit's
+   polling, only its content is), guarded defensively in case that ever
+   changes. No SPA, no external libraries. */
+(function () {
+  var form = document.getElementById('chatedit-form');
+  if (!form || form.dataset.optimisticWired) return;
+  form.dataset.optimisticWired = '1';
+  form.addEventListener('submit', function () {
+    var input = form.elements['message'];
+    var text = input && input.value.trim();
+    if (!text) return;
+    var log = document.getElementById('chatedit-chat');
+    if (!log) return;
+    var empty = log.querySelector('.muted');
+    if (empty) empty.remove();
+    var msg = document.createElement('div');
+    msg.className = 'msg user optimistic';
+    var who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = 'user';
+    msg.appendChild(who);
+    msg.appendChild(document.createTextNode(' ' + text));
+    log.appendChild(msg);
+    log.scrollTop = log.scrollHeight;
+  });
+})();
+</script>

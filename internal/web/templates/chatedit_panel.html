@@ -1,7 +1,13 @@
+<div class="conn-status">
+  {{if eq .ConnState "connecting"}}<span class="state connecting">connecting…</span>
+  {{else if eq .ConnState "error"}}<span class="state error" title="{{.ConnectError}}">connection failed</span>
+  {{else if .Busy}}<span class="state working">working…</span>
+  {{else}}<span class="state connected">connected</span>{{end}}
+</div>
 <div class="editor-grid">
   <div class="chat" id="chatedit-chat" data-scroll-preserve data-scroll-pin>
-    {{range .Log}}<div class="msg {{.Role}}"><span class="who">{{.Role}}</span> {{.Text}}</div>{{else}}<p class="muted">Say what you'd like to change in {{.Path}}.</p>{{end}}
-    {{if .Busy}}<div class="msg agent busy"><span class="who">agent</span> <span class="spinner">thinking…</span></div>{{end}}
+    {{range .Log}}<div class="msg {{.Role}}"><span class="who">{{.Role}}</span> {{.Text}}{{template "agent-parts" .Parts}}</div>{{else}}<p class="muted">Say what you'd like to change in {{.Path}}.</p>{{end}}
+    {{if .Busy}}<div class="msg agent busy"><span class="who">agent</span> <span class="spinner">working…</span>{{template "agent-parts" .LiveParts}}</div>{{end}}
     {{if .Error}}<div class="msg err">⚠️ {{.Error}}</div>{{end}}
   </div>
   <div class="diffpane">
@@ -15,3 +21,20 @@
 {{else}}<span class="muted">no changes proposed yet</span>{{end}}</pre>
   </div>
 </div>
+
+{{/* agent-parts (chat-editor-snappy-polish): shared, expandable rendering of an
+     agent turn's reasoning/tool-call breakdown (swarm.Part), reused for both a
+     settled historical turn (chatTurn.Parts) and the live, DURING-the-turn
+     preview (LiveParts) — the same markup either way, so a part simply keeps
+     its place once the turn settles instead of being re-rendered differently.
+     "text"/"step-start"/"step-finish" parts carry no useful expandable content
+     (the reply text is already the turn's main bubble) and are skipped. */}}
+{{define "agent-parts"}}{{range .}}{{if eq .Type "reasoning"}}<details class="agent-part reasoning">
+  <summary>Reasoning</summary>
+  <pre class="tool-io">{{.Text}}</pre>
+</details>{{else if eq .Type "tool"}}<details class="agent-part tool">
+  <summary>Tool: {{if .Title}}{{.Title}}{{else}}{{.Tool}}{{end}} <span class="part-status {{.Status}}">{{.Status}}</span></summary>
+  {{if .Input}}<dl class="tool-input">{{range $k, $v := .Input}}<dt>{{$k}}</dt><dd>{{$v}}</dd>{{end}}</dl>{{end}}
+  {{if .Output}}<pre class="tool-io">{{.Output}}</pre>{{end}}
+  {{if .Error}}<pre class="tool-io err">{{.Error}}</pre>{{end}}
+</details>{{end}}{{end}}{{end}}
