@@ -808,6 +808,63 @@ func TestPlanViewPills(t *testing.T) {
 	}
 }
 
+// TestPlanRowDeepAnchors locks the per-row shareable anchor (plan-row-deep-
+// anchors): every plan row renders a stable id derived from its task id
+// (`task-<id>`, prefixed so it can't collide with any other element id) and
+// the id cell self-links to its own `#task-<id>` fragment, so
+// `/submodule/<name>/plan#task-<id>` — the exact form reviews, arbitrations,
+// and change docs already cite tasks by — actually scrolls to that row
+// instead of nowhere. Also locks that no column/order changed and that the
+// embedded stylesheet's `:target` highlight is token-driven (no new color
+// literal), scoped to anchor rows only.
+func TestPlanRowDeepAnchors(t *testing.T) {
+	s, _ := setup(t)
+	pl := Plan{ROIStamp: "abc123", Items: []PlanItem{
+		{ID: "imp", Status: StatusTODO, Desc: "implement it"},
+		{ID: "plan-row-deep-anchors", Status: StatusReview, Desc: "this very task"},
+	}}
+	out := renderTmpl(t, s, "plan_items.html", map[string]interface{}{"Name": "alpha", "Plan": pl})
+
+	// (1) every row carries a stable id derived from its task id, and the id
+	// cell self-links to that same fragment.
+	for _, id := range []string{"imp", "plan-row-deep-anchors"} {
+		if !strings.Contains(out, `<tr id="task-`+id+`">`) {
+			t.Fatalf("row for %q missing its stable anchor id:\n%s", id, out)
+		}
+		if !strings.Contains(out, `<a href="#task-`+id+`"><code>`+id+`</code></a>`) {
+			t.Fatalf("row for %q missing its id-cell self-link:\n%s", id, out)
+		}
+	}
+	// (2) no change to columns/data/order: header row unchanged, rows still
+	// render in the same sequence.
+	if !strings.Contains(out, "<tr><th>id</th><th>status</th><th>desc</th><th>deps</th><th>claim</th><th>change doc</th></tr>") {
+		t.Fatalf("table header changed unexpectedly:\n%s", out)
+	}
+	if strings.Index(out, `id="task-imp"`) > strings.Index(out, `id="task-plan-row-deep-anchors"`) {
+		t.Fatalf("row order changed:\n%s", out)
+	}
+
+	// (3) the :target highlight in the embedded stylesheet is scoped to anchor
+	// rows and token-driven (no new color literal), matching the design-system
+	// convention already locked by TestTableScrollWrapsDataTables.
+	css := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		`tr[id^="task-"] { scroll-margin-top:`,
+		`tr[id^="task-"]:target td { background: var(--surface-2); }`,
+		`tr[id^="task-"]:target td:first-child { box-shadow: inset 3px 0 0 var(--accent); }`,
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("style.css missing plan-row anchor rule %q:\n%s", want, css)
+		}
+	}
+	targetStart := strings.Index(css, `tr[id^="task-"]:target td {`)
+	targetEnd := strings.Index(css[targetStart:], `tr[id^="task-"]:target td:first-child`)
+	targetRule := css[targetStart : targetStart+targetEnd]
+	if strings.Contains(targetRule, "#") || strings.Contains(targetRule, "hsl(") {
+		t.Fatalf("plan-row :target highlight must be token-driven, no new color literal:\n%s", targetRule)
+	}
+}
+
 // TestPlanChangeDocLink drives the change-doc linkage end-to-end through the
 // handler: it scans the submodule repo's Beehive stamps and links a task to the
 // change doc its implementing commit recorded when that doc exists under the

@@ -446,6 +446,21 @@ th {
 }
 tr:hover td { background: var(--surface-2); }
 
+/* Plan row deep anchors (plan-row-deep-anchors): plan_items.html gives each
+ * task row a stable, URL-safe id (`task-<taskid>`, prefixed so it can never
+ * collide with another element id) and self-links the id cell to
+ * `#task-<taskid>`, so `/submodule/<name>/plan#task-<id>` — the exact form
+ * reviews, arbitrations, and change docs already cite tasks by — actually
+ * scrolls to that row instead of nowhere. scroll-margin-top reserves room for
+ * the sticky .topbar
+ * so the jump doesn't land the row underneath it; :target then highlights the
+ * row the browser just jumped to so it's easy to locate. Token-driven only
+ * (existing --space-*/--surface-2/--accent) — no new color token, and the
+ * selector is scoped to anchor rows so it can never affect any other table. */
+tr[id^="task-"] { scroll-margin-top: calc(var(--space-6) + var(--space-5)); }
+tr[id^="task-"]:target td { background: var(--surface-2); }
+tr[id^="task-"]:target td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+
 /* Responsive table wrapper (responsive-table-overflow): style.css had exactly
  * one width breakpoint (the .editor-grid stack below) and no overflow-x, so a
  * data table (plan/branch/human/stats — some six columns wide) either forced
