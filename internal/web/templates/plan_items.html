@@ -6,10 +6,10 @@
 {{range .Plan.Items}}<tr>
 <td><code>{{.ID}}</code></td>
 <td><span class="{{.StatusClass}}{{if .Active}} active{{end}}">{{.Status}}</span></td>
-<td>{{.Desc}}</td>
+<td>{{if .BodyHTML}}<details class="task-body"><summary>{{.Desc}}</summary><div class="markdown">{{.BodyHTML}}</div></details>{{else}}{{.Desc}}{{end}}</td>
 <td>{{range .DepStates}}<span class="badge{{if .Done}} live{{end}}" title="{{if .Done}}satisfied (DONE){{else}}pending{{end}}">{{.Name}}</span> {{else}}<span class="muted">&mdash;</span>{{end}}</td>
 <td>{{if .ClaimState}}<span class="badge{{if .Active}} live{{end}}">{{.ClaimState}}</span> <code>{{.Session}}</code> <span class="ago">{{.HeartbeatLabel}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
-<td>{{if .DocHref}}<a href="{{.DocHref}}">change doc</a>{{else if .Doc}}<span class="muted">{{.Doc}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+<td>{{if .DocHref}}<a href="{{.DocHref}}">change doc</a>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
 </tr>{{end}}
 </table>
 <form method="post" action="/submodule/{{.Name}}/plan/delete"

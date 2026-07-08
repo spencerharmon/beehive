@@ -170,8 +170,10 @@ Done when the task leaves `NEEDS-ARBITRATION`.
 4. **Plan/doc/infra.** Ensure the change doc exists at its exact path and `PLAN.md`, `ARTIFACTS.md`,
    `INFRASTRUCTURE.md` are current. Human escalation: a concrete blocker requiring operator input
    (missing credentials/config, unavailable upstream API, contradictory spec, user-visible contract
-   decision) → `beehive task human <sm> <task-id> --reason "<blocker + exact input needed>"`. Not for
-   ordinary uncertainty or tedious work — pick a workable path and continue.
+   decision) → `beehive task human <sm> <task-id> --reason "<reason>"`. Write `<reason>` as short,
+   structured markdown — a one-line summary, then terse bullets naming the concrete blocker and the
+   exact input you need — NOT a run-on sentence; the /human view renders it as formatted markdown. Not
+   for ordinary uncertainty or tedious work — pick a workable path and continue.
 5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills

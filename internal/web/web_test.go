@@ -661,13 +661,15 @@ func TestPlanViewPills(t *testing.T) {
 			t.Fatalf("claim rendering missing %q:\n%s", want, out)
 		}
 	}
-	// (5) the change-doc link resolves; a task with only a design Doc and no
-	// resolved change doc falls back to muted text (no dead link).
+	// (5) the change-doc cell links ONLY a resolved, routable change doc; a task
+	// whose sole reference is an unresolved design Doc renders a muted em-dash —
+	// never an inert/dead reference to the unroutable design-doc path (the old
+	// behavior). The change-doc column is thus always a live link or an em-dash.
 	if !strings.Contains(out, `<a href="/submodule/alpha/doc/bee-imp.md">change doc</a>`) {
-		t.Fatalf("change-doc link missing:\n%s", out)
+		t.Fatalf("resolved change-doc link missing:\n%s", out)
 	}
-	if !strings.Contains(out, `<span class="muted">docs/tasks/fin.md</span>`) {
-		t.Fatalf("design-doc fallback text missing:\n%s", out)
+	if strings.Contains(out, "docs/tasks/fin.md") {
+		t.Fatalf("unresolved design-doc path must not render inert (dead reference):\n%s", out)
 	}
 }
 
@@ -699,6 +701,76 @@ func TestPlanChangeDocLink(t *testing.T) {
 	// Pills still render (status-driven, time-independent).
 	if !strings.Contains(body, "status-todo") || !strings.Contains(body, "status-needs-human") {
 		t.Fatalf("status pills missing from plan view:\n%s", body)
+	}
+}
+
+// TestPlanViewExpandBody is plan-view-detail-polish part 2: the plan view's desc
+// cell is an in-place expand affordance. The collapsed row shows only the Desc
+// (the clipped first body line) as the <summary>; expanding reveals the FULL task
+// body rendered as sanitized markdown — not clipped plaintext. Driven end-to-end
+// through the handler off setup()'s t1, whose body has lines beyond the Desc.
+func TestPlanViewExpandBody(t *testing.T) {
+	s, _ := setup(t)
+	body := get(t, s, "/submodule/alpha/plan").Body.String()
+	for _, want := range []string{
+		`<details class="task-body">`,        // the native expand affordance
+		`<summary>build the thing</summary>`, // collapsed = Desc (first body line)
+		`<div class="markdown">`,             // expanded body is rendered markdown
+		"Files: a.go",                        // a body line only visible expanded
+		"Accept: works",                      // the LAST body line => FULL body shown
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("plan view expand affordance missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestHumanReasonMarkdown is plan-view-detail-polish part 3: a NEEDS-HUMAN task's
+// escalation reason renders as sanitized markdown on the /human view. projectTask
+// renders the reason (inline emphasis/code -> real HTML, raw HTML dropped) and
+// human.html wraps it in the design-system .markdown class — so an operator reads
+// formatted guidance, never raw ** / backticks, and untrusted markup never
+// executes. Split: assert the projection, then the template wrapping.
+func TestHumanReasonMarkdown(t *testing.T) {
+	s, _ := setup(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "PLAN.md")
+	// A NEEDS-HUMAN task whose Human-needed reason carries inline markdown and a
+	// raw <script> the sanitizer must drop.
+	src := "<!-- Beehive-ROI: x -->\n# Plan\n\n" +
+		"## h [NEEDS-HUMAN] <!-- attempts=1 deps= -->\nstuck\n" +
+		"Human-needed: need **prod** creds for `deploy.sh` <script>alert(1)</script>\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := parsePlan(path, time.Now(), time.Hour)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var h PlanItem
+	for _, it := range p.Items {
+		if it.ID == "h" {
+			h = it
+		}
+	}
+	// projectTask rendered the reason as sanitized markdown.
+	rh := string(h.HumanReasonHTML)
+	if !strings.Contains(rh, "<strong>prod</strong>") || !strings.Contains(rh, "<code>deploy.sh</code>") {
+		t.Fatalf("reason markdown not rendered (want bold + code): %q", rh)
+	}
+	if strings.Contains(rh, "**prod**") || strings.Contains(rh, "`deploy.sh`") {
+		t.Fatalf("raw markdown leaked unrendered: %q", rh)
+	}
+	if strings.Contains(rh, "<script>") {
+		t.Fatalf("raw HTML must be sanitized out of the reason: %q", rh)
+	}
+	// The /human template surfaces it inside the .markdown container (mirroring
+	// the handler's row shape: {Sub, Item}).
+	out := renderTmpl(t, s, "human.html", map[string]interface{}{
+		"Rows": []map[string]interface{}{{"Sub": "alpha", "Item": h}},
+	})
+	if !strings.Contains(out, `class="markdown">`) || !strings.Contains(out, "<strong>prod</strong>") {
+		t.Fatalf("human view did not render the reason as .markdown HTML:\n%s", out)
 	}
 }
 

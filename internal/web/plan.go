@@ -1,6 +1,7 @@
 package web
 
 import (
+	"html/template"
 	"os"
 	"strings"
 	"time"
@@ -37,20 +38,28 @@ type Dep struct {
 // DepStates and DocHref are view-only enrichments: DepStates marks each dep
 // satisfied/pending against this plan, and DocHref links the change doc the
 // implementing commit stamped (set by the handler, which has the repo + docs/).
+// BodyHTML and HumanReasonHTML are the sanitized-markdown renders (renderMarkdown,
+// html.WithUnsafe OFF) the views trust as template.HTML: BodyHTML is the FULL task
+// body for the plan view's in-place expand affordance (the collapsed row shows
+// only Desc, the clipped first line), and HumanReasonHTML is the escalation reason
+// for the /human view. Both are derived from UNTRUSTED repo text, so any embedded
+// raw HTML is dropped rather than executed.
 type PlanItem struct {
-	ID          string
-	Status      string
-	Desc        string // first non-empty body line (plan.Task has no Desc field)
-	Deps        []string
-	DepStates   []Dep // deps resolved to satisfied/pending against this plan's DONE set
-	Weight      int
-	Session     string    // claim owner; "" when unclaimed
-	Heartbeat   time.Time // last claim stamp; zero when unclaimed
-	Active      bool      // claim fresh within the TTL (the unified "in progress")
-	Stale       bool      // claim past the TTL (GC-reclaimable; owner presumed dead)
-	Doc         string    // linked change-doc path from a body "Doc:" line, "" if none
-	DocHref     string    // link to view the change doc (from the commit stamp), "" if unresolved
-	HumanReason string    // explicit NEEDS-HUMAN reason from a body "Human-needed:" line
+	ID              string
+	Status          string
+	Desc            string // first non-empty body line (plan.Task has no Desc field)
+	Deps            []string
+	DepStates       []Dep // deps resolved to satisfied/pending against this plan's DONE set
+	Weight          int
+	Session         string        // claim owner; "" when unclaimed
+	Heartbeat       time.Time     // last claim stamp; zero when unclaimed
+	Active          bool          // claim fresh within the TTL (the unified "in progress")
+	Stale           bool          // claim past the TTL (GC-reclaimable; owner presumed dead)
+	Doc             string        // linked change-doc path from a body "Doc:" line, "" if none
+	DocHref         string        // link to view the change doc (from the commit stamp), "" if unresolved
+	HumanReason     string        // explicit NEEDS-HUMAN reason from a body "Human-needed:" line
+	BodyHTML        template.HTML // full task body rendered as sanitized markdown (in-place expand)
+	HumanReasonHTML template.HTML // HumanReason rendered as sanitized markdown (/human view), "" if none
 }
 
 // StatusClass is the design-system pill class for the task's status: the base
@@ -201,7 +210,10 @@ func resolveDeps(items []PlanItem) {
 
 // projectTask maps a plan.Task to the view's PlanItem, deriving Desc (first
 // non-empty body line) and Doc (a "Doc:" convention line in the body) and the
-// active/stale claim flags against now/ttl.
+// active/stale claim flags against now/ttl. It also renders the FULL task body
+// (BodyHTML) and the escalation reason (HumanReasonHTML) as sanitized markdown so
+// the plan view's expand affordance and the /human view show formatted HTML rather
+// than clipped plaintext — never executing raw HTML from the untrusted repo text.
 func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
 	it := PlanItem{
 		ID:          t.ID,
@@ -225,6 +237,17 @@ func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
 		if rest, ok := strings.CutPrefix(s, "Doc:"); ok && it.Doc == "" {
 			it.Doc = strings.TrimSpace(rest)
 		}
+	}
+	// The full body (verbatim, joined) rendered as sanitized markdown backs the
+	// plan view's in-place expand: the collapsed row shows only Desc, expanding
+	// reveals this. Empty body -> "" so the template shows plain Desc, no toggle.
+	if body := strings.Join(t.Body, "\n"); strings.TrimSpace(body) != "" {
+		it.BodyHTML = renderMarkdown(body)
+	}
+	// The escalation reason rendered as markdown for the /human view. "" (no
+	// reason) stays "" so the cell renders empty rather than an empty <p>.
+	if it.HumanReason != "" {
+		it.HumanReasonHTML = renderMarkdown(it.HumanReason)
 	}
 	return it
 }

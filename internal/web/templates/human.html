@@ -5,7 +5,7 @@
 {{range .Rows}}<tr>
   <td>{{.Sub}}</td>
   <td>{{.Item.ID}}</td>
-  <td>{{.Item.HumanReason}}</td>
+  <td>{{if .Item.HumanReasonHTML}}<div class="markdown">{{.Item.HumanReasonHTML}}</div>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
   <td>{{.Item.Desc}}</td>
   <td><a class="btn" href="/human/{{.Sub}}/{{.Item.ID}}">resolve…</a></td>
 </tr>{{else}}<tr><td colspan=5>none</td></tr>{{end}}
