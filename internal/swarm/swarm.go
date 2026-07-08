@@ -551,6 +551,13 @@ type Result struct {
 	// main. Callers may delete stream branch only when this is true; otherwise that
 	// branch is only remaining transcript source.
 	SessionPublished bool
+	// ClaimStaleAtCompletion is set when the pass DID land its work on main and is
+	// honestly Completed, but its claim's heartbeat had aged past TTL by the time it
+	// finished — so a peer could have reclaimed the stale task mid-completion and be
+	// redundantly redoing it. It is a detective signal (a durable transcript warning
+	// is also written): the work is NOT discarded, but the overlap is surfaced rather
+	// than staying silent. See warnIfClaimStale in Run.
+	ClaimStaleAtCompletion bool
 }
 
 // branchFor names the worktree branch and doc stem for a task selection.
@@ -1001,6 +1008,45 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			res.Warning = w
 		}
 	}
+	// lastHeartbeat tracks the wall-clock time of the most recent SUCCESSFUL claim
+	// re-stamp. The claim's staleness horizon is lastHeartbeat+TTL: once now passes
+	// it, a peer's selector may treat the task as abandoned and reclaim it. Heartbeats
+	// re-stamp only at each turn's TOP (never during the possibly long turn body or the
+	// finish->publish->land->release completion sequence), and the loop-bottom wall cap
+	// is bypassed on the completing turn, so a pass can still hold a claim that has
+	// silently gone stale at the instant it completes. Seed it to loop entry (we enter
+	// holding a fresh claim); the turn-1 heartbeat overwrites it with the real stamp.
+	lastHeartbeat := r.now()
+	// warnIfClaimStale is the detective control for the claim-TTL completion race. Call
+	// it from a done path AFTER finish() has sealed+published the transcript and
+	// res.Completed is true: if the claim's heartbeat has aged past TTL, a peer could
+	// have reclaimed the now-stale task and be redundantly redoing this work. We do NOT
+	// undo completion (the work really is on main; discarding it or skipping release is
+	// strictly worse) — instead we durably append a "## warning" block to the transcript
+	// (the same primitive a publish-failure uses, which internal/audit keys off) and set
+	// Result.ClaimStaleAtCompletion. Wording deliberately contains "stale claim" and
+	// "reselect" so audit's lostRaceRe classifies it. TTL<=0 (undefined horizon, some
+	// tests) and a completing turn that heartbeated within TTL are both no-ops.
+	warnIfClaimStale := func() {
+		if r.TTL <= 0 {
+			return
+		}
+		age := r.now().Sub(lastHeartbeat)
+		if age <= r.TTL {
+			return
+		}
+		res.ClaimStaleAtCompletion = true
+		msg := fmt.Sprintf(
+			"task %s completed and landed on main, but its claim went stale before release "+
+				"(no heartbeat for %s, past TTL %s): a peer may have treated it as an abandoned "+
+				"stale claim, reclaimed it, and be redundantly redoing this work — dedupe/reselect "+
+				"should skip the duplicate. The work is NOT discarded; this surfaces the overlap.",
+			taskID(sel), age.Round(time.Second), r.TTL)
+		r.recordPublishFailureWarning(ctx, rec, sessionRel, msg)
+		if res.Warning == "" {
+			res.Warning = msg
+		}
+	}
 	for res.Turns = 1; res.Turns <= r.MaxTurns; res.Turns++ {
 		// Always-on turn boundary: a live "still working, on turn N" heartbeat in the
 		// journal so a stalled pass is visibly stalled rather than silent.
@@ -1042,10 +1088,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// Arbitrate). It re-stamps our session, after first pulling main so we observe
 		// a competitor or a resolution. Three outcomes beyond "ok":
 		if hasTask(sel) {
-			err := cl.Heartbeat(ctx, sel.Task.ID, sel.Task.Status, r.now())
+			hbAt := r.now()
+			err := cl.Heartbeat(ctx, sel.Task.ID, sel.Task.Status, hbAt)
 			switch {
 			case err == nil:
 				// Ownership re-confirmed; the heartbeat already published to peers.
+				// Record the fresh stamp so warnIfClaimStale can tell, at completion,
+				// whether this turn's body outran the claim's TTL horizon.
+				lastHeartbeat = hbAt
 			case errors.Is(err, claim.ErrResolved):
 				// The task left its working status during the previous turn (the agent
 				// drove it terminal, or someone else resolved it). Re-check completion
@@ -1072,6 +1122,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						return res, nil
 					}
 					res.Completed = true
+					warnIfClaimStale()
 					w, demoted, lerr := r.landSourceBranch(ctx, sel, wg, res.Branch)
 					if lerr != nil {
 						cleanup()
@@ -1262,6 +1313,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				return res, nil
 			}
 			res.Completed = true
+			warnIfClaimStale()
 			w, demoted, lerr := r.landSourceBranch(ctx, sel, wg, res.Branch)
 			if lerr != nil {
 				cleanup()

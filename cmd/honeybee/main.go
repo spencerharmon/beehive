@@ -233,7 +233,7 @@ func run() error {
 	session := wtBranch
 
 	runner := &swarm.Runner{
-		Repo: rp, Git: gitRepo, MaxTurns: eff.MaxTurns, MergeRetries: eff.MergeRetries, WallCap: ttl, TTL: ttl, Publish: publish,
+		Repo: rp, Git: gitRepo, MaxTurns: eff.MaxTurns, MergeRetries: eff.MergeRetries, WallCap: wallCapFor(ttl), TTL: ttl, Publish: publish,
 		// RejectLimit bounds how many times a Work task's implementer commit can
 		// fail to land on the submodule's origin (landSourceBranch/demoteUnpushed)
 		// before it escalates to NEEDS-HUMAN instead of recycling to TODO yet
@@ -473,6 +473,26 @@ func shortSHA(s string) string {
 		return s[:12]
 	}
 	return s
+}
+
+// wallCapFor derives a honeybee pass's per-session wall cap from the claim TTL,
+// deliberately BELOW it (ttl - ttl/6, ~83%) so the two concerns are no longer the
+// same number. Historically WallCap == TTL, which coupled "how long one pass may
+// run" to "when a peer may reclaim the task": a pass could run right up to the TTL
+// and only then begin its finish->publish->land->release, holding a claim that had
+// already gone stale. Shrinking WallCap removes that literal coupling and buys a
+// margin for the completion sequence, but it is NOT the load-bearing guarantee —
+// the completing turn bypasses the loop-bottom wall check entirely, and staleness
+// is measured from the last heartbeat (which can lag a long turn body), not from
+// WallCap. The real protection against silently redone work is the detective
+// control in swarm.Runner.Run (warnIfClaimStale). Floored at a positive value so a
+// tiny TTL never yields a zero/negative cap that would end a pass before turn 1.
+func wallCapFor(ttl time.Duration) time.Duration {
+	wc := ttl - ttl/6
+	if wc <= 0 {
+		return ttl
+	}
+	return wc
 }
 
 // instructionDriftWarning reports whether ANY beehive-managed instruction file at

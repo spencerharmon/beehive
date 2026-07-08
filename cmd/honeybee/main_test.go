@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/instruct"
@@ -244,4 +245,37 @@ func TestInstructionDriftWarning(t *testing.T) {
 			t.Fatal("uninstalled root produced no warning, want one")
 		}
 	})
+}
+
+// TestWallCapFor pins the WallCap-from-TTL derivation: it must be strictly BELOW
+// the TTL (so the per-session wall cap and the claim-staleness horizon are no
+// longer the same number), yet remain positive for any positive TTL so a pass is
+// never capped before its first turn. The exact ratio (ttl - ttl/6) is an
+// implementation detail; the invariants are what callers rely on.
+func TestWallCapFor(t *testing.T) {
+	cases := []time.Duration{
+		time.Hour,
+		60 * time.Minute,
+		90 * time.Minute,
+		30 * time.Second,
+		time.Minute,
+	}
+	for _, ttl := range cases {
+		got := wallCapFor(ttl)
+		if got <= 0 {
+			t.Fatalf("wallCapFor(%s)=%s: must be positive so a pass is never capped before turn 1", ttl, got)
+		}
+		if got >= ttl {
+			t.Fatalf("wallCapFor(%s)=%s: must be strictly below TTL to decouple wall cap from staleness", ttl, got)
+		}
+	}
+	// Exact ratio for the production TTL (60m): 60m - 60m/6 = 50m.
+	if got := wallCapFor(time.Hour); got != 50*time.Minute {
+		t.Fatalf("wallCapFor(1h)=%s, want 50m", got)
+	}
+	// A zero/negative TTL has no meaningful horizon; the floor returns the input
+	// unchanged rather than a zero/negative cap that would end a pass immediately.
+	if got := wallCapFor(0); got != 0 {
+		t.Fatalf("wallCapFor(0)=%s, want 0 (floored to input)", got)
+	}
 }

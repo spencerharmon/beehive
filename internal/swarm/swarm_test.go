@@ -1910,6 +1910,85 @@ func TestRunSuccessfulPublishLeavesNoTranscriptWarning(t *testing.T) {
 	}
 }
 
+// TestRunStaleClaimAtCompletionRecordsDurableWarning is the regression for the
+// claim-TTL / WallCap completion race: heartbeats re-stamp only at each turn's
+// TOP, the loop-bottom wall check is bypassed on the completing turn, and
+// staleness is measured from the last heartbeat — so a Work pass whose completing
+// turn's body outruns the claim TTL can land its work on main while its claim has
+// already gone stale, letting a peer reclaim the task and redundantly redo it. The
+// runner must NOT discard the landed work (Completed stays true) but MUST surface
+// the overlap: set Result.ClaimStaleAtCompletion AND durably append a warning block
+// to the transcript so internal/audit classifies it (Aborted + LostRace) for
+// offline dedupe. A mutable injected clock advances past the TTL inside the turn
+// body to reproduce the stale-at-completion instant without a real multi-hour wait.
+func TestRunStaleClaimAtCompletionRecordsDurableWarning(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	// Mutable injected clock. Turn 1's top-of-loop heartbeat stamps the claim at
+	// 12:00 (lastHeartbeat); the turn body then jumps the clock +2h — past the 1h
+	// TTL — before driving the task DONE, so completion is reached with a claim that
+	// aged out mid-turn. The turn loop is single-goroutine, so the plain closure
+	// needs no lock.
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		now = now.Add(2 * time.Hour) // TTL is 1h; the completing turn's body outran it
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{
+		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Now: func() time.Time { return now },
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	// The work landed on main: a completion that raced its own claim must NEVER be
+	// discarded or downgraded to GC — that would drop good work.
+	if !res.Completed || res.GCMarked {
+		t.Fatalf("stale-at-completion must still report a real, landed completion, got %+v", res)
+	}
+	// The detective signal must fire.
+	if !res.ClaimStaleAtCompletion {
+		t.Fatalf("want ClaimStaleAtCompletion set when the completing turn outran the TTL, got %+v", res)
+	}
+	// And it must be durable in the transcript so an offline audit sees the overlap.
+	transcriptPath := filepath.Join(sm, "sessions", res.SessionID+".md")
+	body, rerr := os.ReadFile(transcriptPath)
+	if rerr != nil {
+		t.Fatalf("read transcript: %v", rerr)
+	}
+	if !strings.Contains(string(body), "## \u26a0\ufe0f warning") {
+		t.Fatalf("stale-claim completion must record a trailing warning block, got:\n%s", body)
+	}
+	if !strings.Contains(string(body), "stale") {
+		t.Fatalf("warning block must name the stale claim, got:\n%s", body)
+	}
+	s, aerr := audit.ParseFile(transcriptPath)
+	if aerr != nil {
+		t.Fatalf("audit.ParseFile: %v", aerr)
+	}
+	if !s.Heuristics.Aborted || !s.Heuristics.LostRace {
+		t.Fatalf("audit must flag the stale-claim overlap as Aborted+LostRace, got %+v", s.Heuristics)
+	}
+}
+
 // TestWorkSyncsWorktreeBaseToTrackedTip proves the Work setup fetches and
 // hard-resets the submodule checkout to the tracked-branch tip BEFORE branching
 // the code worktree, so a honeybee starts from the live code rather than the
