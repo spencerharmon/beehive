@@ -42,7 +42,14 @@ worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` �
   "which implementation to land", whether to force over an orphan, or how to reconcile a duplicate is
   NEVER your call and NEVER a `NEEDS-HUMAN` blocker — it is routine reclaim the runner already handles.
   Spending a turn analyzing branch divergence is the single most common way passes have burned their
-  whole turn budget and stranded the task; refuse the rabbit hole.
+  whole turn budget and stranded the task; refuse the rabbit hole. This is about YOUR OWN push; it does
+  not make an already-existing runner-authored reconcile commit suspect. Every kind — a review or
+  arbitration reading history, not only the implementer pushing — may find a commit already sitting
+  there reading `beehive: reconcile dead orphan <remote>/<branch> (<sha>) into <branch> (ours;
+  supersedes, never discards)`, authored under a non-honeybee identity: that is the runner's own
+  already-tested `PushBranchReconciled` mechanism, sanctioned and expected — NOT a violation to
+  investigate, re-derive via git archaeology, or flag. Recognize the shape and proceed straight to
+  judging the actual code diff.
 - No shortcuts. Compute real values. No placeholders, no swallowed errors, no fake "done".
 - Every plan item you add ships a terse, LLM-targeted doc under `submodules/<sm>/docs/`.
 - Keep `PLAN.md`, `ARTIFACTS.md`, `INFRASTRUCTURE.md` current.
