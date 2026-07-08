@@ -1,4 +1,4 @@
-{{template "header"}}
+{{template "header" .}}
 <h1>{{.Name}}</h1>
 <p><a href="/submodule/{{.Name}}/docs">browse all docs &rarr;</a> · <a href="/submodule/{{.Name}}/env">manage deploy env &rarr;</a></p>
 {{$name := .Name}}

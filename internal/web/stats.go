@@ -603,6 +603,8 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		"BuiltinTags":  builtinFacets,
 		"ExtraGroupBy": extraGroupBy(groupBy),
 		"Filtered":     filtered,
+		"Title":        pageTitle("stats"),
+		"Nav":          "stats",
 	}
 	if !filtered {
 		subs, total, err := s.computeStats(r.Context())

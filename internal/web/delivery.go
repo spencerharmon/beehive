@@ -236,12 +236,14 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	shortSHA := full[:min(12, len(full))]
 	s.render(w, "commit_view.html", map[string]interface{}{
 		"Name":    sm.Name,
-		"SHA":     full[:min(12, len(full))],
+		"SHA":     shortSHA,
 		"Author":  f[0],
 		"Date":    f[1],
 		"Subject": f[2],
 		"Patch":   patch,
+		"Title":   pageTitle("commit", shortSHA, sm.Name),
 	})
 }
