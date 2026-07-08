@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/claim"
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/repo"
 	selectt "github.com/spencerharmon/beehive/internal/select"
 	"github.com/spencerharmon/beehive/internal/swarm"
@@ -132,6 +134,19 @@ func run() error {
 		if w := promptEmbedDriftWarning(ctx, primary, baseMain, version.SHA, subs0); w != "" {
 			fmt.Fprintf(os.Stderr, "honeybee: %s\n", w)
 		}
+	}
+
+	// Instruction-drift preflight, Axis B (observability only): Axis A above asks
+	// whether THIS BINARY is stale relative to the tracked submodule tip. Axis B
+	// asks a different question — whether the ON-DISK instruction files at the hive
+	// root (HONEYBEE.md, AGENTS.md, BOOTSTRAP.md, skills/*), which honeybeeProtocol
+	// and friends read straight off disk every pass, still match what THIS SAME
+	// binary would install fresh. Refreshing them is the separate, still-manual
+	// `beehive instruction update` — nothing auto-triggers it, so a freshly
+	// rebuilt (Axis-A-clean) binary can keep injecting a stale on-disk HONEYBEE.md
+	// (Axis-B-dirty) indefinitely. Runs alongside, not instead of, Axis A above.
+	if w := instructionDriftWarning(primaryRoot); w != "" {
+		fmt.Fprintf(os.Stderr, "honeybee: %s\n", w)
 	}
 
 	sel0er := &selectt.Selector{Repo: rp0, Git: primary, Rand: rnd, TTL: ttl}
@@ -458,6 +473,43 @@ func shortSHA(s string) string {
 		return s[:12]
 	}
 	return s
+}
+
+// instructionDriftWarning reports whether ANY beehive-managed instruction file at
+// the hive root (HONEYBEE.md, AGENTS.md, BOOTSTRAP.md, skills/*) has drifted from,
+// or is missing versus, THIS binary's own embedded default and, if so, returns a
+// one-line warning (in promptEmbedDriftWarning's style, above) to print to stderr.
+// It returns "" when every managed file is Clean, or when the scan itself errors
+// (e.g. an unreadable root) — this is OBSERVABILITY ONLY and must never block a
+// pass, mirroring promptEmbedDriftWarning's own never-fatal contract.
+//
+// This is Axis B of instruction drift, orthogonal to promptEmbedDriftWarning's
+// Axis A: Axis A asks whether this BINARY predates the tracked submodule tip.
+// Axis B asks whether the ON-DISK file this pass actually reads (honeybeeProtocol
+// reads HONEYBEE.md straight off disk, falling back to the embedded default only
+// when absent) matches what this SAME binary would install fresh — refreshing it
+// is the separate, still-manual `beehive instruction update`, which nothing here
+// triggers. A host can be Axis-A-clean (freshly rebuilt binary) yet Axis-B-dirty
+// (nobody ran `instruction update` since), which is exactly the gap that left a
+// freshly rebuilt binary still injecting a pre-fix HONEYBEE.md into every pass.
+// Reuses instruct.Scan for the comparison (no new drift logic); run alongside,
+// never instead of, Axis A.
+func instructionDriftWarning(root string) string {
+	st, err := instruct.Scan(root)
+	if err != nil {
+		return "" // best-effort: a scan error must never warn or block a pass
+	}
+	var drifted []string
+	for name, s := range st {
+		if s != instruct.Clean {
+			drifted = append(drifted, fmt.Sprintf("%s(%s)", name, s))
+		}
+	}
+	if len(drifted) == 0 {
+		return ""
+	}
+	sort.Strings(drifted) // deterministic order: st iterates a map
+	return fmt.Sprintf("WARNING preflight: %d beehive-managed instruction file(s) at the hive root have drifted from this binary's embedded default and were not refreshed by `beehive instruction update` (%s) — this pass may be running stale guidance even though the binary itself is up to date; run `beehive instruction update`", len(drifted), strings.Join(drifted, ", "))
 }
 
 // honeybeeProtocol returns the honeybee runtime protocol (the system prompt). It

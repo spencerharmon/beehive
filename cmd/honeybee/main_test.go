@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
@@ -170,4 +171,77 @@ func TestShortSHA(t *testing.T) {
 	if got := shortSHA("abc"); got != "abc" {
 		t.Fatalf("shortSHA(short) = %q, want %q", got, "abc")
 	}
+}
+
+// TestInstructionDriftWarning covers Axis B: drift between the ON-DISK managed
+// instruction files at a hive root and THIS binary's own embedded default,
+// independent of the Axis-A (build-vs-tracked-tip) fixtures above — no git
+// repo is needed here, just a plain directory instruct.Install populates.
+func TestInstructionDriftWarning(t *testing.T) {
+	// Clean install: every managed file byte-identical to the embedded default
+	// -> silent, exactly like a freshly-`instruction update`d hive root.
+	t.Run("clean-silent", func(t *testing.T) {
+		root := t.TempDir()
+		if _, err := instruct.Install(root); err != nil {
+			t.Fatal(err)
+		}
+		if w := instructionDriftWarning(root); w != "" {
+			t.Fatalf("clean root warned: %q", w)
+		}
+	})
+
+	// Operator/legacy-edited HONEYBEE.md differs from the embedded default -> warn,
+	// naming the file and its "modified" status, in the established WARNING style.
+	t.Run("modified-warns", func(t *testing.T) {
+		root := t.TempDir()
+		if _, err := instruct.Install(root); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "HONEYBEE.md"), []byte("stale pre-fix text\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		w := instructionDriftWarning(root)
+		if w == "" {
+			t.Fatal("modified HONEYBEE.md produced no warning, want one")
+		}
+		if !strings.HasPrefix(w, "WARNING preflight:") {
+			t.Fatalf("warning %q not in the established WARNING-preflight style", w)
+		}
+		for _, want := range []string{"HONEYBEE.md", "modified", "beehive instruction update"} {
+			if !strings.Contains(w, want) {
+				t.Fatalf("warning %q missing %q", w, want)
+			}
+		}
+	})
+
+	// A managed file absent entirely (e.g. never installed) -> warn, naming it
+	// "missing" rather than "modified".
+	t.Run("missing-warns", func(t *testing.T) {
+		root := t.TempDir()
+		if _, err := instruct.Install(root); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(root, "AGENTS.md")); err != nil {
+			t.Fatal(err)
+		}
+		w := instructionDriftWarning(root)
+		if w == "" {
+			t.Fatal("missing AGENTS.md produced no warning, want one")
+		}
+		for _, want := range []string{"AGENTS.md", "missing"} {
+			if !strings.Contains(w, want) {
+				t.Fatalf("warning %q missing %q", w, want)
+			}
+		}
+	})
+
+	// A root with nothing installed at all (every managed file Missing) still
+	// warns rather than erroring — Scan itself never fails on absent files.
+	t.Run("uninstalled-root-warns", func(t *testing.T) {
+		root := t.TempDir()
+		w := instructionDriftWarning(root)
+		if w == "" {
+			t.Fatal("uninstalled root produced no warning, want one")
+		}
+	})
 }
