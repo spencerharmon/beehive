@@ -45,8 +45,10 @@ type skillAction struct {
 	Detail string // human explanation (no action implied by itself)
 }
 
-// skillDiff is a proposed whole-file rewrite (infra-conventions), rendered as a
-// unified diff so a file-editing skill previews its change like the chat editor.
+// skillDiff is a proposed whole-file rewrite of ONE target's file (e.g. a single
+// submodule's INFRASTRUCTURE.md), rendered as a unified diff so a file-editing
+// skill previews its change like the chat editor. A plan carries one per file it
+// would touch, each scoped to exactly that target.
 type skillDiff struct {
 	Path   string
 	Before string
@@ -69,13 +71,21 @@ type skillPlan struct {
 
 	Report  []string      // informational findings (report-only skills, or "nothing to do")
 	Actions []skillAction // the concrete mutations apply would perform
-	Diff    *skillDiff    // a proposed file rewrite, when the skill edits a file
+	Diffs   []*skillDiff  // proposed file rewrites, one per target file the skill would edit
 }
 
 // Empty reports whether the plan would change nothing: no actions and no real
 // diff. The panel uses it to show "already clean" and suppress the apply control.
 func (p skillPlan) Empty() bool {
-	return len(p.Actions) == 0 && !p.Diff.changed()
+	if len(p.Actions) > 0 {
+		return false
+	}
+	for _, d := range p.Diffs {
+		if d.changed() {
+			return false
+		}
+	}
+	return true
 }
 
 // skillResult is the outcome of applying a skill: the concrete changes made.
@@ -294,18 +304,20 @@ func (s *Server) skillGC() *skill {
 	}
 }
 
-// skillResources is a read-only inventory of each target's deploy state
-// (INFRASTRUCTURE.md) and produced artifacts (ARTIFACTS.md). Report-only: it has
-// no apply, so the registry refuses to "apply" it.
+// skillResources is a read-only inventory of each submodule target's deploy state
+// (INFRASTRUCTURE.md) and produced artifacts (ARTIFACTS.md). Blue/green is a
+// per-submodule property, so the report scopes every deploy-env line to a named
+// submodule and never presents a hive-wide "active env" for the coordination root
+// (which is not a deployable target). Report-only: it has no apply, so the
+// registry refuses to "apply" it.
 func (s *Server) skillResources() *skill {
 	return &skill{
 		Name:       "resources",
 		Title:      "Report infrastructure & artifacts",
-		Summary:    "Read-only inventory of the root and each submodule: active blue/green deploy env and the produced artifacts.",
+		Summary:    "Read-only inventory of each submodule: its own active blue/green deploy env and the produced artifacts.",
 		ReportOnly: true,
 		plan: func(ctx context.Context) (skillPlan, error) {
 			var p skillPlan
-			p.Report = append(p.Report, infraLine("root", filepath.Join(s.repo.Root, repo.InfraFile)))
 			subs, err := s.repo.Submodules()
 			if err != nil {
 				return skillPlan{}, err
@@ -319,62 +331,89 @@ func (s *Server) skillResources() *skill {
 	}
 }
 
-// skillInfraConventions normalizes the root INFRASTRUCTURE.md so it declares the
-// blue/green deploy markers (Active + Environments), filling in the conventional
-// defaults only for markers that are ABSENT. It is non-destructive (it never
-// removes or rewrites an existing marker) and idempotent, so it applies without a
-// confirm — but it still previews its edit as a diff and writes via the guarded
-// publish path.
+// skillInfraConventions normalizes each SUBMODULE's own INFRASTRUCTURE.md so it
+// declares the blue/green deploy markers (Active + Environments), filling in the
+// conventional defaults only for markers that are ABSENT. Blue/green is a
+// per-submodule property, so it acts on every submodule's
+// submodules/<name>/INFRASTRUCTURE.md independently and never on the coordination
+// root (which is not a deployable target). It is non-destructive (it never removes
+// or rewrites an existing marker) and idempotent, so it applies without a confirm —
+// but it still previews each edit as a diff and writes via the guarded publish path.
 func (s *Server) skillInfraConventions() *skill {
-	path := filepath.Join(s.repo.Root, repo.InfraFile)
 	return &skill{
 		Name:    "infra-conventions",
 		Title:   "Normalize infrastructure conventions",
-		Summary: "Ensure the root INFRASTRUCTURE.md declares the blue/green deploy markers (Active + Environments), adding the conventional defaults when absent.",
+		Summary: "Ensure each submodule's INFRASTRUCTURE.md declares its own blue/green deploy markers (Active + Environments), adding the conventional defaults when absent.",
 		plan: func(ctx context.Context) (skillPlan, error) {
-			before, err := readFileOrEmpty(path)
+			subs, err := s.repo.Submodules()
 			if err != nil {
 				return skillPlan{}, err
 			}
-			after := normalizeInfraConventions(before)
 			var p skillPlan
-			if after == before {
-				p.Report = append(p.Report, "INFRASTRUCTURE.md already declares the blue/green markers")
-				return p, nil
+			for _, sm := range subs {
+				path := filepath.Join(sm.Path, repo.InfraFile)
+				before, err := readFileOrEmpty(path)
+				if err != nil {
+					return skillPlan{}, err
+				}
+				after := normalizeInfraConventions(before)
+				if after == before {
+					continue
+				}
+				display := filepath.ToSlash(filepath.Join("submodules", sm.Name, repo.InfraFile))
+				p.Diffs = append(p.Diffs, &skillDiff{Path: display, Before: before, After: after})
+				p.Actions = append(p.Actions, skillAction{
+					Op:     "write",
+					Target: display,
+					Detail: "add " + sm.Name + "'s missing blue/green deploy markers",
+				})
 			}
-			p.Diff = &skillDiff{Path: "INFRASTRUCTURE.md", Before: before, After: after}
-			p.Actions = append(p.Actions, skillAction{
-				Op:     "write",
-				Target: "INFRASTRUCTURE.md",
-				Detail: "add the missing blue/green deploy markers",
-			})
+			if len(p.Actions) == 0 {
+				p.Report = append(p.Report, "every submodule's INFRASTRUCTURE.md already declares the blue/green markers")
+			}
 			return p, nil
 		},
 		apply: func(ctx context.Context) (skillResult, error) {
-			before, err := readFileOrEmpty(path)
+			subs, err := s.repo.Submodules()
 			if err != nil {
 				return skillResult{}, err
 			}
-			after := normalizeInfraConventions(before)
-			if after == before {
-				return skillResult{Done: []string{"INFRASTRUCTURE.md already follows conventions"}}, nil
+			var res skillResult
+			wrote := false
+			for _, sm := range subs {
+				path := filepath.Join(sm.Path, repo.InfraFile)
+				before, err := readFileOrEmpty(path)
+				if err != nil {
+					return skillResult{}, err
+				}
+				after := normalizeInfraConventions(before)
+				if after == before {
+					continue
+				}
+				if err := os.WriteFile(path, []byte(after), 0o644); err != nil {
+					return skillResult{}, err
+				}
+				res.Done = append(res.Done, "wrote "+filepath.ToSlash(filepath.Join("submodules", sm.Name, repo.InfraFile))+" with the conventional deploy markers")
+				wrote = true
 			}
-			if err := os.WriteFile(path, []byte(after), 0o644); err != nil {
+			if !wrote {
+				return skillResult{Done: []string{"every submodule's INFRASTRUCTURE.md already follows conventions"}}, nil
+			}
+			if err := s.publishMain(ctx, "frontend: normalize submodule INFRASTRUCTURE conventions"); err != nil {
 				return skillResult{}, err
 			}
-			if err := s.publishMain(ctx, "frontend: normalize INFRASTRUCTURE conventions"); err != nil {
-				return skillResult{}, err
-			}
-			return skillResult{Done: []string{"wrote INFRASTRUCTURE.md with the conventional deploy markers"}}, nil
+			return res, nil
 		},
 	}
 }
 
-// normalizeInfraConventions returns INFRASTRUCTURE.md source with the blue/green
-// deploy markers guaranteed present: an absent Active: is filled with the default
-// active env and an absent Environments: with the default env set, both via the
-// typed artifacts model so the rest of the document round-trips verbatim.
-// Already-conventional source is returned unchanged (idempotent).
+// normalizeInfraConventions returns one target's INFRASTRUCTURE.md source with the
+// blue/green deploy markers guaranteed present: an absent Active: is filled with
+// the default active env and an absent Environments: with the default env set, both
+// via the typed artifacts model so the rest of the document round-trips verbatim.
+// Already-conventional source is returned unchanged (idempotent). It operates on
+// whatever single file the caller hands it — the caller is responsible for scoping
+// that to a submodule, never the hive root.
 func normalizeInfraConventions(src string) string {
 	in := artifacts.ParseInfra(src)
 	d := in.Deployment() // resolves defaults for any absent marker
@@ -446,9 +485,17 @@ func isTrue(v string) bool {
 	}
 }
 
+// skillDiffView is one file's rendered diff for the panel: the target path plus
+// the diff rows, so a multi-file plan (e.g. per-submodule normalization) previews
+// each file's change under its own path.
+type skillDiffView struct {
+	Path string
+	Rows []editor.DiffRow
+}
+
 // skillPanel is the view model for one skill's card/panel: identity + flags plus,
-// once a dry-run or apply has run, the plan, the rendered diff rows, the result,
-// and any note/error to surface.
+// once a dry-run or apply has run, the plan, the rendered per-file diffs, the
+// result, and any note/error to surface.
 type skillPanel struct {
 	Name        string
 	Title       string
@@ -457,7 +504,7 @@ type skillPanel struct {
 	ReportOnly  bool
 
 	Plan   *skillPlan
-	Rows   []editor.DiffRow
+	Diffs  []skillDiffView
 	Result *skillResult
 	Note   string
 	Err    string
@@ -480,11 +527,13 @@ func newSkillPanel(sk *skill) skillPanel {
 	}
 }
 
-// withPlan attaches a plan (and its rendered diff rows) to the panel.
+// withPlan attaches a plan (and its rendered per-file diffs) to the panel.
 func (p skillPanel) withPlan(plan skillPlan) skillPanel {
 	p.Plan = &plan
-	if plan.Diff.changed() {
-		p.Rows = editor.RenderDiff(plan.Diff.Before, plan.Diff.After)
+	for _, d := range plan.Diffs {
+		if d.changed() {
+			p.Diffs = append(p.Diffs, skillDiffView{Path: d.Path, Rows: editor.RenderDiff(d.Before, d.After)})
+		}
 	}
 	return p
 }

@@ -322,8 +322,11 @@ func (s *Server) Routes() *http.ServeMux {
 	// to the binary's embedded defaults via the SAME installer the CLI uses
 	// (internal/instruct.Update, clobber path). LOCALS.md is never touched.
 	mux.HandleFunc("POST /instruction/update", b((*Server).instructionUpdate))
-	mux.HandleFunc("GET /env", b((*Server).envGet))
-	mux.HandleFunc("POST /env/deploy", b((*Server).envDeploy))
+	// Blue/green deploy is per-submodule (each target owns its own
+	// INFRASTRUCTURE.md state), never a single global env: the panel and the
+	// deploy write are scoped to the named submodule.
+	mux.HandleFunc("GET /submodule/{name}/env", b((*Server).envGet))
+	mux.HandleFunc("POST /submodule/{name}/env/deploy", b((*Server).envDeploy))
 	mux.HandleFunc("GET /human", b((*Server).human))
 	mux.HandleFunc("GET /human/{sub}/{id}", b((*Server).humanResolvePage))
 	mux.HandleFunc("GET /human/{sub}/{id}/panel/{sid}", b((*Server).humanResolvePanel))
@@ -467,7 +470,10 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
+	// No global "active env": blue/green is per-submodule. Each card's Env comes
+	// from that submodule's OWN INFRASTRUCTURE.md (subViews), and the deploy panel
+	// is scoped per submodule (/submodule/{name}/env) — the dashboard never reads a
+	// single hive-wide deploy state.
 	// Read-only hygiene summary alongside the submodule cards. A scan error is
 	// surfaced inside the widget (not swallowed) rather than failing the whole
 	// dashboard, which is the operator's primary page.
@@ -476,7 +482,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
 	}
 	rootFiles := s.rootFileLinks()
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Env": env, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": rootFiles, "RootFilesDrift": rootFilesDrift(rootFiles)})
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": rootFiles, "RootFilesDrift": rootFilesDrift(rootFiles)})
 }
 
 // subViews builds the dashboard card data for every submodule: State
@@ -1164,22 +1170,40 @@ func (s *Server) instructionUpdate(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// envGet renders one submodule's blue/green deploy panel from its OWN
+// INFRASTRUCTURE.md (submodules/<name>/INFRASTRUCTURE.md) — never a global env.
+// The panel carries the submodule name so its deploy form posts back to the same
+// scoped route.
 func (s *Server) envGet(w http.ResponseWriter, r *http.Request) {
-	env, _ := parseEnv(filepath.Join(s.repo.Root, repo.InfraFile))
-	s.render(w, "env_panel.html", map[string]interface{}{"Env": env})
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	env, _ := parseEnv(filepath.Join(sm.Path, repo.InfraFile))
+	s.render(w, "env_panel.html", map[string]interface{}{"Name": sm.Name, "Env": env})
 }
 
+// envDeploy switches ONE submodule's active env, writing only that submodule's
+// INFRASTRUCTURE.md (submodules/<name>/INFRASTRUCTURE.md) so a deploy on one
+// target never touches another's deploy state. It resolves the submodule from the
+// path, deploys, publishes, then re-renders that submodule's scoped panel.
 func (s *Server) envDeploy(w http.ResponseWriter, r *http.Request) {
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	target := r.FormValue("target")
 	if target == "" {
 		http.Error(w, "target required", 400)
 		return
 	}
-	if err := deploy(filepath.Join(s.repo.Root, repo.InfraFile), target); err != nil {
+	if err := deploy(filepath.Join(sm.Path, repo.InfraFile), target); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := s.publishMain(r.Context(), "frontend: deploy "+target); err != nil {
+	if err := s.publishMain(r.Context(), "frontend: deploy "+sm.Name+" "+target); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}

@@ -834,15 +834,87 @@ func TestEnvDeploy(t *testing.T) {
 	s, root := setup(t)
 	form := url.Values{"target": {"green"}}
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/env/deploy", strings.NewReader(form.Encode()))
+	req := httptest.NewRequest("POST", "/submodule/alpha/env/deploy", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	s.Routes().ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Fatalf("deploy %d", w.Code)
 	}
-	b, _ := os.ReadFile(filepath.Join(root, repo.InfraFile))
+	// The write lands in the SUBMODULE's own INFRASTRUCTURE.md, not the root.
+	b, _ := os.ReadFile(filepath.Join(root, "submodules", "alpha", repo.InfraFile))
 	if !strings.Contains(string(b), "Active: green") {
-		t.Fatalf("env: %q", b)
+		t.Fatalf("alpha env: %q", b)
+	}
+	// The root INFRASTRUCTURE.md is never touched by a per-submodule deploy.
+	if _, err := os.Stat(filepath.Join(root, repo.InfraFile)); !os.IsNotExist(err) {
+		if rb, _ := os.ReadFile(filepath.Join(root, repo.InfraFile)); strings.Contains(string(rb), "Active: green") {
+			t.Fatalf("root INFRASTRUCTURE.md was mutated by a per-submodule deploy: %q", rb)
+		}
+	}
+}
+
+// TestEnvDeployPerSubmoduleIsolated is the core of env-badge-per-submodule: with
+// two submodules in OPPOSITE blue/green states, deploying one switches only its
+// own INFRASTRUCTURE.md — the other's active env, its panel, and its dashboard
+// card badge are all unchanged. Blue/green is per-submodule, never global.
+func TestEnvDeployPerSubmoduleIsolated(t *testing.T) {
+	s, root := setup(t)
+	// alpha active blue, bravo active green — deliberately opposite.
+	if err := os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.InfraFile),
+		[]byte("# infra\nActive: blue\nEnvironments: blue, green\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bravo := filepath.Join(root, "submodules", "bravo")
+	if err := os.MkdirAll(bravo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bravo, repo.ROIFile), []byte("# bravo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bravo, repo.InfraFile),
+		[]byte("# infra\nActive: green\nEnvironments: blue, green\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Switch ONLY alpha: blue -> green.
+	if w := postForm(t, s, "/submodule/alpha/env/deploy", url.Values{"target": {"green"}}); w.Code != 200 {
+		t.Fatalf("alpha deploy %d: %s", w.Code, w.Body)
+	}
+
+	// alpha's own doc flipped to green.
+	ab, _ := os.ReadFile(filepath.Join(root, "submodules", "alpha", repo.InfraFile))
+	if !strings.Contains(string(ab), "Active: green") {
+		t.Fatalf("alpha not switched to green: %q", ab)
+	}
+	// bravo's doc is byte-for-byte untouched (still green, its own state).
+	bb, _ := os.ReadFile(filepath.Join(bravo, repo.InfraFile))
+	if string(bb) != "# infra\nActive: green\nEnvironments: blue, green\n" {
+		t.Fatalf("bravo INFRASTRUCTURE.md changed by alpha's deploy: %q", bb)
+	}
+	// bravo's panel still reports green (scoped read is unaffected).
+	pb := get(t, s, "/submodule/bravo/env").Body.String()
+	if !strings.Contains(pb, "active: <b>green</b>") {
+		t.Fatalf("bravo panel not green after alpha deploy:\n%s", pb)
+	}
+	// bravo's dashboard card badge is still its OWN env (green), independent of
+	// alpha now also being green: switch alpha to blue and confirm bravo stays.
+	if w := postForm(t, s, "/submodule/alpha/env/deploy", url.Values{"target": {"blue"}}); w.Code != 200 {
+		t.Fatalf("alpha re-deploy %d: %s", w.Code, w.Body)
+	}
+	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+	views, err := s.subViews(context.Background(), now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]subView{}
+	for _, v := range views {
+		by[v.Name] = v
+	}
+	if by["alpha"].Env != "blue" {
+		t.Errorf("alpha card Env = %q, want blue", by["alpha"].Env)
+	}
+	if by["bravo"].Env != "green" {
+		t.Errorf("bravo card Env = %q, want green (unchanged by alpha's deploys)", by["bravo"].Env)
 	}
 }
 
@@ -2485,12 +2557,13 @@ func TestMergePanelConfirmAndIndicator(t *testing.T) {
 }
 
 // TestEnvDeployConfirmAndIndicator: switching the active environment is impactful,
-// so the deploy control also confirms and shows a loading indicator.
+// so the deploy control also confirms and shows a loading indicator. The panel is
+// scoped to one submodule, so its form posts to that submodule's deploy route.
 func TestEnvDeployConfirmAndIndicator(t *testing.T) {
 	s, _ := setup(t)
-	b := get(t, s, "/env").Body.String()
+	b := get(t, s, "/submodule/alpha/env").Body.String()
 	for _, want := range []string{
-		`id="env-panel"`, `hx-post="/env/deploy"`, `hx-indicator="#htmx-progress"`, "hx-confirm=",
+		`id="env-panel"`, `hx-post="/submodule/alpha/env/deploy"`, `hx-indicator="#htmx-progress"`, "hx-confirm=",
 	} {
 		if !strings.Contains(b, want) {
 			t.Fatalf("env panel missing %q:\n%s", want, b)
@@ -3191,11 +3264,11 @@ func TestFrontendWritesReachOrigin(t *testing.T) {
 		t.Fatalf("ROI edit did not reach origin main: %q", got)
 	}
 
-	if w := postForm(t, s, "/env/deploy", url.Values{"target": {"green"}}); w.Code != 200 {
+	if w := postForm(t, s, "/submodule/alpha/env/deploy", url.Values{"target": {"green"}}); w.Code != 200 {
 		t.Fatalf("deploy %d: %s", w.Code, w.Body)
 	}
 	assertOriginAtLocalHead(t, root, origin)
-	if got := hygGit(t, origin, "show", "main:"+repo.InfraFile); !strings.Contains(got, "Active: green") {
+	if got := hygGit(t, origin, "show", "main:submodules/alpha/"+repo.InfraFile); !strings.Contains(got, "Active: green") {
 		t.Fatalf("env deploy did not reach origin main: %q", got)
 	}
 }
