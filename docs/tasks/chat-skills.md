@@ -37,9 +37,10 @@ closures. The registry is the single lookup/dispatch point:
   each skill.
 
 `skillPlan` is the read-only dry-run: `Report` (findings), `Actions`
-(`{Op,Target,Detail}` mutations it would perform), and an optional `Diff`
-(`{Path,Before,After}`) for a file rewrite. `Empty()` (no actions and no real
-diff) drives the "nothing to do" state and suppresses the apply control.
+(`{Op,Target,Detail}` mutations it would perform), and `Diffs` (each
+`{Path,Before,After}`) previewing the per-file rewrites it would make. `Empty()` (no
+actions and no changed diff) drives the "nothing to do" state and suppresses the
+apply control.
 
 ### 2. The four skills
 
@@ -55,18 +56,22 @@ diff) drives the "nothing to do" state and suppresses the apply control.
   keep/reclaim decision. Apply takes `s.gitMu`, snapshots the reclaim set, then
   runs `Reload` — reusing the editor's own tested reclaim (which also re-registers
   the fresh/pending sessions it keeps) rather than a second divergent walk.
-- **resources** (report-only): a read-only inventory of the root and every
-  submodule — active blue/green deploy env (`INFRASTRUCTURE.md` via
-  `artifacts.LoadInfra`) and produced artifacts (`ARTIFACTS.md` via
-  `artifacts.LoadArtifacts`). No apply; the registry refuses it.
-- **infra-conventions** (non-destructive, diff): normalizes the root
-  `INFRASTRUCTURE.md` so it declares the blue/green markers, filling the
-  conventional defaults only for markers that are ABSENT (never rewriting an
-  existing one). `normalizeInfraConventions` routes through the typed model
-  (`ParseInfra` → `Deployment` for defaults → `SetActive`/`SetEnvs` → `String`), so
-  the rest of the document round-trips verbatim and the op is idempotent. Plan
-  previews the change as a unified diff; apply writes the file and publishes via the
-  shared `publishMain` path.
+- **resources** (report-only): a read-only inventory of each submodule — its own
+  active blue/green deploy env (`INFRASTRUCTURE.md` via `artifacts.LoadInfra`) and
+  produced artifacts (`ARTIFACTS.md` via `artifacts.LoadArtifacts`). Blue/green is a
+  per-submodule property, so every deploy-env line is scoped to a named submodule and
+  the coordination root (not a deployable target) is never reported. No apply; the
+  registry refuses it.
+- **infra-conventions** (non-destructive, diff): iterates `s.repo.Submodules()` and
+  normalizes each submodule's own `submodules/<name>/INFRASTRUCTURE.md` so it declares
+  that submodule's blue/green markers, filling the conventional defaults only for
+  markers that are ABSENT (never rewriting an existing one). Blue/green is a
+  per-submodule property, so it acts on every submodule independently and never on the
+  coordination root. `normalizeInfraConventions` routes one file through the typed
+  model (`ParseInfra` → `Deployment` for defaults → `SetActive`/`SetEnvs` → `String`),
+  so the rest of the document round-trips verbatim and the op is idempotent. Plan
+  previews one unified diff per changed submodule; apply writes each file and publishes
+  once via the shared `publishMain` path.
 
 ### 3. `internal/editor` — `Reclaimable` (gc's read-only half)
 
@@ -100,15 +105,19 @@ a `/skills` nav link is added in `layout.html`.
   - `TestSkillsPageListsSkills` — the index lists all four skills and a dry-run
     control.
   - `TestSkillUnknownIs404` — unknown skill errors on both plan and apply.
-  - `TestSkillResourcesReportOnly` — a report-only dry-run returns the inventory;
-    apply is refused (400) with no mutation path.
+  - `TestSkillResourcesReportOnly` — a report-only dry-run returns the per-submodule
+    inventory (a named `alpha` line) and never a hive-wide `root:` deploy line; apply
+    is refused (400) with no mutation path.
   - `TestSkillCleanupStaleConfirmGateAndApply` — the destructive acceptance: the
     dry-run lists exactly the stale dirs without removing them; an UNCONFIRMED apply
     refuses (asks to confirm) and removes nothing; only a CONFIRMED apply removes
     exactly the stale dirs while sparing the non-matching directory.
-  - `TestSkillInfraConventionsAppliesExactPlan` — the dry-run previews the markers
-    as a diff; apply (no confirm needed) writes EXACTLY the proposed content; a
-    second dry-run is a no-op (idempotent).
+  - `TestSkillInfraConventionsAppliesExactPlan` — with alpha missing the markers and
+    bravo already declaring its own, the dry-run previews the markers only for alpha's
+    `submodules/alpha/INFRASTRUCTURE.md`; apply (no confirm needed) writes EXACTLY that
+    content, leaves bravo byte-for-byte untouched, and — the inversion of the old
+    global behavior — never writes deploy markers to the hive root (which stays empty);
+    a second dry-run is a no-op (idempotent).
 - `internal/editor/reclaimable_test.go` `TestReclaimableListsStaleCleanOnly` —
   `Reclaimable` returns only the stale+clean edit worktree (sorted), never a fresh,
   pending, or honeybee worktree, and mutates nothing; after `Reload` reclaims it,

@@ -62,18 +62,45 @@ path-parameterized and holds no package-level deployment state, so it is
 submodule-agnostic by construction. Correct scoping is a property of the CALL
 SITES passing the right per-submodule path, which is what this change enforces.
 
+### 5. Maintenance skills scope blue/green per-submodule (`internal/web/skills.go`)
+
+The chat-skills registry had two blue/green call sites still acting on the repo
+ROOT, contradicting "blue/green is not a global concept". Both are re-scoped to the
+submodule (the root is the hive coordination point, not a deployable target):
+
+- `skillResources` (report-only) dropped its `infraLine("root", …)` line: the
+  resources inventory no longer presents a hive-wide "active env" for the root. Its
+  existing per-submodule loop (`infraLine(sm.Name, …)`) is unchanged, so each deploy
+  line is scoped to a named submodule.
+- `skillInfraConventions` (the diff-previewing normalizer) now ITERATES every
+  submodule and normalizes each one's own `submodules/<name>/INFRASTRUCTURE.md`
+  (adding absent blue/green markers via `normalizeInfraConventions`) instead of
+  writing the repo-root doc. The plan previews one diff per submodule that needs
+  markers; apply writes exactly those files and publishes once. To carry N
+  independent file previews, `skillPlan.Diff` became `skillPlan.Diffs []*skillDiff`
+  and the panel/`skill_panel.html` render one labelled `<pre class="diff">` per file.
+
+`normalizeInfraConventions` is unchanged (it operates on whatever single file it is
+handed); only its call site moved from the root to a per-submodule loop.
+
 ## Audit of every blue/green call site
 
 - `envGet` / `envDeploy` — now per-submodule (was global root). FIXED.
 - dashboard header `Active env` — removed (was a global root read). FIXED.
 - `subViews` card badge — already per-submodule (`sm.Path`); NOT regressed.
 - `explorer` INFRA render (`internal/web/web.go`) — already per-submodule.
-- `internal/web/skills.go` `skillResources`, `skillInfraConventions`, `infraLine` —
-  each already acts on an EXPLICITLY named target (the root repo-wide infra doc, or
-  a specific submodule in the inventory loop). They never apply one submodule's env
-  to another, so they are not the "global treatment" this task corrects; left
-  unchanged (and out of the task's declared file scope). The root
-  `INFRASTRUCTURE.md` remains a legitimate repo-wide notes doc.
+- `internal/web/skills.go` `skillResources` / `infraLine("root", …)` — the root
+  deploy-env line in the resources report is REMOVED; every remaining `infraLine`
+  is scoped to a named submodule. FIXED.
+- `internal/web/skills.go` `skillInfraConventions` / `normalizeInfraConventions` —
+  re-scoped from `filepath.Join(s.repo.Root, repo.InfraFile)` to a loop over every
+  submodule's own `submodules/<name>/INFRASTRUCTURE.md`; the hive root is never
+  given blue/green markers. FIXED.
+
+Every remaining blue/green read/write now takes an explicit submodule and touches
+only that submodule's `INFRASTRUCTURE.md`. The root `INFRASTRUCTURE.md` remains a
+legitimate repo-wide NOTES doc — it simply carries no blue/green DEPLOY markers,
+which are a per-target concept.
 
 ## Tests (`internal/web/web_test.go`)
 
@@ -89,3 +116,16 @@ SITES passing the right per-submodule path, which is what this change enforces.
   `submodules/alpha/INFRASTRUCTURE.md`.
 - `TestDashboardCards` (unchanged) still passes: the per-card env read is not
   regressed.
+
+## Tests (`internal/web/skills_test.go`)
+
+- `TestSkillInfraConventionsAppliesExactPlan` — rewritten for the per-submodule
+  scope: with alpha lacking markers and bravo already declaring them, the dry-run
+  proposes markers ONLY for `submodules/alpha/INFRASTRUCTURE.md`, apply writes
+  exactly that, bravo is byte-for-byte untouched, the coordination-root
+  `INFRASTRUCTURE.md` stays EMPTY (no blue/green markers — the inversion of the old
+  global behavior), and a second dry-run is a no-op.
+- `TestSkillResourcesReportOnly` — additionally asserts the resources report never
+  contains a `root:` deploy line (no hive-wide active env).
+- `TestSkillsPageListsSkills` (unchanged) — `infra-conventions` and `resources` are
+  still registered; the skills index is not regressed.

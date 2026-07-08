@@ -62,15 +62,22 @@ func TestSkillUnknownIs404(t *testing.T) {
 }
 
 // TestSkillResourcesReportOnly proves a report-only skill produces a dry-run
-// inventory and refuses apply (no mutation path at all).
+// inventory and refuses apply (no mutation path at all). It also locks that the
+// inventory is per-submodule: no hive-wide "root" deploy-env line (blue/green is
+// not a global concept).
 func TestSkillResourcesReportOnly(t *testing.T) {
 	s, _ := setup(t)
 	plan := postForm(t, s, "/skills/resources/plan", url.Values{})
 	if plan.Code != http.StatusOK {
 		t.Fatalf("resources plan: got %d", plan.Code)
 	}
-	if b := plan.Body.String(); !strings.Contains(b, "alpha") {
+	b := plan.Body.String()
+	if !strings.Contains(b, "alpha") {
 		t.Fatalf("resources plan missing submodule inventory:\n%s", b)
+	}
+	// The coordination root is not a deploy target: no "root: active ..." line.
+	if strings.Contains(b, "root:") {
+		t.Fatalf("resources plan must not present a hive-wide root deploy line:\n%s", b)
 	}
 	if w := postForm(t, s, "/skills/resources/apply", url.Values{"confirm": {"on"}}); w.Code != http.StatusBadRequest {
 		t.Fatalf("report-only apply: got %d want 400", w.Code)
@@ -139,32 +146,67 @@ func TestSkillCleanupStaleConfirmGateAndApply(t *testing.T) {
 	}
 }
 
-// TestSkillInfraConventionsAppliesExactPlan proves a non-destructive, diff-
-// previewing skill: the dry-run shows the proposed markers, apply (no confirm
-// needed) writes exactly that content, and a second dry-run is a no-op.
+// TestSkillInfraConventionsAppliesExactPlan proves the non-destructive, diff-
+// previewing skill normalizes each SUBMODULE's OWN INFRASTRUCTURE.md and never the
+// hive coordination root (blue/green is per-submodule, not a global concept). With
+// alpha lacking the markers and bravo already declaring them, the dry-run proposes
+// the markers only for alpha's submodules/alpha/INFRASTRUCTURE.md; apply (no
+// confirm) writes exactly that; bravo is byte-for-byte untouched; the root is never
+// given deploy markers; and a second dry-run is a no-op.
 func TestSkillInfraConventionsAppliesExactPlan(t *testing.T) {
 	s, root := setup(t)
+	// bravo already declares its own markers -> a no-op the skill must skip.
+	bravo := filepath.Join(root, "submodules", "bravo")
+	if err := os.MkdirAll(bravo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const bravoInfra = "# infra\nActive: green\nEnvironments: blue, green\n"
+	if err := os.WriteFile(filepath.Join(bravo, repo.InfraFile), []byte(bravoInfra), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootInfra := filepath.Join(root, repo.InfraFile)
+	alphaTarget := filepath.ToSlash(filepath.Join("submodules", "alpha", repo.InfraFile))
+
 	plan := postForm(t, s, "/skills/infra-conventions/plan", url.Values{})
 	if plan.Code != http.StatusOK {
 		t.Fatalf("plan: got %d", plan.Code)
 	}
 	pb := plan.Body.String()
-	for _, want := range []string{"Active: blue", "Environments: blue, green"} {
+	// The proposed markers, scoped to alpha's OWN INFRASTRUCTURE.md path.
+	for _, want := range []string{"Active: blue", "Environments: blue, green", alphaTarget} {
 		if !strings.Contains(pb, want) {
-			t.Fatalf("plan diff missing %q:\n%s", want, pb)
+			t.Fatalf("plan missing %q:\n%s", want, pb)
 		}
 	}
+	// bravo already declares its markers -> never proposed (per-submodule scan).
+	if strings.Contains(pb, "bravo") {
+		t.Fatalf("plan must not propose the already-conventional bravo:\n%s", pb)
+	}
+
 	done := postForm(t, s, "/skills/infra-conventions/apply", url.Values{})
 	if done.Code != http.StatusOK {
 		t.Fatalf("apply: got %d body=%s", done.Code, done.Body)
 	}
-	got, err := os.ReadFile(filepath.Join(root, repo.InfraFile))
+	// alpha's OWN doc got exactly the conventional markers.
+	got, err := os.ReadFile(filepath.Join(root, "submodules", "alpha", repo.InfraFile))
 	if err != nil {
-		t.Fatalf("read applied infra: %v", err)
+		t.Fatalf("read applied alpha infra: %v", err)
 	}
 	if want := "Active: blue\nEnvironments: blue, green\n"; string(got) != want {
-		t.Fatalf("applied content = %q, want %q", string(got), want)
+		t.Fatalf("alpha applied content = %q, want %q", string(got), want)
 	}
+	// bravo is byte-for-byte untouched by alpha's normalization.
+	if bb, _ := os.ReadFile(filepath.Join(bravo, repo.InfraFile)); string(bb) != bravoInfra {
+		t.Fatalf("bravo INFRASTRUCTURE.md changed: %q", bb)
+	}
+	// The coordination root's INFRASTRUCTURE.md stays EMPTY: infra-conventions
+	// never writes blue/green deploy markers to the hive root (repo.Init seeds it
+	// empty; a global write would have filled in "Active: ..."). This is the exact
+	// inversion of the old global behavior.
+	if rb, err := os.ReadFile(rootInfra); err != nil || string(rb) != "" {
+		t.Fatalf("root INFRASTRUCTURE.md must stay empty (no blue/green markers), got %q err=%v", rb, err)
+	}
+
 	again := postForm(t, s, "/skills/infra-conventions/plan", url.Values{})
 	if b := again.Body.String(); !strings.Contains(b, "already") {
 		t.Fatalf("second plan should be a no-op:\n%s", b)
