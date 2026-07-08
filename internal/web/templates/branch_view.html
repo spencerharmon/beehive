@@ -16,6 +16,7 @@
 {{range .Sections}}
 <section class="card">
 <h2>{{.Date}}</h2>
+<div class="table-scroll">
 <table>
 <tr><th>sha</th><th>refs</th><th>subject</th><th>author</th><th>change doc</th><th>delivered</th></tr>
 {{range .Commits}}<tr>
@@ -27,6 +28,7 @@
 <td>{{if .FlipHref}}<a href="{{.FlipHref}}">hive <code>{{.FlipSHA}}</code></a>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
 </tr>{{end}}
 </table>
+</div>
 </section>
 {{else}}
 <p class="muted">No commits.</p>

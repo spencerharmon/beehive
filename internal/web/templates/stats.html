@@ -52,6 +52,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
 </section>
 
 {{if .Filtered}}
+<div class="table-scroll">
 <table>
 <tr>{{range .GroupBy}}<th>{{.}}</th>{{end}}<th>delivered tasks ✅</th><th>honeybees 🐝</th><th>✅/🐝</th><th>stranded</th></tr>
 {{range .Grouped}}<tr>
@@ -62,7 +63,9 @@ unknown tag key or value simply yields no rows, never an error.</p>
   <td>{{if .Stranded}}<span class="state danger">{{.Stranded}}</span>{{else}}0{{end}}</td>
 </tr>{{else}}<tr><td colspan="12" class="muted">no sessions match every filter (an unknown tag key or value yields no rows)</td></tr>{{end}}
 </table>
+</div>
 {{else}}
+<div class="table-scroll">
 <table>
 <tr><th>submodule</th><th>delivered tasks ✅</th><th>honeybees 🐝</th><th>✅/🐝</th><th>stranded</th></tr>
 {{range .Subs}}<tr>
@@ -73,6 +76,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
   <td>{{if .Stranded}}<span class="state danger">{{.Stranded}}</span>{{else}}0{{end}}</td>
 </tr>{{if .Models}}<tr class="models"><td colspan=5>
   <details><summary class="muted">by model ({{len .Models}})</summary>
+  <div class="table-scroll">
   <table class="nested">
   <tr><th>model</th><th>delivered ✅</th><th>honeybees 🐝</th><th>✅/🐝</th></tr>
   {{range .Models}}<tr>
@@ -82,9 +86,11 @@ unknown tag key or value simply yields no rows, never an error.</p>
     <td>{{printf "%.1f%%" .DeliveredPerBeePct}}</td>
   </tr>{{end}}
   </table>
+  </div>
   </details>
 </td></tr>{{end}}{{if .Deliveries}}<tr class="models"><td colspan=5>
   <details><summary class="muted">deliveries ({{len .Deliveries}})</summary>
+  <div class="table-scroll">
   <table class="nested">
   <tr><th>task</th><th>hive PLAN flip</th><th>submodule change doc</th></tr>
   {{range .Deliveries}}<tr>
@@ -93,6 +99,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
     <td>{{if .DocHref}}<a href="{{.DocHref}}">{{.DocPath}}</a>{{else if .DocPath}}<span class="muted">{{.DocPath}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
   </tr>{{end}}
   </table>
+  </div>
   </details>
 </td></tr>{{end}}{{else}}<tr><td colspan=5 class="muted">no submodules</td></tr>{{end}}
 <tr class="total">
@@ -103,6 +110,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
   <td><b>{{.Total.Stranded}}</b></td>
 </tr>{{if .Total.Models}}<tr class="models"><td colspan=5>
   <details><summary class="muted">total by model ({{len .Total.Models}})</summary>
+  <div class="table-scroll">
   <table class="nested">
   <tr><th>model</th><th>delivered ✅</th><th>honeybees 🐝</th><th>✅/🐝</th></tr>
   {{range .Total.Models}}<tr>
@@ -112,8 +120,10 @@ unknown tag key or value simply yields no rows, never an error.</p>
     <td>{{printf "%.1f%%" .DeliveredPerBeePct}}</td>
   </tr>{{end}}
   </table>
+  </div>
   </details>
 </td></tr>{{end}}
 </table>
+</div>
 {{end}}
 {{template "footer"}}

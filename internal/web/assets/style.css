@@ -446,6 +446,26 @@ th {
 }
 tr:hover td { background: var(--surface-2); }
 
+/* Responsive table wrapper (responsive-table-overflow): style.css had exactly
+ * one width breakpoint (the .editor-grid stack below) and no overflow-x, so a
+ * data table (plan/branch/human/stats — some six columns wide) either forced
+ * whole-page horizontal scroll or squeezed illegibly at phone widths. Wrap a
+ * table `<div class="table-scroll"><table>…</table></div>` so it scrolls
+ * horizontally WITHIN its own box instead. The wrapper — not the table —
+ * carries the table's usual vertical margin (the same --space-4 token the
+ * bare `table` rule above uses) and zeroes the wrapped table's own margin, so
+ * wrapping never changes desktop-width spacing (no parent-child margin
+ * collapsing to double up once overflow-x establishes a new block formatting
+ * context). Token-driven, no new color token; `.nested` (the /stats
+ * drill-down tables) keeps its inherited table styling untouched — this rule
+ * only adds scroll behaviour + margin bookkeeping. */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin: var(--space-4) 0;
+}
+.table-scroll > table { margin: 0; }
+
 /* Sessions list ---------------------------------------------------------- */
 ul.sessions { list-style: none; padding: 0; margin: var(--space-4) 0; }
 ul.sessions li {
