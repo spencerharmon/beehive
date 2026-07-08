@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
@@ -158,6 +159,124 @@ func TestPromptEmbedDriftWarning(t *testing.T) {
 		phantom := strings.Repeat("a", 40)
 		if w := promptEmbedDriftWarning(ctx, hive, "HEAD", phantom, subs); w != "" {
 			t.Fatalf("unknown SHA warned: %q", w)
+		}
+	})
+}
+
+// TestInstructionDriftWarning locks the Axis-B preflight guard: it warns iff a
+// hive-root managed instruction file (AGENTS.md/HONEYBEE.md/BOOTSTRAP.md) drifts
+// from THIS binary's embedded default, reusing internal/instruct.StatusOf. It is
+// complementary to the Axis-A promptEmbedDriftWarning above (build-vs-tracked-tip);
+// a hive that is Axis-A-clean can still be Axis-B-dirty and vice versa. instruct
+// .Install lays down the exact embedded defaults, so a freshly installed root is
+// the byte-identical, no-drift baseline.
+func TestInstructionDriftWarning(t *testing.T) {
+	install := func(t *testing.T) string {
+		t.Helper()
+		root := t.TempDir()
+		if _, err := instruct.Install(root); err != nil {
+			t.Fatalf("instruct.Install: %v", err)
+		}
+		return root
+	}
+
+	// Freshly installed defaults are byte-identical to what this binary ships -> no
+	// drift -> silent.
+	t.Run("clean-silent", func(t *testing.T) {
+		if w := instructionDriftWarning(install(t)); w != "" {
+			t.Fatalf("clean hive warned: %q", w)
+		}
+	})
+
+	// A stale/customized HONEYBEE.md differs from the embedded default -> warn,
+	// naming it "modified" and pointing at the `beehive instruction update` fix.
+	t.Run("modified-warns", func(t *testing.T) {
+		root := install(t)
+		if err := os.WriteFile(filepath.Join(root, "HONEYBEE.md"), []byte("# stale protocol\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		w := instructionDriftWarning(root)
+		if w == "" {
+			t.Fatal("modified HONEYBEE.md produced no warning, want one")
+		}
+		for _, want := range []string{"WARNING preflight", "HONEYBEE.md", "modified", "beehive instruction update"} {
+			if !strings.Contains(w, want) {
+				t.Fatalf("warning %q missing %q", w, want)
+			}
+		}
+	})
+
+	// An absent managed root file -> warn, naming it "missing".
+	t.Run("missing-warns", func(t *testing.T) {
+		root := install(t)
+		if err := os.Remove(filepath.Join(root, "BOOTSTRAP.md")); err != nil {
+			t.Fatal(err)
+		}
+		w := instructionDriftWarning(root)
+		if w == "" {
+			t.Fatal("missing BOOTSTRAP.md produced no warning, want one")
+		}
+		for _, want := range []string{"BOOTSTRAP.md", "missing"} {
+			if !strings.Contains(w, want) {
+				t.Fatalf("warning %q missing %q", w, want)
+			}
+		}
+	})
+
+	// Several drifted root files are all named in the single warning line.
+	t.Run("multiple-drift-all-named", func(t *testing.T) {
+		root := install(t)
+		if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("# custom\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(root, "HONEYBEE.md")); err != nil {
+			t.Fatal(err)
+		}
+		w := instructionDriftWarning(root)
+		for _, want := range []string{"AGENTS.md", "HONEYBEE.md"} {
+			if !strings.Contains(w, want) {
+				t.Fatalf("warning %q missing %q", w, want)
+			}
+		}
+	})
+
+	// Drift confined to a skills/ file (a managed file, but NOT a hive-root doc)
+	// must stay silent: Axis-B tracks only the injected root protocol files, so a
+	// skill edit never trips it. This locks the deliberate root-only scope.
+	t.Run("skill-drift-silent", func(t *testing.T) {
+		root := install(t)
+		skill := filepath.Join(root, "skills", "cleanup.md")
+		if _, err := os.Stat(skill); err != nil {
+			t.Skipf("skills/cleanup.md not installed: %v", err)
+		}
+		if err := os.WriteFile(skill, []byte("# custom skill\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if w := instructionDriftWarning(root); w != "" {
+			t.Fatalf("skill-only drift warned (root docs only): %q", w)
+		}
+	})
+
+	// A site-authored, unmanaged file (LOCALS.md, never in the managed set) present
+	// alongside clean root docs never fires: StatusOf returns ok=false for it.
+	t.Run("unmanaged-file-silent", func(t *testing.T) {
+		root := install(t)
+		if err := os.WriteFile(filepath.Join(root, "LOCALS.md"), []byte("# site facts\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if w := instructionDriftWarning(root); w != "" {
+			t.Fatalf("unmanaged LOCALS.md warned: %q", w)
+		}
+	})
+
+	// An empty root (no managed files at all — e.g. a repo not yet migrated by
+	// `beehive instruction update`) treats every root doc as missing and names all.
+	t.Run("empty-root-warns-all", func(t *testing.T) {
+		w := instructionDriftWarning(t.TempDir())
+		for _, want := range []string{"AGENTS.md", "HONEYBEE.md", "BOOTSTRAP.md", "missing"} {
+			if !strings.Contains(w, want) {
+				t.Fatalf("warning %q missing %q", w, want)
+			}
 		}
 	})
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/claim"
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/repo"
 	selectt "github.com/spencerharmon/beehive/internal/select"
 	"github.com/spencerharmon/beehive/internal/swarm"
@@ -132,6 +133,21 @@ func run() error {
 		if w := promptEmbedDriftWarning(ctx, primary, baseMain, version.SHA, subs0); w != "" {
 			fmt.Fprintf(os.Stderr, "honeybee: %s\n", w)
 		}
+	}
+
+	// Instruction-embed drift guard (Axis B, observability only): a SECOND,
+	// independent drift axis that Axis A above cannot see. honeybeeProtocol()
+	// injects HONEYBEE.md from the hive root's ON-DISK file, refreshed only by the
+	// still-manual `beehive instruction update` — beehive-rebuild (which closes
+	// Axis A) never touches it. So a binary that fully contains the tracked-main
+	// tip (Axis-A clean) can STILL inject a stale or absent protocol. Compare the
+	// hive-root managed instruction files against THIS binary's embedded defaults
+	// (reusing internal/instruct's single default source, no second comparison) and
+	// warn in promptEmbedDriftWarning's style. Runs alongside — not instead of — the
+	// Axis-A check (they are complementary); non-fatal, never touches selection/
+	// claim/publish.
+	if w := instructionDriftWarning(primaryRoot); w != "" {
+		fmt.Fprintf(os.Stderr, "honeybee: %s\n", w)
 	}
 
 	sel0er := &selectt.Selector{Repo: rp0, Git: primary, Rand: rnd, TTL: ttl}
@@ -449,6 +465,47 @@ func promptEmbedDriftWarning(ctx context.Context, hive *git.Repo, baseRef, build
 		return fmt.Sprintf("WARNING preflight: this honeybee binary was built from %s but %s's tracked-main tip is %s, which the binary does not contain — the deployed beehive binaries predate merged changes, so their embedded prompts (HONEYBEE.md et al.) and code may be stale; redeploy the binaries (LOCALS.md: beehive-rebuild)", shortSHA(buildSHA), treePath, shortSHA(tip))
 	}
 	return "" // no target's history holds our build SHA: cannot identify self, stay silent
+}
+
+// instructionDriftWarning reports whether any hive-root managed instruction file
+// (AGENTS.md, HONEYBEE.md, BOOTSTRAP.md) has drifted from THIS binary's embedded
+// default and, if so, returns a one-line warning (in promptEmbedDriftWarning's
+// style) naming the drifted/missing files; it returns "" when every one is
+// byte-identical to the embedded default.
+//
+// This is the SECOND drift axis (Axis B), complementary to — never a replacement
+// for — promptEmbedDriftWarning (Axis A). Axis A asks "is this binary behind the
+// tracked-main tip?"; a rebuild (LOCALS.md: beehive-rebuild) closes it. Axis B asks
+// "does the on-disk protocol the agent is actually injected match what this binary
+// ships?": honeybeeProtocol() reads HONEYBEE.md from the hive root's on-disk file,
+// which ONLY the still-manual `beehive instruction update` refreshes — a rebuild
+// never touches it — so a binary can be Axis-A-clean yet inject a stale/absent
+// protocol. It reuses internal/instruct.StatusOf as the single embedded-default
+// source (no second comparison here). OBSERVABILITY ONLY: an unreadable file is
+// skipped (never fatal), and it never affects selection/claim/publish.
+func instructionDriftWarning(root string) string {
+	// The root instruction files honeybeeProtocol()/bootstrap inject from disk. We
+	// name them explicitly (not every managed file) so a drifted skill under
+	// skills/ never fires a warning about the injected root protocol; a caller that
+	// iterates its own declared set is exactly StatusOf's intended shape.
+	names := []string{"AGENTS.md", "HONEYBEE.md", "BOOTSTRAP.md"}
+	var drift []string
+	for _, name := range names {
+		st, ok, err := instruct.StatusOf(root, name)
+		if err != nil || !ok {
+			continue // unreadable, or not a managed file: stay silent, never fatal
+		}
+		switch st {
+		case instruct.Missing:
+			drift = append(drift, name+" (missing)")
+		case instruct.Modified:
+			drift = append(drift, name+" (modified)")
+		}
+	}
+	if len(drift) == 0 {
+		return "" // every managed root file matches the embedded default: no drift
+	}
+	return fmt.Sprintf("WARNING preflight: hive-root instruction file(s) %s differ from this binary's embedded defaults — the agent is injected the on-disk HONEYBEE.md et al., which only `beehive instruction update` refreshes (a binary rebuild does not), so it may be running a stale or absent protocol; run `beehive instruction update` here to refresh them", strings.Join(drift, ", "))
 }
 
 // shortSHA abbreviates a full commit SHA to 12 hex chars for log lines, leaving a
