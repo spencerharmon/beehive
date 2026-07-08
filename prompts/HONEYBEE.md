@@ -125,6 +125,13 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
 - Write the change doc at EXACTLY `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` (the beehive layer,
   NOT inside the code worktree). The runner's completion check requires it there; a doc elsewhere reads
   as "not done".
+- Regardless of whether this task changes code: `git commit` your beehive-layer worktree's `PLAN.md`
+  status flip and `docs/` changes YOURSELF, in THIS worktree — a doc-only task commits here exactly like
+  a code task does. This is NOT the forbidden "author in the live/shared checkout": this worktree (your
+  cwd) is your own private one, never the checkout `main`/`submodules/<sm>/repo` point at. Leaving these
+  changes uncommitted is not "the runner will handle it" — the runner only ever merges commits that
+  already exist on your branch, so an uncommitted status flip or doc is silently lost the moment your
+  claim's heartbeat goes stale, and the task gets redispatched from scratch having delivered nothing.
 - Commit the code on branch `bee-<taskid>` with the `Beehive: <taskid> <doc-path>` stamp and ensure that
   commit is PUSHED to the submodule's origin (an unpushed commit dangles the pointer for every other
   host). Bump the submodule pointer: from the beehive-layer worktree (never `submodules/<sm>/repo`
