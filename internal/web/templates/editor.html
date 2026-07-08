@@ -2,10 +2,11 @@
 <h1>edit · {{.File}}</h1>
 <p><a href="/">dashboard</a> · chatting with the AI editor on its own branch. Changes are not live until merged.</p>
 <div id="editor"
+     role="status" aria-live="polite"
      hx-get="/editor/{{.ID}}/panel"
      hx-trigger="load, every 1500ms"
      hx-swap="innerHTML">
-  <p>loading…</p>
+  {{template "skeleton-transcript"}}
 </div>
 <form hx-post="/editor/{{.ID}}/chat" hx-target="#editor" hx-swap="innerHTML"
       hx-on::after-request="this.reset()">

@@ -6,8 +6,8 @@
   <ul class="bootstrap-steps">
     {{range .Unmet}}<li><b>{{.Title}}</b> &mdash; {{.Detail}}</li>{{end}}
   </ul>
-  <div id="bootstrap-agent" hx-get="/bootstrap" hx-trigger="load" hx-swap="innerHTML">
-    <p class="muted">loading setup assistant&hellip;</p>
+  <div id="bootstrap-agent" role="status" aria-live="polite" hx-get="/bootstrap" hx-trigger="load" hx-swap="innerHTML">
+    {{template "skeleton-transcript"}}
   </div>
 </section>
 {{end}}

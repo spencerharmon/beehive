@@ -1,0 +1,32 @@
+{{/* Reusable loading-skeleton components for the htmx-polled panes.
+
+     A polled pane's initial shell (marked role="status" aria-live="polite" so the
+     first swap-in is announced to assistive tech) embeds one of these shaped
+     placeholders instead of a bare "loading…" flash: pulsing token-driven blocks
+     sized to the pane's eventual content. Two shapes cover every polled shell:
+
+       skeleton-transcript — a stack of mono-height lines on a surface panel,
+                             echoing a <pre class="session"> transcript / chat log
+                             (#session-body, #resolve, #editor, #chatedit,
+                             #bootstrap-agent).
+       skeleton-list       — full-width rows echoing ul.sessions <li> rows
+                             (#session-list).
+
+     The bars are decorative (aria-hidden); a visually-hidden "Loading…" line is
+     the text equivalent while the region loads, and the shell's live region
+     announces the swapped-in content. Motion is a token-driven pulse gated behind
+     prefers-reduced-motion in style.css (.skeleton*, @keyframes bee-skeleton). */}}
+{{define "skeleton-transcript"}}<div class="skeleton skeleton-transcript" aria-hidden="true">
+  <span class="skeleton-line"></span>
+  <span class="skeleton-line"></span>
+  <span class="skeleton-line"></span>
+  <span class="skeleton-line"></span>
+  <span class="skeleton-line"></span>
+  <span class="skeleton-line"></span>
+</div><span class="sr-only">Loading…</span>{{end}}
+{{define "skeleton-list"}}<div class="skeleton skeleton-list" aria-hidden="true">
+  <span class="skeleton-row"></span>
+  <span class="skeleton-row"></span>
+  <span class="skeleton-row"></span>
+  <span class="skeleton-row"></span>
+</div><span class="sr-only">Loading…</span>{{end}}
