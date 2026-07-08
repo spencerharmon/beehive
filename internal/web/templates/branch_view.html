@@ -19,7 +19,7 @@
 <table>
 <tr><th>sha</th><th>refs</th><th>subject</th><th>author</th><th>change doc</th><th>delivered</th></tr>
 {{range .Commits}}<tr>
-<td><code>{{.SHA}}</code></td>
+<td><span class="sha-cell"><a href="/submodule/{{$.Name}}/commit/{{.SHA}}"><code>{{.SHA}}</code></a>{{template "copybtn" .SHA}}</span></td>
 <td>{{if .Refs}}<span class="badge">{{.Refs}}</span>{{end}}</td>
 <td>{{.Subject}}</td>
 <td class="muted">{{.Author}}</td>
@@ -35,4 +35,5 @@
 {{if .HasPrev}}<a href="?offset={{.Prev}}">&larr; prev</a>{{end}}
 {{if .HasNext}}<a href="?offset={{.Next}}">next &rarr;</a>{{end}}
 </nav>
+{{template "copyui"}}
 {{template "footer"}}

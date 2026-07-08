@@ -1,7 +1,55 @@
 {{template "header"}}
 <p><a href="/submodule/{{.Name}}/branches">&larr; {{.Name}} commits</a></p>
-<h1>{{.Name}} <code>{{.SHA}}</code></h1>
+<h1>{{.Name}} <span class="sha-cell"><code>{{.SHA}}</code>{{template "copybtn" .SHA}}</span></h1>
 <p class="muted">{{.Subject}}</p>
 <p class="muted">{{.Author}} &middot; {{.Date}}</p>
 <pre class="diff">{{.Patch}}</pre>
+{{template "copyui"}}
 {{template "footer"}}
+
+{{/* copybtn / copyui back the sha deep-link + copy-to-clipboard control
+   (commit-sha-deep-links). Defined here, used by BOTH this page and
+   branch_view.html (one parsed template set, so a define is shared). */}}
+{{define "copybtn"}}<button type="button" class="copy" data-copy="{{.}}" aria-label="Copy {{.}} to clipboard" title="Copy to clipboard" hidden>copy</button>{{end}}
+
+{{define "copyui"}}
+<span id="copy-status" class="visually-hidden" role="status" aria-live="polite"></span>
+<script>
+/* commit-sha-deep-links: dependency-free, progressively-enhanced copy-to-
+   clipboard for sha cells. With NO JavaScript every sha stays plain, selectable
+   text and the .copy buttons stay hidden (shipped with the [hidden] attribute,
+   revealed only here), so a no-JS reader loses nothing — never a dead control.
+   One delegated listener serves every .copy button; the #copy-status polite
+   live region announces the result for assistive tech. No external libraries
+   (single-binary embed, no CDN). */
+(function () {
+  var buttons = document.querySelectorAll('button.copy');
+  if (!buttons.length) return;
+  for (var i = 0; i < buttons.length; i++) buttons[i].hidden = false;
+  var status = document.getElementById('copy-status'), clearTimer;
+  function announce(msg) {
+    if (!status) return;
+    status.textContent = msg;
+    clearTimeout(clearTimer);
+    clearTimer = setTimeout(function () { status.textContent = ''; }, 2000);
+  }
+  function flash(btn) {
+    btn.classList.add('copied');
+    setTimeout(function () { btn.classList.remove('copied'); }, 1200);
+  }
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('button.copy') : null;
+    if (!btn) return;
+    var text = btn.getAttribute('data-copy') || '';
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { flash(btn); announce('Copied ' + text); },
+        function () { announce('Copy failed \u2014 select the text and copy manually'); }
+      );
+    } else {
+      announce('Copy unavailable \u2014 select the text and copy manually');
+    }
+  });
+})();
+</script>
+{{end}}

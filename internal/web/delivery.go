@@ -198,12 +198,21 @@ func safeSHA(s string) bool {
 	return true
 }
 
-// commitView renders one hive superproject commit's PLAN.md diff, scoped to a
-// single submodule — the destination a delivery-traceability FlipHref points
-// at ("why is this DONE"). Read-only: it only ever runs git show/rev-parse
-// against the beehive repo's OWN history, never a mutation. sha is validated
-// as hex and rev-parsed before use, so an invalid or unresolvable sha 404s
-// instead of ever reaching a shell-unsafe or non-existent ref.
+// commitView renders one commit's diff at /submodule/{name}/commit/{sha}. TWO
+// deep-linked surfaces resolve here, and a sha lives in exactly ONE of two
+// separate object stores, so it dispatches by WHERE the sha actually resolves:
+//
+//   - the branches view links a SUBMODULE code commit (branch_view.html's sha
+//     cells; commitGraph reads sm.RepoDir()) — rendered as that commit's own
+//     full code diff, the URL's literal "submodule {name}'s commit {sha}";
+//   - a delivery-traceability FlipHref links the HIVE superproject commit that
+//     flipped a task to DONE — rendered as its PLAN.md diff, "why is this DONE".
+//
+// The submodule's own history is tried first (the URL's literal reading), then
+// the hive; so linking either surface here is a live link, never a dead one.
+// Read-only throughout (git rev-parse/show only, never a mutation). sha is
+// hex-validated then rev-parsed in each repo, so a sha in NEITHER 404s (never
+// an error page) — commitView's original contract, now serving both surfaces.
 func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -215,33 +224,55 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	full, err := s.git.RevParse(r.Context(), sha)
-	if err != nil {
-		http.NotFound(w, r)
+	// Submodule code commit first (the URL's literal meaning), else the hive
+	// PLAN.md flip a FlipHref points at. Each yields nil when sha isn't a commit
+	// in that repo, so an unresolvable sha falls through to a 404.
+	if data := commitViewData(r.Context(), git.New(sm.RepoDir()), sm.Name, sha, ""); data != nil {
+		s.render(w, "commit_view.html", data)
 		return
 	}
-	meta, err := s.git.Run(r.Context(), "show", "-s", "--date=short", "--format=%an%x1f%ad%x1f%s", full)
-	if err != nil {
-		http.NotFound(w, r)
+	if data := commitViewData(r.Context(), s.git, sm.Name, sha, planRelPath(sm)); data != nil {
+		s.render(w, "commit_view.html", data)
 		return
+	}
+	http.NotFound(w, r)
+}
+
+// commitViewData rev-parses sha in g and builds commit_view.html's data map, or
+// nil when sha does not resolve to a commit in g. An absent or non-git repo, or
+// a sha this repo has never seen, all read as "not found" (never an error) — the
+// best-effort contract every file-derived view here follows — so commitView can
+// degrade to the OTHER repo or a clean 404. scopePath, when non-empty, restricts
+// the shown diff to that ONE pathspec: the hive flip passes the submodule's
+// PLAN.md so the page can never leak an unrelated hive file; the submodule-code
+// path passes "" for the commit's whole diff (its own repo, nothing to leak).
+func commitViewData(ctx context.Context, g *git.Repo, name, sha, scopePath string) map[string]interface{} {
+	full, err := g.RevParse(ctx, sha)
+	if err != nil {
+		return nil
+	}
+	meta, err := g.Run(ctx, "show", "-s", "--date=short", "--format=%an%x1f%ad%x1f%s", full)
+	if err != nil {
+		return nil
 	}
 	f := strings.SplitN(meta, "\x1f", 3)
 	for len(f) < 3 {
 		f = append(f, "")
 	}
-	// Scoped to this submodule's PLAN.md only — never a whole-commit diff —
-	// so the page can never leak an unrelated file from elsewhere in the hive.
-	patch, err := s.git.Run(r.Context(), "show", "--format=", full, "--", planRelPath(sm))
-	if err != nil {
-		http.NotFound(w, r)
-		return
+	showArgs := []string{"show", "--format=", full}
+	if scopePath != "" {
+		showArgs = append(showArgs, "--", scopePath)
 	}
-	s.render(w, "commit_view.html", map[string]interface{}{
-		"Name":    sm.Name,
+	patch, err := g.Run(ctx, showArgs...)
+	if err != nil {
+		return nil
+	}
+	return map[string]interface{}{
+		"Name":    name,
 		"SHA":     full[:min(12, len(full))],
 		"Author":  f[0],
 		"Date":    f[1],
 		"Subject": f[2],
 		"Patch":   patch,
-	})
+	}
 }

@@ -2173,6 +2173,122 @@ func TestCommitView(t *testing.T) {
 	}
 }
 
+// TestCommitViewSubmoduleCode is commit-sha-deep-links' core: branch_view.html's
+// sha cells deep-link a SUBMODULE code commit to /submodule/{name}/commit/{sha},
+// so that URL must render the submodule commit's OWN diff — not the hive PLAN.md
+// flip, and never a 404. commitView resolves the sha in the submodule's own
+// history first, which is what makes the branch-view link live.
+func TestCommitViewSubmoduleCode(t *testing.T) {
+	s, root := setup(t)
+	repoDir := filepath.Join(root, "submodules", "alpha", "repo")
+	commitRepoAt(t, repoDir, "add the widget")
+	sha := hygGit(t, repoDir, "rev-parse", "--short=12", "HEAD")
+
+	w := get(t, s, "/submodule/alpha/commit/"+sha)
+	if w.Code != 200 {
+		t.Fatalf("submodule commit view %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	// The submodule commit's own subject + code diff (the code, not a PLAN flip).
+	if !strings.Contains(body, "add the widget") || !strings.Contains(body, "f.txt") {
+		t.Fatalf("submodule commit view missing its subject/code diff:\n%s", body)
+	}
+	if !strings.Contains(body, sha) {
+		t.Fatalf("submodule commit view missing its sha %q:\n%s", sha, body)
+	}
+}
+
+// TestBranchViewShaDeepLink locks branch_view.html's two changes: every commit
+// sha cell (a) LINKS to its /submodule/{name}/commit/{sha} view and (b) carries
+// the progressively-enhanced copy control — a .copy button shipped hidden with
+// the sha in data-copy, plus the delegated Clipboard-API script and the polite
+// #copy-status live region. The sha itself stays plain selectable <code> text
+// as the no-JS fallback.
+func TestBranchViewShaDeepLink(t *testing.T) {
+	s, root := setup(t)
+	repoDir := filepath.Join(root, "submodules", "alpha", "repo")
+	commitRepoAt(t, repoDir, "add the widget")
+	sha := hygGit(t, repoDir, "rev-parse", "--short=12", "HEAD")
+
+	w := get(t, s, "/submodule/alpha/branches")
+	if w.Code != 200 {
+		t.Fatalf("branches %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `href="/submodule/alpha/commit/`+sha+`"`) {
+		t.Fatalf("branch view sha not linked to its commit view (sha %s):\n%s", sha, body)
+	}
+	for _, want := range []string{
+		`class="copy"`,            // the copy control itself
+		`data-copy="` + sha + `"`, // carrying this row's sha
+		`id="copy-status"`,        // the accessible confirmation live region
+		`aria-live="polite"`,      // announced politely to assistive tech
+		"navigator.clipboard",     // Clipboard API, dependency-free
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("branch view copy control missing %q:\n%s", want, body)
+		}
+	}
+	// No-JS fallback: the sha stays plain selectable text and the copy button
+	// ships hidden (revealed only by the script), so no-JS loses nothing.
+	if !strings.Contains(body, `<code>`+sha+`</code>`) {
+		t.Fatalf("branch view dropped the plain selectable sha text:\n%s", body)
+	}
+	if !strings.Contains(body, `title="Copy to clipboard" hidden>`) {
+		t.Fatalf("copy button must ship hidden for the no-JS fallback:\n%s", body)
+	}
+}
+
+// TestCommitViewCopyControl locks the same progressively-enhanced copy control
+// on the commit view itself, beside the page's sha heading.
+func TestCommitViewCopyControl(t *testing.T) {
+	s, root := setup(t)
+	repoDir := filepath.Join(root, "submodules", "alpha", "repo")
+	commitRepoAt(t, repoDir, "add the widget")
+	sha := hygGit(t, repoDir, "rev-parse", "--short=12", "HEAD")
+
+	body := get(t, s, "/submodule/alpha/commit/"+sha).Body.String()
+	for _, want := range []string{
+		`data-copy="` + sha + `"`,           // copy THIS commit's sha
+		`class="copy"`,                      //
+		`id="copy-status"`,                  // accessible confirmation
+		`aria-live="polite"`,                //
+		"navigator.clipboard",               // Clipboard API
+		`title="Copy to clipboard" hidden>`, // ships hidden: no-JS fallback
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("commit view copy control missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestStatsFlipShaLinkResolves verifies the /stats deliveries FlipSHA cell links
+// to a target that actually RESOLVES (not assumed): it derives the hive flip
+// commit from real history, confirms /stats links FlipSHA to exactly that
+// commit, then GETs the FlipHref to prove commitView still renders the hive
+// PLAN.md flip for a hive sha now that it ALSO serves submodule commits.
+func TestStatsFlipShaLinkResolves(t *testing.T) {
+	s, root := setup(t)
+	writeHivePlan(t, root, "alpha", "dt1", "TODO")
+	commitAll(t, root, "dt1-todo")
+	writeHivePlan(t, root, "alpha", "dt1", "DONE")
+	commitAll(t, root, "dt1-done")
+	flipSHA := hygGit(t, root, "rev-parse", "--short=12", "HEAD")
+
+	href := "/submodule/alpha/commit/" + flipSHA
+	if stats := get(t, s, "/stats").Body.String(); !strings.Contains(stats, `href="`+href+`"`) {
+		t.Fatalf("stats FlipSHA not linked to its hive flip commit %s:\n%s", flipSHA, stats)
+	}
+	// That link resolves: the hive PLAN.md flip (the "[DONE]" diff), not a 404.
+	w := get(t, s, href)
+	if w.Code != 200 {
+		t.Fatalf("stats FlipHref %s did not resolve: %d: %s", href, w.Code, w.Body)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "[DONE]") {
+		t.Fatalf("stats FlipHref resolved but missing the PLAN flip diff:\n%s", body)
+	}
+}
+
 // TestEditorDiffAddDelClasses confirms the chat-diff pane renders unified-diff
 // rows with add/del/eq classes (styled by the design-system --diff-* tokens).
 func TestEditorDiffAddDelClasses(t *testing.T) {

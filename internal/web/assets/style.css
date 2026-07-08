@@ -689,3 +689,37 @@ ul.secrets > li > code {
   font-size: var(--text-sm);
 }
 ul.secrets details.inline-edit { margin: 0; }
+
+/* Sha deep-link + copy control (commit-sha-deep-links) ------------------- */
+/* .sha-cell keeps a sha (linked to its commit view) and its copy button on one
+   baseline. button.copy is a small, unobtrusive secondary button; it ships
+   [hidden] and is revealed only by JS, so a no-JS reader just sees the plain
+   selectable sha — never a dead control. .copied is the brief post-copy visual
+   confirmation (the accessible confirmation is the #copy-status live region). */
+.sha-cell { display: inline-flex; align-items: center; gap: var(--space-2); }
+button.copy {
+  padding: 0 0.5em;
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--border);
+}
+button.copy:hover { color: var(--text); filter: none; }
+button.copy.copied { color: #fff; background: var(--success); border-color: transparent; }
+
+/* Screen-reader-only utility: visually removed but kept in the accessibility
+   tree, so a polite live region (#copy-status) can announce a copy result with
+   no visible chrome. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
