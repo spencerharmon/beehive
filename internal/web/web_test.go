@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"html/template"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -4485,5 +4488,255 @@ func TestStatsAddFilterRedirectWithOperator(t *testing.T) {
 	}
 	if got, want := u.Query()["filter"], []string{"model=opus"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("redirect filter params (garbage fop): got %v want %v", got, want)
+	}
+}
+
+// --- status-badge-contrast-fix -----------------------------------------------
+//
+// ui-audit-001 flagged several solid-fill status/state badges (white text over
+// an opaque single-hue background) under the WCAG 2.x 4.5:1 normal-text
+// contrast threshold, measured against the DECLARED hsl() values via the
+// standard relative-luminance formula (not eyeballed). The helpers below
+// recompute that same formula from whatever internal/web/assets/style.css
+// ACTUALLY declares today, so a future edit that quietly drags one of these
+// fills back under 4.5:1 fails TestBadgeSolidFillsMeetWCAGAA instead of
+// shipping a silent regression.
+
+// hslToRGB converts an hsl(h, s, l) triple (h in degrees; s, l in 0..1) to
+// sRGB components in 0..1, using the same conversion the CSS Color spec (and
+// every browser) applies to hsl().
+func hslToRGB(h, s, l float64) (r, g, b float64) {
+	h = math.Mod(h, 360)
+	if h < 0 {
+		h += 360
+	}
+	c := (1 - math.Abs(2*l-1)) * s
+	x := c * (1 - math.Abs(math.Mod(h/60, 2)-1))
+	m := l - c/2
+	var r1, g1, b1 float64
+	switch {
+	case h < 60:
+		r1, g1, b1 = c, x, 0
+	case h < 120:
+		r1, g1, b1 = x, c, 0
+	case h < 180:
+		r1, g1, b1 = 0, c, x
+	case h < 240:
+		r1, g1, b1 = 0, x, c
+	case h < 300:
+		r1, g1, b1 = x, 0, c
+	default:
+		r1, g1, b1 = c, 0, x
+	}
+	return r1 + m, g1 + m, b1 + m
+}
+
+// srgbChannelToLinear applies the WCAG 2.x relative-luminance transfer
+// function to a single sRGB channel in 0..1.
+func srgbChannelToLinear(c float64) float64 {
+	if c <= 0.03928 {
+		return c / 12.92
+	}
+	return math.Pow((c+0.055)/1.055, 2.4)
+}
+
+// relativeLuminance is the WCAG 2.x relative luminance of an sRGB color whose
+// channels are each in 0..1.
+func relativeLuminance(r, g, b float64) float64 {
+	return 0.2126*srgbChannelToLinear(r) + 0.7152*srgbChannelToLinear(g) + 0.0722*srgbChannelToLinear(b)
+}
+
+// contrastRatio is the WCAG 2.x contrast ratio between two relative
+// luminances: (lighter+0.05)/(darker+0.05).
+func contrastRatio(l1, l2 float64) float64 {
+	if l1 < l2 {
+		l1, l2 = l2, l1
+	}
+	return (l1 + 0.05) / (l2 + 0.05)
+}
+
+// hslWhiteContrast is the WCAG contrast ratio between an hsl(h, s%, l%)
+// background (h in degrees; s, l in PERCENT, 0..100) and opaque white (#fff)
+// foreground text — the pairing every badge/state pill under test uses.
+func hslWhiteContrast(h, s, l float64) float64 {
+	r, g, b := hslToRGB(h, s/100, l/100)
+	return contrastRatio(1.0, relativeLuminance(r, g, b))
+}
+
+// cssHueDegrees extracts the numeric degrees of a `--hue-x: N;` custom
+// property declared in style.css (e.g. "hue-done" -> 146), so the test
+// verifies against whatever hue is ACTUALLY in force rather than a duplicated
+// literal.
+func cssHueDegrees(t *testing.T, css, hueVar string) float64 {
+	t.Helper()
+	re := regexp.MustCompile(`--` + regexp.QuoteMeta(hueVar) + `:\s*([\d.]+)\s*;`)
+	m := re.FindStringSubmatch(css)
+	if m == nil {
+		t.Fatalf("style.css: no `--%s: <degrees>;` declaration found", hueVar)
+	}
+	deg, err := parseFloatT(t, m[1])
+	if err != nil {
+		t.Fatalf("style.css: --%s value %q: %v", hueVar, m[1], err)
+	}
+	return deg
+}
+
+// cssSelectorHueSL extracts the saturation/lightness percentages a CSS rule's
+// `background: hsl(var(--hueVar) S% L%)` declaration uses (e.g. `.badge.live`
+// borrowing `--hue-done`) — the mode-invariant badges that hardcode S/L
+// directly rather than going through a --badge-solid-* token.
+func cssSelectorHueSL(t *testing.T, css, selector, hueVar string) (s, l float64) {
+	t.Helper()
+	re := regexp.MustCompile(regexp.QuoteMeta(selector) + `\s*\{[^}]*background:\s*hsl\(\s*var\(--` + regexp.QuoteMeta(hueVar) + `\)\s*([\d.]+)%\s*([\d.]+)%\s*\)`)
+	m := re.FindStringSubmatch(css)
+	if m == nil {
+		t.Fatalf("style.css: %s has no `background: hsl(var(--%s) S%% L%%)` declaration", selector, hueVar)
+	}
+	return parseFloat2T(t, m[1], m[2])
+}
+
+// cssTokenHueSLAll extracts every `--tokenName: hsl(var(--hueVar) S% L%);`
+// declaration for tokenName, in source order (the :root/light declaration
+// first, the `prefers-color-scheme: dark` override second) — the
+// --badge-solid-green/--badge-solid-red tokens, each declared once per mode.
+func cssTokenHueSLAll(t *testing.T, css, tokenName, hueVar string) [][2]float64 {
+	t.Helper()
+	re := regexp.MustCompile(`--` + regexp.QuoteMeta(tokenName) + `:\s*hsl\(\s*var\(--` + regexp.QuoteMeta(hueVar) + `\)\s*([\d.]+)%\s*([\d.]+)%\s*\)`)
+	ms := re.FindAllStringSubmatch(css, -1)
+	out := make([][2]float64, 0, len(ms))
+	for _, m := range ms {
+		s, l := parseFloat2T(t, m[1], m[2])
+		out = append(out, [2]float64{s, l})
+	}
+	return out
+}
+
+func parseFloatT(t *testing.T, s string) (float64, error) {
+	t.Helper()
+	return strconv.ParseFloat(s, 64)
+}
+
+func parseFloat2T(t *testing.T, a, b string) (float64, float64) {
+	t.Helper()
+	av, err := parseFloatT(t, a)
+	if err != nil {
+		t.Fatalf("parse %q: %v", a, err)
+	}
+	bv, err := parseFloatT(t, b)
+	if err != nil {
+		t.Fatalf("parse %q: %v", b, err)
+	}
+	return av, bv
+}
+
+// TestBadgeSolidFillsMeetWCAGAA locks the status-badge-contrast-fix acceptance:
+// every enumerated solid-fill badge/state pill reaches >=4.5:1 contrast (WCAG
+// AA, normal text) against its white foreground, in BOTH light and dark, using
+// the values ACTUALLY declared in the embedded stylesheet (computed, not
+// eyeballed). It also locks that each pill's background still routes through
+// the dedicated --badge-solid-green/--badge-solid-red tokens (not directly
+// through --success/--danger, which serve other, contrast-incompatible
+// purposes elsewhere — see the :root comment in style.css) so a future edit
+// can't silently revert the wiring while leaving the tokens themselves fixed.
+func TestBadgeSolidFillsMeetWCAGAA(t *testing.T) {
+	raw, err := assetFS.ReadFile("assets/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(raw)
+	const minRatio = 4.5
+
+	hueDone := cssHueDegrees(t, css, "hue-done")
+	hueReview := cssHueDegrees(t, css, "hue-review")
+	hueArbitration := cssHueDegrees(t, css, "hue-arbitration")
+
+	assertMeets := func(label string, h, s, l float64) {
+		t.Helper()
+		got := hslWhiteContrast(h, s, l)
+		if got < minRatio {
+			t.Errorf("%s: hsl(%g %g%% %g%%) vs white = %.3f:1, want >= %.1f:1", label, h, s, l, got, minRatio)
+		}
+	}
+
+	// Mode-invariant pills: a single hardcoded S/L borrowing a shared hue var,
+	// so one declaration covers both light and dark.
+	liveS, liveL := cssSelectorHueSL(t, css, ".badge.live", "hue-done")
+	assertMeets(".badge.live (mode-invariant)", hueDone, liveS, liveL)
+	driftDriftS, driftDriftL := cssSelectorHueSL(t, css, ".badge.drift-drift", "hue-review")
+	assertMeets(".badge.drift-drift (mode-invariant)", hueReview, driftDriftS, driftDriftL)
+
+	// Mode-varying pills driven by the dedicated --badge-solid-green /
+	// --badge-solid-red tokens: each token must declare exactly one light
+	// (:root) and one dark (prefers-color-scheme: dark) value, and BOTH must
+	// independently clear the threshold.
+	greenSL := cssTokenHueSLAll(t, css, "badge-solid-green", "hue-done")
+	if len(greenSL) != 2 {
+		t.Fatalf("style.css: expected 2 declarations of --badge-solid-green (light+dark), found %d", len(greenSL))
+	}
+	assertMeets("--badge-solid-green (light)", hueDone, greenSL[0][0], greenSL[0][1])
+	assertMeets("--badge-solid-green (dark)", hueDone, greenSL[1][0], greenSL[1][1])
+
+	redSL := cssTokenHueSLAll(t, css, "badge-solid-red", "hue-arbitration")
+	if len(redSL) != 2 {
+		t.Fatalf("style.css: expected 2 declarations of --badge-solid-red (light+dark), found %d", len(redSL))
+	}
+	assertMeets("--badge-solid-red (light)", hueArbitration, redSL[0][0], redSL[0][1])
+	assertMeets("--badge-solid-red (dark)", hueArbitration, redSL[1][0], redSL[1][1])
+
+	// Lock the wiring: every enumerated consumer routes through the
+	// dedicated token, not the shared --success/--danger it used to.
+	for _, want := range []string{
+		".badge.env-green { background: var(--badge-solid-green);",
+		".badge.drift-clean { background: var(--badge-solid-green);",
+		".state.live { background: var(--badge-solid-green);",
+		".badge.drift-missing { background: var(--badge-solid-red);",
+		".state.dirty { background: var(--badge-solid-red);",
+	} {
+		if !strings.Contains(css, want) {
+			t.Errorf("style.css: missing expected wiring %q (badge no longer routes through the accessible token?)", want)
+		}
+	}
+	for _, unwanted := range []string{
+		".badge.env-green { background: var(--success);",
+		".badge.drift-clean { background: var(--success);",
+		".state.live { background: var(--success);",
+		".badge.drift-missing { background: var(--danger);",
+		".state.dirty { background: var(--danger);",
+	} {
+		if strings.Contains(css, unwanted) {
+			t.Errorf("style.css: still has pre-fix wiring %q (--success/--danger do not clear 4.5:1 with white text here)", unwanted)
+		}
+	}
+
+	// The per-status hue IDENTITY must be untouched: --hue-done/--hue-review/
+	// --hue-arbitration still drive .status-done/.status-needs-review/
+	// .status-needs-arbitration (the translucent status pills), so this fix
+	// only retuned lightness on the solid fills, never the hue palette.
+	for _, want := range []string{
+		".status-done { --sh: var(--hue-done); }",
+		".status-needs-review { --sh: var(--hue-review); }",
+		".status-needs-arbitration { --sh: var(--hue-arbitration); }",
+	} {
+		if !strings.Contains(css, want) {
+			t.Errorf("style.css: status pill hue wiring changed unexpectedly, missing %q", want)
+		}
+	}
+}
+
+// TestBadgeContrastHelpersKnownValues sanity-checks the WCAG helpers
+// themselves against well-known reference ratios (black/white on white is
+// 1:1/21:1) so a bug in hslToRGB/relativeLuminance/contrastRatio can't
+// silently rubber-stamp TestBadgeSolidFillsMeetWCAGAA above.
+func TestBadgeContrastHelpersKnownValues(t *testing.T) {
+	if got := hslWhiteContrast(0, 0, 100); math.Abs(got-1.0) > 0.001 {
+		t.Errorf("white-on-white = %.4f, want 1.0", got)
+	}
+	if got := hslWhiteContrast(0, 0, 0); math.Abs(got-21.0) > 0.01 {
+		t.Errorf("black-on-white = %.4f, want 21.0", got)
+	}
+	// A pure, fully-saturated mid-lightness red (hsl(0 100% 50%) = #ff0000)
+	// against white is a widely-published reference value (~3.998:1).
+	if got := hslWhiteContrast(0, 100, 50); math.Abs(got-3.998) > 0.01 {
+		t.Errorf("pure red vs white = %.4f, want ~3.998", got)
 	}
 }
