@@ -9,7 +9,9 @@
 //
 //	## <id> [<STATUS>] <!-- attempts=N deps=a,b session=<id> heartbeat=<RFC3339> -->
 //	free-form body lines...
-//	Human-needed: concrete blocker/reason (only when status is NEEDS-HUMAN)
+//	Human-needed: concrete blocker/reason (only when status is NEEDS-HUMAN),
+//	  optionally continued by immediately-following non-blank lines (e.g.
+//	  bullets naming the blocker/needed input) up to the next blank line
 //
 // The ROI stamp is the first comment; tasks are H2 headers carrying a metadata
 // comment. Body lines between headers belong to the preceding task. A task is
@@ -225,25 +227,54 @@ func (t *Task) header() string {
 	return fmt.Sprintf("## %s [%s] <!-- %s -->", t.ID, t.Status, meta)
 }
 
-// HumanReason returns the current reason a task is blocked for operator input,
-// recorded as a body field so humans can read/edit it directly in PLAN.md.
-func (t *Task) HumanReason() string {
-	for _, line := range t.Body {
-		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), humanReasonPrefix); ok {
-			return strings.TrimSpace(rest)
+// humanReasonSpan locates the Human-needed field's line range [start, end) in
+// t.Body: the line carrying the "Human-needed:" prefix plus any immediately
+// following non-blank lines — the structured bullets HONEYBEE.md's escalation
+// guidance asks agents to write (a one-line summary plus bullets naming the
+// concrete blocker/needed input) — stopping at the first blank line or the end
+// of the body. Returns start == -1 when no such field exists. HumanReason,
+// setHumanReason, and clearHumanReason all share this so the three stay in
+// agreement about the field's extent (plan-view-detail-polish).
+func (t *Task) humanReasonSpan() (start, end int) {
+	for i, line := range t.Body {
+		if _, ok := strings.CutPrefix(strings.TrimSpace(line), humanReasonPrefix); ok {
+			j := i + 1
+			for j < len(t.Body) && strings.TrimSpace(t.Body[j]) != "" {
+				j++
+			}
+			return i, j
 		}
 	}
-	return ""
+	return -1, -1
+}
+
+// HumanReason returns the current reason a task is blocked for operator input,
+// recorded as a body field so humans can read/edit it directly in PLAN.md. A
+// structured reason (see humanReasonSpan) spans the "Human-needed:" line and
+// every immediately-following non-blank line, joined back with newlines, so a
+// view can render the whole thing as markdown (e.g. a summary plus bullets)
+// instead of only ever its first line.
+func (t *Task) HumanReason() string {
+	start, end := t.humanReasonSpan()
+	if start == -1 {
+		return ""
+	}
+	first := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(t.Body[start]), humanReasonPrefix))
+	if end == start+1 {
+		return first
+	}
+	lines := append([]string{first}, t.Body[start+1:end]...)
+	return strings.Join(lines, "\n")
 }
 
 func (t *Task) setHumanReason(reason string) {
 	reason = oneLine(reason)
 	field := humanReasonPrefix + " " + reason
-	for i, line := range t.Body {
-		if _, ok := strings.CutPrefix(strings.TrimSpace(line), humanReasonPrefix); ok {
-			t.Body[i] = field
-			return
-		}
+	if start, end := t.humanReasonSpan(); start != -1 {
+		rest := append([]string{}, t.Body[end:]...)
+		t.Body = append(t.Body[:start:start], field)
+		t.Body = append(t.Body, rest...)
+		return
 	}
 	if len(t.Body) > 0 && strings.TrimSpace(t.Body[len(t.Body)-1]) != "" {
 		t.Body = append(t.Body, "")
@@ -251,18 +282,18 @@ func (t *Task) setHumanReason(reason string) {
 	t.Body = append(t.Body, field)
 }
 
-// clearHumanReason drops the Human-needed body field (and a trailing blank line
-// it may have introduced) when a NEEDS-HUMAN task is resolved, so a reopened task
-// does not carry a stale blocker reason. A no-op when no such field exists.
+// clearHumanReason drops the Human-needed body field — including any
+// structured continuation lines (see humanReasonSpan) — and a trailing blank
+// line it may have introduced, when a NEEDS-HUMAN task is resolved, so a
+// reopened task does not carry a stale blocker reason. A no-op when no such
+// field exists.
 func (t *Task) clearHumanReason() {
-	for i, line := range t.Body {
-		if _, ok := strings.CutPrefix(strings.TrimSpace(line), humanReasonPrefix); !ok {
-			continue
-		}
-		t.Body = append(t.Body[:i], t.Body[i+1:]...)
-		t.Body = trimTrailingBlank(t.Body)
+	start, end := t.humanReasonSpan()
+	if start == -1 {
 		return
 	}
+	t.Body = append(t.Body[:start:start], t.Body[end:]...)
+	t.Body = trimTrailingBlank(t.Body)
 }
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }

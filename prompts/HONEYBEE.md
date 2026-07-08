@@ -178,7 +178,9 @@ Done when the task leaves `NEEDS-ARBITRATION`.
    `INFRASTRUCTURE.md` are current. Human escalation: a concrete blocker requiring operator input
    (missing credentials/config, unavailable upstream API, contradictory spec, user-visible contract
    decision) → `beehive task human <sm> <task-id> --reason "<blocker + exact input needed>"`. Not for
-   ordinary uncertainty or tedious work — pick a workable path and continue.
+   ordinary uncertainty or tedious work — pick a workable path and continue. Write `--reason` as
+   short, structured markdown, not a run-on sentence: a one-line summary, then bullets naming the
+   concrete blocker and the exact input needed — the `/human` view renders it as formatted markdown.
 5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills

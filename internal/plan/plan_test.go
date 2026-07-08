@@ -317,6 +317,65 @@ func TestRequestHumanRejectsEmptyAndDone(t *testing.T) {
 	}
 }
 
+// TestHumanReasonStructuredSpan is the storage-side core of
+// plan-view-detail-polish: a "Human-needed:" field may carry a one-line
+// summary plus bullets immediately below it — the structure HONEYBEE.md's
+// escalation guidance asks agents to write — and HumanReason/clearHumanReason
+// must treat the WHOLE span (the prefix line plus every immediately-following
+// non-blank line, stopping at the next blank line) as one field, not just its
+// first line, so a view can render the complete reason as markdown.
+func TestHumanReasonStructuredSpan(t *testing.T) {
+	tk := &Task{ID: "a", Status: StatusHuman, Body: []string{
+		"stuck",
+		"",
+		"Human-needed: Missing credentials for the deploy API.",
+		"- Blocker: cannot authenticate to the release service",
+		"- Needed: a fresh API token for that service",
+		"",
+		"Files: a.go",
+	}}
+	want := "Missing credentials for the deploy API.\n" +
+		"- Blocker: cannot authenticate to the release service\n" +
+		"- Needed: a fresh API token for that service"
+	if got := tk.HumanReason(); got != want {
+		t.Fatalf("reason = %q, want %q", got, want)
+	}
+	// Resolving must drop the ENTIRE span, including the bullets, and leave
+	// unrelated trailing body content (Files:) untouched.
+	if err := tk.Resolve(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := tk.HumanReason(); got != "" {
+		t.Fatalf("reason after resolve = %q, want cleared", got)
+	}
+	s := (&Plan{Tasks: []*Task{tk}}).String()
+	if strings.Contains(s, "Human-needed:") || strings.Contains(s, "Blocker:") {
+		t.Fatalf("resolve left structured reason lines behind:\n%s", s)
+	}
+	if !strings.Contains(s, "Files: a.go") {
+		t.Fatalf("resolve dropped unrelated trailing body content:\n%s", s)
+	}
+}
+
+// TestSetHumanReasonReplacesStructuredSpan proves setHumanReason (as
+// RequestHuman uses it to overwrite a prior escalation) replaces a PRIOR
+// structured reason's whole span — summary plus bullets — rather than only
+// overwriting its first line and leaving stale bullets orphaned in the body.
+func TestSetHumanReasonReplacesStructuredSpan(t *testing.T) {
+	tk := &Task{ID: "a", Status: StatusHuman, Body: []string{
+		"Human-needed: old summary.",
+		"- old bullet one",
+		"- old bullet two",
+	}}
+	tk.setHumanReason("new summary, one line")
+	if got := tk.HumanReason(); got != "new summary, one line" {
+		t.Fatalf("reason = %q", got)
+	}
+	if strings.Contains(strings.Join(tk.Body, "\n"), "old bullet") {
+		t.Fatalf("stale bullets survived a reason replacement: %v", tk.Body)
+	}
+}
+
 func TestResolveReopensHumanTask(t *testing.T) {
 	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
 	tk := &Task{ID: "a", Status: StatusTODO, Session: "bee-1", Heartbeat: now, Body: []string{"do thing"}}

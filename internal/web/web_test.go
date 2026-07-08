@@ -364,6 +364,47 @@ func TestPlanAndHuman(t *testing.T) {
 	}
 }
 
+// TestHumanViewRendersStructuredReasonMarkdown is the /human half of
+// plan-view-detail-polish: a NEEDS-HUMAN task's reason — a one-line summary
+// plus bullets naming the concrete blocker/needed input, the structure
+// HONEYBEE.md's escalation guidance now asks agents to write — renders as
+// real markdown markup (a list), not escaped raw text carrying literal "- "
+// characters or a raw "Human-needed:" prefix.
+func TestHumanViewRendersStructuredReasonMarkdown(t *testing.T) {
+	s, root := setup(t)
+	sm := filepath.Join(root, "submodules", "alpha")
+	if err := os.WriteFile(filepath.Join(sm, repo.PlanFile), []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## stuck [NEEDS-HUMAN] <!-- attempts=4 deps= -->\nblocked\n"+
+			"Human-needed: Missing credentials for the deploy API.\n"+
+			"- Blocker: cannot authenticate to the release service\n"+
+			"- Needed: a fresh API token for that service\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := get(t, s, "/human")
+	if w.Code != 200 {
+		t.Fatalf("human %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"Missing credentials for the deploy API.",
+		"<li>Blocker: cannot authenticate to the release service</li>",
+		"<li>Needed: a fresh API token for that service</li>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("rendered reason missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "Human-needed:") {
+		t.Fatalf("raw Human-needed: prefix leaked into the rendered view:\n%s", body)
+	}
+	if strings.Contains(body, "- Blocker:") {
+		t.Fatalf("bullet rendered as raw dash text instead of a real list:\n%s", body)
+	}
+}
+
 // TestParsePlanRealFormat is the core of web-plan-parser-unify: the web parser is
 // now a thin adapter over internal/plan, so a REAL H2-header PLAN.md (the format
 // the runner actually writes, with session/heartbeat claim metadata) parses —
@@ -792,6 +833,81 @@ func TestPlanChangeDocLink(t *testing.T) {
 	// Pills still render (status-driven, time-independent).
 	if !strings.Contains(body, "status-todo") || !strings.Contains(body, "status-needs-human") {
 		t.Fatalf("status pills missing from plan view:\n%s", body)
+	}
+}
+
+// TestPlanChangeDocLinkFallsBackToDesignDoc is plan-view-detail-polish's core
+// "none inert" fix: a task with no stamped implementing commit yet (still in
+// flight) falls back to its planned "Doc:" design-doc convention line when
+// THAT resolves to a real file under the submodule's docs/ tree — including a
+// NESTED path (docs/tasks/...), which the old basename-only resolver missed
+// (it would look for "haswork.md" flat under docs/, never finding it under
+// docs/tasks/). A task whose Doc: line names a file that doesn't exist must
+// still render with NO link — the "never a dead href" contract holds for the
+// fallback exactly as it does for the commit-stamp mechanism.
+func TestPlanChangeDocLinkFallsBackToDesignDoc(t *testing.T) {
+	s, root := setup(t)
+	sm := filepath.Join(root, "submodules", "alpha")
+	tasksDir := filepath.Join(sm, "docs", "tasks")
+	if err := os.MkdirAll(tasksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tasksDir, "haswork.md"), []byte("# haswork design doc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sm, repo.PlanFile), []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## haswork [TODO] <!-- attempts=0 deps= -->\nin flight, no commit yet\nDoc: docs/tasks/haswork.md\n\n"+
+			"## nodoc [TODO] <!-- attempts=0 deps= -->\nno design doc file on disk\nDoc: docs/tasks/missing.md\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := get(t, s, "/submodule/alpha/plan")
+	if w.Code != 200 {
+		t.Fatalf("plan %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `href="/submodule/alpha/doc/tasks/haswork.md"`) {
+		t.Fatalf("nested design-doc fallback link missing:\n%s", body)
+	}
+	if strings.Contains(body, "/doc/tasks/missing.md") {
+		t.Fatalf("absent design doc must not be linked:\n%s", body)
+	}
+	if !strings.Contains(body, `<span class="muted">docs/tasks/missing.md</span>`) {
+		t.Fatalf("unresolvable design doc should still show its path as inert text:\n%s", body)
+	}
+}
+
+// TestPlanItemExpandRendersFullBody is the expand-in-place half of
+// plan-view-detail-polish: a task row carries its full body (not just the
+// clipped Desc line) rendered through renderMarkdown into a <details> the
+// reader can open, sanitized the same way every other VIEW pane is (a script
+// tag is dropped, real markup like a heading/list survives).
+func TestPlanItemExpandRendersFullBody(t *testing.T) {
+	s, _ := setup(t)
+	pl := Plan{ROIStamp: "abc123", Items: []PlanItem{
+		{
+			ID: "imp", Status: StatusTODO, Desc: "implement it",
+			Body: "implement it\n\n## Detail\n- one\n- two\n\n<script>alert(1)</script>",
+		},
+		{ID: "nobody", Status: StatusDone, Desc: "shipped, no body"},
+	}}
+	out := renderTmpl(t, s, "plan_items.html", map[string]interface{}{"Name": "alpha", "Plan": pl})
+	if !strings.Contains(out, "<details>") || !strings.Contains(out, "<summary") {
+		t.Fatalf("expand-in-place affordance missing:\n%s", out)
+	}
+	for _, want := range []string{`<div class="markdown">`, "<h2>Detail</h2>", "<li>one</li>", "<li>two</li>"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expanded body missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "alert(1)") {
+		t.Fatalf("expanded body's script payload was not sanitized:\n%s", out)
+	}
+	// A task with no body gets no expand affordance at all (nothing to reveal).
+	if strings.Count(out, "<details>") != 1 {
+		t.Fatalf("want exactly one expand affordance (only 'imp' has a body):\n%s", out)
 	}
 }
 

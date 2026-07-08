@@ -833,13 +833,21 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	// Link each task to the change doc its implementing commit stamped
-	// (Beehive: <taskid> <docpath>): scan this submodule's history once for the
-	// stamps, then resolve each to a viewable doc under the submodule's docs/
-	// (resolveDocHref guards traversal + existence, so a link is never dead).
+	// Link each task to a viewable doc — never inert when one is locatable
+	// (plan-view-detail-polish's "none inert" fix, auditing plan-view-pills'
+	// resolution against delivery-traceability's): first the change doc its
+	// implementing commit stamped (Beehive: <taskid> <docpath>, scanned once
+	// for this submodule's history), falling back to the task's own planned
+	// "Doc:" design-doc convention line when THAT resolves to a real file
+	// (e.g. a still-in-flight task's docs/tasks/<id>.md design doc). Both
+	// paths go through resolveDocHref (traversal + existence guarded), so a
+	// row with neither locatable is still never a dead link.
 	docs := changeDocsByTask(r.Context(), sm.RepoDir())
 	for i := range p.Items {
 		p.Items[i].DocHref = resolveDocHref(sm, docs[p.Items[i].ID])
+		if p.Items[i].DocHref == "" && p.Items[i].Doc != "" {
+			p.Items[i].DocHref = resolveDocHref(sm, p.Items[i].Doc)
+		}
 	}
 	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p})
 }

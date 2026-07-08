@@ -118,22 +118,58 @@ func changeDocsByTask(ctx context.Context, repoDir string) map[string]string {
 	return docs
 }
 
-// resolveDocHref returns a link to view docPath's change doc when it names a
-// real file under the submodule's docs/ dir, else "". Only the basename is used
-// and it is traversal-guarded, so a link can never escape submodules/<sm>/docs/
-// or reach another submodule.
+// resolveDocHref returns a link to VIEW docPath's doc (via the doc handler,
+// web.go's `doc`) when it names a real file under the submodule's docs/ dir,
+// else "". docPath may be any of the conventions a caller hands it (plan-
+// view-detail-polish unified these, previously audited as two independent
+// resolvers): a flat `Beehive: <taskid> <docpath>` commit-stamp basename
+// ("bee-t1.md"), that same stamp prefixed with "docs/" ("docs/bee-t1.md") or
+// with the beehive-layer's own submodule root ("submodules/<name>/docs/bee-
+// t1.md" — some commits stamp the doc path from the hive root instead of the
+// submodule root), or a PLAN.md "Doc:" design-doc convention line, which nests
+// under a docs/ subdirectory ("docs/tasks/t1.md", "docs/audit/....md"). Every
+// form normalizes (normalizeDocPath) to one slash-separated path relative to
+// the submodule's docs/ dir, traversal/charset-guarded via safeDocPath (nested
+// segments allowed, unlike the single-segment safeBranch this used before), so
+// a link can never escape submodules/<sm>/docs/ or reach another submodule; a
+// doc that does not resolve under ANY of these forms returns "" — never a dead
+// link.
 func resolveDocHref(sm repo.Submodule, docPath string) string {
+	rel := normalizeDocPath(sm, docPath)
+	if rel == "" {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(sm.Path, "docs", filepath.FromSlash(rel))); err != nil {
+		return ""
+	}
+	return "/submodule/" + sm.Name + "/doc/" + rel
+}
+
+// normalizeDocPath reduces a raw doc-path stamp/convention string (see
+// resolveDocHref) to a slash-separated path relative to the submodule's docs/
+// dir, or "" when it is empty or fails validation. It strips an optional
+// "submodules/<sm.Name>/" hive-root prefix, then an optional leading "docs/"
+// component (the convention every known form uses to anchor itself under the
+// submodule's docs/ dir); the remainder is validated via safeDocPath
+// (traversal/charset-guarded, nested segments allowed — docs/tasks/*,
+// docs/audit/*, ...). A path that never had a "docs/" component to anchor it
+// (i.e. some other, unanticipated convention) degrades to just its basename,
+// validated the same way — this keeps every historical flat stamp resolving
+// exactly as before rather than rejecting it outright.
+func normalizeDocPath(sm repo.Submodule, docPath string) string {
 	if docPath == "" {
 		return ""
 	}
-	base := filepath.Base(docPath)
-	if !safeBranch(base) {
+	p := strings.TrimPrefix(filepath.ToSlash(docPath), "submodules/"+sm.Name+"/")
+	if rest, ok := strings.CutPrefix(p, "docs/"); ok {
+		p = rest
+	} else {
+		p = filepath.Base(p)
+	}
+	if !safeDocPath(p) {
 		return ""
 	}
-	if _, err := os.Stat(filepath.Join(sm.Path, "docs", base)); err != nil {
-		return ""
-	}
-	return "/submodule/" + sm.Name + "/doc/" + base
+	return p
 }
 
 // sectionByDate groups a single submodule's date-ordered commits (git log is

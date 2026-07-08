@@ -1,6 +1,7 @@
 package web
 
 import (
+	"html/template"
 	"os"
 	"strings"
 	"time"
@@ -37,10 +38,14 @@ type Dep struct {
 // DepStates and DocHref are view-only enrichments: DepStates marks each dep
 // satisfied/pending against this plan, and DocHref links the change doc the
 // implementing commit stamped (set by the handler, which has the repo + docs/).
+// Body is the task's full body text verbatim (plan-view-detail-polish): the
+// expand-in-place detail view renders it (via BodyHTML) so a row can reveal
+// more than Desc's single clipped line.
 type PlanItem struct {
 	ID          string
 	Status      string
 	Desc        string // first non-empty body line (plan.Task has no Desc field)
+	Body        string // full body text verbatim (all lines, joined with "\n"), "" if empty
 	Deps        []string
 	DepStates   []Dep // deps resolved to satisfied/pending against this plan's DONE set
 	Weight      int
@@ -49,8 +54,32 @@ type PlanItem struct {
 	Active      bool      // claim fresh within the TTL (the unified "in progress")
 	Stale       bool      // claim past the TTL (GC-reclaimable; owner presumed dead)
 	Doc         string    // linked change-doc path from a body "Doc:" line, "" if none
-	DocHref     string    // link to view the change doc (from the commit stamp), "" if unresolved
-	HumanReason string    // explicit NEEDS-HUMAN reason from a body "Human-needed:" line
+	DocHref     string    // link to view the change doc (from the commit stamp or the design Doc), "" if unresolved
+	HumanReason string    // explicit NEEDS-HUMAN reason from a body "Human-needed:" line (may span multiple lines)
+}
+
+// BodyHTML renders the task's full body (Body) as sanitized markdown for the
+// expand-in-place detail affordance (plan-view-detail-polish): the complete
+// task description, not just the clipped Desc first line, through the same
+// renderMarkdown helper the explorer/ROI/doc views already use (editor-
+// markdown-render). "" when the task carries no body.
+func (it PlanItem) BodyHTML() template.HTML {
+	if it.Body == "" {
+		return ""
+	}
+	return renderMarkdown(it.Body)
+}
+
+// HumanReasonHTML renders the task's NEEDS-HUMAN reason (HumanReason) as
+// sanitized markdown for the /human view (plan-view-detail-polish): a
+// structured reason (a one-line summary plus bullets, per HONEYBEE.md's
+// escalation guidance) renders as real markup instead of raw escaped text.
+// "" when the task carries no reason.
+func (it PlanItem) HumanReasonHTML() template.HTML {
+	if it.HumanReason == "" {
+		return ""
+	}
+	return renderMarkdown(it.HumanReason)
 }
 
 // StatusClass is the design-system pill class for the task's status: the base
@@ -200,7 +229,8 @@ func resolveDeps(items []PlanItem) {
 }
 
 // projectTask maps a plan.Task to the view's PlanItem, deriving Desc (first
-// non-empty body line) and Doc (a "Doc:" convention line in the body) and the
+// non-empty body line), Body (the full body verbatim, for the expand-in-place
+// detail view), and Doc (a "Doc:" convention line in the body), and the
 // active/stale claim flags against now/ttl.
 func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
 	it := PlanItem{
@@ -213,6 +243,9 @@ func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
 		Active:      t.Active(now, ttl),
 		Stale:       t.Stale(now, ttl),
 		HumanReason: t.HumanReason(),
+	}
+	if len(t.Body) > 0 {
+		it.Body = strings.Join(t.Body, "\n")
 	}
 	for _, line := range t.Body {
 		s := strings.TrimSpace(line)
