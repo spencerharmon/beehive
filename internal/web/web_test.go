@@ -1196,6 +1196,102 @@ func TestAssetsStyleServed(t *testing.T) {
 	}
 }
 
+// TestTableScrollWrapsDataTables is the core of responsive-table-overflow:
+// style.css had exactly one width breakpoint (the .editor-grid stack) and no
+// overflow-x, so every data table forced whole-page horizontal scroll or an
+// illegible column squeeze at narrow widths. It asserts (1) the embedded
+// `.table-scroll` rule (overflow-x:auto, token-driven margin bookkeeping, no
+// new color token) and (2) that every enumerated table — plan_items.html
+// (widest/most-visited), branch_view.html, human.html, and stats.html's two
+// top-level tables PLUS its three nested `.nested` drill-downs (by-model,
+// deliveries, total-by-model) — renders wrapped in
+// `<div class="table-scroll"><table>…`. There is no browser here, so this
+// checks the markup/CSS contract rather than rendered pixels.
+func TestTableScrollWrapsDataTables(t *testing.T) {
+	s, _ := setup(t)
+
+	// (1) The CSS rule: overflow-x, and the wrapper (not the table) carries the
+	// vertical margin so wrapping never doubles up desktop spacing. No new
+	// color token — grep for the design system's --color-*/hsl( conventions
+	// would be brittle, so just confirm no bespoke color literal snuck in.
+	css := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		".table-scroll {", "overflow-x: auto", ".table-scroll > table { margin: 0; }",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("style.css missing table-scroll rule %q:\n%s", want, css)
+		}
+	}
+	scrollRuleStart := strings.Index(css, ".table-scroll {")
+	scrollRuleEnd := strings.Index(css[scrollRuleStart:], "}")
+	scrollRule := css[scrollRuleStart : scrollRuleStart+scrollRuleEnd]
+	if strings.Contains(scrollRule, "#") || strings.Contains(scrollRule, "hsl(") {
+		t.Fatalf(".table-scroll must be token-driven, no new color literal:\n%s", scrollRule)
+	}
+
+	// (2) plan_items.html — the 6-col task table.
+	pl := Plan{ROIStamp: "abc123", Items: []PlanItem{{ID: "t1", Status: StatusTODO, Desc: "x"}}}
+	planOut := renderTmpl(t, s, "plan_items.html", map[string]interface{}{"Name": "alpha", "Plan": pl})
+	if !strings.Contains(planOut, "<div class=\"table-scroll\">\n<table>") {
+		t.Fatalf("plan_items.html table not wrapped in .table-scroll:\n%s", planOut)
+	}
+
+	// (3) branch_view.html — the commit table.
+	branchOut := renderTmpl(t, s, "branch_view.html", map[string]interface{}{
+		"Name": "alpha",
+		"Sections": []Section{{Date: "2026-07-01", Commits: []Commit{
+			{SHA: "abc1234", Subject: "a commit", Author: "bee"},
+		}}},
+		"HasPrev": false, "HasNext": false,
+	})
+	if !strings.Contains(branchOut, "<div class=\"table-scroll\">\n<table>") {
+		t.Fatalf("branch_view.html table not wrapped in .table-scroll:\n%s", branchOut)
+	}
+
+	// (4) human.html — the pending-human table, through the real handler
+	// (setup's fixture plan already carries a NEEDS-HUMAN task, t2).
+	humanOut := get(t, s, "/human").Body.String()
+	if !strings.Contains(humanOut, "<div class=\"table-scroll\">\n<table><tr><th>submodule</th>") {
+		t.Fatalf("human.html table not wrapped in .table-scroll:\n%s", humanOut)
+	}
+
+	// (5) stats.html default view — the per-submodule table plus both nested
+	// drill-downs (by-model, deliveries) and the total-by-model table: 4
+	// wrappers total.
+	statsData := map[string]interface{}{
+		"Filters": nil, "GroupBy": []string(nil), "GroupBySet": toSet(nil),
+		"BuiltinTags": builtinFacets, "ExtraGroupBy": "", "Filtered": false,
+		"Subs": []subStat{{
+			Name: "alpha", DeliveredTasks: 1, Honeybees: 2,
+			Models:     []modelStat{{Model: "m1", DeliveredTasks: 1, Honeybees: 1}},
+			Deliveries: []DeliveryLink{{TaskID: "t1", FlipSHA: "abc", FlipHref: "/x"}},
+		}},
+		"Total": subStat{
+			DeliveredTasks: 1, Honeybees: 2,
+			Models: []modelStat{{Model: "m1", DeliveredTasks: 1, Honeybees: 1}},
+		},
+	}
+	statsOut := renderTmpl(t, s, "stats.html", statsData)
+	if n := strings.Count(statsOut, `<div class="table-scroll">`); n != 4 {
+		t.Fatalf("stats.html default view: want 4 .table-scroll wrappers (top-level + by-model + deliveries + total-by-model), got %d:\n%s", n, statsOut)
+	}
+	if n := strings.Count(statsOut, "<div class=\"table-scroll\">\n  <table class=\"nested\">"); n != 3 {
+		t.Fatalf("stats.html: want the 3 nested drill-down tables wrapped in .table-scroll, got %d:\n%s", n, statsOut)
+	}
+
+	// (6) stats.html grouped (Filtered) view — the filter/group-by aggregation
+	// table takes the OTHER branch of the {{if .Filtered}} split.
+	groupedData := map[string]interface{}{
+		"Filters": nil, "GroupBy": []string{"kind"}, "GroupBySet": toSet([]string{"kind"}),
+		"BuiltinTags": builtinFacets, "ExtraGroupBy": "", "Filtered": true,
+		"Grouped": []groupStat{{Values: []string{"work"}, DeliveredTasks: 1, Honeybees: 1}},
+	}
+	groupedOut := renderTmpl(t, s, "stats.html", groupedData)
+	if !strings.Contains(groupedOut, "<div class=\"table-scroll\">\n<table>") {
+		t.Fatalf("stats.html grouped view table not wrapped in .table-scroll:\n%s", groupedOut)
+	}
+}
+
 // TestRenderMarkdownSanitized is the core of editor-markdown-render: markdown
 // renders to the expected HTML (headings/lists/code/emphasis) AND repo content
 // is sanitized — a <script> block is dropped (not passed through) and a
