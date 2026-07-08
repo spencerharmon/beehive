@@ -2078,7 +2078,7 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	write("bee-dead.md", repo.SessionStub("bee-dead-stream"))   // branch gone -> NOT live
 	write("bee-final.md", "# final transcript\nall done.\n")    // non-stub -> NOT live
 
-	infos := s.sessionInfos(ctx, sessDir, time.Now())
+	infos := s.sessionInfos(ctx, s.headSHA(ctx), repo.Submodule{Name: "alpha", Path: filepath.Join(root, "submodules", "alpha")}, time.Now())
 	got := map[string]bool{}
 	for _, in := range infos {
 		got[in.ID] = in.Live
@@ -2128,6 +2128,165 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	}
 	if b := finalPage.Body.String(); !strings.Contains(b, `class="badge">ended`) || strings.Contains(b, `>running</span>`) || strings.Contains(b, `>live</span>`) {
 		t.Errorf("final session page should show ended badge only, got: %q", b)
+	}
+}
+
+// seedDeliveredTask sets up a fully-traceable DONE task in alpha: the hive
+// PLAN.md flip commit (delivery-traceability half a) plus the submodule code
+// stamp and its change doc (branch-graph-sectioned half b), returning the short
+// hive flip sha a session's links must resolve to. It is the shared fixture the
+// session-list-links-labels tests link a session against. Mirrors the setup in
+// TestComputeStatsDeliveryLinks / TestBranchesDeliveryLink so the session
+// surface is proven to reuse the SAME resolvers, not a parallel one.
+func seedDeliveredTask(t *testing.T, root, id string) string {
+	t.Helper()
+	writeHivePlan(t, root, "alpha", id, "TODO")
+	commitAll(t, root, id+"-todo")
+	writeHivePlan(t, root, "alpha", id, "DONE")
+	commitAll(t, root, id+"-done")
+	flipSHA := hygGit(t, root, "rev-parse", "--short=12", "HEAD")
+	docsDir := filepath.Join(root, "submodules", "alpha", "docs")
+	if err := os.MkdirAll(docsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(docsDir, "bee-"+id+".md"), []byte("# "+id+" change doc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitRepoAt(t, filepath.Join(root, "submodules", "alpha", "repo"),
+		"impl "+id+"\n\nBeehive: "+id+" bee-"+id+".md")
+	return flipSHA
+}
+
+// TestSessionChangeLinksShared is session-list-links-labels' core assertion:
+// a session's links resolve through the SAME task-keyed records the
+// delivery-traceability and branch-graph-sectioned views already build, so a
+// worker, reviewer, AND arbitrator session for ONE DONE task all point at the
+// same task, change doc, and hive flip commit. A session that moved no locatable
+// task (a reconcile pass here) degrades every link to blank (rendered as plain
+// text, never a dead link) with no error, yet still renders its row. It also
+// locks the row labels: the shortened display name and the kind+model tags read
+// back from the transcript header (stats-tag-model's sessionTags, git-only).
+func TestSessionChangeLinksShared(t *testing.T) {
+	s, root := setup(t)
+	ctx := context.Background()
+	const opus = "github-copilot/claude-opus-4.8"
+
+	flipSHA := seedDeliveredTask(t, root, "dt1")
+
+	// Three sessions on the SAME task branch (bee-dt1), one per honeybee kind,
+	// plus a reconcile session that moved no task (the negative control).
+	writeTranscript(t, root, "bee-dt1-100-1", "work", opus)
+	writeTranscript(t, root, "bee-dt1-200-2", "review", opus)
+	writeTranscript(t, root, "bee-dt1-300-3", "arbitrate", opus)
+	writeTranscript(t, root, "bee-reconcile-900-9", "reconcile", opus)
+
+	sm := repo.Submodule{Name: "alpha", Path: filepath.Join(root, "submodules", "alpha")}
+	infos := s.sessionInfos(ctx, s.headSHA(ctx), sm, time.Now())
+	by := map[string]sessionInfo{}
+	for _, in := range infos {
+		by[in.ID] = in
+	}
+
+	want := sessionChange{
+		TaskID:     "dt1",
+		TaskHref:   "/submodule/alpha/plan",
+		DocPath:    "bee-dt1.md",
+		DocHref:    "/submodule/alpha/doc/bee-dt1.md",
+		CommitSHA:  flipSHA,
+		CommitHref: "/submodule/alpha/commit/" + flipSHA,
+	}
+	for _, tc := range []struct{ id, kind string }{
+		{"bee-dt1-100-1", "work"},
+		{"bee-dt1-200-2", "review"},
+		{"bee-dt1-300-3", "arbitrate"},
+	} {
+		in, ok := by[tc.id]
+		if !ok {
+			t.Fatalf("session %q missing from list", tc.id)
+		}
+		if in.Display != "dt1" {
+			t.Errorf("%s Display = %q, want dt1 (bee- prefix and -<epoch>-<pid> stripped)", tc.id, in.Display)
+		}
+		if in.Kind != tc.kind || in.Model != opus {
+			t.Errorf("%s labels = kind:%q model:%q, want kind:%q model:%q", tc.id, in.Kind, in.Model, tc.kind, opus)
+		}
+		if !reflect.DeepEqual(in.Change, want) {
+			t.Errorf("%s Change = %+v\nwant %+v (all kinds share one task-keyed record)", tc.id, in.Change, want)
+		}
+	}
+
+	// Negative control: a reconcile session moved no locatable task, so every
+	// href is blank — but the row still renders with its kind/model labels.
+	rc, ok := by["bee-reconcile-900-9"]
+	if !ok {
+		t.Fatal("reconcile session missing from list")
+	}
+	if rc.Change.TaskHref != "" || rc.Change.DocHref != "" || rc.Change.CommitHref != "" {
+		t.Errorf("reconcile session must have NO change links, got %+v", rc.Change)
+	}
+	if rc.Display != "reconcile" || rc.Kind != "reconcile" {
+		t.Errorf("reconcile row labels = display:%q kind:%q, want reconcile/reconcile", rc.Display, rc.Kind)
+	}
+}
+
+// TestSessionListRendersLabelsAndLinks drives the same feature through the
+// RENDERED list body (GET .../sessions/body): the shortened name is the link
+// text (never the full pid-bearing stem), kind+model show as badges, and the
+// task/change-doc/hive-flip links are all present — the operator-facing surface.
+func TestSessionListRendersLabelsAndLinks(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+	flipSHA := seedDeliveredTask(t, root, "dt1")
+	writeTranscript(t, root, "bee-dt1-100-1", "work", opus)
+
+	w := get(t, s, "/submodule/alpha/sessions/body")
+	if w.Code != 200 {
+		t.Fatalf("sessions body %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, wantStr := range []string{
+		`>dt1</a>`,                                       // link text is the shortened name
+		`<span class="badge kind">work</span>`,           // kind tag
+		`<span class="badge model">` + opus + `</span>`,  // model tag
+		`href="/submodule/alpha/plan"`,                   // task link
+		`href="/submodule/alpha/doc/bee-dt1.md"`,         // change-doc link
+		`href="/submodule/alpha/commit/` + flipSHA + `"`, // hive flip commit link
+	} {
+		if !strings.Contains(body, wantStr) {
+			t.Fatalf("sessions list body missing %q:\n%s", wantStr, body)
+		}
+	}
+	if strings.Contains(body, `>bee-dt1-100-1</a>`) {
+		t.Fatalf("list link text should be the shortened name, not the full stem:\n%s", body)
+	}
+}
+
+// TestSessionPageFullBranchAndLinks locks the session PAGE surface: the heading
+// is the shortened name, the FULL stem is shown as secondary text, the kind+model
+// labels render, and the same task/change-doc/hive-flip links appear.
+func TestSessionPageFullBranchAndLinks(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+	flipSHA := seedDeliveredTask(t, root, "dt1")
+	writeTranscript(t, root, "bee-dt1-100-1", "work", opus)
+
+	w := get(t, s, "/submodule/alpha/session/bee-dt1-100-1")
+	if w.Code != 200 {
+		t.Fatalf("session page %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, wantStr := range []string{
+		`<h1>alpha · dt1</h1>`,       // heading is the shortened name
+		`<code>bee-dt1-100-1</code>`, // full stem as secondary text
+		`<span class="badge kind">work</span>`,
+		`<span class="badge model">` + opus + `</span>`,
+		`href="/submodule/alpha/plan"`,
+		`href="/submodule/alpha/doc/bee-dt1.md"`,
+		`href="/submodule/alpha/commit/` + flipSHA + `"`,
+	} {
+		if !strings.Contains(body, wantStr) {
+			t.Fatalf("session page missing %q:\n%s", wantStr, body)
+		}
 	}
 }
 

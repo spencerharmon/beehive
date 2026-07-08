@@ -19,9 +19,32 @@ import (
 // sessionInfo describes one recorded session for the list view.
 type sessionInfo struct {
 	ID       string // file stem, e.g. bee-T3-1751210912
+	Display  string // shortened name: "bee-" prefix and "-<epoch>-<pid>" suffix stripped
 	Modified time.Time
-	Ago      string // human "3s"/"5m" since last write
-	Live     bool   // stream branch still exists = honeybee still running
+	Ago      string        // human "3s"/"5m" since last write
+	Live     bool          // stream branch still exists = honeybee still running
+	Kind     string        // sessionTags "kind" (work/review/...); "" when underivable (a live stub)
+	Model    string        // sessionTags "model"; "" when unstamped/underivable
+	Change   sessionChange // the task/change-doc/commit this session moved (blank hrefs degrade gracefully)
+}
+
+// sessionChange links a session to the change it moved — the task, its change
+// doc, and the hive commit that flipped it DONE — REUSING the two existing
+// resolvers verbatim: branch-graph-sectioned's stamp scan (changeDocsByTask +
+// resolveDocHref) for the doc and delivery-traceability's hive-flip locator
+// (buildDeliveries) for the commit. A session is keyed by its task id (the
+// branch minus "bee-"), so a worker, reviewer, or arbitrator session all resolve
+// to the SAME record. Every href degrades to "" when unlocatable — a session
+// with no resolvable change (e.g. reconcile/bootstrap, or an in-flight task with
+// no stamped commit yet) renders that link as plain text, never a dead link or
+// an error.
+type sessionChange struct {
+	TaskID     string // the session's task id (branch minus "bee-"), "" if underivable
+	TaskHref   string // link to the plan the task lives in, "" when it is not a plan task
+	DocPath    string // change-doc path from the code commit's Beehive stamp, "" if none
+	DocHref    string // link to view the change doc, "" if it does not resolve
+	CommitSHA  string // short hive commit sha that flipped the task DONE, "" if not DONE/unlocated
+	CommitHref string // link to view that hive flip commit, "" if not DONE/unlocated
 }
 
 // sessionsList is the page shell; the listing body auto-refreshes via HTMX so
@@ -48,7 +71,7 @@ func (s *Server) sessionsListBody(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	sync := s.followMain(r.Context(), now)
 	s.render(w, "session_list_body.html", map[string]interface{}{
-		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), sm.SessionsDir(), now), "Sync": sync,
+		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), s.headSHA(r.Context()), sm, now), "Sync": sync,
 	})
 }
 
@@ -67,10 +90,19 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 	// Follow off-box runs before deriving liveness so a session that started on
 	// another host reads its stub locally (correct running/ended badge on load).
 	s.followMain(r.Context(), time.Now())
+	// The full stem (branch) is shown as secondary text; the shortened name
+	// (task id) is the heading, and the same task id resolves the change links.
+	tags := s.sessionTags(sessionRef{submodule: sm.Name, path: filepath.Join(sm.SessionsDir(), branch+".md")})
+	display, taskID := sessionDisplayTask(branch, tags["branch"])
+	change := s.sessionChanges(r.Context(), s.headSHA(r.Context()), sm, []string{taskID})[taskID]
 	s.render(w, "session_view.html", map[string]interface{}{
-		"Name":   sm.Name,
-		"Branch": branch,
-		"Live":   s.sessionLive(r.Context(), sm.SessionsDir(), branch),
+		"Name":    sm.Name,
+		"Branch":  branch, // full stem, rendered as secondary text
+		"Display": display,
+		"Kind":    tags["kind"],
+		"Model":   tags["model"],
+		"Change":  change,
+		"Live":    s.sessionLive(r.Context(), sm.SessionsDir(), branch),
 	})
 }
 
@@ -284,13 +316,22 @@ func (s *Server) readSessionBranch(ctx context.Context, branch, rel string) (str
 // whose file is a STUB is a running session: its freshness/liveness come from the
 // streaming branch's tip commit time, not the stub's (fixed) mtime. A non-stub
 // entry is a finished session, dated by its file mtime.
-func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []sessionInfo {
+//
+// Each row also carries its kind+model tags (stats-tag-model's sessionTags, from
+// the transcript header via git alone), a shortened display name, and the
+// task/change-doc/commit links the session moved (sessionChanges). All of these
+// degrade gracefully: a live stub (no header yet), a legacy/malformed transcript,
+// or a session whose task has no locatable doc/flip simply omits the missing
+// pieces — never an error.
+func (s *Server) sessionInfos(ctx context.Context, head string, sm repo.Submodule, now time.Time) []sessionInfo {
+	dir := sm.SessionsDir()
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
 	rem, _ := s.git.Remote(ctx)
 	var out []sessionInfo
+	var taskIDs []string // index-aligned with out, so changes zip back by position
 	for _, e := range ents {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
@@ -300,9 +341,10 @@ func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []
 			continue
 		}
 		id := strings.TrimSuffix(e.Name(), ".md")
+		path := filepath.Join(dir, e.Name())
 		mod := fi.ModTime()
 		live := false
-		if raw, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
+		if raw, err := os.ReadFile(path); err == nil {
 			if branch, isStub := repo.ParseSessionStub(string(raw)); isStub {
 				// A stub streams to an isolated branch that the honeybee deletes on exit
 				// (deferred, even on error/orphaned publish). So branch existence tracks
@@ -317,15 +359,135 @@ func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []
 				}
 			}
 		}
+		// kind+model tags reuse stats-tag-model's sessionTags verbatim (header
+		// parse via git alone); a stub/legacy/malformed transcript yields none.
+		tags := s.sessionTags(sessionRef{submodule: sm.Name, path: path})
+		display, taskID := sessionDisplayTask(id, tags["branch"])
+		taskIDs = append(taskIDs, taskID)
 		out = append(out, sessionInfo{
 			ID:       id,
+			Display:  display,
 			Modified: mod,
 			Ago:      humanAgo(now.Sub(mod)),
 			Live:     live,
+			Kind:     tags["kind"],
+			Model:    tags["model"],
 		})
+	}
+	// Resolve the traceability links for every task in ONE shared, cached pass,
+	// then zip each record back onto its row by position (before the sort below).
+	changes := s.sessionChanges(ctx, head, sm, taskIDs)
+	for i := range out {
+		out[i].Change = changes[taskIDs[i]]
 	}
 	// Newest activity first so running sessions sit at the top.
 	sort.Slice(out, func(i, j int) bool { return out[i].Modified.After(out[j].Modified) })
+	return out
+}
+
+// sessionDisplayTask derives a session's shortened display name and its task id
+// from the file stem and the header-authoritative branch (headerBranch, "" when
+// the transcript has no parseable header — e.g. a live stub). When the header
+// branch is known it is authoritative: display and task id are both the branch
+// minus "bee-" (unambiguous even for a task id that ends in digits). Without it
+// we fall back to stripping the stem's "bee-" prefix and trailing "-<epoch>"
+// and "-<pid>" numeric segments (sessionDisplayName), which is what a live stub
+// (always the current pid-bearing form) needs.
+func sessionDisplayTask(stem, headerBranch string) (display, taskID string) {
+	if headerBranch != "" {
+		t := strings.TrimPrefix(headerBranch, "bee-")
+		return t, t
+	}
+	d := sessionDisplayName(stem)
+	return d, d
+}
+
+// sessionDisplayName shortens a session file stem "bee-<taskid>-<epoch>[-<pid>]"
+// to "<taskid>" by dropping the "bee-" prefix and up to two trailing numeric
+// segments (the runner's "-<epoch>-<pid>" discriminator; see
+// internal/swarm.SessionID). A task id ending in a number keeps it: only the two
+// trailing all-digit segments are removed, so "bee-session-audit-003-<epoch>-<pid>"
+// shortens to "session-audit-003". A stem that does not fit the shape loses only
+// the "bee-" prefix, so an odd name still renders (never blank).
+func sessionDisplayName(stem string) string {
+	name := strings.TrimPrefix(stem, "bee-")
+	for i := 0; i < 2; i++ {
+		j := strings.LastIndexByte(name, '-')
+		if j <= 0 || !allDigits(name[j+1:]) {
+			break
+		}
+		name = name[:j]
+	}
+	return name
+}
+
+// allDigits reports whether s is a non-empty run of ASCII digits.
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// sessionChanges resolves, for each task id, the change a session moved — the
+// task (plan), its change doc, and the hive commit that flipped it DONE —
+// REUSING the existing resolvers rather than re-deriving anything:
+//   - change doc: branch-graph-sectioned's changeDocsByTask + resolveDocHref
+//     (any task a code commit stamped, DONE or in-flight),
+//   - commit: delivery-traceability's buildDeliveries hive-flip locator (DONE
+//     tasks only),
+//   - task: a link to the plan when the id is a real plan task.
+//
+// Every history scan is memoized per HEAD via viewCache — the docs scan shares
+// delivery.go's own "delivery-docs:" key (identical, want-independent
+// computation) and buildDeliveries reuses its "delivery-flips:" key with the
+// stable want=doneTaskIDs set, so the list view's N rows and a single-session
+// view cost the same one scan and never collide with the branches/stats views'
+// cache. All lookups are best-effort: a missing doc/flip/task simply leaves that
+// href "".
+func (s *Server) sessionChanges(ctx context.Context, head string, sm repo.Submodule, taskIDs []string) map[string]sessionChange {
+	docs, _ := cachedView(head, s.cache, "delivery-docs:"+sm.Name, func() (map[string]string, error) {
+		return changeDocsByTask(ctx, sm.RepoDir()), nil
+	})
+	planIDs, _ := cachedView(head, s.cache, "plan-taskids:"+sm.Name, func() (map[string]bool, error) {
+		p, err := readParsePlan(sm.PlanPath())
+		if err != nil {
+			return nil, err
+		}
+		set := make(map[string]bool, len(p.Tasks))
+		for _, t := range p.Tasks {
+			set[t.ID] = true
+		}
+		return set, nil
+	})
+	deliveries := indexDeliveries(s.buildDeliveries(ctx, head, sm, doneTaskIDs(sm)))
+	out := make(map[string]sessionChange, len(taskIDs))
+	for _, id := range taskIDs {
+		if id == "" {
+			continue
+		}
+		if _, done := out[id]; done {
+			continue // several sessions share a task id (work/review/arbitration)
+		}
+		doc := docs[id]
+		d := deliveries[id]
+		c := sessionChange{
+			TaskID:     id,
+			DocPath:    doc,
+			DocHref:    resolveDocHref(sm, doc),
+			CommitSHA:  d.FlipSHA,
+			CommitHref: d.FlipHref,
+		}
+		if planIDs[id] {
+			c.TaskHref = "/submodule/" + sm.Name + "/plan"
+		}
+		out[id] = c
+	}
 	return out
 }
 

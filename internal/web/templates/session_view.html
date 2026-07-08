@@ -1,6 +1,7 @@
 {{template "header"}}
-<h1>{{.Name}} · {{.Branch}}</h1>
-<p><a href="/submodule/{{.Name}}/sessions">all sessions</a> · {{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">ended</span>{{end}}</p>
+<h1>{{.Name}} · {{.Display}}</h1>
+<p class="muted branch-full"><code>{{.Branch}}</code>{{if .Kind}} · <span class="badge kind">{{.Kind}}</span>{{end}}{{if .Model}} · <span class="badge model">{{.Model}}</span>{{end}}</p>
+<p><a href="/submodule/{{.Name}}/sessions">all sessions</a> · {{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">ended</span>{{end}}{{if .Change.TaskHref}} · <a href="{{.Change.TaskHref}}">task</a>{{end}}{{if .Change.DocHref}} · <a href="{{.Change.DocHref}}">change doc</a>{{end}}{{if .Change.CommitHref}} · <a href="{{.Change.CommitHref}}">commit <code>{{.Change.CommitSHA}}</code></a>{{end}}</p>
 <div id="session-body"
      hx-get="/submodule/{{.Name}}/session/{{.Branch}}/body"
      hx-trigger="load, every 2s"

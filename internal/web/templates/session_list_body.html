@@ -1,8 +1,11 @@
 {{with .Sync}}<p class="sync-status{{if .Err}} stale{{end}}">followed {{.Ago}} ago{{if .Err}} · pull stalled: {{.Err}}{{end}}</p>{{end}}
 <ul class="sessions">
 {{range .Sessions}}<li>
-  <a href="/submodule/{{$.Name}}/session/{{.ID}}">{{.ID}}</a>
+  <a href="/submodule/{{$.Name}}/session/{{.ID}}">{{.Display}}</a>
+  {{if .Kind}}<span class="badge kind">{{.Kind}}</span>{{end}}
+  {{if .Model}}<span class="badge model">{{.Model}}</span>{{end}}
   {{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">idle</span>{{end}}
   <span class="ago">{{.Ago}} ago</span>
+  {{if or .Change.TaskHref .Change.DocHref .Change.CommitHref}}<span class="change">{{if .Change.TaskHref}}<a href="{{.Change.TaskHref}}">task</a>{{end}}{{if .Change.DocHref}} · <a href="{{.Change.DocHref}}">change doc</a>{{end}}{{if .Change.CommitHref}} · <a href="{{.Change.CommitHref}}">commit <code>{{.Change.CommitSHA}}</code></a>{{end}}</span>{{end}}
 </li>{{else}}<li>no sessions yet</li>{{end}}
 </ul>
