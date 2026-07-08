@@ -7,6 +7,13 @@
 <div id="htmx-toast" role="alert" aria-live="assertive" hidden></div>
 <header class="topbar"><nav class="nav"><a class="brand" href="/">beehive</a><span class="nav-links"><a href="/">dashboard</a><a href="/stats">stats</a><a href="/secrets">secrets</a><a href="/merge">merge</a><a href="/human">human</a><a href="/hygiene">hygiene</a><a href="/skills">skills</a></span></nav></header>
 <main class="container">{{end}}
+{{/* breadcrumb: an ancestor trail rooted at the dashboard, rendered on every
+   non-dashboard page as a <nav aria-label="breadcrumb"> landmark. Dot is the
+   page's []Crumb (nil/empty on the dashboard -> nothing renders). Ancestor
+   crumbs carry an Href; the terminal current-page crumb has an empty Href and is
+   marked aria-current. Separators are drawn by CSS (::before) so they are not in
+   the a11y tree and never get selected/copied. */}}
+{{define "breadcrumb"}}{{if .}}<nav class="breadcrumb" aria-label="breadcrumb"><ol>{{range .}}<li>{{if .Href}}<a href="{{.Href}}">{{.Label}}</a>{{else}}<span aria-current="page">{{.Label}}</span>{{end}}</li>{{end}}</ol></nav>{{end}}{{end}}
 {{define "footer"}}</main>
 <script>
 /* poll-scroll-preserve: an htmx poll-refresh swaps a pane's innerHTML, which

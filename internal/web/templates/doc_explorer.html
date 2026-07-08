@@ -1,12 +1,12 @@
 {{template "header"}}
-<p><a href="/submodule/{{.Name}}">&larr; {{.Name}}</a></p>
+{{template "breadcrumb" .Crumbs}}
 <h1>{{.Name}} docs</h1>
 <p class="muted">Every file under <code>submodules/{{.Name}}/docs/</code> — change docs, audit reports, task design docs — read-only.</p>
 {{range .Sections}}
 <section class="card">
 <h2><code>docs/{{if .Dir}}{{.Dir}}/{{end}}</code></h2>
 <ul class="file-links">
-{{range .Files}}<li class="file-link present"><a href="{{.Href}}">{{.Name}}</a></li>{{end}}
+{{range .Files}}<li class="file-link present"><a href="{{.Href}}?from=docs">{{.Name}}</a></li>{{end}}
 </ul>
 </section>
 {{else}}

@@ -243,5 +243,6 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 		"Date":    f[1],
 		"Subject": f[2],
 		"Patch":   patch,
+		"Crumbs":  commitCrumbs(sm.Name, full[:min(12, len(full))]),
 	})
 }

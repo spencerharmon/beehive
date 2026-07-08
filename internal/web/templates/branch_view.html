@@ -1,4 +1,5 @@
 {{template "header"}}
+{{template "breadcrumb" .Crumbs}}
 <h1>{{.Name}} commits</h1>
 <section class="card merge-inline">
 <h2>Merge a branch</h2>
@@ -23,7 +24,7 @@
 <td>{{if .Refs}}<span class="badge">{{.Refs}}</span>{{end}}</td>
 <td>{{.Subject}}</td>
 <td class="muted">{{.Author}}</td>
-<td>{{if .DocTask}}<span class="badge">{{.DocTask}}</span> {{if .DocHref}}<a href="{{.DocHref}}">{{.DocPath}}</a>{{else}}<span class="muted">{{.DocPath}}</span>{{end}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+<td>{{if .DocTask}}<span class="badge">{{.DocTask}}</span> {{if .DocHref}}<a href="{{.DocHref}}?from=branches">{{.DocPath}}</a>{{else}}<span class="muted">{{.DocPath}}</span>{{end}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
 <td>{{if .FlipHref}}<a href="{{.FlipHref}}">hive <code>{{.FlipSHA}}</code></a>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
 </tr>{{end}}
 </table>

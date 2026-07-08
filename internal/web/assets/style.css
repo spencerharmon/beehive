@@ -195,6 +195,43 @@ small, .small { font-size: var(--text-sm); }
   padding: var(--space-5) var(--space-5) var(--space-7);
 }
 
+/* Breadcrumb trail (breadcrumb-nav-trail): a compact ancestor path rooted at the
+   dashboard, rendered near the top of every non-dashboard page as a
+   <nav aria-label="breadcrumb"> landmark whose current crumb carries aria-current.
+   The "/" separators are drawn with a ::before pseudo-element so they stay out of
+   the accessibility tree and are never selected/copied with the crumb text. Muted
+   ancestor links echo the top-nav treatment; the current crumb reads in the base
+   text colour. Tokens only — no hard-coded colours. */
+.breadcrumb { margin: 0 0 var(--space-4); }
+.breadcrumb ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.breadcrumb li { display: inline-flex; align-items: center; min-width: 0; }
+.breadcrumb li + li::before {
+  content: "/";
+  margin-right: var(--space-2);
+  color: var(--text-muted);
+}
+.breadcrumb a { color: var(--text-muted); }
+.breadcrumb a:hover { color: var(--accent); text-decoration: none; }
+.breadcrumb [aria-current="page"] {
+  color: var(--text);
+  font-weight: 600;
+  /* the terminal crumb can be a long branch/sha/file name — keep it from
+     overflowing the row on a narrow viewport. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Cards ------------------------------------------------------------------ */
 .cards {
   display: grid;

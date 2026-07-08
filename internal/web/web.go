@@ -720,9 +720,10 @@ func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 	// present files' rendered content — the index is what makes an absent member
 	// reachable). Driven by the declared set, not the directory listing.
 	s.render(w, "explorer.html", map[string]interface{}{
-		"Name":  sm.Name,
-		"Docs":  docs,
-		"Files": optionalFileLinks(sm),
+		"Name":   sm.Name,
+		"Docs":   docs,
+		"Files":  optionalFileLinks(sm),
+		"Crumbs": explorerCrumbs(sm.Name),
 	})
 }
 
@@ -762,6 +763,7 @@ func (s *Server) branches(w http.ResponseWriter, r *http.Request) {
 		"HasPrev":  off > 0,
 		"Next":     off + lim,
 		"HasNext":  len(cs) == lim, // a full page may have more
+		"Crumbs":   branchesCrumbs(sm.Name),
 	})
 }
 
@@ -790,8 +792,13 @@ func (s *Server) doc(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// The breadcrumb's intermediate crumb reflects the page that actually linked
+	// here (the `from` token every caller threads), so the trail names the real
+	// entry route instead of the old hardcoded "commits" back-link; an unknown
+	// token defaults to the submodule page (docCrumbs).
 	s.render(w, "doc_view.html", map[string]interface{}{
 		"Name": sm.Name, "File": file, "Body": renderMarkdown(string(b)),
+		"Crumbs": docCrumbs(sm.Name, r.URL.Query().Get("from"), file),
 	})
 }
 
@@ -819,6 +826,7 @@ func (s *Server) docExplorer(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "doc_explorer.html", map[string]interface{}{
 		"Name":     sm.Name,
 		"Sections": sectionDocs(entries),
+		"Crumbs":   docsCrumbs(sm.Name),
 	})
 }
 
@@ -841,7 +849,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 	for i := range p.Items {
 		p.Items[i].DocHref = resolveDocHref(sm, docs[p.Items[i].ID])
 	}
-	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p})
+	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p, "Crumbs": planCrumbs(sm.Name)})
 }
 
 // planDelete removes a submodule's PLAN.md and publishes the deletion, so the
