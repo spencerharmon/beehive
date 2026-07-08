@@ -48,7 +48,23 @@ your manual edit is just one more participant in that protocol. Three cases:
   `beehive worktree add <branch>`; edit under `.worktrees/<branch>/`; publish with
   `git -C .worktrees/<branch> push . HEAD:main` (local-only hive with
   `updateInstead`; push to `origin/main` if the hive has a remote); then
-  `beehive worktree rm <branch>`.
+  `beehive worktree rm <branch>`. **Exception:** `AGENTS.md`, `HONEYBEE.md`,
+  `BOOTSTRAP.md`, and every `skills/*.md` are **generated**, not authored here —
+  each renders from the beehive submodule's `prompts/<name>.md` (the `//go:embed`
+  set `internal/instruct.Files()` reads). `beehive instruction update` overwrites
+  a drifted root copy back to that embedded default, and `beehive init` seeds a
+  brand-new install from the same embed — neither ever sees a root-level edit. So
+  a change meant to last is submodule CODE instead (the first case above), on the
+  source template, not this worktree. Mapping, 1:1 by name except one trap: root
+  `AGENTS.md` ← `prompts/AGENTS.md`; `HONEYBEE.md` ← `prompts/HONEYBEE.md`;
+  `BOOTSTRAP.md` ← `prompts/bootstrap_guide.md` — **not** the similarly-named
+  `prompts/bootstrap.md`, the unrelated per-pass bootstrap-KIND runtime prompt;
+  each `skills/<name>.md` ← `prompts/skills/<name>.md`. `LOCALS.md` is the one
+  root doc NOT in this managed set — site-authored, untouched by `instruction
+  update`, edited in place like any other file. Verify a fix with `beehive
+  instruction list` (diffs every managed file against the running binary's
+  embedded default: `clean` / `modified` / `missing`) against a binary rebuilt
+  from the new commit.
 - **`ROI.md`** — human-owned: prefer the `beehived` editor UI. Agents are hook-
   blocked from committing it under the honeybee identity; operator-directed edits go
   through the editor or the worktree process. See `skills/modify-roi.md`.
