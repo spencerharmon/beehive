@@ -94,6 +94,15 @@ BINDIR="$DESTDIR$PREFIX/bin"
 ETCDIR="$DESTDIR$CONFDIR"
 GPGHOME="$ETCDIR/gnupg"
 
+# Stamp the build commit into any from-source binaries (prompt-embed drift
+# guard): a running binary can then tell whether it predates the tracked-main tip
+# and warn. Best-effort — a source tree with no .git (e.g. a release tarball)
+# builds an honest unstamped "dev" binary rather than a wrong SHA.
+BUILD_SHA=""
+if command -v git >/dev/null 2>&1; then
+  BUILD_SHA=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
+fi
+
 if command -v go >/dev/null 2>&1; then
   GOOS_DETECTED=$(go env GOOS)
   GOARCH_DETECTED=$(go env GOARCH)
@@ -132,7 +141,11 @@ install_binary() {
   mkdir -p "$tmpbase"
   tmpdir=$(mktemp -d "$tmpbase/beehive-install.XXXXXX")
   trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
-  (cd "$ROOT" && CGO_ENABLED="${CGO_ENABLED:-0}" go build -trimpath -o "$tmpdir/$bin" "./cmd/$bin")
+  if [ -n "$BUILD_SHA" ]; then
+    (cd "$ROOT" && CGO_ENABLED="${CGO_ENABLED:-0}" go build -trimpath -ldflags "-X github.com/spencerharmon/beehive/internal/version.SHA=$BUILD_SHA" -o "$tmpdir/$bin" "./cmd/$bin")
+  else
+    (cd "$ROOT" && CGO_ENABLED="${CGO_ENABLED:-0}" go build -trimpath -o "$tmpdir/$bin" "./cmd/$bin")
+  fi
   install -m 0755 "$tmpdir/$bin" "$BINDIR/$bin"
   rm -rf "$tmpdir"
   trap - EXIT HUP INT TERM

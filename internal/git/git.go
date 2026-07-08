@@ -441,6 +441,34 @@ func (r *Repo) IsAncestor(ctx context.Context, maybe, ref string) (bool, error) 
 	return true, nil
 }
 
+// GitlinkAt returns the commit SHA recorded for the submodule gitlink at path in
+// ref's tree (the "tracked pointer" a superproject commit pins the submodule to),
+// or "" when path is not a gitlink there. It reads `git ls-tree <ref> -- <path>`
+// and returns the object id only for a mode-160000 (gitlink/commit) entry, so a
+// regular file, a missing path, or an empty tree yields "" (not an error) — the
+// caller reads "no tracked pointer" as "cannot compare" rather than a failure.
+// Used by the prompt-embed drift guard to resolve the beehive submodule's
+// tracked-main tip at dispatch time.
+func (r *Repo) GitlinkAt(ctx context.Context, ref, path string) (string, error) {
+	out, err := r.Run(ctx, "ls-tree", ref, "--", path)
+	if err != nil {
+		return "", err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", nil
+	}
+	// Entry format: "<mode> <type> <sha>\t<path>"; a gitlink is mode 160000.
+	if !strings.HasPrefix(out, "160000 ") {
+		return "", nil
+	}
+	fields := strings.Fields(out)
+	if len(fields) < 3 {
+		return "", nil
+	}
+	return fields[2], nil
+}
+
 // DeleteRemoteBranch deletes branch on remote (`git push remote --delete
 // refs/heads/branch`). It is idempotent against a peer that deleted the branch
 // first: git's "remote ref does not exist" rejection is reported as success, so

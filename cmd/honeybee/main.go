@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/claim"
@@ -19,6 +20,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/repo"
 	selectt "github.com/spencerharmon/beehive/internal/select"
 	"github.com/spencerharmon/beehive/internal/swarm"
+	"github.com/spencerharmon/beehive/internal/version"
 	"github.com/spencerharmon/beehive/prompts"
 )
 
@@ -116,6 +118,22 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// Prompt-embed drift guard (observability only): the prompts (HONEYBEE.md et
+	// al.) and all code are compiled into these binaries, so a change merged to
+	// main only reaches a live pass after an operator redeploys (LOCALS.md:
+	// beehive-rebuild) — there is no auto-trigger. If this binary's build SHA is a
+	// commit the beehive submodule's tracked-main tip no longer contains, the
+	// deployed binaries predate merged changes and their embedded prompts/code may
+	// be stale; warn in the same style as the dirty-checkout warning above. This is
+	// deliberately non-fatal and never touches selection/claim/publish: a "dev"
+	// build (no stamped SHA) or any unresolved git state simply stays silent.
+	if subs0, serr := rp0.Submodules(); serr == nil {
+		if w := promptEmbedDriftWarning(ctx, primary, baseMain, version.SHA, subs0); w != "" {
+			fmt.Fprintf(os.Stderr, "honeybee: %s\n", w)
+		}
+	}
+
 	sel0er := &selectt.Selector{Repo: rp0, Git: primary, Rand: rnd, TTL: ttl}
 	if debug {
 		sel0er.Debug = os.Stderr
@@ -388,6 +406,58 @@ func claimable(k selectt.Kind) bool {
 	default:
 		return false
 	}
+}
+
+// promptEmbedDriftWarning reports whether THIS binary is stale relative to the
+// beehive submodule's tracked-main tip and, if so, returns a one-line warning (in
+// the dirty-checkout warning's style) to print to stderr; it returns "" when the
+// binary is up to date, when there is nothing to compare, or when any git state
+// is unresolved. It is OBSERVABILITY ONLY: it never errors out and never affects
+// selection/claim/publish, so an unstamped build or a transient git hiccup is
+// silent rather than noisy or fatal.
+//
+// The "self" submodule (the one whose source produced these binaries) is the one
+// whose repo object DB contains buildSHA — buildSHA is a commit of the beehive
+// product repo, so only that target's checkout holds the object; unrelated
+// targets (flux, helm-charts, …) never will. "Stale" means the tracked-main tip
+// is NOT contained in the build (the build predates/behind the tip): the binary
+// was compiled before commits the hive now pins were merged, so its embedded
+// prompts/code lag. Silence when the build already contains the tip (fresh build,
+// or a dev build ahead of the tracked pointer) — that is not drift.
+func promptEmbedDriftWarning(ctx context.Context, hive *git.Repo, baseRef, buildSHA string, subs []repo.Submodule) string {
+	if strings.TrimSpace(buildSHA) == "" {
+		return "" // honest dev build: no stamped SHA, nothing to compare
+	}
+	for _, sm := range subs {
+		smRepo := git.New(sm.RepoDir())
+		if !smRepo.CommitExists(ctx, buildSHA) {
+			continue // build SHA is not a commit of this target: not our source repo
+		}
+		// Self submodule found — its history holds our build commit.
+		treePath := "submodules/" + sm.Name + "/repo"
+		tip, err := hive.GitlinkAt(ctx, baseRef, treePath)
+		if err != nil || tip == "" {
+			return "" // no resolvable tracked pointer: cannot compare, stay silent
+		}
+		contains, err := smRepo.IsAncestor(ctx, tip, buildSHA)
+		if err != nil {
+			return "" // ancestry undeterminable (e.g. tip not fetched): stay silent
+		}
+		if contains {
+			return "" // build already contains the tracked tip: up to date (or ahead)
+		}
+		return fmt.Sprintf("WARNING preflight: this honeybee binary was built from %s but %s's tracked-main tip is %s, which the binary does not contain — the deployed beehive binaries predate merged changes, so their embedded prompts (HONEYBEE.md et al.) and code may be stale; redeploy the binaries (LOCALS.md: beehive-rebuild)", shortSHA(buildSHA), treePath, shortSHA(tip))
+	}
+	return "" // no target's history holds our build SHA: cannot identify self, stay silent
+}
+
+// shortSHA abbreviates a full commit SHA to 12 hex chars for log lines, leaving a
+// shorter or non-hex value untouched.
+func shortSHA(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }
 
 // honeybeeProtocol returns the honeybee runtime protocol (the system prompt). It

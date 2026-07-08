@@ -993,3 +993,55 @@ func TestCommitReachable(t *testing.T) {
 		}
 	})
 }
+
+func TestGitlinkAt(t *testing.T) {
+	r := initRepo(t)
+	ctx := context.Background()
+
+	// A base commit gives us a real 40-hex SHA to point a gitlink at and a real
+	// blob path to prove GitlinkAt rejects non-gitlink entries.
+	os.WriteFile(filepath.Join(r.Dir, "regular"), []byte("x"), 0o644)
+	if err := r.Commit(ctx, "base"); err != nil {
+		t.Fatalf("base commit: %v", err)
+	}
+	sha, err := r.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+
+	// Stage a real gitlink (mode 160000) without a working-tree checkout, exactly
+	// as a superproject records a submodule pointer, then commit the index.
+	if _, err := r.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+sha+",submodules/beehive/repo"); err != nil {
+		t.Fatalf("stage gitlink: %v", err)
+	}
+	if _, err := r.Run(ctx, "commit", "-m", "add gitlink"); err != nil {
+		t.Fatalf("commit gitlink: %v", err)
+	}
+
+	// The gitlink resolves to the pinned commit at the given ref.
+	got, err := r.GitlinkAt(ctx, "HEAD", "submodules/beehive/repo")
+	if err != nil {
+		t.Fatalf("GitlinkAt(gitlink): %v", err)
+	}
+	if got != sha {
+		t.Fatalf("GitlinkAt(gitlink) = %q, want %q", got, sha)
+	}
+
+	// A regular file is not a gitlink: "" with no error.
+	got, err = r.GitlinkAt(ctx, "HEAD", "regular")
+	if err != nil {
+		t.Fatalf("GitlinkAt(regular): %v", err)
+	}
+	if got != "" {
+		t.Fatalf("GitlinkAt(regular) = %q, want \"\"", got)
+	}
+
+	// An absent path is "" with no error (ls-tree prints nothing).
+	got, err = r.GitlinkAt(ctx, "HEAD", "does/not/exist")
+	if err != nil {
+		t.Fatalf("GitlinkAt(absent): %v", err)
+	}
+	if got != "" {
+		t.Fatalf("GitlinkAt(absent) = %q, want \"\"", got)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -13,7 +14,9 @@ func versionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "print version",
-		Run:   func(*cobra.Command, []string) { fmt.Println("beehive dev") },
+		// The build SHA is stamped via -ldflags at release/install time (see
+		// internal/version); an unstamped `go build` honestly prints "beehive dev".
+		Run: func(*cobra.Command, []string) { fmt.Println(version.String()) },
 	}
 }
 
