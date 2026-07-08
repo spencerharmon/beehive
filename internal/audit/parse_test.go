@@ -39,6 +39,9 @@ func TestScanBodyTrailingOnlyRegression(t *testing.T) {
 	if h.LostRace {
 		t.Errorf("LostRace=true, want false (no lost-claim language)")
 	}
+	if h.HarnessAbortStall {
+		t.Errorf("HarnessAbortStall=true, want false (a warning-block abort is not a tool-abort stall)")
+	}
 }
 
 // TestScanBodyQuotedWarningNotTrailing: a quoted "## ⚠️ warning" block (inside
@@ -68,7 +71,7 @@ func TestScanBodyQuotedWarningNotTrailing(t *testing.T) {
 		t.Fatalf("userTurns=%d want 2", s.UserTurns)
 	}
 	h := s.Heuristics
-	if h.Aborted || h.CompletionMiss || h.LostRace {
+	if h.Aborted || h.CompletionMiss || h.LostRace || h.HarnessAbortStall {
 		t.Fatalf("quoted (non-trailing) warning must not classify as an abort: %+v", h)
 	}
 	if h.AbortReason != "" {
@@ -109,6 +112,39 @@ func TestScanBodyLastOccurrenceWins(t *testing.T) {
 	if h.LostRace {
 		t.Errorf("LostRace=true, want false")
 	}
+	if h.HarnessAbortStall {
+		t.Errorf("HarnessAbortStall=true, want false (a warning-block abort is not a tool-abort stall)")
+	}
+}
+
+// TestScanBodyQuotedToolAbortNotTrailing is the tool-abort twin of
+// TestScanBodyQuotedWarningNotTrailing: a session whose own work QUOTES a prior
+// transcript's raw "Tool execution aborted" line mid-body (this series' charter)
+// and then keeps working to a clean end must NOT be flagged. Only a genuinely
+// TRAILING tool-abort — nothing real after it — is this session's own stall.
+func TestScanBodyQuotedToolAbortNotTrailing(t *testing.T) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# session bee-qabort\n\nsubmodule: beehive \u00b7 kind: work \u00b7 branch: bee-qabort\n")
+	b.WriteString("\n## user\n\nplease investigate the stalled sessions\n")
+	b.WriteString("\n## assistant\n\nSampling a prior session's trailing stall:\n\n```\nTool execution aborted\n```\n")
+	b.WriteString("\n## assistant\n\nNow implementing the fix.\n")
+	b.WriteString("\n## user\n\nlooks good, ship it\n")
+	b.WriteString("\n## assistant\n\nDone: committed and pushed.\n")
+
+	s, err := parseTranscript("bee-qabort-200.md", []byte(b.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Turns != 3 || s.UserTurns != 2 {
+		t.Fatalf("turns=%d userTurns=%d want 3/2 (whole file, not gated by the quoted abort line)", s.Turns, s.UserTurns)
+	}
+	h := s.Heuristics
+	if h.Aborted || h.CompletionMiss || h.HarnessAbortStall {
+		t.Fatalf("quoted (non-trailing) tool-abort must not classify as a stall: %+v", h)
+	}
+	if h.AbortReason != "" {
+		t.Errorf("abortReason=%q want empty", h.AbortReason)
+	}
 }
 
 // TestParseQuotedWarningFixtureSessionAudit003 parses the real corpus file
@@ -145,7 +181,7 @@ func TestParseQuotedWarningFixtureSessionAudit003(t *testing.T) {
 		t.Errorf("userTurns=%d want 5", s.UserTurns)
 	}
 	h := s.Heuristics
-	if h.Aborted || h.LostRace || h.CompletionMiss {
+	if h.Aborted || h.LostRace || h.CompletionMiss || h.HarnessAbortStall {
 		t.Errorf("flags=%+v want all false (the quoted warning at line 1468 is not this session's "+
 			"own abort; regression: pre-fix flagged aborted/lost_race/completion_miss)", h)
 	}
@@ -162,6 +198,11 @@ func TestParseQuotedWarningFixtureSessionAudit003(t *testing.T) {
 // successful "Deliverables"/"Verification" summary. Before this fix the
 // engine reported 16 turns / aborted / lost_race / completion_miss; after the
 // fix it must report the file's REAL 70 turns and no abort flags at all.
+//
+// It ALSO guards the harness-abort-stall rule: this file contains a genuine
+// (RECOVERED) tool-abort — an exact standalone "Tool execution aborted" at line
+// 1895 that the runner followed with a "## user"/"continue" turn — so
+// HarnessAbortStall must stay false (only a genuinely-TRAILING tool-abort flags).
 func TestParseQuotedWarningFixtureSessionAudit005(t *testing.T) {
 	path := filepath.Join("testdata", "quoted-warning", "bee-session-audit-005-1783429207-734855.md")
 	s, err := ParseFile(path)
@@ -188,7 +229,7 @@ func TestParseQuotedWarningFixtureSessionAudit005(t *testing.T) {
 		t.Errorf("userTurns=%d want 4", s.UserTurns)
 	}
 	h := s.Heuristics
-	if h.Aborted || h.LostRace || h.CompletionMiss {
+	if h.Aborted || h.LostRace || h.CompletionMiss || h.HarnessAbortStall {
 		t.Errorf("flags=%+v want all false (regression: pre-fix flagged aborted/lost_race/completion_miss)", h)
 	}
 	if h.AbortReason != "" {
@@ -208,8 +249,8 @@ func TestParseDirQuotedWarningFixtures(t *testing.T) {
 		t.Fatalf("parsed %d sessions, want 2", len(ss))
 	}
 	for _, s := range ss {
-		if s.Heuristics.Aborted {
-			t.Errorf("%s wrongly classified as aborted (a quoted warning line must not gate)", s.ID)
+		if h := s.Heuristics; h.Aborted || h.HarnessAbortStall {
+			t.Errorf("%s wrongly classified as aborted (a quoted warning/abort line must not gate): %+v", s.ID, h)
 		}
 	}
 }
