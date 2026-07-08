@@ -8,6 +8,69 @@
      hx-swap="innerHTML">
   <div id="session-loading">{{template "skeleton-transcript"}}</div>
 </div>
+<script>
+/* session-toc-nav: the transcript pane (session-transcript-rendered-toc) renders
+   each turn as a <section class="turn"> with a stable id, and a TOC overlay of
+   [data-anchor] jump links plus [data-jump] prev/next buttons for agent outputs
+   and runner replies. The transcript scrolls INSIDE its own #session-transcript
+   container (not the window), so a plain "#id" href would move the wrong
+   scroller — we scroll the container itself to the target. Delegated off the
+   document so it survives every htmx poll-swap of #session-body (the fragment
+   carries no script); a no-op when the target is absent (e.g. hidden while the
+   raw live stream is showing). No external libraries (single-binary embed). */
+(function () {
+  function container() { return document.getElementById('session-transcript'); }
+  function scrollToSection(sec) {
+    var cont = container();
+    if (!cont || !sec) return;
+    // Move the container so the section's top aligns with the container's top,
+    // regardless of offsetParent nesting (getBoundingClientRect is viewport-abs).
+    cont.scrollTop += sec.getBoundingClientRect().top - cont.getBoundingClientRect().top;
+  }
+  function jump(dir, role) {
+    var cont = container();
+    if (!cont) return;
+    var sel = role ? 'section.turn.turn-' + role : 'section.turn';
+    var secs = Array.prototype.slice.call(cont.querySelectorAll(sel));
+    if (!secs.length) return;
+    var ctop = cont.getBoundingClientRect().top, EPS = 2, target = null;
+    if (dir > 0) { // first section starting below the current top edge
+      for (var i = 0; i < secs.length; i++) {
+        if (secs[i].getBoundingClientRect().top - ctop > EPS) { target = secs[i]; break; }
+      }
+    } else { // last section starting above the current top edge
+      for (var j = secs.length - 1; j >= 0; j--) {
+        if (secs[j].getBoundingClientRect().top - ctop < -EPS) { target = secs[j]; break; }
+      }
+    }
+    if (target) scrollToSection(target);
+  }
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    var a = t.closest('[data-anchor]');
+    if (a) { e.preventDefault(); scrollToSection(document.getElementById(a.getAttribute('data-anchor'))); return; }
+    var b = t.closest('[data-jump]');
+    if (b) {
+      e.preventDefault();
+      var spec = b.getAttribute('data-jump').split('-'); // "next-assistant" / "prev-user"
+      jump(spec[0] === 'next' ? 1 : -1, spec[1] || '');
+    }
+  });
+  // The 2s poll re-renders the fragment (a fresh <details open>), which would
+  // otherwise re-open a TOC the reader collapsed. Remember the reader's choice and
+  // reapply it after each swap. `toggle` doesn't bubble, but a capture-phase
+  // document listener still sees it; poll-scroll-preserve handles scroll itself.
+  var tocOpen = true;
+  document.addEventListener('toggle', function (e) {
+    if (e.target && e.target.id === 'session-toc') tocOpen = e.target.open;
+  }, true);
+  document.addEventListener('htmx:afterSwap', function () {
+    var toc = document.getElementById('session-toc');
+    if (toc) toc.open = tocOpen;
+  });
+})();
+</script>
 {{if .Live}}
 <script>
 /* session-stream: while a honeybee runs, stream its transcript over SSE so agent
@@ -34,20 +97,35 @@
   });
 
   function render(text) {
-    var pre = document.getElementById('session-transcript');
-    if (!pre) { // the poll hasn't rendered the container yet: create it ourselves
+    var cont = document.getElementById('session-transcript');
+    if (!cont) { // the poll hasn't rendered the container yet: create it ourselves
       var lp = document.getElementById('session-loading');
       if (lp) lp.remove();
-      pre = document.createElement('pre');
-      pre.className = 'session';
-      pre.id = 'session-transcript';
-      pre.setAttribute('data-scroll-preserve', '');
-      pre.setAttribute('data-scroll-pin', '');
-      body.appendChild(pre);
+      cont = document.createElement('div');
+      cont.className = 'session';
+      cont.id = 'session-transcript';
+      cont.setAttribute('data-scroll-preserve', '');
+      cont.setAttribute('data-scroll-pin', '');
+      body.appendChild(cont);
     }
-    var pinned = pre.scrollHeight - pre.scrollTop - pre.clientHeight <= SLACK;
+    // Live streaming shows raw text token-by-token: rendering half-written
+    // markdown (an unclosed ``` fence, a dangling **) would flicker as tokens
+    // arrive, so the structured turns + TOC are the poll/end render, not the live
+    // frame. Keep a single <pre> child for the raw stream and hide any TOC a
+    // prior poll left — its anchors don't exist while we show raw text. On the
+    // "end" event the authoritative poll swaps the structured turns + TOC back in.
+    var toc = document.getElementById('session-toc');
+    if (toc) toc.style.display = 'none';
+    var pre = cont.querySelector('pre.session-live');
+    if (!pre) {
+      cont.textContent = ''; // drop any structured turns a prior poll rendered
+      pre = document.createElement('pre');
+      pre.className = 'session-live';
+      cont.appendChild(pre);
+    }
+    var pinned = cont.scrollHeight - cont.scrollTop - cont.clientHeight <= SLACK;
     pre.textContent = text;
-    if (pinned) pre.scrollTop = pre.scrollHeight; // follow new output at the bottom
+    if (pinned) cont.scrollTop = cont.scrollHeight; // follow new output at the bottom
   }
 
   function renderSync(st) {

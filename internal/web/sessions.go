@@ -91,9 +91,14 @@ func (s *Server) sessionLive(ctx context.Context, dir, id string) bool {
 	return ok
 }
 
-// sessionBody returns just the transcript text (the htmx-poll pane). It shares
-// sessionTranscript with the SSE stream, so the poll and the live stream render
-// the identical file-derived transcript and staleness banner.
+// sessionBody returns the transcript pane (the htmx-poll fragment), rendered as
+// structured, sanitized turns with a table-of-contents overlay
+// (session-transcript-rendered-toc) rather than a flat text dump. It shares
+// sessionTranscript with the SSE stream, so the poll and the live stream read
+// the identical file-derived transcript and staleness banner; the live stream
+// shows raw token-by-token text while running, and this poll render (the
+// authoritative/final view and the no-SSE fallback) supplies the structured
+// turns + TOC.
 func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -110,7 +115,13 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.render(w, "session_body.html", map[string]interface{}{"Body": body, "Sync": sync})
+	// Render the flat transcript into structured, sanitized turns + a TOC
+	// (session-transcript-rendered-toc). The scroll container keeps its stable id
+	// and scroll-preserve/pin attributes so poll-scroll-preserve is unaffected.
+	s.render(w, "session_body.html", map[string]interface{}{
+		"Transcript": parseTranscript(body),
+		"Sync":       sync,
+	})
 }
 
 // sessionStream pushes the session transcript to the browser over server-sent
