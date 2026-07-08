@@ -239,22 +239,37 @@ func strandedCount(ctx context.Context, g *git.Repo, done map[string]bool) int {
 	return len(strandedTaskSet(ctx, g, done))
 }
 
-// tagFilter is one FILTER BAR chip: an ANDed `tag=value` equality test over a
-// session's resolved tags (sessionTags). Composed by the operator through
-// separate key/value inputs (never a query string to type) but always
-// canonicalized to the `filter=key=value` URL shape (buildStatsURL), so the
-// FILTER BAR stays shareable/bookmarkable.
+// tagFilter is one FILTER BAR chip: an ANDed test over a session's resolved
+// tags (sessionTags). Composed by the operator through separate key/operator/
+// value inputs (never a query string to type) but always canonicalized to the
+// `filter=key<op>value` URL shape (buildStatsURL), so the FILTER BAR stays
+// shareable/bookmarkable. Op is the per-chip selector — never typed syntax —
+// and is one of:
+//
+//	""  or "=" — equality (tags[Key] == Value); "" is the zero value so every
+//	             pre-existing plain-equality chip/literal keeps working with no
+//	             call site needing to set it explicitly.
+//	"!=" — not-equal (tags[Key] != Value). A tag a session's resolved set
+//	       omits reads as "" (sessionTags never stores an empty value), so a
+//	       missing tag counts as "not equal" to any non-empty Value — the same
+//	       missing-tag-reads-as-empty-string semantics `=` already had.
+//	"=~" — regex-match (regexp.MatchString(Value, tags[Key])). An invalid
+//	       Value pattern degrades to "matches nothing" (see matchesFilters)
+//	       rather than a 500 — still no query-expression language, just a
+//	       chip whose own pattern happens to be unusable.
 type tagFilter struct {
-	Key, Value string
+	Key, Op, Value string
 }
 
-// filterChip is one rendered FILTER BAR entry: the chip's key/value plus the
-// href that removes JUST this chip — every OTHER active filter and the current
-// group-by selection carried through unchanged — so removing a chip is a
-// single plain link, no JS, no partial-state loss.
+// filterChip is one rendered FILTER BAR entry: the chip's key/operator/value
+// plus the href that removes JUST this chip — every OTHER active filter and
+// the current group-by selection carried through unchanged — so removing a
+// chip is a single plain link, no JS, no partial-state loss. Op is always the
+// DISPLAY form ("=", "!=", or "=~" — never "", unlike tagFilter.Op's zero
+// value) since it is rendered directly into the chip's text.
 type filterChip struct {
-	Key, Value string
-	RemoveHref string
+	Key, Op, Value string
+	RemoveHref     string
 }
 
 // groupStat is one row of the /stats filter+group-by view: the resolved tag
@@ -278,14 +293,31 @@ func (g *groupStat) derive() {
 }
 
 // matchesFilters reports whether tags satisfies EVERY filter chip (AND, never
-// OR): a filter whose key is absent from tags reads as "" (sessionTags never
-// stores an empty value), so it fails any filter with a non-empty Value —
-// exactly the "unknown tag key or value yields an empty group" contract, with
-// no special-casing needed here.
+// OR), each tested with its OWN operator (tagFilter.Op — a per-chip selector,
+// never typed syntax): a filter whose key is absent from tags reads as ""
+// (sessionTags never stores an empty value), so `=`/`!=` decide against that
+// empty string and `=~` matches its pattern against it — exactly the "unknown
+// tag key or value yields an empty group" contract, with no special-casing
+// needed here. An invalid `=~` pattern degrades to matching NOTHING (never a
+// 500): the chip itself just yields an empty group, same as any other
+// unsatisfiable filter.
 func matchesFilters(tags map[string]string, filters []tagFilter) bool {
 	for _, f := range filters {
-		if tags[f.Key] != f.Value {
-			return false
+		v := tags[f.Key]
+		switch f.Op {
+		case "!=":
+			if v == f.Value {
+				return false
+			}
+		case "=~":
+			re, err := regexp.Compile(f.Value)
+			if err != nil || !re.MatchString(v) {
+				return false
+			}
+		default: // "" (zero value) or "=": plain equality, unchanged from before Op existed.
+			if v != f.Value {
+				return false
+			}
 		}
 	}
 	return true
@@ -404,10 +436,14 @@ func (s *Server) computeGroupedStats(ctx context.Context, filters []tagFilter, g
 	return out, nil
 }
 
-// parseFilters extracts every `filter=key=value` query param as an ANDed
-// FILTER BAR chip. A malformed chip (no `=`, or an empty key) is dropped
-// rather than erroring — there is no query-expression language, only
-// composable k=v equality chips.
+// parseFilters extracts every `filter=key<op>value` query param as an ANDed
+// FILTER BAR chip, where <op> is `=` (the default — no operator marker at all,
+// so every pre-existing `filter=key=value` chip parses exactly as before),
+// `!=`, or `=~`: a trailing `!` on the key (`key!=value`) or a leading `~` on
+// the value (`key=~value`) selects it. A malformed chip (no `=` at all, or an
+// empty key once any operator marker is stripped) is dropped rather than
+// erroring — there is no query-expression language, only composable,
+// per-chip-operator filters.
 func parseFilters(r *http.Request) []tagFilter {
 	var out []tagFilter
 	for _, raw := range r.URL.Query()["filter"] {
@@ -415,9 +451,34 @@ func parseFilters(r *http.Request) []tagFilter {
 		if i <= 0 {
 			continue
 		}
-		out = append(out, tagFilter{Key: raw[:i], Value: raw[i+1:]})
+		key, op, val := raw[:i], "", raw[i+1:]
+		switch {
+		case strings.HasSuffix(key, "!"):
+			key, op = key[:len(key)-1], "!="
+		case strings.HasPrefix(val, "~"):
+			val, op = val[1:], "=~"
+		}
+		if key == "" {
+			continue
+		}
+		out = append(out, tagFilter{Key: key, Op: op, Value: val})
 	}
 	return out
+}
+
+// parseFilterOp normalizes the add-filter form's `fop` operator-selector
+// value (the per-chip selector — never typed syntax — the FILTER BAR's
+// "+ add filter" control posts alongside fkey/fval) to the SAME Op convention
+// parseFilters itself produces: "!=" and "=~" pass through, anything else
+// (missing, "=", or garbage from a hand-built request) normalizes to the ""
+// zero-value equality Op, exactly like a plain `filter=key=value` chip.
+func parseFilterOp(r *http.Request) string {
+	switch op := strings.TrimSpace(r.URL.Query().Get("fop")); op {
+	case "!=", "=~":
+		return op
+	default:
+		return ""
+	}
 }
 
 // parseGroupBy extracts the GROUP-BY tag key list. It accepts both the
@@ -444,13 +505,19 @@ func parseGroupBy(r *http.Request) []string {
 
 // buildStatsURL composes a /stats query string in the ONE canonical shape
 // every chip-removal link, group-by toggle, and add-filter redirect converges
-// on: one `filter=key=value` param per chip, one comma-joined `group-by` param
-// when non-empty. So the URL an operator bookmarks always has the exact shape
-// the docs example shows, regardless of which control produced it.
+// on: one `filter=key<op>value` param per chip (op defaults to `=` for the
+// zero-value/`=` case, so a plain-equality chip's URL is byte-identical to
+// before operators existed), one comma-joined `group-by` param when
+// non-empty. So the URL an operator bookmarks always has the exact shape the
+// docs example shows, regardless of which control produced it.
 func buildStatsURL(filters []tagFilter, groupBy []string) string {
 	q := url.Values{}
 	for _, f := range filters {
-		q.Add("filter", f.Key+"="+f.Value)
+		op := f.Op
+		if op == "" {
+			op = "="
+		}
+		q.Add("filter", f.Key+op+f.Value)
 	}
 	if len(groupBy) > 0 {
 		q.Set("group-by", strings.Join(groupBy, ","))
@@ -506,7 +573,7 @@ func toSet(keys []string) map[string]bool {
 // page. The handler never writes anything: every branch below only reads.
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	if fkey := strings.TrimSpace(r.URL.Query().Get("fkey")); fkey != "" {
-		filters := append(parseFilters(r), tagFilter{Key: fkey, Value: strings.TrimSpace(r.URL.Query().Get("fval"))})
+		filters := append(parseFilters(r), tagFilter{Key: fkey, Op: parseFilterOp(r), Value: strings.TrimSpace(r.URL.Query().Get("fval"))})
 		http.Redirect(w, r, buildStatsURL(filters, parseGroupBy(r)), http.StatusSeeOther)
 		return
 	}
@@ -522,7 +589,11 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 				rest = append(rest, o)
 			}
 		}
-		chips[i] = filterChip{Key: f.Key, Value: f.Value, RemoveHref: buildStatsURL(rest, groupBy)}
+		op := f.Op
+		if op == "" {
+			op = "="
+		}
+		chips[i] = filterChip{Key: f.Key, Op: op, Value: f.Value, RemoveHref: buildStatsURL(rest, groupBy)}
 	}
 
 	data := map[string]interface{}{

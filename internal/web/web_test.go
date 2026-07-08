@@ -4086,3 +4086,288 @@ func TestStatsAddFilterRedirect(t *testing.T) {
 		t.Fatalf("redirect must preserve group-by=model, got %q (location=%q)", got, loc)
 	}
 }
+
+// TestParseFiltersOperators is tag-filter-operators' direct parseFilters unit
+// test: `!=` (a trailing `!` on the key) and `=~` (a leading `~` on the value)
+// both parse off the raw `filter=key<op>value` chip, while a bare
+// `filter=key=value` chip keeps parsing to the "" zero-value Op exactly as
+// before operators existed (so every pre-existing chip/URL is unaffected).
+func TestParseFiltersOperators(t *testing.T) {
+	r := httptest.NewRequest("GET", "/stats?filter=kind=review&filter=model!=sonnet&filter=branch=~%5Ebee-&filter=malformed", nil)
+	got := parseFilters(r)
+	want := []tagFilter{
+		{Key: "kind", Op: "", Value: "review"},
+		{Key: "model", Op: "!=", Value: "sonnet"},
+		{Key: "branch", Op: "=~", Value: "^bee-"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseFilters: got %+v want %+v", got, want)
+	}
+
+	// A chip that is JUST an operator marker with no real key (e.g. a
+	// hand-built `filter=!=x` or `filter==~x`) drops as malformed, same as
+	// the pre-existing empty-key case.
+	r = httptest.NewRequest("GET", "/stats?filter=!=x&filter="+url.QueryEscape("=~x"), nil)
+	if got := parseFilters(r); len(got) != 0 {
+		t.Fatalf("operator-only chips (no key) must be dropped, got %+v", got)
+	}
+}
+
+// TestMatchesFiltersOperators is tag-filter-operators' direct matchesFilters
+// unit test, exercising all three operators plus the two properties the ROI
+// specifically calls out: an absent tag key reads as "" for `!=` exactly like
+// it already did for `=` (missing-tag-reads-as-empty-string), and an
+// unparsable `=~` pattern degrades to "matches nothing" rather than a panic
+// or error return (matchesFilters has no error return at all).
+func TestMatchesFiltersOperators(t *testing.T) {
+	tags := map[string]string{"kind": "review", "model": "opus"}
+
+	// "=" (and its "" zero value) unchanged.
+	if !matchesFilters(tags, []tagFilter{{Key: "kind", Value: "review"}}) {
+		t.Fatal(`kind=review must match`)
+	}
+	if matchesFilters(tags, []tagFilter{{Key: "kind", Value: "work"}}) {
+		t.Fatal(`kind=work must NOT match`)
+	}
+
+	// "!=" excludes an equal value, includes everything else, and includes a
+	// tag the session's set OMITS entirely (reads as "" — never equal to a
+	// non-empty Value).
+	if matchesFilters(tags, []tagFilter{{Key: "kind", Op: "!=", Value: "review"}}) {
+		t.Fatal(`kind!=review must NOT match a review session`)
+	}
+	if !matchesFilters(tags, []tagFilter{{Key: "kind", Op: "!=", Value: "work"}}) {
+		t.Fatal(`kind!=work must match a review session`)
+	}
+	if !matchesFilters(tags, []tagFilter{{Key: "cohort", Op: "!=", Value: "A"}}) {
+		t.Fatal(`cohort!=A must match a session with no cohort tag at all (missing reads as "")`)
+	}
+	// The empty-value edge: a tag the session omits reads as "", so
+	// `cohort!=""` (an empty Value) must EXCLUDE it ("" == "").
+	if matchesFilters(tags, []tagFilter{{Key: "cohort", Op: "!=", Value: ""}}) {
+		t.Fatal(`cohort!= (empty value) must NOT match a session missing the cohort tag ("" == "")`)
+	}
+
+	// "=~" matches by regex; a pattern that fails to compile matches NOTHING,
+	// never panics, and matchesFilters still just returns a plain bool.
+	if !matchesFilters(tags, []tagFilter{{Key: "model", Op: "=~", Value: "^op"}}) {
+		t.Fatal("model=~^op must match model=opus")
+	}
+	if matchesFilters(tags, []tagFilter{{Key: "model", Op: "=~", Value: "^son"}}) {
+		t.Fatal("model=~^son must NOT match model=opus")
+	}
+	if matchesFilters(tags, []tagFilter{{Key: "model", Op: "=~", Value: "("}}) {
+		t.Fatal("an invalid regex must degrade to no match, not match everything")
+	}
+
+	// AND across mixed operators: every chip must hold.
+	mixed := []tagFilter{
+		{Key: "kind", Value: "review"},
+		{Key: "model", Op: "!=", Value: "sonnet"},
+		{Key: "model", Op: "=~", Value: "^op"},
+	}
+	if !matchesFilters(tags, mixed) {
+		t.Fatal("mixed operator set should ALL hold for this session")
+	}
+	mixed[1].Value = "opus" // now model!=opus fails, even though the other two chips still hold
+	if matchesFilters(tags, mixed) {
+		t.Fatal("mixed operator set must fail as soon as ONE chip fails (AND, never OR)")
+	}
+}
+
+// TestStatsGroupedNotEqualOperator is tag-filter-operators' `!=` acceptance
+// case end-to-end: `model!=sonnet` excludes ONLY the sonnet session — a
+// same-kind opus session AND a session with no model header at all (which
+// reads as "" per the pre-existing missing-tag semantics) both survive.
+// Flipping to `model!=` (empty value) then excludes exactly the no-model
+// session instead ("" == "").
+func TestStatsGroupedNotEqualOperator(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+	const sonnet = "github-copilot/claude-sonnet-5"
+
+	writeStatsPlan(t, root, "alpha", [][2]string{{"t1", "DONE"}, {"t2", "DONE"}, {"t3", "DONE"}})
+	writeSubTranscript(t, root, "alpha", "bee-t1-100-1", "work", opus)
+	writeSubTranscript(t, root, "alpha", "bee-t2-200-2", "work", sonnet)
+	writeSubTranscript(t, root, "alpha", "bee-t3-300-3", "work", "") // no model header
+
+	rows, err := s.computeGroupedStats(context.Background(), []tagFilter{{Key: "model", Op: "!=", Value: sonnet}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Honeybees != 2 || rows[0].DeliveredTasks != 2 {
+		t.Fatalf("model!=%s: got %+v, want 1 row Honeybees=2 Delivered=2 (opus + no-model session; sonnet excluded)", sonnet, rows)
+	}
+
+	rows, err = s.computeGroupedStats(context.Background(), []tagFilter{{Key: "model", Op: "!=", Value: ""}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Honeybees != 2 || rows[0].DeliveredTasks != 2 {
+		t.Fatalf(`model!= (empty value): got %+v, want 1 row Honeybees=2 Delivered=2 (opus + sonnet; no-model session excluded)`, rows)
+	}
+
+	// End-to-end through the real handler; the URL stays a plain, shareable
+	// GET (filter=key<op>value, here percent-encoded by the query encoder).
+	w := get(t, s, "/stats?filter="+url.QueryEscape("model!="+sonnet))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /stats?filter=model!=%s: code=%d body=%s", sonnet, w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "model!="+sonnet) {
+		t.Fatalf("response missing rendered chip %q:\n%s", "model!="+sonnet, body)
+	}
+	// BOTH the add-filter form's and the group-by form's hidden re-post
+	// inputs must carry the FULL operator-encoded value, not just the bare
+	// key=value shape — otherwise submitting the group-by checkboxes (a
+	// plain GET on a separate <form>) would silently drop this chip's `!=`
+	// back to an unqualified equality filter.
+	hidden := `value="model!=` + sonnet + `"`
+	if n := strings.Count(body, hidden); n != 2 {
+		t.Fatalf("want the hidden filter re-post input %q exactly twice (filter-add form + group-by form), got %d:\n%s", hidden, n, body)
+	}
+}
+
+// TestStatsGroupedRegexOperator is tag-filter-operators' `=~` acceptance case
+// end-to-end: `model=~^github-copilot/claude-opus` matches only the opus
+// session, excluding sonnet even though both models share a common prefix
+// beyond what the anchored pattern allows.
+func TestStatsGroupedRegexOperator(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+	const sonnet = "github-copilot/claude-sonnet-5"
+
+	writeStatsPlan(t, root, "alpha", [][2]string{{"t1", "DONE"}, {"t2", "TODO"}})
+	writeSubTranscript(t, root, "alpha", "bee-t1-100-1", "work", opus)
+	writeSubTranscript(t, root, "alpha", "bee-t2-200-2", "work", sonnet)
+
+	rows, err := s.computeGroupedStats(context.Background(), []tagFilter{{Key: "model", Op: "=~", Value: `^github-copilot/claude-opus`}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Honeybees != 1 || rows[0].DeliveredTasks != 1 {
+		t.Fatalf("model=~^...opus: got %+v, want 1 row Honeybees=1 Delivered=1 (only the opus session)", rows)
+	}
+
+	w := get(t, s, "/stats?filter="+url.QueryEscape("model=~^github-copilot/claude-opus"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /stats?filter=model=~...: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "model=~^github-copilot/claude-opus") {
+		t.Fatalf("response missing rendered regex chip:\n%s", w.Body.String())
+	}
+}
+
+// TestStatsGroupedInvalidRegexNoMatches is tag-filter-operators' negative
+// control for `=~`: an unparsable pattern degrades to matching NOTHING (zero
+// rows) — never a Go error from computeGroupedStats and never a 500 through
+// the real handler, same "unknown filter yields an empty group" contract
+// stats-filter-groupby already established for equality.
+func TestStatsGroupedInvalidRegexNoMatches(t *testing.T) {
+	s, root := setup(t)
+	writeStatsPlan(t, root, "alpha", [][2]string{{"t1", "DONE"}})
+	writeSubTranscript(t, root, "alpha", "bee-t1-100-1", "work", "github-copilot/claude-opus-4.8")
+
+	rows, err := s.computeGroupedStats(context.Background(), []tagFilter{{Key: "model", Op: "=~", Value: "("}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("invalid regex must yield zero rows, got %+v", rows)
+	}
+
+	w := get(t, s, "/stats?filter="+url.QueryEscape("model=~("))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /stats with an invalid =~ pattern must still be 200, got code=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "no sessions match every filter") {
+		t.Fatalf("invalid-regex filter must render the empty-match copy, not an error:\n%s", w.Body.String())
+	}
+}
+
+// TestStatsGroupedMixedOperatorAND is tag-filter-operators' core acceptance
+// case: three chips, one per operator (`kind=review` equality, `model!=
+// sonnet` not-equal, `branch=~^bee-keep` regex), ANDed together. Each of the
+// three "wrong" sessions fails EXACTLY one chip (proving every operator, not
+// just one of them, actually restricts the pool) while only the session
+// passing all three survives.
+func TestStatsGroupedMixedOperatorAND(t *testing.T) {
+	s, root := setup(t)
+	const opus = "github-copilot/claude-opus-4.8"
+	const sonnet = "github-copilot/claude-sonnet-5"
+
+	writeStatsPlan(t, root, "alpha", [][2]string{
+		{"keepme", "DONE"}, {"keepbutwrongkind", "DONE"}, {"keepbutwrongmodel", "DONE"}, {"dropbranch", "DONE"},
+	})
+	writeSubTranscript(t, root, "alpha", "bee-keepme-100-1", "review", opus)              // passes all 3
+	writeSubTranscript(t, root, "alpha", "bee-keepbutwrongkind-200-2", "work", opus)      // fails kind= ONLY
+	writeSubTranscript(t, root, "alpha", "bee-keepbutwrongmodel-300-3", "review", sonnet) // fails model!= ONLY
+	writeSubTranscript(t, root, "alpha", "bee-dropbranch-400-4", "review", opus)          // fails branch=~ ONLY
+
+	filters := []tagFilter{
+		{Key: "kind", Value: "review"},
+		{Key: "model", Op: "!=", Value: sonnet},
+		{Key: "branch", Op: "=~", Value: "^bee-keep"},
+	}
+	rows, err := s.computeGroupedStats(context.Background(), filters, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Honeybees != 1 || rows[0].DeliveredTasks != 1 {
+		t.Fatalf("mixed-operator AND: got %+v, want exactly 1 row Honeybees=1 Delivered=1 (only bee-keepme survives every chip)", rows)
+	}
+
+	// End-to-end, all three operators in the one shareable URL.
+	q := url.Values{}
+	q.Add("filter", "kind=review")
+	q.Add("filter", "model!="+sonnet)
+	q.Add("filter", "branch=~^bee-keep")
+	w := get(t, s, "/stats?"+q.Encode())
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /stats with mixed operators: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestStatsAddFilterRedirectWithOperator extends TestStatsAddFilterRedirect to
+// the add-filter form's operator selector (`fop`): posting fkey/fop/fval with
+// fop=!= (or =~) must 303-redirect to a `filter=key<op>value` URL carrying
+// that SAME operator, not silently downgrading it to equality.
+func TestStatsAddFilterRedirectWithOperator(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/stats?fkey=model&fop=!=&fval=sonnet")
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("add-filter with fop=!=: code=%d, want %d", w.Code, http.StatusSeeOther)
+	}
+	loc := w.Header().Get("Location")
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := u.Query()["filter"], []string{"model!=sonnet"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("redirect filter params: got %v want %v (location=%q)", got, want, loc)
+	}
+
+	w = get(t, s, "/stats?fkey=model&fop="+url.QueryEscape("=~")+"&fval=%5Eopus")
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("add-filter with fop==~: code=%d, want %d", w.Code, http.StatusSeeOther)
+	}
+	u, err = url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := u.Query()["filter"], []string{"model=~^opus"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("redirect filter params: got %v want %v", got, want)
+	}
+
+	// An unrecognized/garbage fop (never posted by the form itself, but a
+	// hand-built request might try) normalizes to plain equality rather than
+	// producing a bogus operator in the URL.
+	w = get(t, s, "/stats?fkey=model&fop=bogus&fval=opus")
+	u, err = url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := u.Query()["filter"], []string{"model=opus"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("redirect filter params (garbage fop): got %v want %v", got, want)
+	}
+}
