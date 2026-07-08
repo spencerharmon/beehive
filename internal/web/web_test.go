@@ -4740,3 +4740,145 @@ func TestBadgeContrastHelpersKnownValues(t *testing.T) {
 		t.Errorf("pure red vs white = %.4f, want ~3.998", got)
 	}
 }
+
+// TestSrOnlyUtilityDefined locks the form-input-accessible-labels design-system
+// dependency: the embedded stylesheet defines a .sr-only rule that clips
+// content out of the visual viewport (position:absolute + a 1px/clip-rect box)
+// WITHOUT display:none or visibility:hidden — either of which would also drop
+// the paired <label> out of the accessibility tree, defeating the whole
+// point. Every per-field fix below pairs an input with either this class or a
+// plain aria-label; this test is the one place the utility's own contract is
+// locked so a future edit can't silently regress it for every consumer at
+// once.
+func TestSrOnlyUtilityDefined(t *testing.T) {
+	raw, err := assetFS.ReadFile("assets/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(raw)
+	m := regexp.MustCompile(`(?s)\.sr-only\s*\{([^}]*)\}`).FindStringSubmatch(css)
+	if m == nil {
+		t.Fatalf("style.css missing a .sr-only rule")
+	}
+	rule := m[1]
+	for _, want := range []string{"position: absolute", "clip:"} {
+		if !strings.Contains(rule, want) {
+			t.Fatalf(".sr-only rule missing %q:\n%s", want, rule)
+		}
+	}
+	for _, forbidden := range []string{"display: none", "display:none", "visibility: hidden", "visibility:hidden"} {
+		if strings.Contains(rule, forbidden) {
+			t.Fatalf(".sr-only must not use %q (removes the paired label from the accessibility tree, not just the viewport):\n%s", forbidden, rule)
+		}
+	}
+}
+
+// TestFormInputAccessibleLabels is the core of form-input-accessible-labels:
+// every plain-placeholder text/password input the UI audit flagged (Finding
+// #3) now resolves a non-empty accessible name through the standard
+// label/aria-label computation, while the placeholder itself stays put as
+// supplementary hint text (it is not a substitute for a real name — it
+// disappears on input and is exposed to AT inconsistently). One template at a
+// time, covering all nine touched views.
+func TestFormInputAccessibleLabels(t *testing.T) {
+	s, _ := setup(t)
+
+	// dashboard.html: the add-submodule form (url/name/branch), each paired
+	// with its own sr-only <label for=...> / <input id=...>.
+	dash := get(t, s, "/").Body.String()
+	for _, want := range []string{
+		`class="sr-only" for="add-submodule-url"`, `id="add-submodule-url"`,
+		`class="sr-only" for="add-submodule-name"`, `id="add-submodule-name"`,
+		`class="sr-only" for="add-submodule-branch"`, `id="add-submodule-branch"`,
+		`placeholder="repo url (git@host:org/repo.git)"`, // hints retained verbatim
+		`placeholder="name (optional)"`,
+		`placeholder="branch (default main)"`,
+	} {
+		if !strings.Contains(dash, want) {
+			t.Fatalf("dashboard.html add-submodule form missing %q:\n%s", want, dash)
+		}
+	}
+
+	// merge_panel.html: the merge branch input.
+	mergePanel := renderTmpl(t, s, "merge_panel.html", map[string]interface{}{
+		"Subs": []repo.Submodule{{Name: "alpha"}},
+	})
+	for _, want := range []string{`class="sr-only" for="merge-branch"`, `id="merge-branch"`, `placeholder="branch"`} {
+		if !strings.Contains(mergePanel, want) {
+			t.Fatalf("merge_panel.html branch input missing %q:\n%s", want, mergePanel)
+		}
+	}
+
+	// branch_view.html: its own (differently-scoped) merge branch input.
+	branchView := renderTmpl(t, s, "branch_view.html", map[string]interface{}{
+		"Name": "alpha", "Sections": nil, "HasPrev": false, "HasNext": false,
+	})
+	for _, want := range []string{
+		`class="sr-only" for="branch-view-merge-branch"`, `id="branch-view-merge-branch"`,
+		`placeholder="branch to merge"`,
+	} {
+		if !strings.Contains(branchView, want) {
+			t.Fatalf("branch_view.html merge input missing %q:\n%s", want, branchView)
+		}
+	}
+
+	// links_editor.html: submodule-link from/to.
+	linksEditor := renderTmpl(t, s, "links_editor.html", nil)
+	for _, want := range []string{
+		`class="sr-only" for="link-from"`, `id="link-from"`, `placeholder="from"`,
+		`class="sr-only" for="link-to"`, `id="link-to"`, `placeholder="to"`,
+	} {
+		if !strings.Contains(linksEditor, want) {
+			t.Fatalf("links_editor.html missing %q:\n%s", want, linksEditor)
+		}
+	}
+
+	// secrets_panel.html: the per-key edit row repeats once per key (so it
+	// uses aria-label rather than an id, which would collide across rows),
+	// plus the single add-secret key/value pair.
+	secretsPanel := renderTmpl(t, s, "secrets_panel.html", map[string]interface{}{"Keys": []string{"API_TOKEN"}})
+	for _, want := range []string{
+		`aria-label="new value for API_TOKEN"`, `placeholder="new value for API_TOKEN"`,
+		`aria-label="key"`, `placeholder="key"`,
+		`aria-label="value"`, `placeholder="value"`,
+	} {
+		if !strings.Contains(secretsPanel, want) {
+			t.Fatalf("secrets_panel.html missing %q:\n%s", want, secretsPanel)
+		}
+	}
+
+	// stats.html: the /stats filter-add fkey/fval inputs (fop already carried
+	// aria-label="filter operator" before this task — the established
+	// pattern being extended here), plus the adjacent group-by free-text
+	// input (same defect, same template, fixed alongside its neighbors).
+	stats := get(t, s, "/stats").Body.String()
+	for _, want := range []string{
+		`aria-label="filter tag key"`, `placeholder="tag key (e.g. kind)"`,
+		`aria-label="filter operator"`,
+		`aria-label="filter value"`, `placeholder="value (e.g. review)"`,
+		`aria-label="extra group-by tag keys"`, `placeholder="extra tag keys, comma-separated"`,
+	} {
+		if !strings.Contains(stats, want) {
+			t.Fatalf("stats.html filter form missing %q:\n%s", want, stats)
+		}
+	}
+
+	// editor.html / bootstrap_agent.html / human_resolve.html: the three
+	// chat-style message inputs.
+	editorHTML := renderTmpl(t, s, "editor.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"})
+	if !strings.Contains(editorHTML, `aria-label="message to the editor"`) {
+		t.Fatalf("editor.html chat input missing an accessible name:\n%s", editorHTML)
+	}
+
+	bootstrapAgent := renderTmpl(t, s, "bootstrap_agent.html", map[string]interface{}{"ID": "b1"})
+	if !strings.Contains(bootstrapAgent, `aria-label="message to the setup guide"`) {
+		t.Fatalf("bootstrap_agent.html chat input missing an accessible name:\n%s", bootstrapAgent)
+	}
+
+	humanResolve := renderTmpl(t, s, "human_resolve.html", map[string]interface{}{
+		"Sub": "alpha", "Item": PlanItem{ID: "t2"}, "SessID": "s1",
+	})
+	if !strings.Contains(humanResolve, `aria-label="message to the resolution agent"`) {
+		t.Fatalf("human_resolve.html chat input missing an accessible name:\n%s", humanResolve)
+	}
+}

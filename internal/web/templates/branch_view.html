@@ -8,7 +8,8 @@
       hx-indicator="#htmx-progress"
       hx-confirm="Merge this branch into the tracked branch? This runs a real git merge, pushes origin, and advances the pointer — it cannot be undone here.">
   <input type="hidden" name="name" value="{{.Name}}">
-  <input name="branch" placeholder="branch to merge">
+  <label class="sr-only" for="branch-view-merge-branch">branch to merge</label>
+  <input id="branch-view-merge-branch" name="branch" placeholder="branch to merge">
   <button class="merge">merge &amp; publish</button>
 </form>
 <div id="branch-merge-result"></div>

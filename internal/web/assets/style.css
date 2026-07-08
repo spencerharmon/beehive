@@ -166,6 +166,29 @@ p { margin: 0 0 var(--space-4); }
 b { font-weight: 600; }
 small, .small { font-size: var(--text-sm); }
 
+/* Accessibility utilities -------------------------------------------------
+ * .sr-only visually hides an element while keeping it in the accessibility
+ * tree (screen readers / other AT) — the standard clip-rect + 1px technique,
+ * NOT display:none or visibility:hidden (both of which remove it from AT
+ * too). Primary use: pairing a real <label> with an input that shows only a
+ * placeholder as a hint, so every field still resolves a programmatic
+ * accessible name (form-input-accessible-labels) — see stats.html's filter
+ * operator <select> for the pre-existing aria-label sibling pattern this
+ * extends. Extension point: skip-to-content-link adds a
+ * .sr-only-until-focus variant that reveals on :focus by overriding this
+ * rule's clip/position, rather than a second colliding hidden-text utility. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* Layout: sticky top bar + centered content ------------------------------ */
 .topbar {
   position: sticky;

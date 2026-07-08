@@ -35,9 +35,12 @@
 </div>
 <div class="cards">{{template "hygiene-widget" .Hygiene}}</div>
 <form method="post" action="/submodule/add">
-  <input name="url" placeholder="repo url (git@host:org/repo.git)" required>
-  <input name="name" placeholder="name (optional)">
-  <input name="branch" placeholder="branch (default main)">
+  <label class="sr-only" for="add-submodule-url">repo url</label>
+  <input id="add-submodule-url" name="url" placeholder="repo url (git@host:org/repo.git)" required>
+  <label class="sr-only" for="add-submodule-name">name</label>
+  <input id="add-submodule-name" name="name" placeholder="name (optional)">
+  <label class="sr-only" for="add-submodule-branch">branch</label>
+  <input id="add-submodule-branch" name="branch" placeholder="branch (default main)">
   <button>add</button>
 </form>
 {{template "footer"}}

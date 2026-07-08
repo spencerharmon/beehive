@@ -38,7 +38,7 @@
   </div>
   <form hx-post="/human/{{.Sub}}/{{.Item.ID}}/message/{{.SessID}}" hx-target="#resolve" hx-swap="innerHTML"
         hx-on::after-request="this.reset()">
-    <input name="message" placeholder="What does this blocker need? Ask the agent to investigate or draft the change…" autocomplete="off" autofocus style="width:70%">
+    <input name="message" placeholder="What does this blocker need? Ask the agent to investigate or draft the change…" aria-label="message to the resolution agent" autocomplete="off" autofocus style="width:70%">
     <button>send</button>
   </form>
   <form method="post" action="/human/{{.Sub}}/{{.Item.ID}}/discard/{{.SessID}}"
