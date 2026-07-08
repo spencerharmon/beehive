@@ -416,7 +416,10 @@ func (s *Server) submodule(name string) (repo.Submodule, error) {
 // match what the runner/selector see; Env is the submodule's active blue/green
 // deploy env from the typed artifacts model ("" when it has no
 // INFRASTRUCTURE.md); Working is true when a task is actively claimed (a fresh
-// session+heartbeat), driving the card's live overlay.
+// session+heartbeat), driving the card's live overlay; Bees is HOW MANY tasks
+// carry such a fresh claim — the count of honeybees currently working this
+// submodule (0 when idle, and Working is exactly Bees > 0), surfaced on the card
+// with the 🐝 badge.
 type subView struct {
 	Name    string
 	State   string
@@ -425,6 +428,7 @@ type subView struct {
 	Human   int
 	Env     string
 	Working bool
+	Bees    int
 }
 
 // EnvClass is the design-system badge hue modifier for the active deploy env:
@@ -515,9 +519,10 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 		// pending and human — the two counters legitimately overlap, but each task
 		// increments each counter at most once (never double-counted within a
 		// counter). Working = any task with a fresh claim (session+heartbeat within
-		// the TTL). A parse error leaves this submodule's stamp/counts empty rather
-		// than failing the whole dashboard (mirrors the pre-existing per-submodule
-		// resilience).
+		// the TTL); Bees = HOW MANY such fresh claims (the honeybee count on the
+		// card), so Working is exactly Bees > 0. A parse error leaves this
+		// submodule's stamp/counts empty rather than failing the whole dashboard
+		// (mirrors the pre-existing per-submodule resilience).
 		if p, err := s.planView(head, sm.PlanPath(), now, ttl); err == nil {
 			v.Stamp = p.ROIStamp
 			for _, it := range p.Items {
@@ -529,6 +534,7 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 				}
 				if it.Active {
 					v.Working = true
+					v.Bees++
 				}
 			}
 		}
