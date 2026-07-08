@@ -639,6 +639,70 @@ pre.diff .ln.del .chg { background: var(--diff-chg-del-bg); }
   #htmx-progress .spin { animation: none; }
 }
 
+/* Loading skeletons: shaped placeholders shown in an htmx-polled pane's initial
+ * shell (which carries role="status" aria-live="polite" so the swap-in is
+ * announced) BEFORE its first fragment lands — instead of a bare "loading…"
+ * flash. Two shapes echo the pane's eventual content: .skeleton-transcript is a
+ * stack of mono-height lines on a surface panel (transcript / chat panes);
+ * .skeleton-list is full-width rows (the sessions list). Everything is
+ * token-driven (no color literal) and the shimmer is a token-neutral opacity
+ * pulse gated behind prefers-reduced-motion, exactly like the .active claim
+ * pulse above. The two reusable components live in templates/skeleton.html. */
+.skeleton { display: flex; flex-direction: column; gap: var(--space-2); }
+.skeleton-line,
+.skeleton-row {
+  background: var(--surface-2);
+  animation: bee-skeleton 1.4s ease-in-out infinite;
+}
+/* Transcript-shaped block: sits in its own surface panel; the lines are text-row
+   height with staggered widths so it reads as a wrapped transcript, not a table. */
+.skeleton-transcript {
+  background: var(--surface);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+}
+.skeleton-transcript .skeleton-line {
+  height: 0.85em;
+  border-radius: var(--radius-sm);
+}
+.skeleton-transcript .skeleton-line:nth-child(1) { width: 92%; }
+.skeleton-transcript .skeleton-line:nth-child(2) { width: 74%; }
+.skeleton-transcript .skeleton-line:nth-child(3) { width: 84%; }
+.skeleton-transcript .skeleton-line:nth-child(4) { width: 61%; }
+.skeleton-transcript .skeleton-line:nth-child(5) { width: 88%; }
+.skeleton-transcript .skeleton-line:nth-child(6) { width: 46%; }
+/* List-shaped rows: echo ul.sessions <li> rows (full width, bordered), and carry
+   the same vertical margin so the swap-in list does not shift the layout. */
+.skeleton-list { margin: var(--space-4) 0; }
+.skeleton-list .skeleton-row {
+  height: 2.25em;
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-sm);
+}
+@keyframes bee-skeleton {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-line,
+  .skeleton-row { animation: none; }
+}
+
+/* Visually-hidden utility: text kept off-screen for assistive tech only. Used for
+   the skeletons' "Loading…" text equivalent (the bars are aria-hidden). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* Error toast: a failed htmx request that is not swapped in (non-2xx / network)
  * is shown here so a destructive action never fails silently. Click to dismiss. */
 #htmx-toast {

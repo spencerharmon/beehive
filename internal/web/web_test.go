@@ -142,6 +142,128 @@ func TestScrollPreserveWiring(t *testing.T) {
 	}
 }
 
+// TestPollPaneLoadingSkeletons is the core of poll-pane-loading-skeletons: every
+// htmx-polled pane used to open with a bare <p>loading…</p> — no shaped
+// placeholder and, worse, no aria-live, so a screen-reader user got no
+// notification when the first swap landed and sighted users saw a plain-text
+// flash. It asserts (1) the embedded stylesheet carries the token-driven skeleton
+// component (shaped .skeleton-transcript / .skeleton-list blocks, a bee-skeleton
+// pulse, the prefers-reduced-motion gate, and the .sr-only text utility), and
+// (2) that all six polled shells now render a shaped skeleton — not the bare
+// "loading…" text — inside a shell marked role="status" aria-live="polite" so the
+// swap-in is announced to assistive tech.
+func TestPollPaneLoadingSkeletons(t *testing.T) {
+	s, _ := setup(t)
+
+	// (1) CSS: the skeleton component + its reduced-motion gate + the sr-only
+	// utility ship in the embedded stylesheet.
+	css := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		".skeleton {",
+		".skeleton-transcript",
+		".skeleton-list",
+		".skeleton-line",
+		".skeleton-row",
+		"@keyframes bee-skeleton",
+		".skeleton-row { animation: none; }", // reduced-motion gate
+		".sr-only {",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("style.css missing skeleton rule %q", want)
+		}
+	}
+	// The shimmer must stay token-driven: the shared fill rule introduces no
+	// color literal (the design system flips colours via :root tokens only).
+	fillStart := strings.Index(css, ".skeleton-line,")
+	if fillStart < 0 {
+		t.Fatalf("style.css missing shared .skeleton-line,/.skeleton-row fill rule")
+	}
+	fillRule := css[fillStart : fillStart+strings.Index(css[fillStart:], "}")]
+	if strings.Contains(fillRule, "#") || strings.Contains(fillRule, "hsl(") {
+		t.Fatalf("skeleton fill must be token-driven, no color literal:\n%s", fillRule)
+	}
+
+	// (2) Every polled shell renders a shaped skeleton inside a role="status"
+	// aria-live="polite" region, and no longer shows the bare loading text. The
+	// two shapes are the whole component surface: a transcript-shaped block for
+	// the transcript/chat panes and list rows for the sessions list.
+	cases := []struct {
+		name  string
+		tmpl  string
+		data  interface{}
+		shape string   // the shape class expected for this pane
+		gone  string   // the bare-loading node that must no longer render
+		extra []string // other markup that must survive on the shell
+	}{
+		{
+			name:  "sessions list",
+			tmpl:  "session_list.html",
+			data:  map[string]interface{}{"Name": "alpha"},
+			shape: "skeleton-list",
+			gone:  ">loading…<",
+			extra: []string{`id="session-list"`},
+		},
+		{
+			name:  "session transcript",
+			tmpl:  "session_view.html",
+			data:  map[string]interface{}{"Name": "alpha", "Branch": "bee-x"},
+			shape: "skeleton-transcript",
+			gone:  ">loading…<",
+			// #session-loading is preserved: the SSE stream removes it by id.
+			extra: []string{`id="session-body"`, `id="session-loading"`},
+		},
+		{
+			name:  "single-file editor",
+			tmpl:  "editor.html",
+			data:  map[string]interface{}{"ID": "e1", "File": "ROI.md"},
+			shape: "skeleton-transcript",
+			gone:  ">loading…<",
+			extra: []string{`id="editor"`},
+		},
+		{
+			name:  "human resolve agent",
+			tmpl:  "human_resolve.html",
+			data:  map[string]interface{}{"Sub": "alpha", "Item": PlanItem{ID: "t1"}, "SessID": "s1"},
+			shape: "skeleton-transcript",
+			gone:  ">loading…<",
+			extra: []string{`id="resolve"`},
+		},
+		{
+			name:  "bootstrap wizard agent",
+			tmpl:  "bootstrap_agent.html",
+			data:  map[string]interface{}{"ID": "b1"},
+			shape: "skeleton-transcript",
+			gone:  "loading setup assistant",
+			extra: []string{`id="chatedit"`},
+		},
+		{
+			name:  "bootstrap banner agent",
+			tmpl:  "bootstrap-banner",
+			data:  map[string]interface{}{"Bootstrapped": false},
+			shape: "skeleton-transcript",
+			gone:  "loading setup assistant",
+			extra: []string{`id="bootstrap-agent"`},
+		},
+	}
+	for _, c := range cases {
+		out := renderTmpl(t, s, c.tmpl, c.data)
+		if !strings.Contains(out, c.shape) {
+			t.Errorf("%s (%s): missing shaped skeleton %q:\n%s", c.name, c.tmpl, c.shape, out)
+		}
+		if !strings.Contains(out, `role="status" aria-live="polite"`) {
+			t.Errorf("%s (%s): polled shell not marked role=status aria-live=polite:\n%s", c.name, c.tmpl, out)
+		}
+		if strings.Contains(out, c.gone) {
+			t.Errorf("%s (%s): still renders the bare loading text %q:\n%s", c.name, c.tmpl, c.gone, out)
+		}
+		for _, e := range c.extra {
+			if !strings.Contains(out, e) {
+				t.Errorf("%s (%s): missing %q:\n%s", c.name, c.tmpl, e, out)
+			}
+		}
+	}
+}
+
 func TestDashboard(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/")

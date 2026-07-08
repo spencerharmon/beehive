@@ -1,10 +1,11 @@
 {{template "header"}}
 <h1>{{.Name}} · sessions</h1>
 <div id="session-list"
+     role="status" aria-live="polite"
      data-scroll-preserve
      hx-get="/submodule/{{.Name}}/sessions/body"
      hx-trigger="load, every 2s"
      hx-swap="innerHTML">
-  <p>loading…</p>
+  {{template "skeleton-list"}}
 </div>
 {{template "footer"}}
