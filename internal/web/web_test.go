@@ -1628,6 +1628,196 @@ func TestDocViewGuards(t *testing.T) {
 	}
 }
 
+// TestDocExplorerListsWholeTree proves submodule-doc-explorer's core contract:
+// every file under docs/ — a top-level change doc, an audit report under
+// docs/audit/, and a task design doc under docs/tasks/ — is listed with a
+// working link into the existing doc viewer, not just docs reachable from a
+// task/branch row.
+func TestDocExplorerListsWholeTree(t *testing.T) {
+	s, root := setup(t)
+	docsDir := filepath.Join(root, "submodules", "alpha", "docs")
+	os.MkdirAll(filepath.Join(docsDir, "audit"), 0o755)
+	os.MkdirAll(filepath.Join(docsDir, "tasks"), 0o755)
+	os.WriteFile(filepath.Join(docsDir, "bee-doc.md"), []byte("# Change Doc\n"), 0o644)
+	os.WriteFile(filepath.Join(docsDir, "audit", "session-audit-001.md"), []byte("# Audit\n"), 0o644)
+	os.WriteFile(filepath.Join(docsDir, "tasks", "some-task.md"), []byte("# Task Design\n"), 0o644)
+
+	w := get(t, s, "/submodule/alpha/docs")
+	if w.Code != 200 {
+		t.Fatalf("docs explorer %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	links := []string{
+		"/submodule/alpha/doc/bee-doc.md",
+		"/submodule/alpha/doc/audit/session-audit-001.md",
+		"/submodule/alpha/doc/tasks/some-task.md",
+	}
+	for _, href := range links {
+		if !strings.Contains(body, `href="`+href+`"`) {
+			t.Fatalf("doc explorer missing link %q:\n%s", href, body)
+		}
+	}
+	// The links must actually resolve through the existing doc viewer.
+	for _, href := range links {
+		if d := get(t, s, href); d.Code != 200 {
+			t.Fatalf("doc viewer %s: got %d, want 200: %s", href, d.Code, d.Body)
+		}
+	}
+}
+
+// TestDocExplorerNoCrossSubmoduleLeakage proves docExplorer is scoped to ONE
+// submodule's docs/ dir: alpha's docs page must never show beta's doc names or
+// links, even when both have a docs/ tree.
+func TestDocExplorerNoCrossSubmoduleLeakage(t *testing.T) {
+	s, root := setup(t)
+	alphaDocs := filepath.Join(root, "submodules", "alpha", "docs")
+	betaDocs := filepath.Join(root, "submodules", "beta", "docs")
+	os.MkdirAll(alphaDocs, 0o755)
+	os.MkdirAll(betaDocs, 0o755)
+	os.WriteFile(filepath.Join(alphaDocs, "alpha-only.md"), []byte("# Alpha\n"), 0o644)
+	os.WriteFile(filepath.Join(betaDocs, "beta-only.md"), []byte("# Beta\n"), 0o644)
+
+	body := get(t, s, "/submodule/alpha/docs").Body.String()
+	if !strings.Contains(body, "alpha-only.md") {
+		t.Fatalf("alpha's own doc missing from its docs page:\n%s", body)
+	}
+	if strings.Contains(body, "beta-only.md") || strings.Contains(body, "/submodule/beta/") {
+		t.Fatalf("alpha docs page leaked beta's docs:\n%s", body)
+	}
+}
+
+// TestDocExplorerUnknownSubmodule404s locks that an unregistered submodule name
+// 404s rather than rendering an empty/leaky page.
+func TestDocExplorerUnknownSubmodule404s(t *testing.T) {
+	s, _ := setup(t)
+	if w := get(t, s, "/submodule/none/docs"); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown submodule docs: got %d, want 404", w.Code)
+	}
+}
+
+// TestDocExplorerEmptyDocsDir proves an unbootstrapped/docless submodule is a
+// safe no-op — a 200 with an empty listing, never an error — matching
+// resolveDocHref/changeDocsByTask's "absence is a safe no-op" contract.
+func TestDocExplorerEmptyDocsDir(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/submodule/alpha/docs")
+	if w.Code != 200 {
+		t.Fatalf("docs explorer with no docs/ dir: got %d, want 200: %s", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), "No docs yet") {
+		t.Fatalf("expected empty-state message:\n%s", w.Body.String())
+	}
+}
+
+// TestDocPathTraversalGuards locks the {file...} doc route's safety for NESTED
+// paths: a percent-encoded traversal segment reaching the handler as an
+// already-decoded ".." must 404 (never a read outside submodules/<sm>/docs/),
+// while a legitimate nested path (docs/audit/*) resolves.
+func TestDocPathTraversalGuards(t *testing.T) {
+	s, root := setup(t)
+	docsDir := filepath.Join(root, "submodules", "alpha", "docs", "audit")
+	os.MkdirAll(docsDir, 0o755)
+	os.WriteFile(filepath.Join(docsDir, "ok.md"), []byte("# OK\n"), 0o644)
+
+	if w := get(t, s, "/submodule/alpha/doc/audit/ok.md"); w.Code != 200 {
+		t.Fatalf("nested doc: got %d, want 200: %s", w.Code, w.Body)
+	}
+	for _, bad := range []string{
+		"/submodule/alpha/doc/..%2F..%2F..%2Fetc%2Fpasswd",
+		"/submodule/alpha/doc/audit%2F..%2F..%2FROI.md",
+		"/submodule/alpha/doc/%2e%2e/%2e%2e/ROI.md",
+	} {
+		if w := get(t, s, bad); w.Code != http.StatusNotFound {
+			t.Fatalf("traversal %q: got %d, want 404", bad, w.Code)
+		}
+	}
+}
+
+// TestDocTreeWalksSubdirs is the unit core of docTree: it must find files at
+// the docs/ root AND nested under docs/audit/, docs/tasks/, tagging each with
+// its parent Dir and a Href through the doc viewer, and a docs/ dir that does
+// not exist must yield (nil, nil) rather than an error.
+func TestDocTreeWalksSubdirs(t *testing.T) {
+	root := t.TempDir()
+	sm := repo.Submodule{Name: "alpha", Path: filepath.Join(root, "submodules", "alpha")}
+	entries, err := docTree(sm)
+	if err != nil || entries != nil {
+		t.Fatalf("docTree with no docs/ dir = %v, %v, want nil, nil", entries, err)
+	}
+
+	docsDir := filepath.Join(sm.Path, "docs")
+	os.MkdirAll(filepath.Join(docsDir, "audit"), 0o755)
+	os.MkdirAll(filepath.Join(docsDir, "tasks"), 0o755)
+	os.WriteFile(filepath.Join(docsDir, "top.md"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(docsDir, "audit", "a1.md"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(docsDir, "tasks", "t1.md"), []byte("x"), 0o644)
+
+	entries, err = docTree(sm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("docTree = %d entries, want 3: %+v", len(entries), entries)
+	}
+	byPath := map[string]DocEntry{}
+	for _, e := range entries {
+		byPath[e.Path] = e
+	}
+	if top, ok := byPath["top.md"]; !ok || top.Dir != "" || top.Href != "/submodule/alpha/doc/top.md" {
+		t.Fatalf("top-level entry wrong: %+v", top)
+	}
+	if a1, ok := byPath["audit/a1.md"]; !ok || a1.Dir != "audit" || a1.Name != "a1.md" || a1.Href != "/submodule/alpha/doc/audit/a1.md" {
+		t.Fatalf("audit entry wrong: %+v", a1)
+	}
+	if t1, ok := byPath["tasks/t1.md"]; !ok || t1.Dir != "tasks" || t1.Href != "/submodule/alpha/doc/tasks/t1.md" {
+		t.Fatalf("tasks entry wrong: %+v", t1)
+	}
+}
+
+// TestSectionDocsGroupsByDir proves sectionDocs groups by directory with root
+// files leading, THEN alphabetical subdirectories — and that this holds even
+// when a root file's name would sort ALPHABETICALLY between two subdirectory
+// names (i.e. it cannot rely on the input's flat lexical order keeping a
+// directory's members contiguous).
+func TestSectionDocsGroupsByDir(t *testing.T) {
+	entries := []DocEntry{
+		{Path: "audit/a.md", Dir: "audit", Name: "a.md"},
+		{Path: "bee-root.md", Dir: "", Name: "bee-root.md"}, // sorts BETWEEN "audit/" and "tasks/"
+		{Path: "tasks/t.md", Dir: "tasks", Name: "t.md"},
+	}
+	secs := sectionDocs(entries)
+	if len(secs) != 3 {
+		t.Fatalf("want 3 sections, got %d: %+v", len(secs), secs)
+	}
+	if secs[0].Dir != "" || len(secs[0].Files) != 1 || secs[0].Files[0].Name != "bee-root.md" {
+		t.Fatalf("root section not first: %+v", secs[0])
+	}
+	if secs[1].Dir != "audit" || len(secs[1].Files) != 1 {
+		t.Fatalf("audit section wrong: %+v", secs[1])
+	}
+	if secs[2].Dir != "tasks" || len(secs[2].Files) != 1 {
+		t.Fatalf("tasks section wrong: %+v", secs[2])
+	}
+}
+
+// TestSafeDocPath locks the traversal guard directly: nested segments are
+// allowed, but "..", an absolute path, a doubled slash, or an unsafe character
+// anywhere is rejected.
+func TestSafeDocPath(t *testing.T) {
+	ok := []string{"bee-doc.md", "audit/session-audit-001.md", "tasks/some-task.md", "a.b-c_d.md"}
+	for _, p := range ok {
+		if !safeDocPath(p) {
+			t.Errorf("safeDocPath(%q) = false, want true", p)
+		}
+	}
+	bad := []string{"", "/etc/passwd", "../ROI.md", "audit/../ROI.md", "audit/ ok.md", "audit//ok.md"}
+	for _, p := range bad {
+		if safeDocPath(p) {
+			t.Errorf("safeDocPath(%q) = true, want false", p)
+		}
+	}
+}
+
 // writeHivePlan overwrites a submodule's PLAN.md (in the hive checkout, NOT a
 // submodule code repo) with a single task at status, for delivery-traceability
 // tests that need to commit a real TODO -> NEEDS-REVIEW -> DONE sequence to the

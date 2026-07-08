@@ -29,7 +29,7 @@
     {{if .Human}}<a class="badge human" href="/human" title="tasks needing a human">needs-human {{.Human}}</a>{{end}}
   </div>
   <p class="muted small">stamp: <code>{{if .Stamp}}{{.Stamp}}{{else}}&mdash;{{end}}</code></p>
-  <div class="card-links"><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">branches</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <a href="/roi/{{.Name}}">roi</a> · <a href="/edit?path=submodules/{{.Name}}/ROI.md">edit roi (AI)</a></div>
+  <div class="card-links"><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">branches</a> · <a href="/submodule/{{.Name}}/docs">docs</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <a href="/roi/{{.Name}}">roi</a> · <a href="/edit?path=submodules/{{.Name}}/ROI.md">edit roi (AI)</a></div>
 </div>{{else}}<p>no submodules</p>{{end}}
 </div>
 <div class="cards">{{template "hygiene-widget" .Hygiene}}</div>

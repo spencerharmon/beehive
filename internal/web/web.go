@@ -301,7 +301,8 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /submodule/{name}", b((*Server).explorer))
 	mux.HandleFunc("GET /submodule/{name}/branches", b((*Server).branches))
 	mux.HandleFunc("GET /submodule/{name}/commit/{sha}", b((*Server).commitView))
-	mux.HandleFunc("GET /submodule/{name}/doc/{file}", b((*Server).doc))
+	mux.HandleFunc("GET /submodule/{name}/doc/{file...}", b((*Server).doc))
+	mux.HandleFunc("GET /submodule/{name}/docs", b((*Server).docExplorer))
 	mux.HandleFunc("GET /submodule/{name}/plan", b((*Server).plan))
 	mux.HandleFunc("POST /submodule/{name}/plan/delete", b((*Server).planDelete))
 	mux.HandleFunc("GET /submodule/{name}/sessions", b((*Server).sessionsList))
@@ -752,11 +753,15 @@ func (s *Server) branches(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// doc renders one of a submodule's Beehive change docs
-// (submodules/<name>/docs/<file>) as sanitized markdown, so the branch view's
-// commit-stamp links resolve to a readable page. file is a basename guarded
-// against traversal and the read is scoped to that single submodule's docs/ dir
-// (never another submodule, never outside docs/).
+// doc renders one of a submodule's Beehive docs
+// (submodules/<name>/docs/<path>, which may nest under docs/audit/ or
+// docs/tasks/) as sanitized markdown. It backs both the branch view's
+// commit-stamp links (a flat basename) and the doc explorer's whole-tree
+// listing (submodule-doc-explorer, a possibly nested path), so both routes
+// resolve to the SAME viewer. The {file...} wildcard captures the remaining
+// URL segments; path is validated by safeDocPath (traversal-guarded, every
+// segment charset-checked) and the read is scoped to that single submodule's
+// docs/ dir (never another submodule, never outside docs/).
 func (s *Server) doc(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -764,17 +769,44 @@ func (s *Server) doc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	file := r.PathValue("file")
-	if !safeBranch(file) {
+	if !safeDocPath(file) {
 		http.NotFound(w, r)
 		return
 	}
-	b, err := os.ReadFile(filepath.Join(sm.Path, "docs", file))
+	b, err := os.ReadFile(filepath.Join(sm.Path, "docs", filepath.FromSlash(file)))
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	s.render(w, "doc_view.html", map[string]interface{}{
 		"Name": sm.Name, "File": file, "Body": renderMarkdown(string(b)),
+	})
+}
+
+// docExplorer lists EVERY file under a submodule's docs/ tree — change docs,
+// docs/audit/ audit reports, docs/tasks/ task design docs, and anything else
+// written there — each linked through the existing doc viewer (doc/{file...}
+// above). It is distinct from explorer (routed at /submodule/{name}, no
+// trailing "s"): that page renders the FIXED known-optional-file set (ROI.md/
+// INFRASTRUCTURE.md/RULES.md/etc.); this walks the actual docs/ directory, so
+// a doc no commit's Beehive stamp happens to point at (an audit report, a task
+// design doc) is still discoverable instead of reachable only through a
+// task/branch row. Strictly read-only and scoped to this ONE submodule's
+// docs/ dir (docTree never crawls another submodule).
+func (s *Server) docExplorer(w http.ResponseWriter, r *http.Request) {
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	entries, err := docTree(sm)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.render(w, "doc_explorer.html", map[string]interface{}{
+		"Name":     sm.Name,
+		"Sections": sectionDocs(entries),
 	})
 }
 
