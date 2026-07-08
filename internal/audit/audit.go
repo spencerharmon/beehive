@@ -30,13 +30,22 @@
 // for lost-claim language false-positives on essentially every session. The only
 // deterministic, producer-emitted abort signal is the trailing "## ⚠️ warning"
 // block that internal/swarm.recorder.appendWarning writes when the runner aborts
-// a session (wall/turn cap, lost claim, task removed). Abort/lost-race detection
-// therefore keys off that block ONLY — and only the LAST exact occurrence of the
-// header line, and only when it is genuinely trailing (no further turn occurs
-// after it): a session's own work routinely greps/quotes a PRIOR session's
-// transcript as evidence (the session-audit series' explicit charter), which can
-// embed the exact header line mid-body, and such an occurrence must never gate
-// the turn count or seed the abort reason. reconcile-loop is a corpus-level
+// a session (wall/turn cap, lost claim, task removed). LostRace / AbortReason
+// detection therefore keys off that block ONLY — and only the LAST exact
+// occurrence of the header line, and only when it is genuinely trailing (no
+// further turn occurs after it): a session's own work routinely greps/quotes a
+// PRIOR session's transcript as evidence (the session-audit series' explicit
+// charter), which can embed the exact header line mid-body, and such an
+// occurrence must never gate the turn count or seed the abort reason.
+//
+// A session can ALSO end without any such warning block: the surrounding tool
+// harness aborts a call mid-execution (the raw result line "Tool execution
+// aborted", never written by this repo) and the runner never gives the agent a
+// further turn, so the transcript stalls with no verdict. That trailing shape is
+// caught by the ADDITIVE HarnessAbortStall rule (scanBody), which feeds Aborted
+// (and CompletionMiss for a task-bearing kind) exactly as the warning path does,
+// under the identical "last exact occurrence, genuinely trailing" discipline so
+// a merely-quoted abort line never mis-flags. reconcile-loop is a corpus-level
 // property (adjacent reconcile sessions in epoch order) set by ParseDir, not by
 // a single file.
 package audit
@@ -48,7 +57,7 @@ const (
 	KindBootstrap   = "bootstrap"
 	KindWork        = "work"
 	KindReview      = "review"
-	KindArbitration = "arbitration"
+	KindArbitration = "arbitrate"
 	KindReconcile   = "reconcile"
 )
 
@@ -88,4 +97,13 @@ type Heuristics struct {
 	// to another reconcile session with no other-kind work between them — the
 	// reconcile-fired-repeatedly-without-progress waste pattern. Set by ParseDir.
 	ReconcileLoop bool
+	// HarnessAbortStall marks a transcript that ends on a genuinely-trailing raw
+	// "Tool execution aborted" tool result (the harness-level marker, never a
+	// "## ⚠️ warning" block) with no recovery turn after it: the session stalled
+	// mid-tool-call and reached no verdict. It is ADDITIVE to the warning-block
+	// path — a session flagged here also has Aborted set (and CompletionMiss for
+	// a task-bearing kind), so downstream TSV/window output needs no new field;
+	// this flag only records WHICH rule fired. Set by parseTranscript/scanBody,
+	// never persisted to the ledger (the derived Aborted/CompletionMiss are).
+	HarnessAbortStall bool
 }

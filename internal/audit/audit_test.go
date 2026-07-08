@@ -86,7 +86,7 @@ func TestParseCorpus(t *testing.T) {
 			t.Errorf("%s userTurns=%d want %d", id, s.UserTurns, w.userTurns)
 		}
 		// No fixture was runner-aborted, so every conservative flag is clear.
-		if h := s.Heuristics; h.Aborted || h.LostRace || h.CompletionMiss {
+		if h := s.Heuristics; h.Aborted || h.LostRace || h.CompletionMiss || h.HarnessAbortStall {
 			t.Errorf("%s unexpected abort flags %+v", id, h)
 		}
 	}
@@ -316,6 +316,168 @@ func TestAbortNonWork(t *testing.T) {
 	}
 	if h := s.Heuristics; !h.Aborted || h.CompletionMiss || h.LostRace {
 		t.Errorf("aborted reconcile flags=%+v want aborted-only", h)
+	}
+}
+
+// TestHarnessAbortStall drives the ADDITIVE harness-abort path: a transcript
+// whose FINAL turn ends on a genuinely-trailing raw "Tool execution aborted"
+// tool result (no recovery turn, no warning block) is flagged
+// HarnessAbortStall+Aborted+CompletionMiss, with AbortReason defaulted to the
+// marker text and LostRace clear (no lost-claim language). This is the exact
+// blind spot env-badge-per-submodule exposed: a zero-verdict stall that reads
+// clean under the warning-block-only rule.
+func TestHarnessAbortStall(t *testing.T) {
+	s, err := parseTranscript("bee-foo-7.md", []byte(synthAbort("bee-foo", KindWork, 5, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := s.Heuristics
+	if !h.HarnessAbortStall || !h.Aborted || !h.CompletionMiss {
+		t.Errorf("trailing tool-abort flags=%+v want HarnessAbortStall+Aborted+CompletionMiss", h)
+	}
+	if h.AbortReason != "Tool execution aborted" {
+		t.Errorf("abortReason=%q want the tool-abort marker text", h.AbortReason)
+	}
+	if h.LostRace {
+		t.Errorf("LostRace=true, want false (a tool-abort carries no lost-claim language)")
+	}
+	if s.Turns != 5 || s.UserTurns != 1 {
+		t.Errorf("turns=%d userTurns=%d want 5/1 (the aborted-tool turn still counts)", s.Turns, s.UserTurns)
+	}
+}
+
+// TestHarnessAbortStallRecovered: a tool-abort that IS followed by a real
+// recovery turn (the runner handed a "continue" and the agent kept going) is
+// NOT a stall — nothing flags, and turns count the whole file. Regression
+// mirror of the warning-tail guard's "quoted, not trailing" discipline.
+func TestHarnessAbortStallRecovered(t *testing.T) {
+	body := synthAbort("bee-foo", KindWork, 3, "\n## user\n\ncontinue\n\n## assistant\n\nrecovered and finished cleanly\n")
+	s, err := parseTranscript("bee-foo-8.md", []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := s.Heuristics
+	if h.HarnessAbortStall || h.Aborted || h.CompletionMiss || h.LostRace {
+		t.Errorf("recovered tool-abort must not flag: %+v", h)
+	}
+	if h.AbortReason != "" {
+		t.Errorf("abortReason=%q want empty", h.AbortReason)
+	}
+	if s.Turns != 4 || s.UserTurns != 2 {
+		t.Errorf("turns=%d userTurns=%d want 4/2 (whole file, not gated by the mid-body abort)", s.Turns, s.UserTurns)
+	}
+}
+
+// TestHarnessAbortStallKindMatrix pins the CompletionMiss extension: the new
+// path sets CompletionMiss for every task-bearing kind (work/review/arbitrate,
+// each owing a status transition) but not for bootstrap/reconcile (no task
+// handoff), while Aborted+HarnessAbortStall fire regardless of kind.
+func TestHarnessAbortStallKindMatrix(t *testing.T) {
+	cases := []struct {
+		kind           string
+		completionMiss bool
+	}{
+		{KindWork, true},
+		{KindReview, true},
+		{KindArbitration, true},
+		{KindBootstrap, false},
+		{KindReconcile, false},
+	}
+	for _, c := range cases {
+		s, err := parseTranscript("bee-x-100.md", []byte(synthAbort("bee-x", c.kind, 3, "")))
+		if err != nil {
+			t.Fatalf("%s: %v", c.kind, err)
+		}
+		h := s.Heuristics
+		if !h.HarnessAbortStall || !h.Aborted {
+			t.Errorf("%s: want HarnessAbortStall+Aborted, got %+v", c.kind, h)
+		}
+		if h.CompletionMiss != c.completionMiss {
+			t.Errorf("%s: CompletionMiss=%v want %v", c.kind, h.CompletionMiss, c.completionMiss)
+		}
+	}
+}
+
+// TestHarnessAbortThenWarningIsWarningPath proves the two paths stay mutually
+// exclusive on genuine output: a tool-abort SEALED by a trailing runner warning
+// block (the runner writes its warning LAST) is owned by the warning path — the
+// warning header is in scanBody's tool-abort disqualifier set — so
+// HarnessAbortStall stays false while the warning path still classifies it.
+func TestHarnessAbortThenWarningIsWarningPath(t *testing.T) {
+	const reason = "turn 4 exceeded the 1h0m0s per-turn timeout (stalled agent); abandoning for GC"
+	body := synthAbort("bee-x", KindWork, 3, "\n## \u26a0\ufe0f warning\n\n"+reason+"\n")
+	s, err := parseTranscript("bee-x-101.md", []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := s.Heuristics
+	if h.HarnessAbortStall {
+		t.Errorf("a warning-sealed abort must NOT set HarnessAbortStall: %+v", h)
+	}
+	if !h.Aborted || !h.CompletionMiss {
+		t.Errorf("the warning path must still classify it aborted: %+v", h)
+	}
+	if h.AbortReason != reason {
+		t.Errorf("abortReason=%q want the warning text (not the tool-abort marker)", h.AbortReason)
+	}
+}
+
+// TestHarnessAbortStallFixture parses the real corpus file that exposed this
+// blind spot — bee-env-badge-per-submodule (kind=arbitrate), copied verbatim —
+// and asserts it now reads Aborted+CompletionMiss+HarnessAbortStall where the
+// warning-block-only rule read it byte-for-byte clean. Its last two tool calls
+// both returned "Tool execution aborted"; the second is genuinely trailing
+// (only a closing fence + EOF follow), the first was recovered by a "continue".
+func TestHarnessAbortStallFixture(t *testing.T) {
+	path := filepath.Join("testdata", "tool-abort-stall", "bee-env-badge-per-submodule-1783522322-724054.md")
+	s, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile tool-abort-stall fixture: %v", err)
+	}
+	if s.Branch != "bee-env-badge-per-submodule" || s.TaskID != "env-badge-per-submodule" || s.Kind != KindArbitration {
+		t.Errorf("branch=%q taskid=%q kind=%q want bee-env-badge-per-submodule/env-badge-per-submodule/arbitrate",
+			s.Branch, s.TaskID, s.Kind)
+	}
+	if s.Epoch != 1783522322 {
+		t.Errorf("epoch=%d want 1783522322", s.Epoch)
+	}
+	if s.Model != "github-copilot/claude-sonnet-5" {
+		t.Errorf("model=%q want github-copilot/claude-sonnet-5", s.Model)
+	}
+	if s.Bytes != 62906 {
+		t.Errorf("bytes=%d want 62906 (verbatim copy of the real file)", s.Bytes)
+	}
+	if s.Turns != 9 || s.UserTurns != 2 {
+		t.Errorf("turns=%d userTurns=%d want 9/2", s.Turns, s.UserTurns)
+	}
+	h := s.Heuristics
+	if !h.HarnessAbortStall {
+		t.Errorf("the stalled arbitration must set HarnessAbortStall: %+v", h)
+	}
+	if !h.Aborted || !h.CompletionMiss {
+		t.Errorf("must read Aborted+CompletionMiss (regression: today reads clean): %+v", h)
+	}
+	if h.AbortReason != "Tool execution aborted" {
+		t.Errorf("abortReason=%q want the tool-abort marker", h.AbortReason)
+	}
+	if h.LostRace {
+		t.Errorf("LostRace=true, want false")
+	}
+}
+
+// TestParseDirToolAbortStallFixture is the directory-level acceptance: the real
+// fixture parses via ParseDir (the exact path `beehive audit` runs) as a
+// finalized session flagged aborted+harness-stall — never a parse error.
+func TestParseDirToolAbortStallFixture(t *testing.T) {
+	ss, err := ParseDir(filepath.Join("testdata", "tool-abort-stall"))
+	if err != nil {
+		t.Fatalf("ParseDir: %v", err)
+	}
+	if len(ss) != 1 {
+		t.Fatalf("parsed %d sessions, want 1", len(ss))
+	}
+	if h := ss[0].Heuristics; !h.Aborted || !h.HarnessAbortStall {
+		t.Errorf("%s must be flagged aborted+harness-stall via ParseDir: %+v", ss[0].ID, h)
 	}
 }
 
@@ -614,6 +776,26 @@ func synth(branch, kind string, turns int, warning string) string {
 	if warning != "" {
 		fmt.Fprintf(&b, "\n## \u26a0\ufe0f warning\n\n%s\n", warning)
 	}
+	return b.String()
+}
+
+// synthAbort builds a format-faithful transcript whose FINAL assistant turn
+// issues a tool call whose result is the raw harness abort — the exact
+// standalone "Tool execution aborted" line inside a fenced block, rendered
+// exactly as internal/swarm.renderTranscript writes it ("```\n"+err+"\n```\n\n").
+// turns is the TOTAL assistant-turn count (the last one being the aborted-tool
+// turn), so turns >= 1. trailer, if non-empty, is appended verbatim AFTER the
+// abort block (e.g. a "\n## user\n\ncontinue\n..." recovery turn or a trailing
+// warning block), which makes the tool-abort no longer genuinely trailing.
+func synthAbort(branch, kind string, turns int, trailer string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# session %s\n\nsubmodule: beehive \u00b7 kind: %s \u00b7 branch: %s\n", branch, kind, branch)
+	b.WriteString("\n## user\n\nprompt\n")
+	for i := 0; i < turns-1; i++ {
+		b.WriteString("\n## assistant\n\nwork\n")
+	}
+	b.WriteString("\n## assistant\n\n**\U0001f527 bash** `ls -la`\n\n```\nTool execution aborted\n```\n\n")
+	b.WriteString(trailer)
 	return b.String()
 }
 

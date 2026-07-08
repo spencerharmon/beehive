@@ -20,6 +20,16 @@ import (
 // deterministic, producer-written abort marker.
 const warningHeader = "## \u26a0\ufe0f warning"
 
+// toolAbortMarker is the exact line the surrounding agent/tool harness emits as a
+// tool RESULT when a tool call is aborted mid-execution — rendered by
+// internal/swarm.renderTranscript inside a fenced block ("```\n" + p.Error +
+// "\n```\n\n"), so it lands as its own standalone line. It is NOT produced by any
+// code in this repo (it appears nowhere in this repo's source — the harness emits
+// it), so it is pinned as an exact-line literal and matched with the SAME
+// genuinely-trailing discipline as warningHeader: only the last occurrence, and
+// only when nothing of substance follows it, is this session's own stall marker.
+const toolAbortMarker = "Tool execution aborted"
+
 // lostRaceRe matches lost-claim / forced-reselect language. It is applied ONLY
 // to the text inside a warning block, never the whole transcript: the protocol
 // prompt echoed into the user turn contains "lost the race"/"ErrLost"/"STOP",
@@ -174,7 +184,7 @@ func parseTranscript(name string, data []byte) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	turns, userTurns, warn, err := scanBody(data)
+	turns, userTurns, warn, harnessAbortStall, err := scanBody(data)
 	if err != nil {
 		return nil, fmt.Errorf("audit: %s: %w", name, err)
 	}
@@ -196,7 +206,43 @@ func parseTranscript(name string, data []byte) (*Session, error) {
 		s.Heuristics.LostRace = lostRaceRe.MatchString(warn)
 		s.Heuristics.CompletionMiss = hdr.Kind == KindWork
 	}
+	// Harness-abort-stall path (ADDITIVE; see scanBody): a transcript that ends on
+	// a genuinely-trailing raw "Tool execution aborted" tool result — never given
+	// a recovery turn and never sealed by a "## ⚠️ warning" block — reached NO
+	// verdict. Fold it into the same Aborted/CompletionMiss signals the warning
+	// path feeds, so downstream TSV/window output needs no new plumbing. This is
+	// independent of the warning path: on genuine producer output the two are
+	// mutually exclusive (the runner writes its warning LAST, which scanBody's
+	// disqualifier set already accounts for), but if both somehow fired the result
+	// is still a coherent Aborted session. CompletionMiss here extends to every
+	// task-bearing kind (work/review/arbitrate) since the confirmed instance is an
+	// arbitration; bootstrap/reconcile own no task handoff and are excluded.
+	if harnessAbortStall {
+		s.Heuristics.HarnessAbortStall = true
+		s.Heuristics.Aborted = true
+		if s.Heuristics.AbortReason == "" {
+			s.Heuristics.AbortReason = toolAbortMarker
+		}
+		if isTaskBearingKind(hdr.Kind) {
+			s.Heuristics.CompletionMiss = true
+		}
+	}
 	return s, nil
+}
+
+// isTaskBearingKind reports whether a session kind owes a task-status handoff
+// whose premature end is a completion miss: work (→ NEEDS-REVIEW), review
+// (→ NEEDS-ARBITRATION / DONE), and arbitrate (→ DONE) each must land a status
+// transition, so a stall short of it misses completion. bootstrap and reconcile
+// carry no such handoff (they never mark a task DONE) and are excluded — matching
+// their exclusion from the delivered-only trend gauge.
+func isTaskBearingKind(kind string) bool {
+	switch kind {
+	case KindWork, KindReview, KindArbitration:
+		return true
+	default:
+		return false
+	}
 }
 
 // splitName decomposes a transcript file name "<branch>-<epoch>[-<suffix>].md"
@@ -313,26 +359,36 @@ func parseHeaderLine(line string) (header, error) {
 }
 
 // scanBody counts assistant and user turns by the PINNED exact-line rule,
-// UNCONDITIONALLY end to end, and extracts the trailing "## ⚠️ warning" block
-// text (everything after the warning header line) — but ONLY if the file's
-// LAST exact warningHeader line is genuinely trailing: no "## assistant"/
-// "## user" turn-marker line occurs anywhere after it.
+// UNCONDITIONALLY end to end, and derives two independent trailing-abort
+// signals from the file's tail:
 //
-// A transcript's own work routinely greps/dumps a PRIOR session's transcript
-// as evidence (the session-audit series' explicit, permanent charter), which
-// can embed another file's exact "## ⚠️ warning" line mid-body. Such an
-// occurrence is quoted content, not this file's own abort marker: it must
-// never gate the turn count and must never seed the warning text. Only the
-// LAST occurrence in the file is even a candidate, and only when nothing real
-// (a turn marker) follows it does it count as this session's real trailing
-// abort block — matching the producer contract (internal/swarm.recorder.
-// appendWarning always writes the block LAST). A scan failure (e.g. an
-// over-long line) is surfaced, never silently truncated.
-func scanBody(data []byte) (turns, userTurns int, warning string, err error) {
+//   - warning: the "## ⚠️ warning" block text (everything after the header
+//     line) — but ONLY if the file's LAST exact warningHeader line is genuinely
+//     trailing: no "## assistant"/"## user" turn-marker line occurs after it.
+//   - harnessAbortStall: true iff the file's LAST exact toolAbortMarker line is
+//     genuinely trailing with respect to turn markers AND warningHeader — the
+//     transcript ends on a raw "Tool execution aborted" tool result, never given
+//     a recovery turn and never sealed by a runner warning block.
+//
+// A transcript's own work routinely greps/dumps a PRIOR session's transcript as
+// evidence (the session-audit series' explicit, permanent charter), which can
+// embed another file's exact "## ⚠️ warning" OR "Tool execution aborted" line
+// mid-body. Such an occurrence is quoted content, not this file's own abort
+// marker: it must never gate the turn count, seed the warning text, or set the
+// stall flag. Only the LAST occurrence of each is even a candidate, and only
+// when nothing of substance follows it does it count — matching the producer
+// contract (internal/swarm.recorder.appendWarning always writes the warning
+// block LAST). Including warningHeader in the tool-abort disqualifier set keeps
+// the two paths mutually exclusive on genuine output: a tool-abort immediately
+// sealed by the runner's warning block is owned by the warning path, not counted
+// as an unrecovered stall. A scan failure (e.g. an over-long line) is surfaced,
+// never silently truncated.
+func scanBody(data []byte) (turns, userTurns int, warning string, harnessAbortStall bool, err error) {
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, 0, 64*1024), 4<<20)
 	var lines []string
-	lastWarn := -1 // index into lines of the LAST exact warningHeader line seen
+	lastWarn := -1  // index into lines of the LAST exact warningHeader line seen
+	lastAbort := -1 // index into lines of the LAST exact toolAbortMarker line seen
 	for sc.Scan() {
 		line := strings.TrimRight(sc.Text(), "\r")
 		switch line {
@@ -342,29 +398,47 @@ func scanBody(data []byte) (turns, userTurns int, warning string, err error) {
 			userTurns++
 		case warningHeader:
 			lastWarn = len(lines)
+		case toolAbortMarker:
+			lastAbort = len(lines)
 		}
 		lines = append(lines, line)
 	}
 	if err := sc.Err(); err != nil {
-		return 0, 0, "", err
+		return 0, 0, "", false, err
 	}
-	if lastWarn < 0 {
-		return turns, userTurns, "", nil
+	// Warning-block path (UNCHANGED behaviour): the last warningHeader, genuinely
+	// trailing (disqualified only by a following turn marker), seeds the text.
+	if lastWarn >= 0 && genuinelyTrailing(lines, lastWarn, "## assistant", "## user") {
+		var warn strings.Builder
+		for _, l := range lines[lastWarn+1:] {
+			warn.WriteString(l)
+			warn.WriteByte('\n')
+		}
+		warning = warn.String()
 	}
-	tail := lines[lastWarn+1:]
-	for _, l := range tail {
-		if l == "## assistant" || l == "## user" {
-			// A real turn follows the last occurrence: it is quoted content
-			// from elsewhere, not a genuine abort marker. Nothing gates on it.
-			return turns, userTurns, "", nil
+	// Harness-abort-stall path (ADDITIVE): the last toolAbortMarker, genuinely
+	// trailing with respect to turn markers AND a runner warning block (so a
+	// warning-sealed abort stays owned by the path above).
+	if lastAbort >= 0 && genuinelyTrailing(lines, lastAbort, "## assistant", "## user", warningHeader) {
+		harnessAbortStall = true
+	}
+	return turns, userTurns, warning, harnessAbortStall, nil
+}
+
+// genuinelyTrailing reports whether the candidate marker at index idx is the
+// file's last line of substance: no line after it exactly equals any of
+// stoppers. It is the shared "last occurrence, nothing real following it"
+// discipline both trailing-abort signals key off, so a merely-quoted marker
+// mid-body (with real content after it) never counts.
+func genuinelyTrailing(lines []string, idx int, stoppers ...string) bool {
+	for _, l := range lines[idx+1:] {
+		for _, s := range stoppers {
+			if l == s {
+				return false
+			}
 		}
 	}
-	var warn strings.Builder
-	for _, l := range tail {
-		warn.WriteString(l)
-		warn.WriteByte('\n')
-	}
-	return turns, userTurns, warn.String(), nil
+	return true
 }
 
 func firstNonEmptyLine(s string) string {
