@@ -103,6 +103,26 @@ func TestScrollPreserveScriptEmbedded(t *testing.T) {
 	}
 }
 
+// TestNativeSkip304ScriptEmbedded is poll-fragment-etag-304's client-side half:
+// htmx (vendored 1.9.10) has no built-in "304 means no-op" rule — it swaps any
+// response in [200,400) except 204, so an empty-body 304 that reaches it would
+// blank the pane. This locks that the defensive htmx:beforeSwap guard (refusing
+// the swap on xhr.status === 304) ships on every full-page response, same as
+// the scroll-restore script above.
+func TestNativeSkip304ScriptEmbedded(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String()
+	for _, want := range []string{
+		"htmx:beforeSwap",
+		"304",
+		"shouldSwap",
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("embedded 304-noop guard script missing %q", want)
+		}
+	}
+}
+
 // TestScrollPreserveWiring locks the per-fragment contract: every polled scroll
 // region carries a STABLE pane id + data-scroll-preserve, and the live-growing
 // panes (session transcript, editor chat) additionally pin to bottom. DOM
@@ -2938,6 +2958,85 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	}
 	if b := finalPage.Body.String(); !strings.Contains(b, `class="badge">ended`) || strings.Contains(b, `>running</span>`) || strings.Contains(b, `>live</span>`) {
 		t.Errorf("final session page should show ended badge only, got: %q", b)
+	}
+}
+
+// TestFragmentETag304 is the core of poll-fragment-etag-304: a polled htmx
+// fragment sets a strong ETag on its 200 and answers a repeat request whose
+// If-None-Match already names it with "304 Not Modified" and an EMPTY body —
+// so a poll that finds nothing new (the common steady state once a session is
+// idle/ended) skips re-sending the identical HTML every 1.5-2s. Exercises both
+// fragments wired to renderConditional (web.go): sessionBody's transcript pane
+// and sessionsListBody's list pane. The session file is a durable non-stub
+// transcript (no branch/remote plumbing needed) with its mtime pushed well
+// into the past so sessionsListBody's rendered "Ago" bucket ("Nh ago") cannot
+// tick over between the two calls this test makes a moment apart — otherwise
+// the fragment's OWN rendered bytes (what the hash is over, by design) would
+// legitimately differ and this test would be exactly as flaky as real time.
+func TestFragmentETag304(t *testing.T) {
+	s, root := setup(t)
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessFile := filepath.Join(sessDir, "bee-final.md")
+	if err := os.WriteFile(sessFile, []byte("# final transcript\nall done.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-90 * time.Minute)
+	if err := os.Chtimes(sessFile, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	getIfNoneMatch := func(path, inm string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("If-None-Match", inm)
+		s.Routes().ServeHTTP(w, req)
+		return w
+	}
+
+	for _, path := range []string{
+		"/submodule/alpha/session/bee-final/body", // sessionBody
+		"/submodule/alpha/sessions/body",          // sessionsListBody
+	} {
+		first := get(t, s, path)
+		if first.Code != 200 {
+			t.Fatalf("%s: first GET status = %d, want 200", path, first.Code)
+		}
+		etag := first.Header().Get("ETag")
+		if etag == "" {
+			t.Fatalf("%s: first GET carries no ETag header", path)
+		}
+		if first.Body.Len() == 0 {
+			t.Fatalf("%s: first GET has an empty body", path)
+		}
+		if cc := first.Header().Get("Cache-Control"); cc == "" {
+			t.Errorf("%s: first GET carries no Cache-Control header (the browser needs one to auto-revalidate)", path)
+		}
+
+		// Repeat, presenting the ETag we just got back: unchanged content, so a
+		// 304 with an empty body — the retransfer this task exists to avoid.
+		second := getIfNoneMatch(path, etag)
+		if second.Code != http.StatusNotModified {
+			t.Fatalf("%s: repeat GET with matching If-None-Match status = %d, want 304", path, second.Code)
+		}
+		if second.Body.Len() != 0 {
+			t.Errorf("%s: 304 response carries a non-empty body: %q", path, second.Body.String())
+		}
+		if got := second.Header().Get("ETag"); got != etag {
+			t.Errorf("%s: 304 ETag = %q, want %q (same representation)", path, got, etag)
+		}
+
+		// A stale/foreign validator must not short-circuit: full 200 body back.
+		stale := getIfNoneMatch(path, `"not-the-real-etag"`)
+		if stale.Code != 200 {
+			t.Fatalf("%s: GET with a non-matching If-None-Match status = %d, want 200", path, stale.Code)
+		}
+		if stale.Body.Len() == 0 {
+			t.Errorf("%s: GET with a non-matching If-None-Match has an empty body", path)
+		}
 	}
 }
 

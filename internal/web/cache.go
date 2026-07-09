@@ -1,6 +1,8 @@
 package web
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"sync"
 )
 
@@ -95,4 +97,21 @@ func cachedView[T any](head string, c *viewCache, key string, load func() (T, er
 	}
 	c.ents[key] = v
 	return v, nil
+}
+
+// fragmentETag returns a strong ETag validator (RFC 7232 §2.3) for a rendered
+// fragment's exact bytes, for the conditional-GET fast path on polled htmx
+// fragments (Server.renderConditional / writeConditional, web.go). It
+// deliberately hashes the FINAL RENDERED OUTPUT rather than a coarser signal
+// like the repo HEAD used by cachedView above: this cache's own doc (above)
+// notes that some pane content is time-dependent — a claim's active/stale flip
+// turns on the wall clock crossing the TTL with NO new commit — so a
+// HEAD-only validator would wrongly keep 304-ing a pane whose rendered text
+// actually changed. Hashing the bytes actually about to be sent means ANY
+// observable change, commit-driven or purely time-driven, changes the digest,
+// so a 304 only ever fires when the fragment is truly byte-identical to what
+// the client already holds.
+func fragmentETag(body []byte) string {
+	sum := sha256.Sum256(body)
+	return `"` + hex.EncodeToString(sum[:]) + `"`
 }

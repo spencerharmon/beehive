@@ -92,4 +92,28 @@
   box.addEventListener('click', hide);
 })();
 </script>
+<script>
+/* etag-304-noop (poll-fragment-etag-304): a conditional-GET fragment
+   (session transcript/list, editor/chat panels, the human-resolve panel — see
+   Server.renderConditional, internal/web/web.go) answers a repeat htmx poll
+   with "304 Not Modified" and NO body when nothing changed. The browser's own
+   HTTP cache normally absorbs that transparently — it attaches If-None-Match
+   for us and, on a 304, hands htmx's XHR the PREVIOUS 200 body, so htmx never
+   even observes the 304. But that absorption is a cache implementation detail
+   we cannot rely on unconditionally (devtools "disable cache", a
+   cache-stripping proxy, …), and the vendored htmx (1.9.10) has no native
+   304 handling of its own: it swaps any response in [200,400) except 204, so
+   a raw 304 that DOES reach the swap layer carries an empty body and would
+   blank the pane. This is the explicit belt-and-suspenders guard for that
+   case: refuse the swap outright, keeping the pane's last-good content.
+   Polling itself is unaffected — it is driven by htmx's own trigger timer, not
+   by whether a swap happened. Separate IIFE from the scripts above; no
+   external libraries (single-binary embed, no CDN). */
+(function () {
+  document.addEventListener('htmx:beforeSwap', function (e) {
+    var xhr = e.detail && e.detail.xhr;
+    if (xhr && xhr.status === 304) e.detail.shouldSwap = false;
+  });
+})();
+</script>
 </body></html>{{end}}

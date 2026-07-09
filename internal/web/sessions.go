@@ -39,6 +39,9 @@ func (s *Server) sessionsList(w http.ResponseWriter, r *http.Request) {
 }
 
 // sessionsListBody returns just the <ul>, read live from the sessions dir.
+// Polled every 2s (session_list.html); renderConditional (web.go) ETags the
+// rendered bytes so a repeat poll with nothing new (the common case once a
+// submodule's sessions are all idle) 304s instead of re-sending the list.
 func (s *Server) sessionsListBody(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -47,7 +50,7 @@ func (s *Server) sessionsListBody(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	sync := s.followMain(r.Context(), now)
-	s.render(w, "session_list_body.html", map[string]interface{}{
+	s.renderConditional(w, r, "session_list_body.html", map[string]interface{}{
 		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), sm.SessionsDir(), now), "Sync": sync,
 	})
 }
@@ -94,7 +97,11 @@ func (s *Server) sessionLive(ctx context.Context, dir, id string) bool {
 
 // sessionBody returns just the transcript text (the htmx-poll pane). It shares
 // sessionTranscript with the SSE stream, so the poll and the live stream render
-// the identical file-derived transcript and staleness banner.
+// the identical file-derived transcript and staleness banner. Polled every 2s
+// (session_view.html); renderConditional (web.go) ETags the rendered bytes so
+// a repeat poll of an idle/ended session (the common steady state — most of a
+// transcript's polled lifetime is spent unchanged) 304s instead of re-sending
+// the whole transcript.
 func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -111,7 +118,7 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.render(w, "session_body.html", map[string]interface{}{"Body": body, "Sync": sync})
+	s.renderConditional(w, r, "session_body.html", map[string]interface{}{"Body": body, "Sync": sync})
 }
 
 // sessionStream pushes the session transcript to the browser over server-sent

@@ -4,6 +4,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"errors"
@@ -446,6 +447,78 @@ func (s *Server) render(w http.ResponseWriter, name string, data interface{}) {
 	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+// renderConditional is render's poll-friendly sibling: it executes the named
+// template into memory and serves the result under a strong ETag computed from
+// its own rendered bytes (fragmentETag, cache.go), replying "304 Not Modified"
+// with an empty body when the request's If-None-Match already names that tag.
+// A polled htmx fragment (session transcripts, editor/chat panels, the human
+// resolve panel — every one on a 1.5-2s hx-trigger) otherwise re-renders and
+// re-transfers its FULL body every tick even when byte-identical to what the
+// browser already holds; this lets a client that already has the current bytes
+// skip the retransfer entirely (poll-fragment-etag-304). Unlike headSHA/
+// viewCache (which key on the repo HEAD alone), hashing the actual rendered
+// output stays correct for panes whose content can change on the wall clock
+// with no new commit — see fragmentETag's doc. Template errors still surface
+// as a 500 exactly as render's do; only a successfully rendered fragment ever
+// reaches the ETag path.
+func (s *Server) renderConditional(w http.ResponseWriter, r *http.Request, name string, data interface{}) {
+	var buf bytes.Buffer
+	if err := s.tmpl.ExecuteTemplate(&buf, name, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeConditional(w, r, buf.Bytes(), "text/html; charset=utf-8")
+}
+
+// writeConditional serves body under a strong ETag (fragmentETag), replying
+// "304 Not Modified" with NO body when the request's If-None-Match already
+// names the current tag — the conditional-GET short-circuit RFC 7232 defines.
+// ETag and Cache-Control are set on BOTH outcomes (a client tracking the
+// validator must see them either way); Content-Type only on the 200, since a
+// 304 MUST NOT carry a representation or the headers that describe one (RFC
+// 7230 §3.3.2). Cache-Control is "no-cache" (may be stored, but MUST always be
+// revalidated with the server) rather than absent or "no-store": that is what
+// makes the payoff automatic for a plain htmx poll — the BROWSER's own HTTP
+// cache attaches If-None-Match for us and, on a 304, hands the XHR layer the
+// previously cached 200 body without htmx ever seeing a raw 304 in the common
+// case (layout.html's htmx:beforeSwap guard covers the uncommon case where it
+// does, so an empty 304 body can never blank the pane either way).
+func writeConditional(w http.ResponseWriter, r *http.Request, body []byte, contentType string) {
+	etag := fragmentETag(body)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "no-cache")
+	if etagMatch(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Write(body)
+}
+
+// etagMatch reports whether etag is named in an If-None-Match request header,
+// which RFC 7232 §3.2 allows to be "*" (matches any current representation) or
+// a comma-separated list of entity-tags, each optionally weak ("W/"-prefixed).
+// The comparison is the weak comparison function §2.3.2 mandates for
+// If-None-Match: the opaque quoted value only, ignoring a "W/" prefix on
+// either side — so a cache that downgraded our strong tag to weak still gets
+// its 304.
+func etagMatch(header, etag string) bool {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return false
+	}
+	if header == "*" {
+		return true
+	}
+	want := strings.TrimPrefix(etag, "W/")
+	for _, part := range strings.Split(header, ",") {
+		if strings.TrimPrefix(strings.TrimSpace(part), "W/") == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) submodule(name string) (repo.Submodule, error) {
