@@ -3051,7 +3051,11 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	write("bee-dead.md", repo.SessionStub("bee-dead-stream"))   // branch gone -> NOT live
 	write("bee-final.md", "# final transcript\nall done.\n")    // non-stub -> NOT live
 
-	infos := s.sessionInfos(ctx, sessDir, time.Now())
+	sm, err := s.submodule("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	infos := s.sessionInfos(ctx, sm, time.Now(), s.ttl())
 	got := map[string]bool{}
 	for _, in := range infos {
 		got[in.ID] = in.Live
@@ -3101,6 +3105,151 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	}
 	if b := finalPage.Body.String(); !strings.Contains(b, `class="badge">ended`) || strings.Contains(b, `>running</span>`) || strings.Contains(b, `>live</span>`) {
 		t.Errorf("final session page should show ended badge only, got: %q", b)
+	}
+}
+
+// TestActiveHoneybeesUnifiedAcrossDashboardAndSessions is active-honeybee-
+// count-unify's core regression. Before this fix, the dashboard counted ONLY
+// fresh PLAN-task claims while the sessions page/list derived liveness ONLY
+// from a session's stream branch — two independent rules that could (and did)
+// disagree. The fixture carries all three shapes the fix must reconcile: (a)
+// a fresh PLAN claim, (b) a stale PLAN claim whose own session stub ALSO
+// points at a branch that no longer exists (proving staleness isn't
+// resurrected by a dangling stub), and (c) a live session with NO PLAN task at
+// all — the exact shape a claimless Bootstrap/Reconcile pass leaves (it takes
+// a singleton .bee-lock-<kind>, never a PLAN claim; see
+// internal/claim.Claimer.ClaimLock). The canonical set must be exactly
+// {bee-a, bee-c}, and activeHoneybees, the dashboard counter, the sessions
+// list, a single sessionLive lookup, and /stats' ActiveNow must ALL agree with
+// it byte-for-byte — this is "a test that fails under today's logic due to c"
+// the Accept criterion names (today's dashboard would report Bees=1, missing
+// bee-c entirely).
+func TestActiveHoneybeesUnifiedAcrossDashboardAndSessions(t *testing.T) {
+	s, root := setup(t)
+	// Real time (not a fixed calendar date): computeStats/subViews below is
+	// exercised both with this captured now/ttl AND through handlers that
+	// resolve their own time.Now()/s.ttl() moments later, so the claims must
+	// still read fresh/stale under whatever the wall clock is at that instant
+	// — a fixed historical timestamp would drift stale as the repo/test ages.
+	now := time.Now().UTC()
+	ttl := time.Hour
+	fresh := now.Add(-5 * time.Minute).Truncate(time.Second).Format(time.RFC3339)
+	stale := now.Add(-90 * time.Minute).Truncate(time.Second).Format(time.RFC3339)
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## a [TODO] <!-- attempts=0 deps= session=bee-a heartbeat="+fresh+" -->\nfresh claim\n\n"+
+			"## b [TODO] <!-- attempts=0 deps= session=bee-b heartbeat="+stale+" -->\nstale claim\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gitAt(t, root, "add", "-A")
+	gitAt(t, root, "commit", "-q", "-m", "seed")
+	// (c)'s ONLY liveness signal: a live stream branch, no PLAN task at all.
+	gitAt(t, root, "branch", "bee-c-stream")
+
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(sessDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// a's and b's own stubs name branches that DON'T exist: their liveness
+	// verdict must come ENTIRELY from the PLAN claim, never a stub/branch check.
+	write("bee-a.md", repo.SessionStub("bee-a-stream-gone"))
+	write("bee-b.md", repo.SessionStub("bee-b-stream-gone"))
+	write("bee-c.md", repo.SessionStub("bee-c-stream"))
+
+	ctx := context.Background()
+	sm, err := s.submodule("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The canonical set itself: exactly {bee-a, bee-c}.
+	bees := s.activeHoneybees(ctx, sm, p)
+	got := map[string]bool{}
+	taskOf := map[string]string{}
+	for _, b := range bees {
+		got[b.Session] = true
+		taskOf[b.Session] = b.TaskID
+	}
+	if want := (map[string]bool{"bee-a": true, "bee-c": true}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("activeHoneybees session set = %v, want %v", got, want)
+	}
+	if taskOf["bee-a"] != "a" {
+		t.Errorf(`bee-a TaskID = %q, want "a"`, taskOf["bee-a"])
+	}
+	if taskOf["bee-c"] != "" {
+		t.Errorf(`bee-c TaskID = %q, want "" (no PLAN task claims a reconcile pass)`, taskOf["bee-c"])
+	}
+
+	// The dashboard counter must equal len(canonical set) == 2, not 1 (today's
+	// bug: it would count only bee-a, missing the claimless bee-c entirely).
+	views, err := s.subViews(ctx, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alpha subView
+	for _, v := range views {
+		if v.Name == "alpha" {
+			alpha = v
+		}
+	}
+	if alpha.Bees != 2 {
+		t.Errorf("dashboard alpha.Bees = %d, want 2 (== the canonical set {bee-a, bee-c})", alpha.Bees)
+	}
+	if !alpha.Working {
+		t.Error("dashboard alpha.Working = false, want true")
+	}
+
+	// The sessions page/list must agree EXACTLY: bee-a and bee-c live (the
+	// former via its PLAN claim despite its OWN stub's branch being gone, the
+	// latter via its live stream branch with no PLAN claim at all), bee-b NOT
+	// live (a stale claim whose own stub's branch is also gone).
+	infos := s.sessionInfos(ctx, sm, now, ttl)
+	live := map[string]bool{}
+	for _, in := range infos {
+		live[in.ID] = in.Live
+	}
+	if !live["bee-a"] {
+		t.Error("sessionInfos: bee-a want Live=true (fresh PLAN claim)")
+	}
+	if live["bee-b"] {
+		t.Error("sessionInfos: bee-b want Live=false (stale claim, dead stub branch)")
+	}
+	if !live["bee-c"] {
+		t.Error("sessionInfos: bee-c want Live=true (live stream branch, no PLAN claim) — the case that fails if the claimless-session half of the union is ever dropped")
+	}
+
+	// A single-session sessionLive lookup (the session page's own badge) must
+	// match the same verdict for each id — no second, divergent rule.
+	if !s.sessionLive(ctx, sm, "bee-a", now, ttl) {
+		t.Error("sessionLive(bee-a) = false, want true")
+	}
+	if s.sessionLive(ctx, sm, "bee-b", now, ttl) {
+		t.Error("sessionLive(bee-b) = true, want false")
+	}
+	if !s.sessionLive(ctx, sm, "bee-c", now, ttl) {
+		t.Error("sessionLive(bee-c) = false, want true")
+	}
+
+	// /stats' ActiveNow must also agree: 2, matching the dashboard.
+	subs, _, err := s.computeStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range subs {
+		if st.Name == "alpha" && st.ActiveNow != 2 {
+			t.Errorf("stats alpha.ActiveNow = %d, want 2", st.ActiveNow)
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/git"
 )
@@ -20,7 +21,13 @@ import (
 //
 //	DeliveredTasks (✅) = tasks at PLAN [DONE] — a task can take more than one
 //	                     merge, so we count the task, not merges.
-//	Honeybees      (🐝) = session transcript files (one per honeybee pass).
+//	Honeybees      (🐝) = session transcript files (one per honeybee pass);
+//	                     an ALL-TIME historical count, unlike ActiveNow below.
+//	ActiveNow           = honeybees actively working THIS submodule right now,
+//	                     via activeHoneybees — the SAME canonical active set
+//	                     the dashboard counter and the sessions page/list read
+//	                     (active-honeybee-count-unify), so this figure can never
+//	                     disagree with either of them.
 //	Stranded            = tasks with a stamped bee-<task> branch ahead of main that
 //	                     never merged (finished work whose merge didn't land — the
 //	                     wedge indicator; not lost, GC never drops an unmerged branch).
@@ -36,6 +43,7 @@ type subStat struct {
 	Name               string
 	DeliveredTasks     int
 	Honeybees          int
+	ActiveNow          int
 	Stranded           int
 	DeliveredPerBeePct float64
 	Models             []modelStat
@@ -86,8 +94,18 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 	// so a multi-submodule /stats render pays a single `rev-parse`, not one per
 	// submodule (mirrors headSHA's own doc comment / the planView cache key).
 	head := s.headSHA(ctx)
+	// now/ttl for ActiveNow's claim-freshness projection (activeHoneybees),
+	// resolved once and shared across every submodule exactly like head above.
+	now, ttl := time.Now(), s.ttl()
 	for _, sm := range sms {
 		st := subStat{Name: sm.Name}
+		// ActiveNow: the canonical active-honeybee set (active-honeybee-count-
+		// unify) — the SAME set the dashboard counter and sessions page/list
+		// read, never a re-derived rule. A PLAN.md parse error leaves it 0
+		// rather than failing the whole page (mirrors subViews' own resilience).
+		if p, perr := s.planView(head, sm.PlanPath(), now, ttl); perr == nil {
+			st.ActiveNow = len(s.activeHoneybees(ctx, sm, p))
+		}
 		doneIDs := doneTaskIDs(sm)
 		done := make(map[string]bool, len(doneIDs))
 		for _, id := range doneIDs {
@@ -155,6 +173,7 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 		subs = append(subs, st)
 		total.DeliveredTasks += st.DeliveredTasks
 		total.Honeybees += st.Honeybees
+		total.ActiveNow += st.ActiveNow
 		total.Stranded += st.Stranded
 	}
 	total.Models = buildModelStats(totBees, totDelivered)

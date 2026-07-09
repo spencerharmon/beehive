@@ -34,7 +34,10 @@ type Dep struct {
 // PlanItem is one task row projected from a plan.Task for the templates. The
 // view needs Desc/Doc, which plan.Task does not carry, so they are derived from
 // the task body (first non-empty line / a "Doc:" convention line). Active/Stale
-// are the unified claim state (session + heartbeat freshness vs the TTL).
+// are the unified claim state (session + heartbeat freshness vs the TTL); Active
+// is also, verbatim, the PLAN-claim half of active.go's canonical activeHoneybees
+// union (active-honeybee-count-unify) — the plan view and the dashboard/sessions/
+// stats consumers all read this SAME field, never a second computation of it.
 // DepStates and DocHref are view-only enrichments: DepStates marks each dep
 // satisfied/pending against this plan, and DocHref links the change doc the
 // implementing commit stamped (set by the handler, which has the repo + docs/).
