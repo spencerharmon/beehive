@@ -22,6 +22,137 @@ type sessionInfo struct {
 	Modified time.Time
 	Ago      string // human "3s"/"5m" since last write
 	Live     bool   // stream branch still exists = honeybee still running
+	Display  string // session-list-links-labels: ID shortened for display (sessionDisplayName)
+	Kind     string // stats-tag-model's kind tag (sessionTags), "" if undetermined
+	Model    string // stats-tag-model's model tag (sessionTags), "" if undetermined
+	sessionLink
+}
+
+// sessionLink is delivery-traceability's/branch-graph-sectioned's doc+commit
+// resolution (DeliveryLink, delivery.go) plus a link to the task's own
+// PLAN.md row, reused for ONE session (session-list-links-labels): "link
+// every session to the change(s) it moved" (as worker, reviewer, or
+// arbitrator) — one click from the session to the task, the change doc, and
+// the hive commit that delivered it. Keyed off the task id the session's file
+// stem names (taskIDForSession); every field is "" when unresolved (id has no
+// task-shaped stem, no plan row, no stamped doc, no DONE flip yet) — never a
+// dead link, matching DeliveryLink/resolveDocHref's own contract. Shared by
+// the session-list row (sessionInfo, embedded above) and the session page
+// (sessionView).
+type sessionLink struct {
+	TaskID   string
+	TaskHref string // link to the task's PLAN.md row (plan-row-deep-anchors), "" if not in the current plan
+	DocPath  string // change-doc path the task's implementing commit stamped, "" if none
+	DocHref  string // link to view that doc (branch-graph-sectioned), "" if unresolved
+	FlipSHA  string // short hive commit sha that flipped the task DONE, "" if not (yet) applicable
+	FlipHref string // link to view that hive commit (delivery-traceability), "" if unresolved
+}
+
+// taskIDForSession derives the task id a session's file stem names, reusing
+// stats.go's bee-<task>-<epoch>-<pid> convention (sessionNameRE) — the SAME
+// split stats' per-task honeybee tally already relies on, so a shortened
+// display name and a resolved task/doc/commit link never disagree about what
+// task a row names. "" when id does not match: a legacy pre-pid stem (session
+// naming added the trailing -<pid> after some history had already
+// accumulated — see swarm.SessionID), or a non-task session kind
+// (bee-bootstrap-*/bee-reconcile-*, which name no PLAN task at all) — left
+// unresolved rather than guessed.
+func taskIDForSession(id string) string {
+	if m := sessionNameRE.FindStringSubmatch(id); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// sessionDisplayName shortens a session id for display
+// (session-list-links-labels): the "bee-" prefix and the "-<epoch>-<pid>"
+// suffix stripped — exactly taskIDForSession's capture, reused here so the
+// label a row shows and the task it links to always name the same thing.
+// Falls back to the id unchanged when it doesn't match that shape: never a
+// mangled/ambiguous guess (a legacy pre-pid id can itself end in digits, e.g.
+// "ui-audit-002", which would be unsafe to split without a trailing pid to
+// anchor where the task name ends).
+func sessionDisplayName(id string) string {
+	if t := taskIDForSession(id); t != "" {
+		return t
+	}
+	return id
+}
+
+// sessionLinksFor resolves sessionLink for every id in ids
+// (session-list-links-labels), reusing delivery-traceability's/branch-graph-
+// sectioned's existing doc+commit machinery verbatim rather than re-deriving
+// it:
+//
+//   - the change doc (DocPath/DocHref) comes from changeDocsByTask/
+//     resolveDocHref (branches.go) for ANY task status, not only DONE — a
+//     worker session's own task is usually still NEEDS-REVIEW (not yet DONE)
+//     when its doc first exists. changeDocsByTask takes no `want` filter (it
+//     is always the FULL task-id -> doc-path map), so sharing buildDeliveries'
+//     own "delivery-docs:"+sm.Name cache entry here is always correct: no
+//     caller can ever see a narrower result than another's.
+//   - the hive flip commit (FlipSHA/FlipHref) comes from buildDeliveries
+//     (delivery.go), called with the EXACT SAME argument computeStats already
+//     uses (doneTaskIDs(sm)) rather than this call's own session-derived ids.
+//     DONE is a terminal status (internal/plan's state machine has no
+//     transition out of it), so a task that is not currently DONE never has a
+//     flip commit no matter what `want` asks for — meaning doneTaskIDs(sm) is
+//     ALWAYS the complete, correct `want` set for this half, and passing the
+//     same deterministic argument every caller uses keeps this call on the
+//     SAME "delivery-flips:"+sm.Name cache entry with no risk of one caller's
+//     `want` shadowing another's (cachedView's key carries no memory of what
+//     `want` a load populated it with — see cache.go).
+//
+// TaskHref links to the task's own PLAN.md row (plan-row-deep-anchors) only
+// when it is still present in sm's CURRENT plan p; a task retired from the
+// plan still resolves its doc/flip (both are git-history reads, independent
+// of the live PLAN.md) but gets no TaskHref. Returns a map keyed by SESSION id
+// (not task id, so multiple sessions sharing one task each get their own,
+// identical entry); an id with no derivable task id still gets a zero-value
+// entry (every field ""), never omitted, so a caller can range over ids
+// without a second existence check.
+func (s *Server) sessionLinksFor(ctx context.Context, head string, sm repo.Submodule, p Plan, ids []string) map[string]sessionLink {
+	out := make(map[string]sessionLink, len(ids))
+	taskOf := make(map[string]string, len(ids))
+	wantTasks := make(map[string]bool)
+	for _, id := range ids {
+		t := taskIDForSession(id)
+		taskOf[id] = t
+		if t != "" {
+			wantTasks[t] = true
+		}
+	}
+	if len(wantTasks) == 0 {
+		for _, id := range ids {
+			out[id] = sessionLink{}
+		}
+		return out
+	}
+	planIDs := make(map[string]bool, len(p.Items))
+	for _, it := range p.Items {
+		planIDs[it.ID] = true
+	}
+	docs, _ := cachedView(head, s.cache, "delivery-docs:"+sm.Name, func() (map[string]string, error) {
+		return changeDocsByTask(ctx, sm.RepoDir()), nil
+	})
+	flips := indexDeliveries(s.buildDeliveries(ctx, head, sm, doneTaskIDs(sm)))
+	for _, id := range ids {
+		t := taskOf[id]
+		if t == "" {
+			out[id] = sessionLink{}
+			continue
+		}
+		link := sessionLink{TaskID: t, DocPath: docs[t], DocHref: resolveDocHref(sm, docs[t])}
+		if planIDs[t] {
+			link.TaskHref = "/submodule/" + sm.Name + "/plan#task-" + t
+		}
+		if f, ok := flips[t]; ok {
+			link.FlipSHA = f.FlipSHA
+			link.FlipHref = f.FlipHref
+		}
+		out[id] = link
+	}
+	return out
 }
 
 // sessionsList is the page shell; the listing body auto-refreshes via HTMX so
@@ -70,12 +201,28 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 	// Follow off-box runs before deriving liveness so a session that started on
 	// another host reads its stub locally (correct running/ended badge on load).
 	s.followMain(r.Context(), time.Now())
+	ctx := r.Context()
+	now, ttl := time.Now(), s.ttl()
+	head := s.headSHA(ctx)
+	// session-list-links-labels: the SAME task/doc/commit resolution the
+	// session list uses (sessionLinksFor, one-id slice), plus the shortened
+	// display name shown as the page's primary heading — the full session id
+	// (still "Branch" here for the existing route/crumb plumbing) moves to
+	// smaller, secondary text below it.
+	p, _ := s.planView(head, sm.PlanPath(), now, ttl)
+	link := s.sessionLinksFor(ctx, head, sm, p, []string{branch})[branch]
 	s.render(w, "session_view.html", map[string]interface{}{
-		"Name":   sm.Name,
-		"Branch": branch,
-		"Live":   s.sessionLive(r.Context(), sm, branch, time.Now(), s.ttl()),
-		"Title":  pageTitle(branch, sm.Name),
-		"Crumbs": sessionCrumbs(sm.Name, branch),
+		"Name":     sm.Name,
+		"Branch":   branch,
+		"Display":  sessionDisplayName(branch),
+		"Live":     s.sessionLive(ctx, sm, branch, now, ttl),
+		"Title":    pageTitle(branch, sm.Name),
+		"Crumbs":   sessionCrumbs(sm.Name, branch),
+		"TaskHref": link.TaskHref,
+		"DocPath":  link.DocPath,
+		"DocHref":  link.DocHref,
+		"FlipSHA":  link.FlipSHA,
+		"FlipHref": link.FlipHref,
 	})
 }
 
@@ -312,16 +459,25 @@ func (s *Server) readSessionBranch(ctx context.Context, branch, rel string) (str
 // freshness/liveness come from the streaming branch's tip commit time, not the
 // stub's (fixed) mtime. A non-stub entry is a finished session, dated by its
 // file mtime.
+//
+// Display/Kind/Model/sessionLink are session-list-links-labels' additions: a
+// shortened display name (sessionDisplayName), the kind+model tags stats-tag-
+// model's sessionTags already derives from the SAME transcript (a live/stub
+// session has no header yet, so both are leniently "" until it finalizes),
+// and the task/doc/commit resolution (sessionLinksFor) — "link every session
+// to the change(s) it moved".
 func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.Time, ttl time.Duration) []sessionInfo {
 	dir := sm.SessionsDir()
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
-	p, _ := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	head := s.headSHA(ctx)
+	p, _ := s.planView(head, sm.PlanPath(), now, ttl)
 	claimed := claimedSessions(p)
 	rem, _ := s.git.Remote(ctx)
 	var out []sessionInfo
+	var ids []string
 	for _, e := range ents {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
@@ -346,12 +502,21 @@ func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.T
 				}
 			}
 		}
+		tags := s.sessionTags(sessionRef{submodule: sm.Name, path: filepath.Join(dir, e.Name())})
+		ids = append(ids, id)
 		out = append(out, sessionInfo{
 			ID:       id,
 			Modified: mod,
 			Ago:      humanAgo(now.Sub(mod)),
 			Live:     live,
+			Display:  sessionDisplayName(id),
+			Kind:     tags["kind"],
+			Model:    tags["model"],
 		})
+	}
+	links := s.sessionLinksFor(ctx, head, sm, p, ids)
+	for i := range out {
+		out[i].sessionLink = links[out[i].ID]
 	}
 	// Newest activity first so running sessions sit at the top.
 	sort.Slice(out, func(i, j int) bool { return out[i].Modified.After(out[j].Modified) })
