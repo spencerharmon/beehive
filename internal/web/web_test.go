@@ -7081,3 +7081,41 @@ func TestSessionListLinksDegradeGracefully(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionListRowWraps is session-list-row-flex-wrap: session-list-links-labels
+// grew each ul.sessions <li> from ~3 items to up to 8 (name link + up to four
+// badges + task/doc/commit deep links + right-pushed timestamp), but ul.sessions li
+// is display:flex with no flex-wrap, so on a narrow/mobile viewport the row
+// overflows horizontally instead of reflowing — the classic mobile horizontal-scroll
+// bug on a core per-submodule operator page. The fix adds flex-wrap: wrap to
+// ul.sessions li (matching the codebase convention every other multi-item pill/meta
+// row already follows — .card-meta and .chips are both display:flex; flex-wrap:wrap),
+// so the grown row reflows onto multiple lines; the existing gap keeps spacing on
+// both axes and ul.sessions .ago { margin-left:auto } still right-aligns the
+// timestamp on wide widths, degrading cleanly on wrap. There is no browser here, so
+// this checks the embedded-stylesheet contract, not rendered pixels.
+func TestSessionListRowWraps(t *testing.T) {
+	s, _ := setup(t)
+	css := get(t, s, "/assets/style.css").Body.String()
+
+	// The rule must exist and carry flex-wrap: wrap, scoped to the ul.sessions li
+	// block itself (not merely somewhere in the sheet) so a badge-grown row reflows
+	// instead of overflowing.
+	const sel = "ul.sessions li {"
+	start := strings.Index(css, sel)
+	if start < 0 {
+		t.Fatalf("style.css missing %q rule:\n%s", sel, css)
+	}
+	rule := css[start : start+strings.Index(css[start:], "}")]
+	if !strings.Contains(rule, "flex-wrap: wrap") {
+		t.Fatalf("ul.sessions li must carry flex-wrap: wrap so the grown session row reflows at narrow widths:\n%s", rule)
+	}
+	// The row stays a flexbox and the timestamp keeps its right-push, so wrapping
+	// degrades cleanly rather than collapsing the layout.
+	if !strings.Contains(rule, "display: flex") {
+		t.Fatalf("ul.sessions li must remain display: flex:\n%s", rule)
+	}
+	if !strings.Contains(css, "ul.sessions .ago { margin-left: auto; }") {
+		t.Fatalf("style.css missing ul.sessions .ago right-align rule (timestamp push):\n%s", css)
+	}
+}
