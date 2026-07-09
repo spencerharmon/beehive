@@ -238,4 +238,8 @@ files or `$TMPDIR` (the runner tears your worktree down for you), no re-verifica
 check", no out-of-repo reads. Post-delivery your turn has no productive move left, so any such trailing
 action only stalls on the per-turn idle timeout; the transcript then ends on a "made no progress"
 warning and the engine misflags the already-finished session aborted/completion_miss — poisoning the
-very ledger later audit passes mine. Deliver, then stop.
+very ledger later audit passes mine. Deliver, then stop. Concretely: the runner also
+watches for your terminal flip mid-turn and hard-cancels the turn the instant it observes
+it, so any further tool call you attempt after that commit is not a grey area — it is
+itself the defect this rule exists to prevent, whether or not the runner's cancellation
+beats you to it.

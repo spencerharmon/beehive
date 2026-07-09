@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3550,5 +3551,118 @@ func TestRealRunVerifyClassifies(t *testing.T) {
 	}
 	if _, err := realRunVerify(ctx, dir, "beehive-no-such-binary-xyz"); err == nil {
 		t.Fatalf("a missing binary must surface an infra error, got nil")
+	}
+}
+
+// predicateHardStopSession models a single turn that chains two tool calls: the
+// first (deliver) commits the task's terminal status flip + change doc — i.e. the
+// exact predicate r.complete checks — and the second (recorded via secondCallRan)
+// is a further, unneeded tool call the agent should never have been solicited for
+// once the runner observes the first has met the predicate. It waits on ctx
+// between the two calls so the test can assert the mid-turn hard-stop watchdog
+// cancels turnCtx (and so never lets the second call run) instead of only
+// noticing the completion at the top of the NEXT turn.
+type predicateHardStopSession struct {
+	deliver       func()
+	secondCallRan *atomic.Bool
+}
+
+func (s *predicateHardStopSession) Prompt(ctx context.Context, text string) (string, error) {
+	s.deliver()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-time.After(2 * time.Second):
+	}
+	s.secondCallRan.Store(true)
+	return "", nil
+}
+func (s *predicateHardStopSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+func (s *predicateHardStopSession) Close() error                                    { return nil }
+
+// TestPredicateHardStopCancelsTurnMidStream proves the primary fix: the runner
+// watches for the task's completion predicate WHILE a turn is still in flight and
+// hard-cancels the turn ctx the instant it is met, instead of waiting for the
+// between-turn check — so a chained tool call the agent attempts AFTER delivering
+// the terminal flip never executes, the pass still finalizes with the correct
+// terminal status, and no error/warning is produced (the cancellation is treated
+// as a normal settle, not a fault).
+func TestPredicateHardStopCancelsTurnMidStream(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	secondCallRan := &atomic.Bool{}
+	sess := &predicateHardStopSession{
+		deliver: func() {
+			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		},
+		secondCallRan: secondCallRan,
+	}
+	r := &Runner{
+		Repo: rp, Git: g, Client: fixedClient{sess: sess}, MaxTurns: 5,
+		WallCap: time.Hour, TTL: time.Hour, PredicatePoll: 5 * time.Millisecond,
+	}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("a mid-turn predicate hard-stop must not be fatal, got: %v", err)
+	}
+	if !res.Completed || res.GCMarked || res.Lost {
+		t.Fatalf("want a clean completion, got %+v", res)
+	}
+	if res.Warning != "" {
+		t.Fatalf("a predicate hard-stop is a normal settle, want no warning, got %q", res.Warning)
+	}
+	if secondCallRan.Load() {
+		t.Fatalf("the second tool call ran after the terminal flip — the mid-turn predicate hard-stop failed to cancel the turn in time")
+	}
+}
+
+// TestPredicateHardStopNoSpuriousCancel is the negative control: a turn that
+// NEVER reaches the completion predicate (the task never leaves its working
+// status) must run to its normal per-turn ceiling unchanged — the watchdog must
+// never fire on a task that genuinely has not delivered.
+func TestPredicateHardStopNoSpuriousCancel(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
+
+	r := &Runner{
+		Repo: rp, Git: g, Client: fixedClient{sess: blockingSession{}}, MaxTurns: 5,
+		WallCap: time.Hour, TTL: time.Hour,
+		TurnTimeout: 50 * time.Millisecond, PredicatePoll: 5 * time.Millisecond,
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.GCMarked {
+		t.Fatalf("want the normal TurnTimeout abandon, unaffected by the predicate watchdog: %+v", res)
+	}
+	if !contains(res.Warning, "per-turn ceiling") {
+		t.Fatalf("want the ordinary TurnTimeout warning, got %q", res.Warning)
 	}
 }
