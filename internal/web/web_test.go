@@ -3788,6 +3788,48 @@ func TestHygieneViewCacheWidget(t *testing.T) {
 	}
 }
 
+// TestHygienePacksTableA11y is the core of hygiene-packs-table-polish: the
+// object-store "pack-dir health" table was added to /hygiene AFTER the sibling
+// table tasks locked their conventions (responsive-table-overflow's .table-scroll
+// wrapper and table-header-scope's scope="col" headers), so it fell through both
+// — the one data table missing the responsive wrapper and whose <thead> cells a
+// screen reader read as unscoped soup. Rendering the hygiene-widget with a Packs
+// row asserts (1) the table is wrapped in <div class="table-scroll"> exactly like
+// every other data table and (2) each of the 5 <thead> <th> cells carries
+// scope="col", while the leading repo cell stays a plain data <td> (no
+// scope="row" — it is a value, not a row header). No browser here, so this checks
+// the markup contract, not rendered pixels.
+func TestHygienePacksTableA11y(t *testing.T) {
+	s, _ := setup(t)
+	// A single clean pack row (Temps 0, Packs < packCountWarn) so PackWarn is
+	// false: the header/wrapper contract must hold regardless of the warn tint.
+	hyg := Hygiene{Packs: []RepoPack{{Repo: "hive", Size: 4096, Packs: 3, Temps: 0}}}
+	out := renderTmpl(t, s, "hygiene-widget", hyg)
+
+	// (1) wrapped in .table-scroll like the other data tables (the wrapper, not
+	// the table, carries the responsive overflow — same shape as plan_items etc).
+	if !strings.Contains(out, "<div class=\"table-scroll\">\n<table class=\"hygiene-packs\">") {
+		t.Fatalf("hygiene-packs table not wrapped in .table-scroll:\n%s", out)
+	}
+	// (2) every column header scoped for screen readers.
+	for _, col := range []string{"repo", "pack-dir size", "packs", "temps", "state"} {
+		if want := fmt.Sprintf("<th scope=\"col\">%s</th>", col); !strings.Contains(out, want) {
+			t.Fatalf("hygiene-packs header missing scoped column %q:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, "<th scope=\"col\">"); n != 5 {
+		t.Fatalf("hygiene-packs: want 5 scope=col headers, got %d:\n%s", n, out)
+	}
+	// The leading repo cell stays a data <td> — a value, not a row header — so no
+	// scope="row" conversion crept in.
+	if !strings.Contains(out, "<td><code>hive</code></td>") {
+		t.Fatalf("hygiene-packs repo cell should remain a plain data <td>:\n%s", out)
+	}
+	if strings.Contains(out, "scope=\"row\"") {
+		t.Fatalf("hygiene-packs should carry no scope=\"row\" (repo is a data cell):\n%s", out)
+	}
+}
+
 // seedPackDir fabricates a repo's own .git/objects/pack with `packs` live
 // pack-*.pack files (each with its .idx sibling) and `temps` leftover repack temps
 // (spread across tmp_pack_/tmp_idx_/tmp_rev_), so a repack storm can be simulated
