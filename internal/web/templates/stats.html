@@ -29,13 +29,13 @@ unknown tag key or value simply yields no rows, never an error.</p>
 <form method="get" action="/stats" class="filter-add">
 {{range .Filters}}<input type="hidden" name="filter" value="{{.Key}}{{.Op}}{{.Value}}">{{end}}
 {{range .GroupBy}}<input type="hidden" name="group-by" value="{{.}}">{{end}}
-<input name="fkey" list="tag-keys" placeholder="tag key (e.g. kind)">
+<input name="fkey" list="tag-keys" placeholder="tag key (e.g. kind)" aria-label="filter tag key">
 <select name="fop" aria-label="filter operator">
 <option value="=">=</option>
 <option value="!=">!=</option>
 <option value="=~">=~ (regex)</option>
 </select>
-<input name="fval" placeholder="value (e.g. review)">
+<input name="fval" placeholder="value (e.g. review)" aria-label="filter value">
 <button type="submit">+ add filter</button>
 </form>
 <datalist id="tag-keys">{{range .BuiltinTags}}<option value="{{.}}">{{end}}</datalist>
@@ -45,7 +45,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
 <span class="muted">group by:</span>
 {{$gb := .GroupBySet}}
 {{range .BuiltinTags}}<label><input type="checkbox" name="group-by" value="{{.}}"{{if index $gb .}} checked{{end}}> {{.}}</label>{{end}}
-<input name="group-by" placeholder="extra tag keys, comma-separated" value="{{.ExtraGroupBy}}">
+<input name="group-by" placeholder="extra tag keys, comma-separated" aria-label="extra group-by tag keys" value="{{.ExtraGroupBy}}">
 <button type="submit">apply</button>
 </form>
 {{if .Filtered}}<p class="muted"><a href="/stats">&larr; reset (clear filters &amp; group-by)</a></p>{{end}}

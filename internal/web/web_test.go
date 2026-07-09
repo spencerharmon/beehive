@@ -264,6 +264,124 @@ func TestPollPaneLoadingSkeletons(t *testing.T) {
 	}
 }
 
+// TestFormInputsHaveAccessibleNames locks form-input-accessible-labels: every
+// placeholder-only text/password input across these forms now also carries a
+// programmatic accessible name. Two paired patterns, both computed by the
+// standard label/aria-label name computation: a visually-hidden
+// <label class="sr-only"> tied to the input by for/id for the structured
+// create/merge/link forms, and a direct aria-label for the chat message inputs,
+// the secrets fields (rendered in a {{range}} loop, where a static id would
+// collide), and the /stats filter (matching the fop <select aria-label> already
+// there). Placeholders are retained as supplementary hints — a placeholder is not
+// a reliable accessible name (it disappears on input and is inconsistently
+// exposed to AT), which is the whole reason for the added pairing.
+func TestFormInputsHaveAccessibleNames(t *testing.T) {
+	s, _ := setup(t)
+
+	cases := []struct {
+		name string
+		html string
+		want []string
+	}{
+		{
+			name: "dashboard.html add-submodule form",
+			html: get(t, s, "/").Body.String(),
+			want: []string{
+				`<label class="sr-only" for="add-sub-url">Repository URL</label>`,
+				`id="add-sub-url"`,
+				`<label class="sr-only" for="add-sub-name">Submodule name</label>`,
+				`id="add-sub-name"`,
+				`<label class="sr-only" for="add-sub-branch">Branch</label>`,
+				`id="add-sub-branch"`,
+				`placeholder="repo url (git@host:org/repo.git)"`, // hint retained
+			},
+		},
+		{
+			name: "merge_panel.html merge form",
+			html: renderTmpl(t, s, "merge_panel.html", map[string]interface{}{
+				"Subs": []repo.Submodule{{Name: "alpha"}}, "Selected": "alpha",
+			}),
+			want: []string{
+				`<label class="sr-only" for="merge-name">Submodule</label>`,
+				`id="merge-name"`,
+				`<label class="sr-only" for="merge-branch">Branch to merge</label>`,
+				`id="merge-branch"`,
+				`placeholder="branch"`, // hint retained
+			},
+		},
+		{
+			name: "branch_view.html inline merge form",
+			html: renderTmpl(t, s, "branch_view.html", map[string]interface{}{
+				"Name": "alpha", "Sections": nil, "HasPrev": false, "HasNext": false,
+			}),
+			want: []string{
+				`<label class="sr-only" for="branch-merge-branch">Branch to merge</label>`,
+				`id="branch-merge-branch"`,
+				`placeholder="branch to merge"`, // hint retained
+			},
+		},
+		{
+			name: "links_editor.html link form",
+			html: renderTmpl(t, s, "links_editor.html", map[string]interface{}{}),
+			want: []string{
+				`<label class="sr-only" for="link-from">From submodule</label>`,
+				`id="link-from"`,
+				`<label class="sr-only" for="link-to">To submodule</label>`,
+				`id="link-to"`,
+			},
+		},
+		{
+			name: "secrets_panel.html key/value forms",
+			html: renderTmpl(t, s, "secrets_panel.html", map[string]interface{}{"Keys": []string{"API_KEY"}}),
+			want: []string{
+				`aria-label="new value for API_KEY"`, // per-key edit input (looped: a static id would collide)
+				`aria-label="secret key"`,
+				`aria-label="secret value"`,
+				`placeholder="new value for API_KEY"`, // hint retained
+				`placeholder="key"`,                   // hint retained
+			},
+		},
+		{
+			name: "stats.html filter form",
+			html: get(t, s, "/stats").Body.String(),
+			want: []string{
+				`aria-label="filter tag key"`,
+				`aria-label="filter value"`,
+				`aria-label="extra group-by tag keys"`,
+				`placeholder="tag key (e.g. kind)"`, // hint retained
+			},
+		},
+		{
+			name: "editor.html chat input",
+			html: renderTmpl(t, s, "editor.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"}),
+			want: []string{
+				`aria-label="message to the editor"`,
+				`placeholder="Ask the editor to change something`, // ASCII-safe prefix; hint retained
+			},
+		},
+		{
+			name: "bootstrap_agent.html chat input",
+			html: renderTmpl(t, s, "bootstrap_agent.html", map[string]interface{}{"ID": "b1"}),
+			want: []string{`aria-label="message to the setup guide"`},
+		},
+		{
+			name: "human_resolve.html chat input",
+			html: renderTmpl(t, s, "human_resolve.html", map[string]interface{}{
+				"Sub": "alpha", "Item": PlanItem{ID: "t1"}, "SessID": "s1",
+			}),
+			want: []string{`aria-label="message to the resolution agent"`},
+		},
+	}
+
+	for _, c := range cases {
+		for _, want := range c.want {
+			if !strings.Contains(c.html, want) {
+				t.Errorf("%s: missing accessible-name markup %q in:\n%s", c.name, want, c.html)
+			}
+		}
+	}
+}
+
 func TestDashboard(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/")

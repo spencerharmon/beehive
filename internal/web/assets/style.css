@@ -690,7 +690,9 @@ pre.diff .ln.del .chg { background: var(--diff-chg-del-bg); }
 }
 
 /* Visually-hidden utility: text kept off-screen for assistive tech only. Used for
-   the skeletons' "Loading…" text equivalent (the bars are aria-hidden). */
+   the skeletons' "Loading…" text equivalent (the bars are aria-hidden) and for
+   sr-only <label>s that give placeholder-only form fields a programmatic name
+   (a placeholder is not a reliable accessible name). */
 .sr-only {
   position: absolute;
   width: 1px;

@@ -7,8 +7,10 @@
       hx-post="/merge" hx-target="#merge-panel" hx-select="#merge-panel" hx-swap="outerHTML"
       hx-indicator="#htmx-progress"
       hx-confirm="Merge this branch into the tracked branch? This runs a real git merge, pushes origin, and advances the pointer — it cannot be undone here.">
-  <select name="name">{{range .Subs}}<option{{if eq .Name $.Selected}} selected{{end}}>{{.Name}}</option>{{end}}</select>
-  <input name="branch" placeholder="branch">
+  <label class="sr-only" for="merge-name">Submodule</label>
+  <select id="merge-name" name="name">{{range .Subs}}<option{{if eq .Name $.Selected}} selected{{end}}>{{.Name}}</option>{{end}}</select>
+  <label class="sr-only" for="merge-branch">Branch to merge</label>
+  <input id="merge-branch" name="branch" placeholder="branch">
   <button class="merge">merge</button>
 </form>
 </div>

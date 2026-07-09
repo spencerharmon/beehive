@@ -1,4 +1,4 @@
 {{template "header" .}}
 <h1>Submodule links</h1>
-<form method="post" action="/submodule/link"><input name="from" placeholder="from"><input name="to" placeholder="to"><button>link</button></form>
+<form method="post" action="/submodule/link"><label class="sr-only" for="link-from">From submodule</label><input id="link-from" name="from" placeholder="from"><label class="sr-only" for="link-to">To submodule</label><input id="link-to" name="to" placeholder="to"><button>link</button></form>
 {{template "footer"}}
