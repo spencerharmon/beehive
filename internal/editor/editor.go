@@ -2,6 +2,7 @@ package editor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -29,6 +30,15 @@ type agentClient interface {
 // has explicitly approved merging. beehived performs the merge on its behalf, so
 // "ask the agent to merge" and clicking Merge converge to the same git state.
 const mergeMarker = "<<<MERGE>>>"
+
+// transcriptSidecarPath is the tracked file (repo-relative to the edit
+// worktree) that carries a session's running chat log while a remote-durable
+// edit is in flight (chat-diff-session-durability): committed on the edit
+// branch alongside the proposed target-file change each turn, so a push/fetch
+// that recovers the branch also recovers the transcript. It is bookkeeping for
+// THIS in-flight session only, never part of the proposed change, so merge()
+// strips it from the branch again before ever publishing to main.
+const transcriptSidecarPath = ".beehive-editor-session.json"
 
 // editableBasenames are the beehive coordination-file basenames an editor
 // session may touch: every member of the per-submodule optional-file set
@@ -176,6 +186,34 @@ func ValidateFile(file string) error {
 	return nil
 }
 
+// trustedRemote resolves the primary repo's configured remote and verifies it
+// is this repo's OWN — it shares history with local main (editor-safety-
+// guards) — before returning it. Both "no remote configured" (local sharing)
+// and "a foreign/unrelated remote is configured" (never trusted) report as ""
+// — the safe sharing-modes no-op signal. A trusted remote is the ONLY remote
+// ever used as an edit base, a merge push target, or (chat-diff-session-
+// durability) a per-turn durability push/fetch/recovery target.
+func (m *Manager) trustedRemote(ctx context.Context) (string, error) {
+	remote, err := m.primary.Remote(ctx)
+	if err != nil {
+		return "", err
+	}
+	if remote == "" {
+		return "", nil
+	}
+	if err := m.primary.Fetch(ctx, remote, "main"); err != nil {
+		return "", fmt.Errorf("fetch %s main: %w", remote, err)
+	}
+	own, err := m.primary.SharesHistory(ctx, "main", remote+"/main")
+	if err != nil {
+		return "", err
+	}
+	if !own {
+		return "", nil
+	}
+	return remote, nil
+}
+
 // Open creates a worktree+branch for editing file and registers a session.
 //
 // Base selection is safety-hardened (editor-safety-guards): a configured remote
@@ -190,27 +228,17 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 	if err := ValidateFile(file); err != nil {
 		return nil, err
 	}
-	remote, err := m.primary.Remote(ctx)
+	// trusted is "" unless the configured remote is verified as the repo's OWN
+	// (shared history) — never a foreign/unrelated one. Only a trusted remote is
+	// used as the edit base, the merge push target, and (chat-diff-session-
+	// durability) the per-turn durability push/fetch target.
+	trusted, err := m.trustedRemote(ctx)
 	if err != nil {
 		return nil, err
 	}
 	base := "main" // local main: the safe default
-	trusted := ""  // remote to publish to on merge; only a verified repo-own remote
-	if remote != "" {
-		if err := m.primary.Fetch(ctx, remote, "main"); err != nil {
-			return nil, fmt.Errorf("fetch %s main: %w", remote, err)
-		}
-		// Don't blindly trust origin/main: prefer it over local main ONLY when it
-		// is the repo's own remote (shared history). A foreign origin/main is the
-		// exact wrong-base that turned "edit ROI.md" into "delete ROI.md".
-		own, err := m.primary.SharesHistory(ctx, "main", remote+"/main")
-		if err != nil {
-			return nil, err
-		}
-		if own {
-			base = remote + "/main"
-			trusted = remote
-		}
+	if trusted != "" {
+		base = trusted + "/main"
 	}
 	baseMain, err := m.primary.RevParse(ctx, base)
 	if err != nil {
@@ -286,6 +314,14 @@ func (m *Manager) Close(ctx context.Context, id string) error {
 	s.mu.Unlock()
 	_ = m.primary.WorktreeRemove(ctx, s.wtPath)
 	_, _ = m.primary.Run(ctx, "branch", "-D", s.Branch)
+	if s.remote != "" {
+		// chat-diff-session-durability: an intentionally closed session must
+		// never resurrect itself from its own pushed copy on a later Reload's
+		// remote scan. Best-effort — DeleteRemoteBranch already tolerates
+		// "already gone" as success, and a real failure here (network/auth) must
+		// not block Close.
+		_ = m.primary.DeleteRemoteBranch(ctx, s.remote, s.Branch)
+	}
 	return m.persist()
 }
 
@@ -337,8 +373,26 @@ func isEditBranch(branch string) bool {
 //     (within ttl) OR carries a pending unpublished change (dirty tree or an
 //     unmerged commit) — a pending/approved change is NEVER reclaimed, whatever
 //     its age; and
-//   - RECLAIM it (git worktree remove + branch -D) when it is both stale (no fresh
-//     record) and clean (no pending change) — the abandoned-edit leak.
+//   - RECLAIM it (git worktree remove + branch -D, plus — chat-diff-session-
+//     durability — deleting its pushed copy on a trusted remote, so it can never
+//     be resurrected by a later remote scan below) when it is both stale (no
+//     fresh record) and clean (no pending change) — the abandoned-edit leak.
+//
+// chat-diff-session-durability extends this to survive a LOST local worktree,
+// not just a restarted process over the same checkout:
+//
+//   - a dangling worktree registration whose checkout directory was removed
+//     out of band (e.g. a wiped scratch dir) is pruned and rebuilt — from the
+//     surviving local branch when one exists (never discarding a not-yet-
+//     pushed commit in favor of an older remote tip), else, only on a verified
+//     repo-own remote, fetched and rebuilt from that remote's tip; and
+//   - when a trusted remote exists, every one of ITS edit-* branches with NO
+//     local trace at all (a different host, or a fully-lost local repo) is
+//     likewise fetched and rebuilt.
+//
+// Either recovery path then runs through the SAME fresh/pending KEEP-or-RECLAIM
+// decision as any other worktree, and restore() recovers the chat transcript
+// from the branch's own committed sidecar when the local record can't supply it.
 //
 // Non-edit worktrees (bee-*, beehive-*, main) are skipped entirely. The store is
 // rewritten to exactly the surviving sessions, so the prune is idempotent: a
@@ -353,38 +407,150 @@ func (m *Manager) Reload(ctx context.Context) error {
 	for _, rec := range recs {
 		byBranch[rec.Branch] = rec
 	}
+	trusted, err := m.trustedRemote(ctx)
+	if err != nil {
+		return err
+	}
 	wts, err := m.primary.Worktrees(ctx)
 	if err != nil {
 		return err
 	}
 	now := m.now()
+	seen := make(map[string]bool, len(wts))
 	for _, w := range wts {
 		if !isEditBranch(w.Branch) {
 			continue
 		}
-		rec, hasRec := byBranch[w.Branch]
-		pending, perr := m.worktreePending(ctx, w)
-		if perr != nil {
-			return perr
+		seen[w.Branch] = true
+		missing, serr := dirMissing(w.Path)
+		if serr != nil {
+			return serr
 		}
-		fresh := hasRec && now.Sub(rec.Activity) < m.ttl
-		if fresh || pending {
-			s, serr := m.restore(ctx, w, rec, hasRec)
-			if serr != nil {
-				return serr
+		if missing {
+			// The checkout directory is gone (removed out of band) but git's own
+			// worktree admin metadata still lists it; clear that dangling
+			// registration before attempting to rebuild at the same path.
+			_, _ = m.primary.Run(ctx, "worktree", "prune")
+			wtPath, ok, rerr := m.recoverMissingWorktree(ctx, w.Branch, trusted)
+			if rerr != nil {
+				return rerr
 			}
-			if s != nil {
-				m.mu.Lock()
-				m.byID[s.ID] = s
-				m.mu.Unlock()
+			if !ok {
+				continue // gone everywhere reachable; nothing left to keep or reclaim
 			}
-			continue
+			w.Path = wtPath
 		}
-		if err := m.reclaim(ctx, w); err != nil {
+		if err := m.evaluateWorktree(ctx, w, byBranch, now, trusted); err != nil {
 			return err
 		}
 	}
+	if trusted != "" {
+		// Recover sessions with NO local trace whatsoever — a different host, or
+		// a fully-lost local repo — from every edit-* branch the trusted remote
+		// still carries that this local loop never saw.
+		branches, err := m.primary.ListRemoteBranches(ctx, trusted, "edit-*")
+		if err != nil {
+			return err
+		}
+		for _, branch := range branches {
+			if seen[branch] {
+				continue
+			}
+			wtPath, ok, rerr := m.recoverMissingWorktree(ctx, branch, trusted)
+			if rerr != nil {
+				return rerr
+			}
+			if !ok {
+				continue
+			}
+			w := git.Worktree{Path: wtPath, Branch: branch}
+			if err := m.evaluateWorktree(ctx, w, byBranch, now, trusted); err != nil {
+				return err
+			}
+		}
+	}
 	return m.persist()
+}
+
+// evaluateWorktree applies Reload's KEEP-or-RECLAIM decision to one edit
+// worktree (freshly recovered or already present): KEEP + register when it
+// carries a fresh persisted record or a pending unpublished change, else
+// RECLAIM it — and, when trusted names a verified repo-own remote, delete its
+// pushed copy there too, so a reclaimed session is never resurrected by a
+// later Reload's remote scan (chat-diff-session-durability).
+func (m *Manager) evaluateWorktree(ctx context.Context, w git.Worktree, byBranch map[string]sessionRecord, now time.Time, trusted string) error {
+	rec, hasRec := byBranch[w.Branch]
+	pending, err := m.worktreePending(ctx, w)
+	if err != nil {
+		return err
+	}
+	fresh := hasRec && now.Sub(rec.Activity) < m.ttl
+	if fresh || pending {
+		s, err := m.restore(ctx, w, rec, hasRec, trusted)
+		if err != nil {
+			return err
+		}
+		if s != nil {
+			m.mu.Lock()
+			m.byID[s.ID] = s
+			m.mu.Unlock()
+		}
+		return nil
+	}
+	if err := m.reclaim(ctx, w); err != nil {
+		return err
+	}
+	if trusted != "" {
+		_ = m.primary.DeleteRemoteBranch(ctx, trusted, w.Branch) // best-effort; never resurrect
+	}
+	return nil
+}
+
+// dirMissing reports whether path does not currently exist on disk. Any other
+// stat failure (e.g. a permissions error) is a real error, never folded into
+// "missing".
+func dirMissing(path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
+}
+
+// recoverMissingWorktree rebuilds branch's worktree at its standard path when
+// its checkout directory is gone (chat-diff-session-durability): reused as-is
+// from the surviving LOCAL branch ref when one exists — so a not-yet-pushed
+// commit is never discarded in favor of an older remote tip — else, only when
+// trusted names a verified repo-own remote, fetched and rebuilt from that
+// remote's tip. ok=false means branch survives NOWHERE reachable; there is
+// nothing to recover (treated exactly like an already-reclaimed session).
+func (m *Manager) recoverMissingWorktree(ctx context.Context, branch, trusted string) (wtPath string, ok bool, err error) {
+	wtPath = filepath.Join(m.absRoot, ".worktrees", branch)
+	if _, verr := m.primary.RevParse(ctx, "refs/heads/"+branch); verr == nil {
+		if _, err := m.primary.Run(ctx, "worktree", "add", wtPath, branch); err != nil {
+			return "", false, err
+		}
+		return wtPath, true, nil
+	}
+	if trusted == "" {
+		return "", false, nil
+	}
+	tip, err := m.primary.LsRemoteBranch(ctx, trusted, branch)
+	if err != nil {
+		return "", false, err
+	}
+	if tip == "" {
+		return "", false, nil // gone everywhere; nothing to recover
+	}
+	if err := m.primary.Fetch(ctx, trusted, branch); err != nil {
+		return "", false, err
+	}
+	if err := m.primary.WorktreeAdd(ctx, wtPath, branch, trusted+"/"+branch); err != nil {
+		return "", false, err
+	}
+	return wtPath, true, nil
 }
 
 // Reclaimable reports, without mutating anything, the edit-branch worktrees a
@@ -393,6 +559,10 @@ func (m *Manager) Reload(ctx context.Context) error {
 // skill can present an exact dry-run plan ("these branches will be removed")
 // that applying (Reload) then performs. Branch names are sorted for a
 // deterministic plan. Non-edit worktrees (bee-*, beehive-*, main) are ignored.
+//
+// This is a purely LOCAL preview: it does not fetch a remote's edit-* branches,
+// so a session with no local trace at all (chat-diff-session-durability's
+// cross-host recovery) is never listed here — Reload alone recovers those.
 func (m *Manager) Reclaimable(ctx context.Context) ([]string, error) {
 	recs, err := m.store.load()
 	if err != nil {
@@ -431,7 +601,10 @@ func (m *Manager) Reclaimable(ctx context.Context) ([]string, error) {
 // that must be preserved: uncommitted working-tree changes, or commits on the
 // branch not yet on main. The three-dot diff (merge-base(main,branch)..branch)
 // scopes "unmerged" to what the branch itself changed, so main advancing after
-// the fork does not read as pending.
+// the fork does not read as pending. The durability sidecar (transcriptSidecarPath)
+// is excluded from the committed-diff check: it is bookkeeping, not a proposal,
+// so a session that only ever chatted (no real file edit) stays reclaimable
+// after its TTL exactly as it was before chat-diff-session-durability existed.
 func (m *Manager) worktreePending(ctx context.Context, w git.Worktree) (bool, error) {
 	wg := git.New(w.Path)
 	clean, err := wg.Clean(ctx)
@@ -445,11 +618,18 @@ func (m *Manager) worktreePending(ctx context.Context, w git.Worktree) (bool, er
 	if err != nil {
 		return false, err
 	}
-	return strings.TrimSpace(out) != "", nil
+	for _, f := range strings.Split(out, "\n") {
+		if f = strings.TrimSpace(f); f != "" && f != transcriptSidecarPath {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // reclaim removes a stale edit worktree and deletes its branch, mirroring the
 // swarm gc-worktree-reclaim cleanup (force-remove the worktree, then branch -D).
+// Deleting its pushed remote copy, when one exists, is the caller's job
+// (evaluateWorktree) — reclaim itself stays purely local.
 func (m *Manager) reclaim(ctx context.Context, w git.Worktree) error {
 	if err := m.primary.WorktreeRemove(ctx, w.Path); err != nil {
 		return err
@@ -460,12 +640,22 @@ func (m *Manager) reclaim(ctx context.Context, w git.Worktree) error {
 
 // restore rebuilds a live *Session from a surviving edit worktree so the resumed
 // edit is fully operable (diff/state/merge) after a restart. With a persisted
-// record it uses the recorded file/remote/base/log/activity verbatim; without one
-// (a pending worktree whose store entry was lost) it best-effort derives the
-// edited file from git and the publish remote from the repo, returning (nil, nil)
-// only when no edited file can be determined (the worktree is still kept on disk,
-// never destroyed, by Reload's pending guard).
-func (m *Manager) restore(ctx context.Context, w git.Worktree, rec sessionRecord, hasRec bool) (*Session, error) {
+// record it uses the recorded file/base/log/activity verbatim; without one (a
+// pending worktree whose store entry was lost) it best-effort derives the
+// edited file from git, returning (nil, nil) only when no edited file can be
+// determined (the worktree is still kept on disk, never destroyed, by Reload's
+// pending guard). trusted (Reload's already-verified repo-own remote, "" for
+// local sharing or a foreign remote) is used, for a record-less recovery, in
+// place of the record's own Remote — the same trust gate every other remote use
+// in this package goes through (editor-safety-guards).
+//
+// The edit branch's own committed transcript sidecar (chat-diff-session-
+// durability) is preferred over whatever the record carried, when the worktree
+// has one: it is what survives a lost-and-rebuilt worktree when the record
+// itself was also lost, and is otherwise just as fresh (both are written every
+// turn). An older session that predates the sidecar, or one that never had a
+// trusted remote so never wrote one, falls back to the record's own log.
+func (m *Manager) restore(ctx context.Context, w git.Worktree, rec sessionRecord, hasRec bool, trusted string) (*Session, error) {
 	file := rec.File
 	remote := rec.Remote
 	baseMain := rec.BaseMain
@@ -480,10 +670,11 @@ func (m *Manager) restore(ctx context.Context, w git.Worktree, rec sessionRecord
 			return nil, nil
 		}
 		file = f
-		if r, rerr := m.primary.Remote(ctx); rerr == nil {
-			remote = r
-		}
+		remote = trusted
 		activity = m.now()
+	}
+	if sidecar, ok := readTranscriptSidecar(w.Path); ok {
+		log = sidecar
 	}
 	s := &Session{
 		ID:       w.Branch,
@@ -534,6 +725,23 @@ func (m *Manager) editedFile(ctx context.Context, w git.Worktree) (string, error
 		}
 	}
 	return "", nil
+}
+
+// readTranscriptSidecar loads the durability sidecar (transcriptSidecarPath)
+// from an edit worktree, if present and well-formed. A missing or malformed
+// sidecar is not an error: restore() falls back to the local store's own
+// record in that case (an older session that predates the sidecar, or one
+// that never had a trusted remote so never wrote it).
+func readTranscriptSidecar(wtPath string) ([]Turn, bool) {
+	b, err := os.ReadFile(filepath.Join(wtPath, transcriptSidecarPath))
+	if err != nil {
+		return nil, false
+	}
+	var log []Turn
+	if err := json.Unmarshal(b, &log); err != nil {
+		return nil, false
+	}
+	return log, true
 }
 
 // StartChat appends the user's message and runs the agent turn in the
@@ -588,6 +796,22 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 	if cerr := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); cerr != nil && cerr != git.ErrNothing {
 		s.setErr("commit: " + cerr.Error())
 	}
+	// Remote durability (chat-diff-session-durability): a trusted remote means
+	// this session's edit branch converges through git like a honeybee's
+	// bee-<taskid> branch, so a crash/restart/different host can resume it.
+	// Commit the running transcript as a tracked sidecar (merge() strips it
+	// again before ever publishing to main) and push the branch, mirroring
+	// honeybee's own push-after-commit. Obeying sharing-modes: with no trusted
+	// remote (local sharing, or a foreign/unrelated one) this whole step is a
+	// no-op, so behavior is unchanged from before this feature existed. A
+	// failure here is surfaced via the session's error state, never swallowed.
+	if s.remote != "" {
+		if terr := s.commitTranscript(ctx); terr != nil {
+			s.setErr("transcript commit: " + terr.Error())
+		} else if perr := s.wt.PushBranchReconciled(ctx, s.remote, s.Branch); perr != nil {
+			s.setErr("push: " + perr.Error())
+		}
+	}
 	if doMerge {
 		// An agent-driven merge can NEVER confirm a protected whole-file deletion;
 		// that requires an explicit human action. A phantom deletion (e.g. a wrong
@@ -604,6 +828,53 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 		s.setErr("persist: " + perr.Error())
 	}
 	return display, nil
+}
+
+// commitTranscript writes the session's current chat log to the durability
+// sidecar (transcriptSidecarPath) and commits it on the edit branch, so an
+// immediately-following push (runTurn, when a trusted remote exists) carries
+// the transcript along with the proposed change. It is bookkeeping only —
+// never part of the proposal — so merge() strips it again before ever
+// publishing to main. Nothing-to-commit (the log serializes identically to
+// what is already committed) is tolerated.
+func (s *Session) commitTranscript(ctx context.Context) error {
+	s.mu.Lock()
+	logCopy := make([]Turn, len(s.log))
+	copy(logCopy, s.log)
+	s.mu.Unlock()
+	b, err := json.MarshalIndent(logCopy, "", "  ")
+	if err != nil {
+		return err
+	}
+	abs := filepath.Join(s.wtPath, transcriptSidecarPath)
+	if err := os.WriteFile(abs, append(b, '\n'), 0o644); err != nil {
+		return err
+	}
+	if err := s.wt.CommitPaths(ctx, "editor: session transcript", transcriptSidecarPath); err != nil && err != git.ErrNothing {
+		return err
+	}
+	return nil
+}
+
+// stripTranscriptSidecar removes the durability sidecar (if present) from the
+// edit worktree and commits the removal, so a publish (merge) never carries
+// it into main. Already-absent is a no-op (a session that never had a trusted
+// remote, so never wrote one).
+func (s *Session) stripTranscriptSidecar(ctx context.Context) error {
+	abs := filepath.Join(s.wtPath, transcriptSidecarPath)
+	if _, err := os.Stat(abs); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := os.Remove(abs); err != nil {
+		return err
+	}
+	if err := s.wt.CommitPaths(ctx, "editor: drop session transcript before publish", transcriptSidecarPath); err != nil && err != git.ErrNothing {
+		return err
+	}
+	return nil
 }
 
 // prompt opens the opencode session on first use (seeding system + first
@@ -658,6 +929,14 @@ func (s *Session) merge(ctx context.Context, confirmDelete bool) error {
 		if ProtectedDeletion(s.File, base, proposed) {
 			return ErrDeleteNeedsConfirm
 		}
+	}
+	// The durability sidecar (chat-diff-session-durability), if this session
+	// ever committed one, is bookkeeping for the IN-FLIGHT session only — it
+	// must never reach main. Strip it from the branch before publishing; a
+	// no-op when none was ever written (no trusted remote existed for this
+	// session).
+	if serr := s.stripTranscriptSidecar(ctx); serr != nil {
+		return serr
 	}
 	if s.remote != "" {
 		// A configured remote is authoritative: publish to remote main (hard fail if
