@@ -19,6 +19,15 @@
 <div id="htmx-toast" role="alert" aria-live="assertive" hidden></div>
 <header class="topbar"><nav class="nav"><a class="brand" href="/">beehive</a><span class="nav-links"><a href="/"{{if eq .Nav "dashboard"}} aria-current="page"{{end}}>dashboard</a><a href="/stats"{{if eq .Nav "stats"}} aria-current="page"{{end}}>stats</a><a href="/secrets"{{if eq .Nav "secrets"}} aria-current="page"{{end}}>secrets</a><a href="/merge"{{if eq .Nav "merge"}} aria-current="page"{{end}}>merge</a><a href="/human"{{if eq .Nav "human"}} aria-current="page"{{end}}>human</a><a href="/hygiene"{{if eq .Nav "hygiene"}} aria-current="page"{{end}}>hygiene</a><a href="/skills"{{if eq .Nav "skills"}} aria-current="page"{{end}}>skills</a></span></nav></header>
 <main class="container" id="main" tabindex="-1">{{end}}
+{{/* breadcrumb: an ancestor trail rooted at the dashboard, rendered on every
+   non-dashboard page as a <nav aria-label="breadcrumb"> landmark. Dot is the
+   page's []Crumb (nil/empty on the dashboard -> nothing renders). Ancestor
+   crumbs carry an Href; the terminal current-page crumb has an empty Href and is
+   marked aria-current. Separators are drawn by CSS (::before) so they are not in
+   the a11y tree and never get selected/copied. A distinct landmark from the
+   top-nav's own aria-current (page-chrome-title-favicon's Nav key) — the two
+   never collide on the same element. */}}
+{{define "breadcrumb"}}{{if .}}<nav class="breadcrumb" aria-label="breadcrumb"><ol>{{range .}}<li>{{if .Href}}<a href="{{.Href}}">{{.Label}}</a>{{else}}<span aria-current="page">{{.Label}}</span>{{end}}</li>{{end}}</ol></nav>{{end}}{{end}}
 {{define "footer"}}</main>
 <script>
 /* poll-scroll-preserve: an htmx poll-refresh swaps a pane's innerHTML, which

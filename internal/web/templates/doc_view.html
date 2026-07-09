@@ -1,5 +1,5 @@
 {{template "header" .}}
-<p><a href="/submodule/{{.Name}}/branches">&larr; {{.Name}} commits</a></p>
+{{template "breadcrumb" .Crumbs}}
 <h1>{{.File}}</h1>
 <div class="markdown">{{.Body}}</div>
 {{template "footer"}}

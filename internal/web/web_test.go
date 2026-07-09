@@ -1186,9 +1186,10 @@ func TestPlanViewPills(t *testing.T) {
 			t.Fatalf("claim rendering missing %q:\n%s", want, out)
 		}
 	}
-	// (5) the change-doc link resolves; a task with only a design Doc and no
-	// resolved change doc falls back to muted text (no dead link).
-	if !strings.Contains(out, `<a href="/submodule/alpha/doc/bee-imp.md">change doc</a>`) {
+	// (5) the change-doc link resolves (threaded with ?from=plan so the doc
+	// viewer's breadcrumb names the plan as the entry route); a task with only a
+	// design Doc and no resolved change doc falls back to muted text (no dead link).
+	if !strings.Contains(out, `<a href="/submodule/alpha/doc/bee-imp.md?from=plan">change doc</a>`) {
 		t.Fatalf("change-doc link missing:\n%s", out)
 	}
 	if !strings.Contains(out, `<span class="muted">docs/tasks/fin.md</span>`) {
@@ -1215,7 +1216,7 @@ func TestPlanChangeDocLink(t *testing.T) {
 		t.Fatalf("plan %d: %s", w.Code, w.Body)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `href="/submodule/alpha/doc/bee-t1.md"`) {
+	if !strings.Contains(body, `href="/submodule/alpha/doc/bee-t1.md?from=plan"`) {
 		t.Fatalf("t1 change-doc link missing:\n%s", body)
 	}
 	if strings.Contains(body, "/doc/bee-missing.md") {
@@ -1259,7 +1260,7 @@ func TestPlanChangeDocLinkFallsBackToDesignDoc(t *testing.T) {
 		t.Fatalf("plan %d: %s", w.Code, w.Body)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `href="/submodule/alpha/doc/tasks/haswork.md"`) {
+	if !strings.Contains(body, `href="/submodule/alpha/doc/tasks/haswork.md?from=plan"`) {
 		t.Fatalf("nested design-doc fallback link missing:\n%s", body)
 	}
 	if strings.Contains(body, "/doc/tasks/missing.md") {
@@ -2368,7 +2369,7 @@ func TestBranchesDocLink(t *testing.T) {
 
 	w := get(t, s, "/submodule/alpha/branches")
 	body := w.Body.String()
-	if !strings.Contains(body, `href="/submodule/alpha/doc/bee-doc.md"`) {
+	if !strings.Contains(body, `href="/submodule/alpha/doc/bee-doc.md?from=branches"`) {
 		t.Fatalf("resolved change-doc link missing:\n%s", body)
 	}
 	if strings.Contains(body, "/doc/missing.md") {
@@ -2393,6 +2394,163 @@ func TestDocViewGuards(t *testing.T) {
 	}
 	if w := get(t, s, "/submodule/alpha/doc/nope.md"); w.Code != http.StatusNotFound {
 		t.Fatalf("missing doc: got %d, want 404", w.Code)
+	}
+}
+
+// breadcrumbHTML extracts just the breadcrumb <nav>…</nav> fragment from a page
+// body so crumb assertions are scoped to the trail and never accidentally match
+// the always-present top-nav bar (which also links "/" and "/stats") or, on a
+// submodule-hierarchy page, page-chrome-title-favicon's own aria-current on the
+// top-nav. Empty means the page rendered no breadcrumb.
+func breadcrumbHTML(t *testing.T, body string) string {
+	t.Helper()
+	const open = `<nav class="breadcrumb" aria-label="breadcrumb">`
+	i := strings.Index(body, open)
+	if i < 0 {
+		return ""
+	}
+	rest := body[i:]
+	j := strings.Index(rest, "</nav>")
+	if j < 0 {
+		t.Fatalf("unterminated breadcrumb nav:\n%s", rest)
+	}
+	return rest[:j+len("</nav>")]
+}
+
+// TestDocViewBreadcrumbMultiEntry is breadcrumb-trail-landing's core fix: the doc
+// viewer's trail reflects whichever page ACTUALLY linked to it (the threaded
+// `from` token) instead of the old hardcoded "← <name> commits" back-link, which
+// was wrong for every entry point except the branch graph. Each case asserts the
+// entry crumb, the aria-current terminal crumb, the <nav aria-label="breadcrumb">
+// landmark, and — as a regression guard — that the old hardcoded arrow link is
+// gone and no unrelated entry crumb leaks in. Assertions are scoped to the
+// breadcrumb fragment so the top-nav's own /stats and / links never mask a bug.
+func TestDocViewBreadcrumbMultiEntry(t *testing.T) {
+	s, root := setup(t)
+	docsDir := filepath.Join(root, "submodules", "alpha", "docs")
+	os.MkdirAll(docsDir, 0o755)
+	os.WriteFile(filepath.Join(docsDir, "bee-doc.md"), []byte("# Doc\n"), 0o644)
+
+	// entry is the intermediate crumb each `from` token must render; sub is whether
+	// the dashboard>name submodule crumb is present (dropped only for the global
+	// /stats entry). An empty/unknown token defaults to the submodule page.
+	cases := []struct {
+		from  string
+		entry string
+		sub   bool
+	}{
+		{from: "plan", entry: `<a href="/submodule/alpha/plan">plan</a>`, sub: true},
+		{from: "docs", entry: `<a href="/submodule/alpha/docs">docs</a>`, sub: true},
+		{from: "branches", entry: `<a href="/submodule/alpha/branches">commits</a>`, sub: true},
+		{from: "stats", entry: `<a href="/stats">stats</a>`, sub: false},
+		{from: "", entry: "", sub: true},      // unknown/absent -> submodule page default
+		{from: "bogus", entry: "", sub: true}, // unrecognized token -> same default
+	}
+	// The full set of possible entry crumbs, to assert NON-selected ones are absent.
+	allEntries := map[string]string{
+		"plan":     `<a href="/submodule/alpha/plan">plan</a>`,
+		"docs":     `<a href="/submodule/alpha/docs">docs</a>`,
+		"branches": `<a href="/submodule/alpha/branches">commits</a>`,
+		"stats":    `<a href="/stats">stats</a>`,
+	}
+	for _, c := range cases {
+		url := "/submodule/alpha/doc/bee-doc.md"
+		if c.from != "" {
+			url += "?from=" + c.from
+		}
+		w := get(t, s, url)
+		if w.Code != 200 {
+			t.Fatalf("from=%q: doc view %d: %s", c.from, w.Code, w.Body)
+		}
+		body := w.Body.String()
+		bc := breadcrumbHTML(t, body)
+		if bc == "" {
+			t.Fatalf("from=%q: missing breadcrumb landmark:\n%s", c.from, body)
+		}
+		// Terminal current crumb (the file), exactly one aria-current, rooted at
+		// the dashboard — all within the breadcrumb fragment.
+		if !strings.Contains(bc, `<span aria-current="page">bee-doc.md</span>`) {
+			t.Fatalf("from=%q: missing aria-current terminal crumb:\n%s", c.from, bc)
+		}
+		if n := strings.Count(bc, "aria-current"); n != 1 {
+			t.Fatalf("from=%q: aria-current count = %d, want 1:\n%s", c.from, n, bc)
+		}
+		if !strings.Contains(bc, `<a href="/">dashboard</a>`) {
+			t.Fatalf("from=%q: breadcrumb not rooted at the dashboard:\n%s", c.from, bc)
+		}
+		// The old hardcoded "← <name> commits" back-link must be gone entirely.
+		if strings.Contains(body, "&larr;") {
+			t.Fatalf("from=%q: old hardcoded arrow back-link still present:\n%s", c.from, body)
+		}
+		// The selected entry crumb is present; the submodule crumb tracks c.sub.
+		if c.entry != "" && !strings.Contains(bc, c.entry) {
+			t.Fatalf("from=%q: missing entry crumb %q:\n%s", c.from, c.entry, bc)
+		}
+		subCrumb := `<a href="/submodule/alpha">alpha</a>`
+		if c.sub && !strings.Contains(bc, subCrumb) {
+			t.Fatalf("from=%q: missing submodule crumb:\n%s", c.from, bc)
+		}
+		if !c.sub && strings.Contains(bc, subCrumb) {
+			t.Fatalf("from=%q: submodule crumb should be dropped for the global /stats entry:\n%s", c.from, bc)
+		}
+		// No OTHER entry crumb leaks in (e.g. plan must not show the commits link).
+		for tok, crumb := range allEntries {
+			if crumb == c.entry {
+				continue
+			}
+			if strings.Contains(bc, crumb) {
+				t.Fatalf("from=%q: unrelated entry crumb for %q leaked:\n%s", c.from, tok, bc)
+			}
+		}
+	}
+}
+
+// TestBreadcrumbScoping locks the "every NON-dashboard page" boundary: the
+// dashboard is the root and renders no trail, while a page one level down (the
+// submodule explorer) renders the landmark rooted at the dashboard with itself
+// the aria-current leaf.
+func TestBreadcrumbScoping(t *testing.T) {
+	s, _ := setup(t)
+	if home := get(t, s, "/").Body.String(); strings.Contains(home, `aria-label="breadcrumb"`) {
+		t.Fatalf("dashboard (the root) must not render a breadcrumb:\n%s", home)
+	}
+	bc := breadcrumbHTML(t, get(t, s, "/submodule/alpha").Body.String())
+	if bc == "" {
+		t.Fatal("submodule page missing breadcrumb landmark")
+	}
+	if !strings.Contains(bc, `<a href="/">dashboard</a>`) {
+		t.Fatalf("submodule breadcrumb not rooted at the dashboard:\n%s", bc)
+	}
+	if !strings.Contains(bc, `<span aria-current="page">alpha</span>`) {
+		t.Fatalf("submodule page is not its own aria-current leaf:\n%s", bc)
+	}
+}
+
+// TestSessionViewBreadcrumbDeep covers the deepest trail in the hierarchy: a
+// session view hangs four levels down (dashboard > name > sessions > branch),
+// with every ancestor a working link and the branch the aria-current leaf.
+func TestSessionViewBreadcrumbDeep(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/submodule/alpha/session/bee-deep-42")
+	if w.Code != 200 {
+		t.Fatalf("session view %d: %s", w.Code, w.Body)
+	}
+	bc := breadcrumbHTML(t, w.Body.String())
+	if bc == "" {
+		t.Fatal("session view missing breadcrumb landmark")
+	}
+	for _, want := range []string{
+		`<a href="/">dashboard</a>`,
+		`<a href="/submodule/alpha">alpha</a>`,
+		`<a href="/submodule/alpha/sessions">sessions</a>`,
+		`<span aria-current="page">bee-deep-42</span>`,
+	} {
+		if !strings.Contains(bc, want) {
+			t.Fatalf("session breadcrumb missing %q:\n%s", want, bc)
+		}
+	}
+	if n := strings.Count(bc, "aria-current"); n != 1 {
+		t.Fatalf("aria-current count = %d, want exactly 1 (the branch leaf):\n%s", n, bc)
 	}
 }
 
@@ -2421,11 +2579,12 @@ func TestDocExplorerListsWholeTree(t *testing.T) {
 		"/submodule/alpha/doc/tasks/some-task.md",
 	}
 	for _, href := range links {
-		if !strings.Contains(body, `href="`+href+`"`) {
+		if !strings.Contains(body, `href="`+href+`?from=docs"`) {
 			t.Fatalf("doc explorer missing link %q:\n%s", href, body)
 		}
 	}
-	// The links must actually resolve through the existing doc viewer.
+	// The links must actually resolve through the existing doc viewer (the base
+	// path resolves regardless of the from hint).
 	for _, href := range links {
 		if d := get(t, s, href); d.Code != 200 {
 			t.Fatalf("doc viewer %s: got %d, want 200: %s", href, d.Code, d.Body)
@@ -2710,7 +2869,7 @@ func TestComputeStatsDeliveryLinks(t *testing.T) {
 	if !strings.Contains(body, `href="/submodule/alpha/commit/`+flipSHA+`"`) {
 		t.Fatalf("stats missing hive flip link:\n%s", body)
 	}
-	if !strings.Contains(body, `href="/submodule/alpha/doc/bee-dt1.md"`) {
+	if !strings.Contains(body, `href="/submodule/alpha/doc/bee-dt1.md?from=stats"`) {
 		t.Fatalf("stats missing change-doc link:\n%s", body)
 	}
 	if strings.Contains(body, "/submodule/beta/commit/") {
@@ -5668,13 +5827,36 @@ func TestFaviconEmbeddedAndServed(t *testing.T) {
 	}
 }
 
+// topNavHTML extracts just the top <nav class="nav">…</nav> bar fragment from a
+// page body, so an aria-current assertion about the top-nav never accidentally
+// matches breadcrumb-trail-landing's OWN aria-current on a page's breadcrumb
+// trail terminal crumb (a distinct <nav aria-label="breadcrumb"> landmark that
+// legitimately carries aria-current="page" on submodule-hierarchy pages).
+func topNavHTML(t *testing.T, body string) string {
+	t.Helper()
+	const open = `<nav class="nav">`
+	i := strings.Index(body, open)
+	if i < 0 {
+		t.Fatalf("missing top-nav landmark:\n%s", body)
+	}
+	rest := body[i:]
+	j := strings.Index(rest, "</nav>")
+	if j < 0 {
+		t.Fatalf("unterminated top-nav:\n%s", rest)
+	}
+	return rest[:j+len("</nav>")]
+}
+
 // TestNavAriaCurrentOptional is the (optional, Finding #11) half-step this
 // task invites alongside the title/favicon fix: the top-nav link matching the
 // current top-level section carries aria-current="page" and no other link
-// does. It is a distinct <nav> landmark from breadcrumb-nav-trail's own
+// does. It is a distinct <nav> landmark from breadcrumb-trail-landing's own
 // aria-current on its trail's terminal crumb, so the two never collide on the
-// same element. A submodule-scoped page (not one of the 7 top-nav routes)
-// marks no top-nav link current at all.
+// same element — assertions about the top-nav are scoped to its own fragment
+// (topNavHTML) so they never trip over a page's separate breadcrumb landmark.
+// A submodule-scoped page (not one of the 7 top-nav routes) marks no top-nav
+// link current at all (its OWN breadcrumb trail legitimately marks its terminal
+// crumb current — a different landmark this test does not inspect).
 func TestNavAriaCurrentOptional(t *testing.T) {
 	s, _ := setup(t)
 	dashboard := get(t, s, "/").Body.String()
@@ -5693,9 +5875,13 @@ func TestNavAriaCurrentOptional(t *testing.T) {
 		t.Fatalf("stats should not mark dashboard current:\n%s", stats)
 	}
 
-	// A submodule-scoped page is not one of the 7 top-nav routes: none light up.
+	// A submodule-scoped page is not one of the 7 top-nav routes: none light up
+	// in the TOP-NAV landmark specifically. Scoped to topNavHTML because the
+	// plan page's own breadcrumb trail (breadcrumb-trail-landing) legitimately
+	// carries aria-current="page" on its terminal "plan" crumb — a distinct
+	// landmark from the top-nav bar this test targets.
 	plan := get(t, s, "/submodule/alpha/plan").Body.String()
-	if strings.Contains(plan, `aria-current="page"`) {
-		t.Fatalf("plan page should not mark any top-nav link current:\n%s", plan)
+	if nav := topNavHTML(t, plan); strings.Contains(nav, `aria-current="page"`) {
+		t.Fatalf("plan page should not mark any top-nav link current:\n%s", nav)
 	}
 }

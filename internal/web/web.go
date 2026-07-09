@@ -844,10 +844,11 @@ func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {
 	// present files' rendered content — the index is what makes an absent member
 	// reachable). Driven by the declared set, not the directory listing.
 	s.render(w, "explorer.html", map[string]interface{}{
-		"Name":  sm.Name,
-		"Docs":  docs,
-		"Files": optionalFileLinks(sm),
-		"Title": pageTitle(sm.Name),
+		"Name":   sm.Name,
+		"Docs":   docs,
+		"Files":  optionalFileLinks(sm),
+		"Title":  pageTitle(sm.Name),
+		"Crumbs": explorerCrumbs(sm.Name),
 	})
 }
 
@@ -888,6 +889,7 @@ func (s *Server) branches(w http.ResponseWriter, r *http.Request) {
 		"Next":     off + lim,
 		"HasNext":  len(cs) == lim, // a full page may have more
 		"Title":    pageTitle("commits", sm.Name),
+		"Crumbs":   branchesCrumbs(sm.Name),
 	})
 }
 
@@ -918,7 +920,8 @@ func (s *Server) doc(w http.ResponseWriter, r *http.Request) {
 	}
 	s.render(w, "doc_view.html", map[string]interface{}{
 		"Name": sm.Name, "File": file, "Body": renderMarkdown(string(b)),
-		"Title": pageTitle(file, sm.Name),
+		"Title":  pageTitle(file, sm.Name),
+		"Crumbs": docCrumbs(sm.Name, r.URL.Query().Get("from"), file),
 	})
 }
 
@@ -947,6 +950,7 @@ func (s *Server) docExplorer(w http.ResponseWriter, r *http.Request) {
 		"Name":     sm.Name,
 		"Sections": sectionDocs(entries),
 		"Title":    pageTitle("docs", sm.Name),
+		"Crumbs":   docsCrumbs(sm.Name),
 	})
 }
 
@@ -977,7 +981,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 			p.Items[i].DocHref = resolveDocHref(sm, p.Items[i].Doc)
 		}
 	}
-	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p, "Title": pageTitle("plan", sm.Name)})
+	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p, "Title": pageTitle("plan", sm.Name), "Crumbs": planCrumbs(sm.Name)})
 }
 
 // planDelete removes a submodule's PLAN.md and publishes the deletion, so the

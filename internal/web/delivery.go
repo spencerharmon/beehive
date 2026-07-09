@@ -245,5 +245,6 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 		"Subject": f[2],
 		"Patch":   patch,
 		"Title":   pageTitle("commit", shortSHA, sm.Name),
+		"Crumbs":  commitCrumbs(sm.Name, shortSHA),
 	})
 }
