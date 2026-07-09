@@ -7210,3 +7210,30 @@ func TestSessionListRowWraps(t *testing.T) {
 		t.Fatalf("style.css missing ul.sessions .ago right-align rule (timestamp push):\n%s", css)
 	}
 }
+
+// TestStatusbarRowWraps is panel-statusbar-flex-wrap: the shared .statusbar row
+// (used verbatim by editor_panel.html, chatedit_panel.html, and
+// human_resolve_panel.html) is display:flex with no flex-wrap, so a real-length
+// status message paired with the primary Approve/Reject/Merge/Publish action
+// buttons overflows horizontally at narrow/mobile widths instead of reflowing —
+// the same bug class session-list-row-flex-wrap fixed for ul.sessions li. The fix
+// adds flex-wrap: wrap to .statusbar (one rule, style.css only), matching the
+// codebase's multi-item wrap convention (.card-meta, .chips, ul.sessions li, etc).
+// There is no browser here, so this checks the embedded-stylesheet contract.
+func TestStatusbarRowWraps(t *testing.T) {
+	s, _ := setup(t)
+	css := get(t, s, "/assets/style.css").Body.String()
+
+	const sel = ".statusbar {"
+	start := strings.Index(css, sel)
+	if start < 0 {
+		t.Fatalf("style.css missing %q rule:\n%s", sel, css)
+	}
+	rule := css[start : start+strings.Index(css[start:], "}")]
+	if !strings.Contains(rule, "flex-wrap: wrap") {
+		t.Fatalf(".statusbar must carry flex-wrap: wrap so the action row reflows at narrow widths:\n%s", rule)
+	}
+	if !strings.Contains(rule, "display: flex") {
+		t.Fatalf(".statusbar must remain display: flex:\n%s", rule)
+	}
+}

@@ -643,7 +643,7 @@ section { margin: var(--space-5) 0; }
 }
 .msg.busy .spinner { color: var(--text-muted); font-style: italic; }
 
-.statusbar { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
+.statusbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
 .state { padding: 0.12em 0.6em; border-radius: var(--radius-pill); font-weight: 700; font-size: var(--text-xs); }
 /* Solid white-text fills: the dedicated --badge-solid-* tokens (NOT --danger/
    --success directly — see their :root definitions), same as the equivalent
