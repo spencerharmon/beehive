@@ -19,8 +19,15 @@
 {{end}}
 </section>
 {{end}}
+{{define "cache-widget"}}
+<section id="cache-widget" class="card" aria-label="view cache">
+<h3>view cache</h3>
+<p><span class="badge">{{.Lookups}}</span> lookups &middot; <span class="badge">{{.Misses}}</span> misses &middot; <span class="badge">{{printf "%.1f%%" .HitRatePct}}</span> hit-rate</p>
+<p class="muted">Live process-lifetime gauge of the frontend's parse cache (cache.go) — an ephemeral in-memory count, not a stored metric; it resets to 0 on every restart. Lookups = cache reads attempted; misses = reads that had to re-parse; hit-rate = the rest, served from memory.</p>
+</section>
+{{end}}
 {{template "header" .}}
 <h1>Hive hygiene</h1>
 <p class="muted">Read-only scan of the git cruft that accumulates under updateInstead. Diagnostic only — nothing here is mutated; the operator triggers any fix.</p>
-<div class="cards">{{template "hygiene-widget" .Hygiene}}</div>
+<div class="cards">{{template "hygiene-widget" .Hygiene}}{{template "cache-widget" .Cache}}</div>
 {{template "footer"}}

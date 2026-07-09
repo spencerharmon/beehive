@@ -54,6 +54,37 @@ func (h Hygiene) Total() int {
 // Clean reports whether the scan found no cruft at all (and did not error).
 func (h Hygiene) Clean() bool { return h.Err == "" && h.Total() == 0 }
 
+// CacheStats is the /hygiene page's view-cache widget data: a live,
+// process-lifetime snapshot of the frontend's parse-once cache (see
+// viewCache in cache.go) — lookups, hits, and misses — plus the derived
+// hit-rate a bare miss count can't express on its own. It is a process gauge,
+// not a stored metric: it resets to zero on every restart, same as the cache
+// counters it reads, and the widget labels it as such rather than implying
+// history. Additive and read-only — building it never touches the cache, only
+// reads its counters.
+type CacheStats struct {
+	Lookups int
+	Hits    int
+	Misses  int
+}
+
+// HitRatePct is the derived hit-rate as a 0-100 percentage. It reports 0 before
+// any lookup has happened rather than dividing 0/0, so an idle-since-restart
+// process shows "0%" instead of a misleading NaN or 100%.
+func (c CacheStats) HitRatePct() float64 {
+	if c.Lookups == 0 {
+		return 0
+	}
+	return 100 * float64(c.Hits) / float64(c.Lookups)
+}
+
+// cacheStats snapshots cache's Lookups/Hits/Misses counters into the page-data
+// shape the hygiene template renders. Read-only: it only calls the cache's
+// existing read accessors, never mutates it.
+func cacheStats(cache *viewCache) CacheStats {
+	return CacheStats{Lookups: cache.Lookups(), Hits: cache.Hits(), Misses: cache.Misses()}
+}
+
 // scanHygiene performs a READ-ONLY sweep of the beehive repo for the git cruft
 // that accumulates under updateInstead, returning a per-class drill-down. It
 // MUTATES NOTHING: every git invocation is a query (worktree list, ls-files,

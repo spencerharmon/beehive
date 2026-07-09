@@ -3293,6 +3293,56 @@ func TestHygieneCleanAndWidget(t *testing.T) {
 	}
 }
 
+// TestHygieneCacheWidget proves the /hygiene page surfaces the view-cache
+// performance gauge (Finding #16 / ui-audit-003): the parse cache's Misses()
+// counter is computed but was never rendered anywhere, so an operator could not
+// see the cache degrading. This drives real cache traffic through s.planView
+// (one miss, then one cache-served hit at the same HEAD) and asserts both the
+// counters themselves and the rendered /hygiene body carry the exact resulting
+// lookups/misses/hit-rate — i.e. the widget's numbers are the live viewCache
+// counters, not a placeholder.
+func TestHygieneCacheWidget(t *testing.T) {
+	s, root := setup(t)
+	commitAll(t, root, "init") // give the repo a HEAD so the cache engages
+	path := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	head := s.headSHA(context.Background())
+	if head == "" {
+		t.Fatal("no HEAD after seed commit")
+	}
+	if _, err := s.planView(head, path, time.Now(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	// Second read at the same HEAD is served from cache: a hit, not a miss.
+	if _, err := s.planView(head, path, time.Now(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cache.Lookups(); got != 2 {
+		t.Fatalf("lookups = %d, want 2", got)
+	}
+	if got := s.cache.Misses(); got != 1 {
+		t.Fatalf("misses = %d, want 1", got)
+	}
+	if got := s.cache.Hits(); got != 1 {
+		t.Fatalf("hits = %d, want 1", got)
+	}
+
+	w := get(t, s, "/hygiene")
+	if w.Code != 200 {
+		t.Fatalf("hygiene %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`id="cache-widget"`, "view cache",
+		`<span class="badge">2</span> lookups`,
+		`<span class="badge">1</span> misses`,
+		`<span class="badge">50.0%</span> hit-rate`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("hygiene page missing %q:\n%s", want, body)
+		}
+	}
+}
+
 // TestComputeStats checks the git-derived honeybee-performance figures behind the
 // /stats view: delivered = PLAN [DONE], sessions = transcript files, distinct
 // tasks and the derived ratios — all read live, nothing stored.

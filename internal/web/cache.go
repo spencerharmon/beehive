@@ -41,10 +41,11 @@ import (
 // documented ceiling, not a silent cliff (correctness is unaffected — only the
 // hit-rate).
 type viewCache struct {
-	mu   sync.Mutex
-	gen  string         // HEAD the cached entries were parsed at
-	ents map[string]any // key -> parsed value for the current generation
-	miss int            // loader invocations (cache misses); read via Misses()
+	mu      sync.Mutex
+	gen     string         // HEAD the cached entries were parsed at
+	ents    map[string]any // key -> parsed value for the current generation
+	lookups int            // cachedView calls that engaged the cache (hit or miss); read via Lookups()
+	miss    int            // loader invocations (cache misses); read via Misses()
 }
 
 // newViewCache builds an empty cache. Generations are supplied per call by the
@@ -57,11 +58,34 @@ func newViewCache() *viewCache {
 // cache's life. Repeated reads within one HEAD generation add zero; a commit
 // (a new head passed in) forces the next read to reload and increments it. Used
 // by tests to prove parse-once + commit-invalidation, and usable as a cheap
-// metric.
+// metric. Unchanged by the Lookups/Hits addition below — same counter, same
+// increment site, same semantics existing tests assert on.
 func (c *viewCache) Misses() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.miss
+}
+
+// Lookups reports how many cachedView calls actually engaged the cache (served
+// from an existing entry OR triggered a loader run) over the cache's life. A
+// bypassed call (empty head — see cachedView) never touches the cache at all, so
+// it counts toward neither Lookups nor Misses; that keeps Hits (below) exactly
+// equal to Lookups-Misses with no separate bookkeeping to drift out of sync.
+// Lookups is the denominator a hit-rate needs; Misses (or Hits) is the numerator.
+func (c *viewCache) Lookups() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lookups
+}
+
+// Hits reports how many lookups were served from the cache without invoking the
+// loader (Lookups-Misses, read under one lock so the two counters can't be
+// observed mid-update). Used, alongside Lookups and Misses, as the frontend's
+// process-lifetime cache-health gauge (surfaced on /hygiene).
+func (c *viewCache) Hits() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lookups - c.miss
 }
 
 // cachedView returns the memoized value for key in generation head, invoking
@@ -72,9 +96,11 @@ func (c *viewCache) Misses() int {
 // different heads never read each other's data (at worst they reparse — benign,
 // self-healing thrash). An empty head (a repo with no commits yet, HEAD
 // unresolvable) bypasses the cache and loads fresh — the frontend never serves a
-// value it cannot key to a commit. Errors are not cached (a transient read must
-// not be pinned for the generation). load runs under the lock, giving
-// single-flight: concurrent misses on the same key parse once.
+// value it cannot key to a commit; this path also skips the Lookups/Hits/Misses
+// counters (see Lookups) since it never touches the cache they describe. Errors
+// are not cached (a transient read must not be pinned for the generation). load
+// runs under the lock, giving single-flight: concurrent misses on the same key
+// parse once.
 func cachedView[T any](head string, c *viewCache, key string, load func() (T, error)) (T, error) {
 	if head == "" {
 		return load()
@@ -85,6 +111,7 @@ func cachedView[T any](head string, c *viewCache, key string, load func() (T, er
 		c.gen = head
 		c.ents = map[string]any{}
 	}
+	c.lookups++
 	if v, ok := c.ents[key]; ok {
 		return v.(T), nil
 	}
