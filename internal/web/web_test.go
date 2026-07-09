@@ -382,6 +382,55 @@ func TestFormInputsHaveAccessibleNames(t *testing.T) {
 	}
 }
 
+// TestSkipToContentLink locks skip-to-content-link: the layout renders a "Skip
+// to content" link as the FIRST focusable element in <body> (before the top
+// nav) that jumps to <main id="main">, so a keyboard/AT user can bypass the 7
+// identical top-nav links a11y-tabbed on every page load. The reveal styling
+// reuses the .sr-only visually-hidden utility (grouped into the one rule, no
+// second hidden-text definition) and un-hides only on focus via
+// .skip-link:focus, introducing no new color literal.
+func TestSkipToContentLink(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String() // dashboard renders the full layout shell
+
+	// The skip link is present, targets #main, and reads "Skip to content".
+	if !strings.Contains(page, `<a class="skip-link" href="#main">Skip to content</a>`) {
+		t.Fatalf("layout missing the skip-to-content link:\n%s", page)
+	}
+	// It is the FIRST focusable element in <body>: it appears before the topbar
+	// nav (whose 7 links a keyboard user would otherwise tab through first).
+	body := page[strings.Index(page, "<body>"):]
+	skip := strings.Index(body, `class="skip-link"`)
+	nav := strings.Index(body, `class="topbar"`)
+	if skip < 0 || nav < 0 || skip > nav {
+		t.Fatalf("skip link is not positioned before the nav (skip=%d nav=%d):\n%s", skip, nav, body)
+	}
+	// The jump target: <main> carries id="main"; tabindex="-1" makes the
+	// non-interactive landmark programmatically focusable so focus lands in main
+	// after activation.
+	if !strings.Contains(page, `<main class="container" id="main" tabindex="-1">`) {
+		t.Fatalf("main landmark missing the id=\"main\" jump target:\n%s", page)
+	}
+
+	// CSS: the skip link reuses the .sr-only visually-hidden base (grouped into
+	// the one rule) and reveals itself only on focus.
+	css := get(t, s, "/assets/style.css").Body.String()
+	if !strings.Contains(css, ".skip-link,") {
+		t.Fatalf("skip link does not reuse the grouped .sr-only visually-hidden rule:\n%s", css)
+	}
+	if !strings.Contains(css, ".skip-link:focus {") {
+		t.Fatalf("skip link missing its reveal-on-focus rule:\n%s", css)
+	}
+	// The reveal rule stays token-driven — it introduces no color literal (the
+	// design system flips colours via :root tokens only), so it "adds no new
+	// color token".
+	fs := strings.Index(css, ".skip-link:focus {")
+	revealRule := css[fs : fs+strings.Index(css[fs:], "}")]
+	if strings.Contains(revealRule, "#") || strings.Contains(revealRule, "hsl(") {
+		t.Fatalf("skip-link reveal must be token-driven, no color literal:\n%s", revealRule)
+	}
+}
+
 func TestDashboard(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/")
