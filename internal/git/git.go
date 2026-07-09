@@ -422,6 +422,34 @@ func (r *Repo) LsRemoteBranch(ctx context.Context, remote, branch string) (strin
 	return fields[0], nil
 }
 
+// ListRemoteBranches returns the branch names on remote whose ref matches
+// pattern (a `git ls-remote --heads` glob, e.g. "edit-*"), read from the
+// remote's live ref advertisement — no fetch, no local object needed. It is the
+// plural counterpart of LsRemoteBranch: discover WHICH of an unknown set of
+// branches (e.g. every editor session ever pushed for durability) a remote
+// currently carries, rather than checking one named branch. Empty (nil, nil)
+// when nothing matches.
+func (r *Repo) ListRemoteBranches(ctx context.Context, remote, pattern string) ([]string, error) {
+	out, err := r.Run(ctx, "ls-remote", "--heads", remote, pattern)
+	if err != nil {
+		return nil, err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return nil, nil
+	}
+	var names []string
+	for _, line := range strings.Split(out, "\n") {
+		// "<sha>\trefs/heads/<name>" per line.
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		names = append(names, strings.TrimPrefix(fields[1], "refs/heads/"))
+	}
+	return names, nil
+}
+
 // IsAncestor reports whether commit maybe is contained in ref's history (an
 // ancestor of, or equal to, ref). It wraps `git merge-base --is-ancestor`, which
 // exits 0 for true and 1 for false; any other exit (e.g. a bad object) is a real

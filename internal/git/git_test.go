@@ -785,6 +785,67 @@ func TestSourceBranchReclaimVerbs(t *testing.T) {
 	}
 }
 
+// TestListRemoteBranchesFiltersByPattern proves ListRemoteBranches (chat-diff-
+// session-durability's remote-recovery discovery verb) returns exactly the
+// branches matching the given ls-remote glob, never anything outside it.
+func TestListRemoteBranchesFiltersByPattern(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "f", "v1\n", "v1")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push main: %v", err)
+	}
+	for _, br := range []string{"edit-foo-1", "edit-bar-2", "bee-something-3"} {
+		if _, err := a.Run(ctx, "checkout", "-q", "-b", br); err != nil {
+			t.Fatalf("checkout %s: %v", br, err)
+		}
+		if err := a.Push(ctx, "origin", br); err != nil {
+			t.Fatalf("push %s: %v", br, err)
+		}
+		if _, err := a.Run(ctx, "checkout", "-q", "main"); err != nil {
+			t.Fatalf("checkout main: %v", err)
+		}
+	}
+
+	got, err := a.ListRemoteBranches(ctx, "origin", "edit-*")
+	if err != nil {
+		t.Fatalf("ListRemoteBranches: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 matches, got %v", got)
+	}
+	byName := map[string]bool{}
+	for _, n := range got {
+		byName[n] = true
+	}
+	if !byName["edit-foo-1"] || !byName["edit-bar-2"] {
+		t.Fatalf("ListRemoteBranches = %v, want edit-foo-1 and edit-bar-2", got)
+	}
+	if byName["bee-something-3"] {
+		t.Fatalf("ListRemoteBranches must not match non-edit branches: %v", got)
+	}
+}
+
+// TestListRemoteBranchesEmptyWhenNoMatch confirms no matches is a clean
+// (nil, nil), not an error — a bare remote with only "main" is the common case.
+func TestListRemoteBranchesEmptyWhenNoMatch(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "f", "v1\n", "v1")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push main: %v", err)
+	}
+	got, err := a.ListRemoteBranches(ctx, "origin", "edit-*")
+	if err != nil {
+		t.Fatalf("ListRemoteBranches: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("want no matches, got %v", got)
+	}
+}
+
 // TestCommitExists locks the pure local object-store check PushBranchReconciled
 // and the review-dispatch reachability guard are built on: a real commit
 // resolves true, a well-formed-but-absent sha resolves false (not an error —
