@@ -1,7 +1,9 @@
 <div class="editor-grid">
   <div class="chat" id="chatedit-chat" data-scroll-preserve data-scroll-pin>
-    {{range .Log}}<div class="msg {{.Role}}"><span class="who">{{.Role}}</span> {{.Text}}</div>{{else}}<p class="muted">Say what you'd like to change in {{.Path}}.</p>{{end}}
-    {{if .Busy}}<div class="msg agent busy"><span class="who">agent</span> <span class="spinner">thinking…</span></div>{{end}}
+    {{if .ConnState}}<div class="conn-state {{.ConnState}}" role="status" aria-live="polite">{{.ConnLabel}}</div>{{end}}
+    {{range .Log}}<div class="msg {{.Role}}"><span class="who">{{.Role}}</span>{{range .Parts}}{{template "agent-step" .}}{{end}}{{if .Text}} {{.Text}}{{end}}</div>
+    {{else}}<p class="muted">Say what you'd like to change in {{.Path}}.</p>{{end}}
+    {{if .Busy}}<div class="msg agent busy"><span class="who">agent</span>{{range .LiveSteps}}{{template "agent-step" .}}{{else}}<span class="spinner">Working…</span>{{end}}</div>{{end}}
     {{if .Error}}<div class="msg err">⚠️ {{.Error}}</div>{{end}}
   </div>
   <div class="diffpane">
@@ -15,3 +17,16 @@
 {{else}}<span class="muted">no changes proposed yet</span>{{end}}</pre>
   </div>
 </div>
+
+{{/* agent-step renders ONE reasoning/tool-call item as a native, expandable
+     <details> (no JS, no SPA — same convention as the inline-edit affordances
+     in style.css): every agent output item is shown, not just the final text,
+     with its live status visible in the summary WITHOUT expanding
+     (chat-editor-snappy-polish). Shared by a log entry's persisted Parts and
+     the in-flight turn's LiveSteps, so a step looks identical live and after
+     the turn settles. */}}
+{{define "agent-step"}}<details class="agent-step">
+  <summary><span class="step-kind">{{if eq .Type "reasoning"}}Reasoning{{else}}<b>{{.Tool}}</b>{{if .Title}} — {{.Title}}{{end}}{{end}}</span>{{if .Status}}<span class="step-status {{.Status}}">{{.Status}}</span>{{end}}</summary>
+  {{if eq .Type "reasoning"}}<p>{{.Text}}</p>{{else}}{{if .Input}}<p class="step-input">{{range $k, $v := .Input}}<b>{{$k}}:</b> {{$v}} {{end}}</p>{{end}}{{if .Output}}<pre>{{.Output}}</pre>{{end}}{{if .Error}}<p class="err">{{.Error}}</p>{{end}}{{end}}
+</details>
+{{end}}

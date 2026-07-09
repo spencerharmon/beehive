@@ -102,6 +102,21 @@
   --diff-del-bg: hsl(2 78% 93%);
   --diff-chg-bg: hsl(45 100% 74%);
   --diff-chg-del-bg: hsl(2 88% 78%);
+
+  /* Syntax highlighting (chat-editor-snappy-polish; light) — chosen to sit
+     clearly apart from the diff add/del backgrounds above (no green/red) so a
+     colorized token stays legible on a colored diff row too. */
+  --hl-keyword: hsl(262 55% 47%);
+  --hl-string: hsl(21 65% 38%);
+  --hl-number: hsl(200 70% 38%);
+  --hl-comment: hsl(215 14% 46%);
+  --hl-function: hsl(214 70% 42%);
+  --hl-class: hsl(38 75% 34%);
+  --hl-builtin: hsl(174 65% 30%);
+  --hl-variable: hsl(216 20% 32%);
+  --hl-decorator: hsl(320 55% 42%);
+  --hl-tag: hsl(350 60% 42%);
+  --hl-error: hsl(2 68% 42%);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -138,6 +153,20 @@
     --diff-del-bg: hsl(2 44% 28%);
     --diff-chg-bg: hsl(45 64% 34%);
     --diff-chg-del-bg: hsl(2 52% 40%);
+
+    /* Syntax highlighting (dark) — lighter/more saturated to read on the dark
+       surface tokens above. */
+    --hl-keyword: hsl(262 70% 74%);
+    --hl-string: hsl(21 70% 65%);
+    --hl-number: hsl(200 75% 68%);
+    --hl-comment: hsl(214 13% 62%);
+    --hl-function: hsl(214 85% 72%);
+    --hl-class: hsl(38 80% 62%);
+    --hl-builtin: hsl(174 55% 58%);
+    --hl-variable: hsl(210 20% 82%);
+    --hl-decorator: hsl(320 65% 72%);
+    --hl-tag: hsl(350 70% 72%);
+    --hl-error: hsl(2 72% 66%);
   }
 }
 
@@ -549,6 +578,106 @@ pre.diff .ln.del { background: var(--diff-del-bg); text-decoration: line-through
 pre.diff .ln.eq { background: transparent; }
 pre.diff .chg { background: var(--diff-chg-bg); border-radius: 2px; }
 pre.diff .ln.del .chg { background: var(--diff-chg-del-bg); }
+
+/* Syntax highlighting (chat-editor-snappy-polish) ------------------------- *
+ * internal/web/highlight.go buckets every chroma token into this small,
+ * curated class set (see tokenClass) instead of emitting one of chroma's ~90
+ * lexer-specific subtype codes verbatim, so the CSS stays short and every
+ * common language + markdown still colors sensibly. Applies inside pre.diff
+ * (and composes with the ln.add/del/eq row backgrounds above unchanged — a
+ * highlighted row still gets its add/del background, just with colored text
+ * instead of the plain escape). */
+.hl-kw { color: var(--hl-keyword); font-weight: 600; }
+.hl-fn { color: var(--hl-function); }
+.hl-bi { color: var(--hl-builtin); }
+.hl-var { color: var(--hl-variable); }
+.hl-cl { color: var(--hl-class); font-weight: 600; }
+.hl-dec { color: var(--hl-decorator); }
+.hl-tag { color: var(--hl-tag); }
+.hl-str { color: var(--hl-string); }
+.hl-num { color: var(--hl-number); }
+.hl-com { color: var(--hl-comment); font-style: italic; }
+.hl-op { color: var(--text-muted); }
+.hl-head { color: var(--hl-function); font-weight: 700; } /* markdown # heading */
+.hl-strong { font-weight: 700; }
+.hl-emph { font-style: italic; }
+.hl-del { color: var(--danger); text-decoration: line-through; } /* markdown ~~strike~~ */
+.hl-ins { color: var(--success); }
+.hl-err { color: var(--hl-error); text-decoration: underline wavy; }
+
+/* Chat-edit connection/turn lifecycle badge (chat-editor-snappy-polish): never
+ * strand the user on a bare spinner — connecting (worktree ready, the agent
+ * session is being created), connected (idle, ready), working (a turn is in
+ * flight) and error are NAMED, visibly distinct states, not just a spinner.
+ * Reuses the .status pill shape (an --sh-driven hue) plus a small pulsing dot
+ * borrowed from the .active claim-pulse idiom above. */
+.conn-state {
+  --sh: var(--hue-todo);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  margin-bottom: var(--space-2);
+  padding: 0.14em 0.62em;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  line-height: 1.5;
+  border-radius: var(--radius-pill);
+  background: hsl(var(--sh) var(--pill-s) var(--pill-bg-l));
+  color: hsl(var(--sh) var(--pill-fg-s) var(--pill-fg-l));
+  border: var(--border-width) solid hsl(var(--sh) var(--pill-s) var(--pill-border-l));
+}
+.conn-state::before {
+  content: "";
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  background: hsl(var(--sh) 75% 42%);
+}
+.conn-state.connecting { --sh: var(--hue-todo); }
+.conn-state.connecting::before { animation: bee-pulse-dot 1.3s ease-in-out infinite; }
+.conn-state.working { --sh: var(--hue-active); }
+.conn-state.working::before { animation: bee-pulse-dot 0.9s ease-in-out infinite; }
+.conn-state.connected { --sh: var(--hue-done); }
+.conn-state.error { --sh: var(--hue-arbitration); }
+@keyframes bee-pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .conn-state.connecting::before, .conn-state.working::before { animation: none; }
+}
+
+/* Agent output breakdown (chat-editor-snappy-polish): every reasoning/tool-
+ * call item is its own native <details> (no JS, no SPA — the same convention
+ * as the inline-edit affordances below), so its live status is visible in the
+ * summary WITHOUT expanding, and the full input/output is one click away.
+ * Shared by a log entry's persisted steps and the in-flight turn's live ones,
+ * so a step looks identical live and after the turn settles. */
+.agent-step {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-1) var(--space-2);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: var(--text-sm);
+}
+.agent-step summary { cursor: pointer; color: var(--text-muted); }
+.agent-step[open] summary { margin-bottom: var(--space-1); }
+.agent-step pre { margin: var(--space-1) 0 0; font-size: var(--text-xs); }
+.agent-step .step-input { margin: var(--space-1) 0 0; font-size: var(--text-xs); color: var(--text-muted); }
+.step-status {
+  display: inline-block;
+  margin-left: var(--space-2);
+  padding: 0.05em 0.5em;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+.step-status.completed { background: var(--badge-solid-green); color: #fff; }
+.step-status.error { background: var(--badge-solid-red); color: #fff; }
+.step-status.running, .step-status.pending { background: hsl(var(--hue-active) 58% 32%); color: #fff; }
 
 /* Narrow screens: stack the editor panes --------------------------------- */
 @media (max-width: 48rem) {

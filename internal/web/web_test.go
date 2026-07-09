@@ -2969,6 +2969,53 @@ func TestAssetsStyleHtmxPolish(t *testing.T) {
 	}
 }
 
+// TestAssetsStyleChatEditorSnappyPolish locks the CSS contract chat-editor-
+// snappy-polish depends on: a themed class for every tokenClass bucket
+// (internal/web/highlight.go), the connecting/connected/working/error badge
+// (each a DISTINCT class, not just one generic "busy" look), the expandable
+// agent-step affordance, and per-status step badges — with motion gated behind
+// prefers-reduced-motion like every other polled/animated affordance.
+func TestAssetsStyleChatEditorSnappyPolish(t *testing.T) {
+	s, _ := setup(t)
+	body := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		// Syntax highlighting: one rule per tokenClass bucket.
+		".hl-kw {", ".hl-fn {", ".hl-bi {", ".hl-var {", ".hl-cl {", ".hl-dec {",
+		".hl-tag {", ".hl-str {", ".hl-num {", ".hl-com {", ".hl-op {", ".hl-head {",
+		".hl-strong {", ".hl-emph {", ".hl-del {", ".hl-ins {", ".hl-err {",
+		// Connecting/connected/working/error badge: four VISIBLY DISTINCT states.
+		".conn-state {", ".conn-state.connecting", ".conn-state.connected",
+		".conn-state.working", ".conn-state.error",
+		// Expandable agent output + live status badges.
+		".agent-step {", ".step-status {", ".step-status.completed",
+		".step-status.error", ".step-status.running",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("style.css missing chat-editor-snappy-polish rule %q", want)
+		}
+	}
+	// The connecting/working pulse animation is motion — must respect
+	// prefers-reduced-motion, same as every other animated affordance.
+	idx := strings.Index(body, "@keyframes bee-pulse-dot")
+	if idx < 0 {
+		t.Fatal("style.css missing @keyframes bee-pulse-dot")
+	}
+	if !strings.Contains(body[idx:], "prefers-reduced-motion") {
+		t.Fatal("style.css: bee-pulse-dot animation not gated behind prefers-reduced-motion")
+	}
+	// Every new color token must be declared in BOTH the light :root and the
+	// dark override, like every existing token (light/dark differ only in
+	// values, never in rules — see the file's own header comment).
+	for _, tok := range []string{
+		"--hl-keyword", "--hl-string", "--hl-number", "--hl-comment", "--hl-function",
+		"--hl-class", "--hl-builtin", "--hl-variable", "--hl-decorator", "--hl-tag", "--hl-error",
+	} {
+		if n := strings.Count(body, tok+":"); n != 2 {
+			t.Errorf("style.css: expected %s declared exactly twice (light+dark), found %d", tok, n)
+		}
+	}
+}
+
 // hygGit runs git in dir, failing the test on error. Used to seed cruft and to
 // snapshot repo state for the read-only assertion.
 func hygGit(t *testing.T, dir string, args ...string) string {

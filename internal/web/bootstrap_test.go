@@ -333,6 +333,19 @@ func TestBootstrapAgentHandlerUnbootstrapped(t *testing.T) {
 	}
 }
 
+// TestBootstrapAgentPanelPollsRepeatedly is the chat-editor-snappy-polish
+// regression lock: the panel's wrapper must re-poll on an interval (not just
+// once on load), or a slow/working turn started via the form leaves the human
+// staring at a stale render forever — the exact "bare spinner" the ROI names.
+// Mirrors editor.html's own "load, every ..." wrapper.
+func TestBootstrapAgentPanelPollsRepeatedly(t *testing.T) {
+	s, _ := chatFixture(t, "")
+	body := get(t, s, "/bootstrap").Body.String()
+	if !strings.Contains(body, `hx-trigger="load, every`) {
+		t.Fatalf("#chatedit must poll on an interval, not just once on load:\n%s", body)
+	}
+}
+
 // TestBootstrapAgentHandlerBootstrapped proves the handler re-detects and stays
 // read-only when the repo is already set up: GET /bootstrap returns 204 with an
 // empty body and cuts NO worktree (the banner clears on its own).
