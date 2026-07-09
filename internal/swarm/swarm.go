@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/claim"
@@ -899,6 +900,20 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		rec.commit = func(c context.Context) { _ = r.streamSession(c, sessionRel) }
 		rec.commitIvl = time.Second
 	}
+	// Mid-turn hard stop. For task-bearing kinds only (work/review/arbitrate) the
+	// recorder fires guard.observe on every tool completion; once the committed
+	// completion predicate (the SAME r.complete run between turns) holds, it cancels
+	// the in-flight turn so no trailing tool call runs past the terminal flip. arm()
+	// happens per turn just before Prompt; bootstrap/reconcile leave guard nil (their
+	// predicate can read true mid-edit), so onToolDone stays unset and observe() is
+	// never wired — those kinds keep completing only on the post-turn path.
+	var guard *completionGuard
+	if hasTask(sel) {
+		guard = &completionGuard{
+			check: func() (bool, error) { return r.complete(sel, res.Branch) },
+		}
+		rec.onToolDone = guard.observe
+	}
 	// Plant the stub on main and capture the squash base BEFORE the recorder starts
 	// overwriting the file with the transcript.
 	stubCommit, err := r.startSession(ctx, sessionFile, sessionRel)
@@ -1171,15 +1186,41 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// already polling, so even the long bootstrap turn streams to the UI/debug.
 		// Bound the turn: a stalled opencode call is canceled at TurnTimeout and the
 		// task abandoned for GC, never a multi-hour zombie blocked on a dead socket.
-		turnCtx := ctx
-		cancelTurn := func() {}
+		// The base context is ALWAYS cancelable (even when TurnTimeout==0) so the
+		// completion guard can hard-stop the turn the instant the committed terminal
+		// predicate holds; the optional TurnTimeout layers its deadline on top and
+		// cancelTurn tears down both. The guard is armed with baseCancel, so a mid-
+		// turn trip surfaces as a plain context.Canceled (never DeadlineExceeded).
+		baseCtx, baseCancel := context.WithCancel(ctx)
+		turnCtx := baseCtx
+		cancelTurn := baseCancel
 		if r.TurnTimeout > 0 {
-			turnCtx, cancelTurn = context.WithTimeout(ctx, r.TurnTimeout)
+			var toCancel context.CancelFunc
+			turnCtx, toCancel = context.WithTimeout(baseCtx, r.TurnTimeout)
+			cancelTurn = func() { toCancel(); baseCancel() }
+		}
+		if guard != nil {
+			guard.arm(baseCancel)
 		}
 		_, perr := sess.Prompt(turnCtx, prompt)
 		timedOut := r.TurnTimeout > 0 && turnCtx.Err() == context.DeadlineExceeded
 		idleStalled := errors.Is(perr, ErrTurnIdle)
 		cancelTurn()
+		// Mid-turn hard stop. disarm() unbinds the guard (so no late recorder update
+		// can cancel the next turn) and reports whether observe() canceled THIS turn
+		// because the committed completion predicate held. When it did, treat the turn
+		// as a clean settle rather than an error/timeout: swallow the context.Canceled
+		// Prompt returned and clear the timeout/idle reads, so control falls through to
+		// the normal post-turn complete()/finish() path that finalizes the delivered
+		// terminal status — instead of the fatal "turn N prompt" error a bare cancel
+		// would otherwise raise. No trailing tool call ran past the flip.
+		guardTripped := guard != nil && guard.disarm()
+		if guardTripped {
+			r.logConcise("[honeybee] completion predicate met mid-turn; hard-stopping turn %d before any trailing tool call\n", res.Turns)
+			perr = nil
+			timedOut = false
+			idleStalled = false
+		}
 		// In-place idle recovery: a wedged upstream turn (github-copilot holding the
 		// stream open with zero output, no error, and no opencode read-timeout) is
 		// probabilistic. With retry budget and wall time left, abort the dead turn
@@ -1556,6 +1597,78 @@ func (r *Runner) taskRemoved(ctx context.Context, sel *selectt.Selection) (bool,
 			sel.Task.ID, sel.Submodule.Name, ref), nil
 	}
 	return false, "", nil
+}
+
+// completionGuard is the runner-side MID-TURN hard stop. While a task-bearing turn
+// streams, the recorder invokes observe() each time a tool call completes (see
+// recorder.onToolDone); observe() re-evaluates the SAME committed completion
+// predicate the between-turn check runs (r.complete) and, the instant it holds,
+// cancels the turn's context so opencode is never solicited for another tool call.
+// The turn then falls through to the normal post-turn complete()/finish() path.
+//
+// Why it exists: the runner only regains control BETWEEN turns, but one opencode
+// turn can chain many tool calls, so a turn that has already committed its terminal
+// status flip can run one MORE (out-of-worktree) tool call before the between-turn
+// check fires — wasting the rest of the turn and, when that trailing call is
+// harness-aborted, corrupting internal/audit's completion_miss signal on a session
+// that actually delivered. Stopping at the flip removes both.
+//
+// It is FAIL-OPEN by construction: it cancels ONLY when the predicate returns done
+// with no error while a turn is armed. An unmet predicate, a predicate error, a
+// disarmed guard, or an already-tripped guard all leave the turn running to its
+// natural settle / TurnTimeout, so a slow or erroring check can never truncate real
+// work. Scoped to task-bearing kinds (work/review/arbitrate), whose predicate is a
+// committed terminal status flip performed as the agent's LAST step; bootstrap and
+// reconcile are excluded because their PLAN.md/ROI-stamp predicate can read true
+// mid-edit, so only their post-turn (+ mainAdvanced) path may complete them.
+type completionGuard struct {
+	check func() (bool, error) // committed completion predicate; stable for the pass
+
+	mu      sync.Mutex
+	cancel  context.CancelFunc // current turn's cancel; nil ⇒ no turn armed
+	tripped bool               // observe() has canceled for the armed turn
+}
+
+// arm binds the guard to the turn about to run: its cancel func, trip state reset.
+// Called on the turn-loop goroutine before Prompt. observe() (recorder goroutine)
+// is the only concurrent caller, so the mutex makes the handoff race-free.
+func (g *completionGuard) arm(cancel context.CancelFunc) {
+	g.mu.Lock()
+	g.cancel = cancel
+	g.tripped = false
+	g.mu.Unlock()
+}
+
+// disarm unbinds the guard after the turn settles (so a late recorder update
+// between turns can never cancel the NEXT turn) and reports whether observe()
+// tripped during the turn just ended.
+func (g *completionGuard) disarm() bool {
+	g.mu.Lock()
+	t := g.tripped
+	g.cancel = nil
+	g.mu.Unlock()
+	return t
+}
+
+// observe is the recorder's per-tool-completion hook. On the first clean "done"
+// while armed it cancels the turn exactly once; every other case is a no-op. A nil
+// receiver (guard not wired) and a predicate error are both no-ops — fail-open, so
+// the post-turn path stays the sole place that surfaces predicate errors.
+func (g *completionGuard) observe() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.cancel == nil || g.tripped || g.check == nil {
+		return
+	}
+	done, err := g.check()
+	if err != nil || !done {
+		return // fail-open: never cancel on an error or an unmet predicate
+	}
+	g.tripped = true
+	g.cancel()
 }
 
 // complete is the deterministic per-turn completion check.

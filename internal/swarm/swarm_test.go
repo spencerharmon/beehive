@@ -3552,3 +3552,244 @@ func TestRealRunVerifyClassifies(t *testing.T) {
 		t.Fatalf("a missing binary must surface an infra error, got nil")
 	}
 }
+
+// TestCompletionGuardCancelsOnlyOnCommittedPredicate pins the guard's fail-open
+// contract in isolation: it cancels the armed turn ONLY on a committed predicate
+// (done, nil error), exactly once, and is inert for every other case — an unmet
+// predicate, a predicate error, an unarmed (between-turns) guard, an already-
+// tripped guard, and a nil receiver (the not-wired bootstrap/reconcile case).
+func TestCompletionGuardCancelsOnlyOnCommittedPredicate(t *testing.T) {
+	var canceled int
+	cancel := func() { canceled++ }
+
+	// Unmet predicate: repeated observes never cancel and never report tripped.
+	g := &completionGuard{check: func() (bool, error) { return false, nil }}
+	g.arm(cancel)
+	g.observe()
+	g.observe()
+	if canceled != 0 {
+		t.Fatalf("unmet predicate must not cancel; canceled=%d", canceled)
+	}
+	if g.disarm() {
+		t.Fatalf("unmet predicate must not report tripped")
+	}
+
+	// Predicate error: fail-open — never cancels, never trips.
+	canceled = 0
+	g = &completionGuard{check: func() (bool, error) { return true, errors.New("boom") }}
+	g.arm(cancel)
+	g.observe()
+	if canceled != 0 {
+		t.Fatalf("predicate error must be fail-open; canceled=%d", canceled)
+	}
+	if g.disarm() {
+		t.Fatalf("predicate error must not report tripped")
+	}
+
+	// Unarmed (between turns): observe is inert even when the predicate holds.
+	canceled = 0
+	g = &completionGuard{check: func() (bool, error) { return true, nil }}
+	g.observe()
+	if canceled != 0 {
+		t.Fatalf("unarmed guard must not cancel; canceled=%d", canceled)
+	}
+
+	// Committed predicate while armed: cancels EXACTLY once; extra observes no-op,
+	// disarm reports tripped, and a post-disarm observe cannot cancel a next turn.
+	canceled = 0
+	g = &completionGuard{check: func() (bool, error) { return true, nil }}
+	g.arm(cancel)
+	g.observe()
+	g.observe()
+	if canceled != 1 {
+		t.Fatalf("committed predicate must cancel exactly once; canceled=%d", canceled)
+	}
+	if !g.disarm() {
+		t.Fatalf("committed predicate must report tripped")
+	}
+	g.observe()
+	if canceled != 1 {
+		t.Fatalf("post-disarm observe must be inert; canceled=%d", canceled)
+	}
+
+	// Nil guard: safe no-op (the guard-not-wired path).
+	var ng *completionGuard
+	ng.observe()
+}
+
+// hardStopStreamSession models a task-bearing turn that commits its terminal
+// status flip + change doc MID-turn and would then run one more (trailing) tool
+// call. It is a streamer, so the recorder goroutine drives stream(), which
+// surfaces a completed-tool event the instant Prompt signals delivery. Prompt then
+// blocks: the completion guard must cancel the turn's context before the trailing
+// window elapses, so trailingRan stays false — proving the trailing call never ran.
+type hardStopStreamSession struct {
+	deliver     chan struct{}
+	delivered   bool
+	onDeliver   func()
+	window      time.Duration
+	trailingRan bool
+}
+
+func (s *hardStopStreamSession) Prompt(ctx context.Context, text string) (string, error) {
+	s.onDeliver() // commit the terminal flip + change doc (the delivery tool call lands)
+	if !s.delivered {
+		s.delivered = true
+		close(s.deliver) // let the stream goroutine surface the completed-tool event
+	}
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err() // guard hard-stopped the turn before any trailing call
+	case <-time.After(s.window):
+		s.trailingRan = true // NOT canceled: the trailing tool call ran
+		return "", nil
+	}
+}
+func (s *hardStopStreamSession) Close() error                                    { return nil }
+func (s *hardStopStreamSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+func (s *hardStopStreamSession) stream(ctx context.Context, onUpdate func([]Message), onIdle func()) error {
+	select {
+	case <-s.deliver:
+		onUpdate([]Message{{ID: "m1", Role: "assistant", Parts: []Part{
+			{ID: "p1", Type: "tool", CallID: "c1", Tool: "write", Status: "completed", Output: "flip committed"},
+		}}})
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type hardStopClient struct{ sess *hardStopStreamSession }
+
+func (c *hardStopClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	return c.sess, nil
+}
+
+// TestCompletionGuardHardStopsTurnAtDelivery is the positive integration proof:
+// a Work turn commits its terminal flip + change doc mid-turn, the recorder
+// surfaces the completing tool event, and the runner hard-stops the turn AT that
+// point — the pass finalizes the delivered status on turn 1, no trailing tool call
+// runs, and the transcript audits clean (no CompletionMiss / no Aborted).
+func TestCompletionGuardHardStopsTurnAtDelivery(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	sess := &hardStopStreamSession{
+		deliver: make(chan struct{}),
+		window:  5 * time.Second, // the guard fires in ms; this only bounds a failed run
+		onDeliver: func() {
+			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		},
+	}
+	r := &Runner{Repo: rp, Git: g, Client: &hardStopClient{sess: sess}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed || res.GCMarked {
+		t.Fatalf("a delivered turn must complete cleanly, got %+v", res)
+	}
+	if res.Turns != 1 {
+		t.Fatalf("the guard must finalize on the delivering turn (turn 1), got turn %d", res.Turns)
+	}
+	if sess.trailingRan {
+		t.Fatalf("guard failed to hard-stop: a trailing tool call ran past the committed terminal flip")
+	}
+	transcriptPath := filepath.Join(sm, "sessions", res.SessionID+".md")
+	s, aerr := audit.ParseFile(transcriptPath)
+	if aerr != nil {
+		t.Fatalf("audit.ParseFile: %v", aerr)
+	}
+	if s.Heuristics.CompletionMiss || s.Heuristics.Aborted {
+		t.Fatalf("a guard-clean delivery must not be flagged CompletionMiss/Aborted, got %+v", s.Heuristics)
+	}
+}
+
+// noDeliverStreamSession streams a completed-tool event each turn but NEVER writes
+// the completion artifacts, so the guard's predicate is perpetually unmet.
+type noDeliverStreamSession struct{ tick chan struct{} }
+
+func (s *noDeliverStreamSession) Prompt(ctx context.Context, text string) (string, error) {
+	// Surface a completed-tool event this turn (predicate re-checked, still unmet),
+	// then settle idle without ever delivering.
+	select {
+	case s.tick <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	return "", nil
+}
+func (s *noDeliverStreamSession) Close() error                                    { return nil }
+func (s *noDeliverStreamSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
+func (s *noDeliverStreamSession) stream(ctx context.Context, onUpdate func([]Message), onIdle func()) error {
+	for {
+		select {
+		case <-s.tick:
+			onUpdate([]Message{{ID: "m1", Role: "assistant", Parts: []Part{
+				{ID: "p1", Type: "tool", CallID: "c1", Tool: "read", Status: "completed", Output: "looked"},
+			}}})
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+type noDeliverClient struct{ sess *noDeliverStreamSession }
+
+func (c *noDeliverClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	return c.sess, nil
+}
+
+// TestCompletionGuardLeavesUnmetTurnRunning is the negative control: with the
+// guard wired for a Work pass whose recorder observes tool completions every turn
+// but whose predicate is never met (no artifacts), the pass must be untouched by
+// the mid-turn stop and run to its natural GC cap (MaxTurns+1 turns, GC-marked,
+// not completed) — proving the hard stop is strictly fail-open at the Run level.
+func TestCompletionGuardLeavesUnmetTurnRunning(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [IN-PROGRESS] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	sess := &noDeliverStreamSession{tick: make(chan struct{})}
+	r := &Runner{Repo: rp, Git: g, Client: &noDeliverClient{sess: sess}, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour}
+
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed || !res.GCMarked || res.Turns != 4 {
+		t.Fatalf("an unmet pass must run to the GC cap untouched by the guard, got %+v", res)
+	}
+}

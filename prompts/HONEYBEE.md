@@ -233,9 +233,11 @@ STOP the instant your role section's completion predicate is met — end your tu
 further. This is kind-general (reconcile, work, review, arbitration alike) and relaxes NO predicate
 above: deliver in FULL first — your deliverable committed and, for a work task, the code pushed on
 `bee-<taskid>`, the pointer bumped, and the change doc present at its exact path, with the terminal
-status set. Once that predicate holds, do NOT tack on trailing "housekeeping": no cleanup of scratch
-files or `$TMPDIR` (the runner tears your worktree down for you), no re-verification, no "one last
-check", no out-of-repo reads. Post-delivery your turn has no productive move left, so any such trailing
-action only stalls on the per-turn idle timeout; the transcript then ends on a "made no progress"
-warning and the engine misflags the already-finished session aborted/completion_miss — poisoning the
-very ledger later audit passes mine. Deliver, then stop.
+status set. Sequence delivery so the action that completes this predicate is your turn's LAST tool
+call, and attempt NOTHING after it: the FIRST tool call you make once the predicate holds is itself a
+defect, not harmless housekeeping — no cleanup of scratch files or `$TMPDIR` (the runner tears your
+worktree down for you), no re-verification, no "one last check", no out-of-repo reads. The runner now
+hard-stops the turn the instant the predicate commits, so any such trailing call is cancelled
+mid-flight and its output is worthless; on the older idle path it instead stalls out the per-turn idle
+timeout, ending the transcript on a "made no progress" warning that misflags the already-finished
+session aborted/completion_miss — poisoning the very ledger later audit passes mine. Deliver, then stop.

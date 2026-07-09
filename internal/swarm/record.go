@@ -53,6 +53,16 @@ type recorder struct {
 	// pollIvl is the fallback poll cadence (recorder.pollLoop). Zero = the 700ms
 	// default; tests set a small value so the fallback path advances quickly.
 	pollIvl time.Duration
+
+	// onToolDone, when set, is invoked once per tool call that reaches its
+	// "completed" state, on the recorder's own goroutine (stream OR poll path —
+	// both funnel through streamActivity). The runner wires it to the mid-turn
+	// completionGuard: a committed status flip lands as a completed tool call, so
+	// this is the earliest deterministic point the runner can observe delivery and
+	// hard-stop the turn before the agent is solicited for a trailing tool call.
+	// Kept out of the transcript-render path proper so a nil hook is byte-identical
+	// to the pre-guard recorder.
+	onToolDone func()
 }
 
 // loop drives the recorder for the life of the session. It prefers streaming:
@@ -264,9 +274,13 @@ func (rc *recorder) activity(s string) {
 //     bodies. These never duplicate a concise line.
 //
 // With neither sink configured it is a no-op, so a plain unit test's transcript
-// stays byte-identical.
+// stays byte-identical — UNLESS the completion guard is wired (onToolDone set), in
+// which case it still walks the parts to fire that hook on a tool completion
+// (writing nothing, since rc.activity/rc.debug guard their own nil sinks). This
+// keeps the mid-turn hard stop working on a host that runs without --debug and
+// without an explicitly-set concise sink.
 func (rc *recorder) streamActivity(msgs []Message) {
-	if rc.concise == nil && rc.debug == nil {
+	if rc.concise == nil && rc.debug == nil && rc.onToolDone == nil {
 		return
 	}
 	for _, m := range msgs {
@@ -314,6 +328,14 @@ func (rc *recorder) streamActivity(msgs []Message) {
 						}
 					}
 					rc.activity(fmt.Sprintf("  \u2713 %s\n", p.Tool))
+					// A tool just completed: the agent may have committed the terminal
+					// status flip + change doc. Signal the completion guard (if wired) so
+					// it can poll the committed predicate and hard-stop the turn the
+					// instant delivery is observed — before the next tool call. Fired only
+					// on the completed transition (toolSt-deduped above), never per token.
+					if rc.onToolDone != nil {
+						rc.onToolDone()
+					}
 				case "error":
 					rc.activity(fmt.Sprintf("  \u2717 %s: %s\n", p.Tool, firstLine(p.Error)))
 				}
