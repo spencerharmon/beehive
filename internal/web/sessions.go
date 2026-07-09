@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"net/http"
 	"os"
@@ -129,7 +130,23 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.renderConditional(w, r, "session_body.html", map[string]interface{}{"Body": body, "Sync": sync})
+	s.renderConditional(w, r, "session_body.html", map[string]interface{}{"Transcript": parseTranscript(body), "Sync": sync})
+}
+
+// renderTranscriptPane renders the shared transcript_pane template — the SAME one
+// session_body.html renders for the htmx poll — for a transcript body, so the SSE
+// stream pushes byte-identical turn HTML for a given transcript (the two delivery
+// paths are one shared render, not two that can drift). On the (in-memory,
+// practically impossible) render error it degrades to a minimal pane wrapping the
+// HTML-escaped body, keeping the #session-pane/#session-transcript scroll contract
+// and never emitting unsanitized markup.
+func (s *Server) renderTranscriptPane(body string) string {
+	var b strings.Builder
+	if err := s.tmpl.ExecuteTemplate(&b, "transcript_pane", map[string]interface{}{"Transcript": parseTranscript(body)}); err != nil {
+		return `<div id="session-pane" class="session-pane"><div id="session-transcript" class="session" data-scroll-preserve data-scroll-pin><pre class="session">` +
+			template.HTMLEscapeString(body) + `</pre></div></div>`
+	}
+	return b.String()
 }
 
 // sessionStream pushes the session transcript to the browser over server-sent
@@ -194,7 +211,10 @@ func (s *Server) sessionStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if first || body != last {
-			writeSSEData(w, body)
+			// Push the SAME server-rendered transcript_pane the htmx poll renders, so
+			// both delivery paths carry byte-identical turn HTML. Change detection stays
+			// on the raw body (cheap); the pane is rendered only when it actually changed.
+			writeSSEData(w, s.renderTranscriptPane(body))
 			fl.Flush()
 			last = body
 			first = false

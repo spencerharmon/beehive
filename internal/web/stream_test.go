@@ -29,10 +29,11 @@ func gitAt(t *testing.T, dir string, args ...string) {
 }
 
 // TestSessionStreamEndsForFinishedSession locks the SSE end contract: a finished
-// (non-stub) session streams its durable transcript as data: frames and then a
-// single `event: end`, telling the browser to stop streaming and do one
-// authoritative poll. The handler returns promptly (an ended session is not held
-// open), so a buffered ResponseRecorder captures the whole exchange.
+// (non-stub) session streams its durable transcript as the rendered transcript-pane
+// data: frames and then a single `event: end`, telling the browser to stop
+// streaming and do one authoritative poll. The handler returns promptly (an ended
+// session is not held open), so a buffered ResponseRecorder captures the whole
+// exchange.
 func TestSessionStreamEndsForFinishedSession(t *testing.T) {
 	s, root := setup(t)
 	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
@@ -52,9 +53,18 @@ func TestSessionStreamEndsForFinishedSession(t *testing.T) {
 		t.Fatalf("content-type = %q, want text/event-stream", ct)
 	}
 	body := w.Body.String()
-	// The transcript is delivered line-per-data-field (rejoined by the browser).
-	if !strings.Contains(body, "data: # final transcript") || !strings.Contains(body, "data: all done.") {
-		t.Errorf("stream did not carry the transcript as data frames:\n%s", body)
+	// The transcript is delivered as the SAME server-rendered structured pane the
+	// htmx poll renders (markdown -> sanitized HTML, line-per-data-field rejoined by
+	// the browser), NOT a raw markdown dump: "# final transcript" -> <h1>, the body
+	// -> <p>, inside the stable #session-transcript scroll box.
+	for _, want := range []string{"<h1>final transcript</h1>", "<p>all done.</p>", `id="session-transcript"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stream did not carry the rendered transcript pane (missing %q):\n%s", want, body)
+		}
+	}
+	// The RAW markdown source is rendered first, never streamed verbatim.
+	if strings.Contains(body, "data: # final transcript") {
+		t.Errorf("stream sent raw markdown instead of the rendered pane:\n%s", body)
 	}
 	// The end event tells the client to stop streaming and poll the final once.
 	if !strings.Contains(body, "event: end") {
@@ -203,8 +213,9 @@ func TestSessionStreamLiveStreamsAndCancels(t *testing.T) {
 		}
 	}
 
-	// First frame: the current transcript.
-	waitLine("data: live transcript v1")
+	// First frame: the current transcript, rendered into the structured pane (the
+	// text is wrapped in HTML, so it no longer sits immediately after "data: ").
+	waitLine("live transcript v1")
 
 	// Advance the live branch (a fresh honeybee commit) via a linked worktree —
 	// the branch ref moves in the shared repo, so the server's next re-read sees
@@ -216,7 +227,7 @@ func TestSessionStreamLiveStreamsAndCancels(t *testing.T) {
 	}
 	gitAt(t, wt, "add", "-A")
 	gitAt(t, wt, "commit", "-q", "-m", "v2")
-	waitLine("data: v2 more output")
+	waitLine("v2 more output")
 
 	// Leak guard: disconnecting (cancelling the request) must make the SERVER
 	// handler return promptly. handlerDone closing is the direct proof it stopped
@@ -417,10 +428,12 @@ func TestSessionStreamFollowsOffBoxAndBannersSync(t *testing.T) {
 		}
 	}
 
-	// (2) the off-box transcript streamed as a data frame (proving the stream loop
-	// fetched the stub and resolved the branch), and (3) the follow banner arrived
-	// as a `sync` event whose JSON shows a clean fast-forward ("Err":"" — no stall).
-	waitAll("data: hello from off-box", "event: sync", `"Err":""`)
+	// (2) the off-box transcript streamed as a RENDERED data frame (proving the
+	// stream loop fetched the stub and resolved the branch, then rendered it through
+	// the same transcript_pane as the poll: "hello from off-box" -> <p>), and (3) the
+	// follow banner arrived as a `sync` event whose JSON shows a clean fast-forward
+	// ("Err":"" — no stall).
+	waitAll("<p>hello from off-box</p>", "event: sync", `"Err":""`)
 
 	// (1) local main was fast-forwarded by the stream loop, so the stub is on disk.
 	if _, err := os.Stat(localSess); err != nil {

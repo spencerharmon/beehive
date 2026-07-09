@@ -162,6 +162,100 @@ func TestScrollPreserveWiring(t *testing.T) {
 	}
 }
 
+// sampleTranscript is a small recorded transcript with a header preamble and four
+// user/assistant turns carrying inline markdown, shared by the structured-pane
+// tests below.
+const sampleTranscript = "# session bee-x\n\nsubmodule: alpha · kind: work\n\n" +
+	"## user\n\nkick **off** the run\n\n" +
+	"## assistant\n\nrunning `job` now\n\n" +
+	"## user\n\ncontinue\n\n" +
+	"## assistant\n\nall done\n"
+
+// TestTranscriptPaneRendersStructuredTurns is the heart of session-transcript-toc:
+// the transcript_pane template turns a recorded transcript into segmented,
+// markdown-RENDERED turn <section>s plus a collapsible TOC overlay with working
+// prev/next jump buttons and per-turn anchor links — NOT the old two-line raw
+// <pre>{{.Body}}</pre> dump. It also re-locks the poll-scroll-preserve contract on
+// the (now <div>) scroll box so both features coexist.
+func TestTranscriptPaneRendersStructuredTurns(t *testing.T) {
+	s, _ := setup(t)
+	pane := renderTmpl(t, s, "session_body.html", map[string]interface{}{"Transcript": parseTranscript(sampleTranscript)})
+
+	// (1) Scroll-preserve contract is intact on the scroll box.
+	for _, want := range []string{`id="session-pane"`, `id="session-transcript"`, "data-scroll-preserve", "data-scroll-pin"} {
+		if !strings.Contains(pane, want) {
+			t.Fatalf("pane missing scroll contract %q:\n%s", want, pane)
+		}
+	}
+	// (2) TOC overlay: the details container, the four prev/next jump buttons, and
+	// per-turn anchor links the nav script drives.
+	for _, want := range []string{
+		`id="session-toc"`, "Contents · 4 turns", "(2 agent · 2 reply)",
+		`data-jump="prev-assistant"`, `data-jump="next-assistant"`,
+		`data-jump="prev-user"`, `data-jump="next-user"`,
+		`href="#turn-1"`, `data-anchor="turn-1"`, `href="#turn-4"`, `data-anchor="turn-4"`,
+	} {
+		if !strings.Contains(pane, want) {
+			t.Fatalf("pane missing TOC element %q:\n%s", want, pane)
+		}
+	}
+	// (3) Segmented turn sections, role-classed and anchored, with human labels.
+	for _, want := range []string{
+		`id="turn-1"`, `id="turn-4"`, `class="turn turn-user"`, `class="turn turn-assistant"`,
+		"runner reply", "agent output", "#1", "#4",
+	} {
+		if !strings.Contains(pane, want) {
+			t.Fatalf("pane missing turn section %q:\n%s", want, pane)
+		}
+	}
+	// (4) Turn bodies are markdown RENDERED to HTML, and the preamble too.
+	for _, want := range []string{"<strong>off</strong>", "<code>job</code>", "<h1>session bee-x</h1>"} {
+		if !strings.Contains(pane, want) {
+			t.Fatalf("pane did not render markdown %q:\n%s", want, pane)
+		}
+	}
+	// (5) NOT the old raw dump: no <pre class="session"> escape hatch, and the
+	// marker lines are consumed as boundaries (never re-emitted as visible text).
+	if strings.Contains(pane, `<pre class="session"`) {
+		t.Fatalf("pane still emits a raw <pre> dump:\n%s", pane)
+	}
+	if strings.Contains(pane, "## assistant") || strings.Contains(pane, "## user") {
+		t.Fatalf("turn marker line leaked into rendered output:\n%s", pane)
+	}
+}
+
+// TestPollAndStreamRenderIdenticalTurnHTML is the core acceptance for the
+// two-delivery-paths-agree requirement: the htmx poll (session_body.html, via
+// sessionBody) and the SSE stream (renderTranscriptPane, via sessionStream) render
+// a given transcript through the SAME transcript_pane template, so the pane the
+// stream pushes over the wire is byte-for-byte the pane the poll fragment embeds —
+// they can never drift into two different turn renderings.
+func TestPollAndStreamRenderIdenticalTurnHTML(t *testing.T) {
+	s, _ := setup(t)
+
+	// The exact fragment the htmx poll swaps into #session-body.
+	pollFrag := renderTmpl(t, s, "session_body.html", map[string]interface{}{"Transcript": parseTranscript(sampleTranscript)})
+	// The exact string sessionStream writes as an SSE data payload each frame.
+	streamPane := s.renderTranscriptPane(sampleTranscript)
+
+	// Identical HTML: the SSE pane is a verbatim substring of the poll fragment
+	// (the fragment is just an optional sync banner + this same pane).
+	if !strings.Contains(pollFrag, streamPane) {
+		t.Fatalf("poll fragment does not embed the exact SSE pane.\n--- poll ---\n%s\n--- stream ---\n%s", pollFrag, streamPane)
+	}
+	// And it is the STRUCTURED render, not the render-error fallback (which wraps
+	// the raw body in <pre class="session">) — so "identical" means identical
+	// structured turns, not two identical raw dumps.
+	if strings.Contains(streamPane, `<pre class="session">`) {
+		t.Fatalf("stream pane fell back to a raw dump instead of structured turns:\n%s", streamPane)
+	}
+	for _, want := range []string{`id="session-pane"`, `id="session-transcript"`, `id="turn-1"`, `id="session-toc"`, "<strong>off</strong>"} {
+		if !strings.Contains(streamPane, want) {
+			t.Fatalf("stream pane missing structured element %q:\n%s", want, streamPane)
+		}
+	}
+}
+
 // TestPollPaneLoadingSkeletons is the core of poll-pane-loading-skeletons: every
 // htmx-polled pane used to open with a bare <p>loading…</p> — no shaped
 // placeholder and, worse, no aria-live, so a screen-reader user got no

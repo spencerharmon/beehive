@@ -612,12 +612,120 @@ pre {
   font-size: var(--text-sm);
   line-height: var(--leading);
 }
+/* Structured session transcript ----------------------------------------- */
+/* .session-pane wraps the scroll box (.session) and the floating TOC overlay
+   so the overlay can be absolutely positioned against the pane, not the page. */
+.session-pane { position: relative; }
 .session {
-  white-space: pre-wrap;
-  word-break: break-word;
   max-height: 42rem;
   overflow: auto;
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
 }
+/* Each turn is a <section>; override the global `section` margin below with a
+   tighter inter-turn gap and give agent/reply turns a colored left rule so the
+   two producers stay scannable without reading each header. */
+.session .turn {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-1) 0 var(--space-1) var(--space-3);
+  border-left: 3px solid var(--border);
+  scroll-margin-top: var(--space-3);
+}
+.session .turn:last-child { margin-bottom: 0; }
+.turn-assistant { border-left-color: var(--accent); }
+.turn-user { border-left-color: hsl(var(--hue-review) 70% 45%); }
+.turn-preamble {
+  border-left-style: none;
+  padding-left: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+.turn-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-1);
+}
+.turn-role {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.turn-idx {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+.turn-body > :first-child { margin-top: 0; }
+.turn-body > :last-child { margin-bottom: 0; }
+
+/* Collapsible TOC overlay, pinned to the top-right of the scroll pane. */
+.session-toc {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  z-index: 2;
+  max-width: 20rem;
+  background: var(--surface);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  font-size: var(--text-sm);
+}
+.session-toc > summary {
+  cursor: pointer;
+  padding: var(--space-2) var(--space-3);
+  font-weight: 600;
+  list-style: none;
+  user-select: none;
+}
+.session-toc > summary::-webkit-details-marker { display: none; }
+.session-toc[open] > summary { border-bottom: var(--border-width) solid var(--border); }
+.toc-counts { color: var(--text-muted); font-weight: 400; }
+.session-toc-jumps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: var(--border-width) solid var(--border);
+}
+.toc-jump {
+  cursor: pointer;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text);
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.toc-jump:hover { border-color: var(--accent); color: var(--accent); }
+.session-toc-list {
+  list-style: none;
+  margin: 0;
+  padding: var(--space-1) 0;
+  max-height: 16rem;
+  overflow: auto;
+}
+.session-toc-list li { margin: 0; }
+.session-toc-list a {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  color: var(--text);
+  text-decoration: none;
+}
+.session-toc-list a:hover { background: var(--surface-2); }
+.session-toc-list .toc-num {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+.session-toc-list .toc-assistant .toc-num { color: var(--accent); }
+.session-toc-list .toc-user .toc-num { color: hsl(var(--hue-review) 70% 45%); }
 section { margin: var(--space-5) 0; }
 
 /* AI editor -------------------------------------------------------------- */

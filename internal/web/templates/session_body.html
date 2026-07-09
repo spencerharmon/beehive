@@ -1,2 +1,39 @@
 {{with .Sync}}<p id="session-sync" class="sync-status{{if .Err}} stale{{end}}">followed {{.Ago}} ago{{if .Err}} · pull stalled: {{.Err}}{{end}}</p>{{end}}
-<pre class="session" id="session-transcript" data-scroll-preserve data-scroll-pin>{{.Body}}</pre>
+{{template "transcript_pane" .}}
+{{/* transcript_pane is the shared structured-transcript render used by BOTH the
+   htmx-poll fragment (this file) and the SSE stream (sessionStream executes this
+   same template), so the two delivery paths emit byte-identical turn HTML for a
+   given transcript. #session-transcript is the scroll box and KEEPS its stable id
+   + data-scroll-preserve/data-scroll-pin unconditionally (poll-scroll-preserve
+   keys purely off those), rendered even when .Transcript is absent so the polled
+   scroll contract never depends on transcript data. The TOC overlay + rendered
+   turns render only when a transcript is present (guarded by {{with .Transcript}}
+   so a nil transcript is a no-op, never an error). */}}
+{{define "transcript_pane"}}<div id="session-pane" class="session-pane">
+  {{with .Transcript}}{{if .Turns}}
+  <details id="session-toc" class="session-toc" open>
+    <summary>Contents · {{len .Turns}} turns <span class="toc-counts">({{.Assistants}} agent · {{.Users}} reply)</span></summary>
+    <div class="session-toc-jumps">
+      <button type="button" class="toc-jump" data-jump="prev-assistant" title="previous agent output">&#9650; agent</button>
+      <button type="button" class="toc-jump" data-jump="next-assistant" title="next agent output">&#9660; agent</button>
+      <button type="button" class="toc-jump" data-jump="prev-user" title="previous runner reply">&#9650; reply</button>
+      <button type="button" class="toc-jump" data-jump="next-user" title="next runner reply">&#9660; reply</button>
+    </div>
+    <ol class="session-toc-list">
+      {{range .Turns}}<li class="toc-{{.Role}}"><a href="#{{.Anchor}}" data-anchor="{{.Anchor}}"><span class="toc-num">{{.Index}}</span> {{.Label}}</a></li>
+      {{end}}
+    </ol>
+  </details>
+  {{end}}{{end}}
+  <div id="session-transcript" class="session" data-scroll-preserve data-scroll-pin>
+    {{with .Transcript}}
+    {{if .Preamble}}<div class="turn turn-preamble">{{.Preamble}}</div>{{end}}
+    {{range .Turns}}<section class="turn turn-{{.Role}}" id="{{.Anchor}}">
+      <header class="turn-head"><span class="turn-role">{{.Label}}</span> <span class="turn-idx">#{{.Index}}</span></header>
+      <div class="turn-body">{{.HTML}}</div>
+    </section>
+    {{end}}
+    {{end}}
+  </div>
+</div>
+{{end}}
