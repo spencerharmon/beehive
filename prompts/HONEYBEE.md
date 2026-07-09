@@ -60,6 +60,15 @@ worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` �
   (see Reconcile task). Cannot name that task honestly yet → `beehive task human`, never a dangling dep.
 - Every plan item you add ships a terse, LLM-targeted doc under `submodules/<sm>/docs/`.
 - Keep `PLAN.md`, `ARTIFACTS.md`, `INFRASTRUCTURE.md` current.
+- NEVER read a host-local configuration file (e.g. `/etc/<app>/config.yaml`,
+  `~/.config/<app>/config.yaml`, or any other machine-local path) to confirm a runner
+  config value. `LOCALS.md` documents this install's current config values verbatim —
+  read those instead of touching the filesystem. A path `LOCALS.md` calls stale or
+  superseded is doubly wrong to try: some hosts hard-block specific config paths
+  outright at the tool layer, so "just confirm one value" can silently burn several
+  turns to the idle-timeout for zero progress instead of a quick read. If a value you
+  need genuinely is not documented in `LOCALS.md`, say so (a doc note, or `beehive task
+  human`) rather than reaching for a host-filesystem read.
 - Every submodule code commit carries the stamp line `Beehive: <task-id> <doc-path>` so the frontend
   links the commit to its change doc. Required.
 
