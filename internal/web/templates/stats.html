@@ -1,8 +1,8 @@
 {{template "header" .}}
 <h1>honeybee performance <span class="badge">✅/🐝</span></h1>
 <p class="muted">Derived on read from git — nothing stored, nothing to drift.
-<b>delivered tasks (✅)</b> = tasks marked <code>[DONE]</code> (a task can take more
-than one merge, so we count the task) · <b>honeybees (🐝)</b> = one honeybee pass ·
+<b>delivered tasks</b> = tasks marked <code>[DONE]</code> (a task can take more
+than one merge, so we count the task) · <b>honeybees</b> = one honeybee pass ·
 <b>✅/🐝</b> = delivered tasks per honeybee · <b>active now</b> = honeybees actively
 working that submodule right now (the same canonical set the dashboard counter and
 the sessions page/list use) · <b>stranded</b> = tasks with finished
@@ -56,7 +56,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
 {{if .Filtered}}
 <div class="table-scroll">
 <table>
-<tr>{{range .GroupBy}}<th>{{.}}</th>{{end}}<th>delivered tasks ✅</th><th>honeybees 🐝</th><th>✅/🐝</th><th>stranded</th></tr>
+<tr>{{range .GroupBy}}<th>{{.}}</th>{{end}}<th>delivered tasks</th><th>honeybees</th><th>✅/🐝</th><th>stranded</th></tr>
 {{range .Grouped}}<tr>
   {{range .Values}}<td>{{if .}}{{.}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>{{end}}
   <td>{{.DeliveredTasks}}</td>
@@ -69,7 +69,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
 {{else}}
 <div class="table-scroll">
 <table>
-<tr><th>submodule</th><th>delivered tasks ✅</th><th>honeybees 🐝</th><th>✅/🐝</th><th>active now</th><th>stranded</th></tr>
+<tr><th>submodule</th><th>delivered tasks</th><th>honeybees</th><th>✅/🐝</th><th>active now</th><th>stranded</th></tr>
 {{range .Subs}}<tr>
   <td><a href="/submodule/{{.Name}}/plan">{{.Name}}</a></td>
   <td>{{.DeliveredTasks}}</td>
@@ -81,7 +81,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
   <details><summary class="muted">by model ({{len .Models}})</summary>
   <div class="table-scroll">
   <table class="nested">
-  <tr><th>model</th><th>delivered ✅</th><th>honeybees 🐝</th><th>✅/🐝</th></tr>
+  <tr><th>model</th><th>delivered</th><th>honeybees</th><th>✅/🐝</th></tr>
   {{range .Models}}<tr>
     <td><code>{{.Model}}</code></td>
     <td>{{.DeliveredTasks}}</td>
@@ -116,7 +116,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
   <details><summary class="muted">total by model ({{len .Total.Models}})</summary>
   <div class="table-scroll">
   <table class="nested">
-  <tr><th>model</th><th>delivered ✅</th><th>honeybees 🐝</th><th>✅/🐝</th></tr>
+  <tr><th>model</th><th>delivered</th><th>honeybees</th><th>✅/🐝</th></tr>
   {{range .Total.Models}}<tr>
     <td><code>{{.Model}}</code></td>
     <td>{{.DeliveredTasks}}</td>

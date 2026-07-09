@@ -9,7 +9,7 @@
       {{if .Live}}<span class="state live">State: live</span>{{else}}<span class="state dirty">State: dirty</span>{{end}}
       {{if .Merged}}<button class="merge merged" disabled>Merged</button>
       {{else if .Live}}<button class="merge merged" disabled>Merge</button>
-      {{else if .DeleteRisk}}<span class="state danger">⚠️ whole-file deletion of a human-owned file — blocked</span><button class="merge danger" hx-post="/editor/{{.ID}}/merge" hx-vals='{"confirm":"delete"}' hx-target="#editor" hx-swap="innerHTML" hx-confirm="This merges a deletion of the ENTIRE file. Are you sure?">Confirm deletion &amp; merge</button>
+      {{else if .DeleteRisk}}<span class="state danger">whole-file deletion of a human-owned file — blocked</span><button class="merge danger" hx-post="/editor/{{.ID}}/merge" hx-vals='{"confirm":"delete"}' hx-target="#editor" hx-swap="innerHTML" hx-confirm="This merges a deletion of the ENTIRE file. Are you sure?">Confirm deletion &amp; merge</button>
       {{else}}<button class="merge" hx-post="/editor/{{.ID}}/merge" hx-target="#editor" hx-swap="innerHTML">Merge</button>{{end}}
     </div>
     <pre class="diff" id="editor-diff" data-scroll-preserve>{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
