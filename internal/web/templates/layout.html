@@ -92,4 +92,44 @@
   box.addEventListener('click', hide);
 })();
 </script>
+<div id="copy-live" role="status" aria-live="polite" class="sr-only"></div>
+<script>
+/* commit-sha-deep-links: progressively-enhanced copy-to-clipboard for shas (and
+   any [data-copy] control — branches/paths can reuse it). The value itself is
+   ALWAYS rendered as plain, selectable text, so with JS off the reader still
+   copies it by hand; this only ADDS the one-click button, which is revealed only
+   once we set `.js` on <html> (CSS keeps `.copy-btn` display:none otherwise) so
+   it never shows as a dead control. Success is spoken through the shared
+   #copy-live aria-live region for screen readers and shown visually via the
+   transient `.copied` class + label. Event-delegated so htmx-swapped content is
+   covered too. Separate IIFE from the scripts above; no external libraries
+   (single-binary embed, no CDN). */
+(function () {
+  document.documentElement.classList.add('js');
+  var live = document.getElementById('copy-live');
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest && e.target.closest('.copy-btn');
+    if (!btn) return;
+    if (!btn._idle) btn._idle = btn.textContent;
+    var text = btn.getAttribute('data-copy') || '';
+    function settle(ok) {
+      btn.textContent = ok ? 'copied' : 'copy';
+      btn.classList.toggle('copied', ok);
+      if (live) live.textContent = ok
+        ? ('Copied ' + text + ' to clipboard')
+        : 'Copy failed — select the text and press Ctrl+C';
+      clearTimeout(btn._t);
+      btn._t = setTimeout(function () {
+        btn.textContent = btn._idle;
+        btn.classList.remove('copied');
+      }, 1400);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { settle(true); }, function () { settle(false); });
+    } else {
+      settle(false);
+    }
+  });
+})();
+</script>
 </body></html>{{end}}

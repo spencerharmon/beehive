@@ -20,7 +20,7 @@
 <table>
 <tr><th>sha</th><th>refs</th><th>subject</th><th>author</th><th>change doc</th><th>delivered</th></tr>
 {{range .Commits}}<tr>
-<td><code>{{.SHA}}</code></td>
+<td class="sha-cell"><code>{{.SHA}}</code><button type="button" class="copy-btn" data-copy="{{.SHA}}" aria-label="Copy commit {{.SHA}} to clipboard">copy</button></td>
 <td>{{if .Refs}}<span class="badge">{{.Refs}}</span>{{end}}</td>
 <td>{{.Subject}}</td>
 <td class="muted">{{.Author}}</td>
