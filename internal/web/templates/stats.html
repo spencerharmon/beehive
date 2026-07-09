@@ -75,7 +75,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
   <td>{{.DeliveredTasks}}</td>
   <td>{{.Honeybees}}</td>
   <td>{{printf "%.1f%%" .DeliveredPerBeePct}}</td>
-  <td>{{if .ActiveNow}}<span class="badge live" title="honeybees actively working this submodule right now">🐝 {{.ActiveNow}}</span>{{else}}0{{end}}</td>
+  <td>{{if .ActiveNow}}<span class="badge live" title="honeybees actively working this submodule right now">{{.ActiveNow}}</span>{{else}}0{{end}}</td>
   <td>{{if .Stranded}}<span class="state danger">{{.Stranded}}</span>{{else}}0{{end}}</td>
 </tr>{{if .Models}}<tr class="models"><td colspan=6>
   <details><summary class="muted">by model ({{len .Models}})</summary>
