@@ -2,7 +2,7 @@
 <h1>NEEDS-HUMAN</h1>
 <p class="muted">Tasks the swarm escalated for operator input. Each blocks its dependents until resolved. Open one to get an AI-assisted resolution workspace, or resolve it to reopen it as TODO.</p>
 <div class="table-scroll">
-<table><tr><th>submodule</th><th>id</th><th>reason</th><th>desc</th><th></th></tr>
+<table><tr><th scope="col">submodule</th><th scope="col">id</th><th scope="col">reason</th><th scope="col">desc</th><th scope="col"></th></tr>
 {{range .Rows}}<tr>
   <td>{{.Sub}}</td>
   <td>{{.Item.ID}}</td>
