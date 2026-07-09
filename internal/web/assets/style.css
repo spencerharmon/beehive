@@ -663,6 +663,27 @@ pre.diff .ln.eq { background: transparent; }
 pre.diff .chg { background: var(--diff-chg-bg); border-radius: 2px; }
 pre.diff .ln.del .chg { background: var(--diff-chg-del-bg); }
 
+/* Non-color add/del gutter marker (diff-add-del-noncolor-marker, WCAG 1.4.1
+ * Use of Color) — .ln.del already had a non-color cue above (text-decoration:
+ * line-through), but .ln.add relied on background color ALONE, indistinguish-
+ * able from a context (eq) line without perceiving the green fill. A ::before
+ * glyph gives every row a shape-based cue too: "+" for add, "-" for del
+ * (reinforcing the strike-through), a non-breaking space for eq so the text
+ * column still lines up. Purely additive — the color backgrounds/syntax
+ * highlighting above are unchanged; one shared rule fixes every pre.diff view
+ * (editor/chat/skill/commit/human-resolve panels all render the same
+ * span.ln.{{.Kind}} markup, so this one stylesheet change covers all five). */
+pre.diff .ln::before {
+  display: inline-block;
+  width: 1.1em;
+  margin-right: var(--space-1);
+  text-align: center;
+  font-weight: 700;
+  content: "\00a0";
+}
+pre.diff .ln.add::before { content: "+"; color: var(--success); }
+pre.diff .ln.del::before { content: "-"; color: var(--danger); text-decoration: none; }
+
 /* Syntax highlighting (chat-editor-snappy-polish) ------------------------- *
  * internal/web/highlight.go buckets every chroma token into this small,
  * curated class set (see tokenClass) instead of emitting one of chroma's ~90
