@@ -21,8 +21,9 @@
 {{if .Packs}}
 <details class="hygiene-class" id="hygiene-packs"{{if .PackWarn}} open{{end}}>
 <summary><span class="badge{{if .PackWarn}} drift-missing{{end}}">object store</span> pack-dir health <span class="muted">(per managed repo)</span></summary>
+<div class="table-scroll">
 <table class="hygiene-packs">
-<thead><tr><th>repo</th><th>pack-dir size</th><th>packs</th><th>temps</th><th>state</th></tr></thead>
+<thead><tr><th scope="col">repo</th><th scope="col">pack-dir size</th><th scope="col">packs</th><th scope="col">temps</th><th scope="col">state</th></tr></thead>
 <tbody>
 {{range .Packs}}
 <tr>
@@ -35,6 +36,7 @@
 {{end}}
 </tbody>
 </table>
+</div>
 <p class="hygiene-remedy muted">Read-only stat of each managed repo's own <code>.git/objects/pack</code>. A nonzero temp count (a repack killed mid-flight) or an abnormal pack count signals a repack storm; remediation is the runner-owned <code>beehive gc</code> — this panel never repacks.</p>
 </details>
 {{end}}
