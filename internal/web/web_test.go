@@ -646,14 +646,15 @@ func TestDashboardCards(t *testing.T) {
 	// Rendered card grid: the env badge, the NEEDS-HUMAN count linking /human, the
 	// swarm-state badges, the pending count, and the honeybee count are all present
 	// in the HTML. This body is rendered at real time.Now(), where the fixture's
-	// 2026-06-30 claim is long stale, so every card reads "bees 0" (the badge
-	// renders its count regardless of liveness; the live count is asserted off
-	// subViews with the fixed now above, and the lit-bee markup in
-	// TestDashboardCardPolish).
+	// 2026-06-30 claim is long stale, so every card reads a 🐝 counter of 0 (the
+	// badge renders its count regardless of liveness; the live count is asserted
+	// off subViews with the fixed now above, and the lit-bee markup in
+	// TestDashboardCardPolish). bee-glyph-restore restored the 🐝 glyph on the
+	// counter with an aria-label accessible name (not the interim "bees N" text).
 	body := get(t, s, "/").Body.String()
 	for _, want := range []string{
 		"card-meta", "green", "needs-human 1", `href="/human"`,
-		"bootstrap", "dormant", "pending 2", "bees 0",
+		"bootstrap", "dormant", "pending 2", `aria-label="0 honeybees active"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard HTML missing %q:\n%s", want, body)
@@ -662,7 +663,7 @@ func TestDashboardCards(t *testing.T) {
 }
 
 // TestDashboardCardPolish locks the dashboard-card-polish refinements on top of
-// dashboard-cards: every card shows a "bees N" honeybee count (the live claim
+// dashboard-cards: every card shows a 🐝 honeybee count (the live claim
 // count, teal-lit when bees are working); the commit/branch-graph link reads
 // "commits", not "branches"; the ROI links are ONE labelled view/edit pair per
 // card (no duplicate roi links); and the ROI stamp is rendered in a truncating
@@ -674,10 +675,10 @@ func TestDashboardCardPolish(t *testing.T) {
 	s, root := setup(t)
 
 	// IDLE: the fixture's t1 heartbeat (2026-06-30) is long stale at real now, so
-	// alpha has no live bee. The "bees N" count still renders (as 0) and must NOT
-	// carry the lit "bees-live" modifier.
+	// alpha has no live bee. The 🐝 count still renders (as 0, via its
+	// aria-label accessible name) and must NOT carry the lit "bees-live" modifier.
 	idle := get(t, s, "/").Body.String()
-	if !strings.Contains(idle, "bees 0") {
+	if !strings.Contains(idle, `aria-label="0 honeybees active"`) {
 		t.Errorf("idle dashboard missing the bees honeybee count (should render 0 for a stale claim):\n%s", idle)
 	}
 	if strings.Contains(idle, "bees-live") {
@@ -721,9 +722,9 @@ func TestDashboardCardPolish(t *testing.T) {
 
 	// LIVE: rewrite alpha's PLAN.md so t1 carries a heartbeat fresh at real now
 	// (well within the 60m TTL). alpha now has exactly one live bee, so its card
-	// shows "bees 1" with the teal "bees-live" modifier. The no-commit fixture has
-	// an empty HEAD, so planView bypasses the cache and re-reads this on next
-	// render.
+	// shows a 🐝 counter of 1 (aria-label "1 honeybees active") with the teal
+	// "bees-live" modifier. The no-commit fixture has an empty HEAD, so planView
+	// bypasses the cache and re-reads this on next render.
 	fresh := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
 	if err := os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.PlanFile), []byte(
 		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
@@ -733,7 +734,7 @@ func TestDashboardCardPolish(t *testing.T) {
 		t.Fatal(err)
 	}
 	live := get(t, s, "/").Body.String()
-	if !strings.Contains(live, "bees 1") {
+	if !strings.Contains(live, `aria-label="1 honeybees active"`) {
 		t.Errorf("live dashboard missing the bees 1 honeybee count for the working alpha card:\n%s", live)
 	}
 	if !strings.Contains(live, "badge bees bees-live") {
@@ -5802,16 +5803,20 @@ func TestStatsDefaultUnchanged(t *testing.T) {
 	}
 }
 
-// TestStatsActiveNowNoBareBeeGlyph locks stats-active-now-bee-label: the
-// per-submodule "active now" cell renders the active-honeybee COUNT with no
-// bare 🐝 glyph prefix — presented consistently with the total row (stats.html's
-// {{.Total.ActiveNow}}, a plain number) and the dashboard's text-label
-// "bees {{.Bees}}" form, not the pre-fix "🐝 {{.ActiveNow}}". The count keeps
-// its live-badge highlight + title and the {{else}}0{{end}} zero case; the
-// intentionally-kept ✅/🐝 ratio header/badge/legend (an accepted
-// emoji-glyph-cleanup keep, NOT a gap) stay UNCHANGED.
-func TestStatsActiveNowNoBareBeeGlyph(t *testing.T) {
+// TestBeeCounterGlyphRestored locks bee-glyph-restore: the 🐝 counter glyph is
+// REQUIRED intent on exactly two surfaces — the stats per-submodule "active now"
+// cell (stats.html:78, reverting stats-active-now-bee-label) and the dashboard
+// submodule-card honeybee counter (dashboard.html:28, reverting
+// emoji-glyph-cleanup). On BOTH the literal 🐝 renders WITH its count and WITH an
+// accessible name: the count carries an aria-label naming the metric while the
+// decorative glyph is marked aria-hidden, so AT announces the labelled count once
+// (not "honeybee N"). The live-badge/bees class + title + the stats {{else}}0{{end}}
+// zero case are preserved; the stats TOTAL active-now cell stays a plain number and
+// the intentionally-kept ✅/🐝 ratio header/badge/legend are UNCHANGED.
+func TestBeeCounterGlyphRestored(t *testing.T) {
 	s, _ := setup(t)
+
+	// STATS surface — the per-submodule active-now cell.
 	statsData := map[string]interface{}{
 		"Filters": nil, "GroupBy": []string(nil), "GroupBySet": toSet(nil),
 		"BuiltinTags": builtinFacets, "ExtraGroupBy": "", "Filtered": false,
@@ -5823,35 +5828,45 @@ func TestStatsActiveNowNoBareBeeGlyph(t *testing.T) {
 	}
 	out := renderTmpl(t, s, "stats.html", statsData)
 
-	// The active-now cell renders the count inside the live badge with its
-	// title preserved — and with NO bare 🐝 glyph prefix on the count.
-	const wantCell = `<span class="badge live" title="honeybees actively working this submodule right now">3</span>`
-	if !strings.Contains(out, wantCell) {
-		t.Fatalf("active-now cell must render the count in a live badge without a bare 🐝 prefix; want %q:\n%s", wantCell, out)
+	// The active-now cell renders the 🐝 glyph WITH the count inside the live
+	// badge: aria-label names the metric (the accessible name) and the decorative
+	// glyph is aria-hidden, with the title preserved.
+	const wantStatsCell = `<span class="badge live" title="honeybees actively working this submodule right now" aria-label="3 honeybees active"><span aria-hidden="true">🐝</span> 3</span>`
+	if !strings.Contains(out, wantStatsCell) {
+		t.Fatalf("stats active-now cell must render the 🐝 glyph with an accessible name; want %q:\n%s", wantStatsCell, out)
 	}
-	// The exact pre-fix bare-glyph form must be GONE.
-	const bareCell = `<span class="badge live" title="honeybees actively working this submodule right now">🐝 `
-	if strings.Contains(out, bareCell) {
-		t.Fatalf("active-now cell still renders the bare 🐝 glyph prefix %q:\n%s", bareCell, out)
+	// The {{else}}0{{end}} zero case (beta, ActiveNow=0) still renders a plain 0 —
+	// no live badge, no glyph, no aria-label.
+	if strings.Contains(out, `aria-label="0 honeybees active"`) {
+		t.Fatalf("ActiveNow=0 must render a plain 0, not a glyph badge:\n%s", out)
 	}
-	// Belt-and-suspenders: no "🐝 " (glyph + trailing space) survives anywhere in
-	// the default view — every kept 🐝 is the ✅/🐝 ratio construct, where the
-	// glyph is always followed by "<", never a space.
-	if strings.Contains(out, "🐝 ") {
-		t.Fatalf("a bare 🐝 glyph prefix (\"🐝 \") still renders in the default stats view:\n%s", out)
+	// The stats TOTAL active-now cell is UNCHANGED — a bare bold number, no glyph.
+	if !strings.Contains(out, `<td><b>3</b></td>`) {
+		t.Fatalf("the stats TOTAL active-now cell must stay a plain number (unchanged):\n%s", out)
 	}
-	// The intentionally-kept ✅/🐝 ratio badge (h1) + column header
-	// (emoji-glyph-cleanup's accepted keep) must NOT be stripped by this fix.
+	// The intentionally-kept ✅/🐝 ratio badge (h1) + column header stay UNCHANGED.
 	if !strings.Contains(out, `<span class="badge">✅/🐝</span>`) {
 		t.Fatalf("the intentionally-kept ✅/🐝 ratio badge (h1) must remain:\n%s", out)
 	}
 	if !strings.Contains(out, `<th scope="col">✅/🐝</th>`) {
 		t.Fatalf("the intentionally-kept ✅/🐝 ratio column header must remain:\n%s", out)
 	}
-	// The {{else}}0{{end}} zero case (beta, ActiveNow=0) still renders a plain 0,
-	// never a live badge wrapping it.
-	if strings.Contains(out, `<span class="badge live" title="honeybees actively working this submodule right now">0</span>`) {
-		t.Fatalf("ActiveNow=0 must render a plain 0, not a live badge:\n%s", out)
+
+	// DASHBOARD surface — the submodule-card honeybee counter, restored the same
+	// way: aria-label accessible name + aria-hidden decorative glyph, with the
+	// `badge bees` class + title preserved. The setup fixture's alpha claim is
+	// stale at real now, so the counter reads 0.
+	dash := get(t, s, "/").Body.String()
+	const wantDashGlyph = `aria-label="0 honeybees active"><span aria-hidden="true">🐝</span> 0`
+	if !strings.Contains(dash, wantDashGlyph) {
+		t.Fatalf("dashboard card counter must render the 🐝 glyph with an accessible name; want %q:\n%s", wantDashGlyph, dash)
+	}
+	if !strings.Contains(dash, `class="badge bees"`) {
+		t.Fatalf("dashboard card counter must preserve its `badge bees` class:\n%s", dash)
+	}
+	// The interim text label "bees N" must be gone from the visible counter.
+	if strings.Contains(dash, `>bees 0</span>`) {
+		t.Fatalf("dashboard card counter still renders the interim \"bees N\" text label:\n%s", dash)
 	}
 }
 
