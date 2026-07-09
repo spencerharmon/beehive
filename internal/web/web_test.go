@@ -264,6 +264,101 @@ func TestPollPaneLoadingSkeletons(t *testing.T) {
 	}
 }
 
+// TestPollBackoffEndedContent is the core of poll-backoff-ended-content: a polled
+// pane must not re-fetch identical bytes forever. An ENDED session transcript is
+// durable and never changes again, so its pane fetches ONCE (hx-trigger="load")
+// and stops — no every-2s poll — while a LIVE session keeps the 2s poll (the SSE
+// fallback). The session-list, editor and resolve panes keep polling but back off
+// to a slow (10s) cadence once idle (no live session / agent not busy) and speed
+// back up when work resumes, via a self-refreshing poller carried in the swapped
+// fragment (so the cadence adapts every cycle and re-arms after a form swap).
+func TestPollBackoffEndedContent(t *testing.T) {
+	s, root := setup(t)
+
+	// --- session_view: ended fetches once and stops; live keeps the 2s poll.
+	// This is the required ended-vs-live hx-trigger difference, asserted off the
+	// template's gating on .Live.
+	ended := renderTmpl(t, s, "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x", "Live": false})
+	if !strings.Contains(ended, `hx-trigger="load"`) {
+		t.Errorf("ended session_view must fetch once (hx-trigger=\"load\"):\n%s", ended)
+	}
+	if strings.Contains(ended, "every 2s") {
+		t.Errorf("ended session_view must NOT keep polling every 2s (durable final transcript):\n%s", ended)
+	}
+	live := renderTmpl(t, s, "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x", "Live": true})
+	if !strings.Contains(live, `hx-trigger="load, every 2s"`) {
+		t.Errorf("live session_view must keep the every-2s poll (SSE fallback, unchanged):\n%s", live)
+	}
+
+	// End-to-end: the handler wires .Live from the session file, so an ended
+	// session served over HTTP stops polling while a live one does not.
+	gitAt(t, root, "add", "-A")
+	gitAt(t, root, "commit", "-q", "-m", "seed")
+	gitAt(t, root, "branch", "bee-live-stream")
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-live.md"), []byte(repo.SessionStub("bee-live-stream")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-final.md"), []byte("# final\ndone\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	livePage := get(t, s, "/submodule/alpha/session/bee-live").Body.String()
+	if !strings.Contains(livePage, `hx-trigger="load, every 2s"`) {
+		t.Errorf("served live session page must keep the every-2s poll:\n%s", livePage)
+	}
+	endedPage := get(t, s, "/submodule/alpha/session/bee-final").Body.String()
+	if !strings.Contains(endedPage, `hx-trigger="load"`) || strings.Contains(endedPage, "every 2s") {
+		t.Errorf("served ended session page must fetch once and stop (no every-2s):\n%s", endedPage)
+	}
+
+	// --- session list: the shell fetches once; the body poller owns the cadence,
+	// which adapts to whether any session is live.
+	listShell := renderTmpl(t, s, "session_list.html", map[string]interface{}{"Name": "alpha"})
+	if strings.Contains(listShell, "every 2s") {
+		t.Errorf("session_list shell must not poll directly; the body poller owns cadence:\n%s", listShell)
+	}
+	liveList := renderTmpl(t, s, "session_list_body.html", map[string]interface{}{"Name": "alpha", "AnyLive": true})
+	if !strings.Contains(liveList, `hx-trigger="every 2s"`) || !strings.Contains(liveList, `hx-target="#session-list"`) {
+		t.Errorf("session list with a live session must poll every 2s into #session-list:\n%s", liveList)
+	}
+	idleList := renderTmpl(t, s, "session_list_body.html", map[string]interface{}{"Name": "alpha", "AnyLive": false})
+	if !strings.Contains(idleList, `hx-trigger="every 10s"`) {
+		t.Errorf("idle session list (no live session) must back off to 10s:\n%s", idleList)
+	}
+
+	// --- editor: the shell fetches once; the panel poller is fast while the agent
+	// turn is in flight and backs off once idle.
+	editorShell := renderTmpl(t, s, "editor.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"})
+	if strings.Contains(editorShell, "every 1500ms") {
+		t.Errorf("editor shell must not poll directly; the panel poller owns cadence:\n%s", editorShell)
+	}
+	busyEd := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Busy": true})
+	if !strings.Contains(busyEd, `hx-trigger="every 1500ms"`) {
+		t.Errorf("busy editor panel must poll every 1500ms:\n%s", busyEd)
+	}
+	idleEd := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Busy": false})
+	if !strings.Contains(idleEd, `hx-trigger="every 10s"`) {
+		t.Errorf("idle editor panel must back off to 10s:\n%s", idleEd)
+	}
+
+	// --- resolve: same shape as the editor.
+	resolveShell := renderTmpl(t, s, "human_resolve.html", map[string]interface{}{"Sub": "alpha", "Item": PlanItem{ID: "t1"}, "SessID": "s1"})
+	if strings.Contains(resolveShell, "every 2s") {
+		t.Errorf("resolve shell must not poll directly; the panel poller owns cadence:\n%s", resolveShell)
+	}
+	busyRes := renderTmpl(t, s, "human_resolve_panel.html", map[string]interface{}{"Sub": "alpha", "TaskID": "t1", "SessID": "s1", "Busy": true})
+	if !strings.Contains(busyRes, `hx-trigger="every 2s"`) {
+		t.Errorf("busy resolve panel must poll every 2s:\n%s", busyRes)
+	}
+	idleRes := renderTmpl(t, s, "human_resolve_panel.html", map[string]interface{}{"Sub": "alpha", "TaskID": "t1", "SessID": "s1", "Busy": false})
+	if !strings.Contains(idleRes, `hx-trigger="every 10s"`) {
+		t.Errorf("idle resolve panel must back off to 10s:\n%s", idleRes)
+	}
+}
+
 func TestDashboard(t *testing.T) {
 	s, _ := setup(t)
 	w := get(t, s, "/")

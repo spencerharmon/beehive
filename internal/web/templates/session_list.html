@@ -4,7 +4,7 @@
      role="status" aria-live="polite"
      data-scroll-preserve
      hx-get="/submodule/{{.Name}}/sessions/body"
-     hx-trigger="load, every 2s"
+     hx-trigger="load"
      hx-swap="innerHTML">
   {{template "skeleton-list"}}
 </div>

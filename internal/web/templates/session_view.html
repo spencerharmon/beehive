@@ -4,7 +4,7 @@
 <div id="session-body"
      role="status" aria-live="polite"
      hx-get="/submodule/{{.Name}}/session/{{.Branch}}/body"
-     hx-trigger="load, every 2s"
+     hx-trigger="load{{if .Live}}, every 2s{{end}}"
      hx-swap="innerHTML">
   <div id="session-loading">{{template "skeleton-transcript"}}</div>
 </div>

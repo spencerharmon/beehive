@@ -14,3 +14,11 @@
     <pre class="diff" id="resolve-diff" data-scroll-preserve>{{if .HasChange}}{{.Patch}}{{else}}<span class="muted">no changes made yet</span>{{end}}</pre>
   </div>
 </div>
+{{/* Self-refreshing poller (always present so it re-arms after a form swap and is
+     immune to a busy-flag race): fast while the agent turn is in flight, backing
+     off to 10s once idle so an open resolve pane left settled stops re-transferring
+     an unchanged chat+diff every 2s. */}}
+<div id="resolve-poll" hidden
+     hx-get="/human/{{.Sub}}/{{.TaskID}}/panel/{{.SessID}}"
+     hx-trigger="every {{if .Busy}}2s{{else}}10s{{end}}"
+     hx-target="#resolve" hx-swap="innerHTML"></div>

@@ -6,3 +6,12 @@
   <span class="ago">{{.Ago}} ago</span>
 </li>{{else}}<li>no sessions yet</li>{{end}}
 </ul>
+{{/* Self-refreshing poller: re-fetches this body (recomputing .AnyLive) and swaps
+     it back into #session-list, so the cadence adapts every cycle. A live session
+     keeps the 2s cadence; with none live the list only gains a new session when a
+     pass starts, so it backs off to 10s instead of re-transferring an unchanged
+     list every 2s forever. */}}
+<div id="session-list-poll" hidden
+     hx-get="/submodule/{{.Name}}/sessions/body"
+     hx-trigger="every {{if .AnyLive}}2s{{else}}10s{{end}}"
+     hx-target="#session-list" hx-swap="innerHTML"></div>

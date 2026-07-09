@@ -33,7 +33,7 @@
   <div id="resolve"
        role="status" aria-live="polite"
        hx-get="/human/{{.Sub}}/{{.Item.ID}}/panel/{{.SessID}}"
-       hx-trigger="load, every 2s"
+       hx-trigger="load"
        hx-swap="innerHTML">
     {{template "skeleton-transcript"}}
   </div>

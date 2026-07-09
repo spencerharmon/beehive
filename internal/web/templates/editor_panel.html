@@ -16,3 +16,11 @@
 {{else}}<span class="muted">no changes proposed yet</span>{{end}}</pre>
   </div>
 </div>
+{{/* Self-refreshing poller (always present so it re-arms after a form swap and is
+     immune to a busy-flag race): fast while the agent turn is in flight, backing
+     off to 10s once idle so an open editor left settled stops re-transferring an
+     unchanged chat+diff every 1.5s. */}}
+<div id="editor-poll" hidden
+     hx-get="/editor/{{.ID}}/panel"
+     hx-trigger="every {{if .Busy}}1500ms{{else}}10s{{end}}"
+     hx-target="#editor" hx-swap="innerHTML"></div>

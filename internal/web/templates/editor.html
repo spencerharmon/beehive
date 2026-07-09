@@ -4,7 +4,7 @@
 <div id="editor"
      role="status" aria-live="polite"
      hx-get="/editor/{{.ID}}/panel"
-     hx-trigger="load, every 1500ms"
+     hx-trigger="load"
      hx-swap="innerHTML">
   {{template "skeleton-transcript"}}
 </div>

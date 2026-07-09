@@ -47,8 +47,20 @@ func (s *Server) sessionsListBody(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	sync := s.followMain(r.Context(), now)
+	sessions := s.sessionInfos(r.Context(), sm.SessionsDir(), now)
+	// AnyLive drives the list's poll cadence: with a running session the pane
+	// keeps the 2s live cadence; with none live the list changes only when a new
+	// pass starts, so the body poller backs off (see session_list_body.html)
+	// rather than re-rendering an unchanged list every 2s forever.
+	anyLive := false
+	for _, si := range sessions {
+		if si.Live {
+			anyLive = true
+			break
+		}
+	}
 	s.render(w, "session_list_body.html", map[string]interface{}{
-		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), sm.SessionsDir(), now), "Sync": sync,
+		"Name": sm.Name, "Sessions": sessions, "Sync": sync, "AnyLive": anyLive,
 	})
 }
 
