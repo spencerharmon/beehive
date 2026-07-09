@@ -1,4 +1,5 @@
 {{template "header" .}}
+{{template "breadcrumb" .Crumbs}}
 <h1>{{.Name}} plan</h1>
 <p class="muted">ROI stamp: <code>{{.Plan.ROIStamp}}</code></p>
 <div class="table-scroll">
@@ -10,7 +11,7 @@
 <td>{{.Desc}}{{if .Body}}<details><summary class="muted">expand</summary><div class="markdown">{{.BodyHTML}}</div></details>{{end}}</td>
 <td>{{range .DepStates}}<span class="badge{{if .Done}} live{{end}}" title="{{if .Done}}satisfied (DONE){{else}}pending{{end}}">{{.Name}}</span> {{else}}<span class="muted">&mdash;</span>{{end}}</td>
 <td>{{if .ClaimState}}<span class="badge{{if .Active}} live{{end}}">{{.ClaimState}}</span> <code>{{.Session}}</code> <span class="ago">{{.HeartbeatLabel}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
-<td>{{if .DocHref}}<a href="{{.DocHref}}">change doc</a>{{else if .Doc}}<span class="muted">{{.Doc}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+<td>{{if .DocHref}}<a href="{{.DocHref}}?from=plan">change doc</a>{{else if .Doc}}<span class="muted">{{.Doc}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
 </tr>{{end}}
 </table>
 </div>

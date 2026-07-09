@@ -99,7 +99,7 @@ unknown tag key or value simply yields no rows, never an error.</p>
   {{range .Deliveries}}<tr>
     <td><span class="badge">{{.TaskID}}</span></td>
     <td>{{if .FlipHref}}<a href="{{.FlipHref}}"><code>{{.FlipSHA}}</code></a>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
-    <td>{{if .DocHref}}<a href="{{.DocHref}}">{{.DocPath}}</a>{{else if .DocPath}}<span class="muted">{{.DocPath}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+    <td>{{if .DocHref}}<a href="{{.DocHref}}?from=stats">{{.DocPath}}</a>{{else if .DocPath}}<span class="muted">{{.DocPath}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
   </tr>{{end}}
   </table>
   </div>
