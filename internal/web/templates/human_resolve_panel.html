@@ -7,7 +7,7 @@
   <div class="diffpane">
     <div class="statusbar">
       {{if .Published}}<span class="state live">Published</span><button class="merge merged" disabled>Published</button>
-      {{else if .HasChange}}<span class="state dirty">Unpublished changes</span><button class="merge" hx-post="/human/{{.Sub}}/{{.TaskID}}/publish/{{.SessID}}" hx-target="#resolve" hx-swap="innerHTML" hx-confirm="Publish the agent's changes to the coordination repo's main?">Publish → main</button>
+      {{else if .HasChange}}<span class="state dirty">Unpublished changes</span><button class="merge" hx-post="/human/{{.Sub}}/{{.TaskID}}/publish/{{.SessID}}" hx-target="#resolve" hx-swap="morph:innerHTML" hx-confirm="Publish the agent's changes to the coordination repo's main?">Publish → main</button>
       {{else}}<span class="state live">No changes yet</span><button class="merge merged" disabled>Publish → main</button>{{end}}
     </div>
     {{if .Stat}}<pre class="diffstat">{{.Stat}}</pre>{{end}}

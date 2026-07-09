@@ -9,9 +9,10 @@
    set it, so a submodule-scoped page (plan/session/explorer/...) leaves every
    nav link unmarked rather than guessing a parent section. */}}
 {{define "header"}}<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{if .Title}}{{.Title}}{{else}}beehive{{end}}</title>
+<html lang="en" hx-ext="morph"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{if .Title}}{{.Title}}{{else}}beehive{{end}}</title>
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 <script src="/assets/htmx.min.js"></script>
+<script src="/assets/idiomorph-ext.min.js"></script>
 <link rel="stylesheet" href="/assets/style.css"></head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -21,44 +22,72 @@
 <main class="container" id="main" tabindex="-1">{{end}}
 {{define "footer"}}</main>
 <script>
-/* poll-scroll-preserve: an htmx poll-refresh swaps a pane's innerHTML, which
-   destroys its inner scroll container and yanks the reader back to the top
-   mid-read. We save every [data-scroll-preserve] pane's scrollTop before a swap
-   and restore it after (keyed by a STABLE id that re-renders identically), and
-   also restore the window scroll, so a refresh never jumps the viewport. A
-   [data-scroll-pin] pane that was scrolled to its bottom keeps following new
-   output; otherwise the reader's absolute position is held. Anchors on content,
-   not the container. No external libraries (single-binary embed, no CDN). */
+/* poll-scroll-preserve: an htmx poll-refresh used to swap a pane's innerHTML
+   wholesale, destroying its inner scroll container (and any focus/<details>
+   state within it) and yanking the reader back to the top mid-read. Since
+   session-poll-dom-morph, every polled pane instead morphs in place
+   (hx-ext="morph" on <html>; hx-swap="morph:innerHTML" on the pane — see the
+   vendored idiomorph-ext.min.js below), which reconciles new markup onto the
+   EXISTING nodes (matched by id, falling back to structural position) rather
+   than replacing them outright. A node that survives a morph keeps its live
+   scrollTop, focus, and <details open> state for free, no JS required — so
+   this script's job shrinks to the one thing morph cannot infer on its own:
+   BOTTOM-FOLLOW. A [data-scroll-pin] pane that was scrolled to its bottom
+   right before the swap does not automatically stay pinned once new content
+   lands (morph has no notion of "the reader wants to track the tail"), so we
+   explicitly re-pin it after. We also restore the window scroll, so a refresh
+   never shifts the page if a pane's height changed. Any [data-scroll-preserve]
+   pane WITHOUT [data-scroll-pin] (e.g. the diff panes, the sessions list) now
+   needs no JS at all — the morph itself holds its position — so this script no
+   longer double-handles scroll for them. No external libraries beyond the
+   vendored, embedded morph ext (single-binary, no CDN). */
 (function () {
-  var SLACK = 4, saved = {}, wx = 0, wy = 0;
+  var SLACK = 4, pinned = {}, wx = 0, wy = 0;
   function target(e) { return (e.detail && e.detail.target) || e.target; }
-  function panes(t) {
+  function pins(t) {
     var out = [];
     if (!t || t.nodeType !== 1) return out;
-    if (t.matches && t.matches('[data-scroll-preserve][id]')) out.push(t);
+    if (t.matches && t.matches('[data-scroll-preserve][data-scroll-pin][id]')) out.push(t);
     if (t.querySelectorAll) {
-      var n = t.querySelectorAll('[data-scroll-preserve][id]');
+      var n = t.querySelectorAll('[data-scroll-preserve][data-scroll-pin][id]');
       for (var i = 0; i < n.length; i++) out.push(n[i]);
     }
     return out;
   }
   document.addEventListener('htmx:beforeSwap', function (e) {
     wx = window.scrollX; wy = window.scrollY;
-    panes(target(e)).forEach(function (el) {
-      saved[el.id] = {
-        top: el.scrollTop,
-        pinned: el.scrollHeight - el.scrollTop - el.clientHeight <= SLACK
-      };
+    pins(target(e)).forEach(function (el) {
+      pinned[el.id] = el.scrollHeight - el.scrollTop - el.clientHeight <= SLACK;
     });
   });
   document.addEventListener('htmx:afterSwap', function (e) {
-    panes(target(e)).forEach(function (el) {
-      var s = saved[el.id];
-      if (!s) return;
-      el.scrollTop = (el.hasAttribute('data-scroll-pin') && s.pinned) ? el.scrollHeight : s.top;
+    pins(target(e)).forEach(function (el) {
+      if (pinned[el.id]) el.scrollTop = el.scrollHeight;
     });
     window.scrollTo(wx, wy);
   });
+})();
+</script>
+<script>
+/* morph-preserve-open (session-poll-dom-morph): idiomorph's default attribute
+   sync removes any attribute present on the LIVE node but absent from the
+   freshly rendered fragment it is morphing against. Every <details
+   class="agent-step"> the editor/chat-edit/human-resolve panels render (the
+   shared "agent-step" template in chatedit_panel.html, reused for the live
+   turn's steps) never carries a server-rendered "open" attribute — whether a
+   step is expanded is pure client interaction the server does not track — so
+   an unpatched morph would silently re-close every step a reader expanded on
+   the very next poll tick. Veto JUST the REMOVAL of "open" so a user's
+   expand/collapse survives a morph; every other attribute (and "open" being
+   explicitly added, which never happens here today) still syncs normally.
+   This configures the vendored idiomorph-ext.min.js global directly (its
+   documented extension point — Idiomorph.defaults — not a private API); no
+   external libraries (single-binary embed, no CDN). */
+(function () {
+  if (!window.Idiomorph) return;
+  Idiomorph.defaults.callbacks.beforeAttributeUpdated = function (attr, el, mutationType) {
+    return !(attr === 'open' && mutationType === 'remove');
+  };
 })();
 </script>
 <script>

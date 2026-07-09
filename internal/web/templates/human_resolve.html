@@ -34,10 +34,10 @@
        role="status" aria-live="polite"
        hx-get="/human/{{.Sub}}/{{.Item.ID}}/panel/{{.SessID}}"
        hx-trigger="load, every 2s"
-       hx-swap="innerHTML">
+       hx-swap="morph:innerHTML">
     {{template "skeleton-transcript"}}
   </div>
-  <form hx-post="/human/{{.Sub}}/{{.Item.ID}}/message/{{.SessID}}" hx-target="#resolve" hx-swap="innerHTML"
+  <form hx-post="/human/{{.Sub}}/{{.Item.ID}}/message/{{.SessID}}" hx-target="#resolve" hx-swap="morph:innerHTML"
         hx-on::after-request="this.reset()">
     <input name="message" placeholder="What does this blocker need? Ask the agent to investigate or draft the change…" aria-label="message to the resolution agent" autocomplete="off" autofocus style="width:70%">
     <button>send</button>

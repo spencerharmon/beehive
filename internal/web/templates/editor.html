@@ -5,10 +5,10 @@
      role="status" aria-live="polite"
      hx-get="/editor/{{.ID}}/panel"
      hx-trigger="load, every 1500ms"
-     hx-swap="innerHTML">
+     hx-swap="morph:innerHTML">
   {{template "skeleton-transcript"}}
 </div>
-<form hx-post="/editor/{{.ID}}/chat" hx-target="#editor" hx-swap="innerHTML"
+<form hx-post="/editor/{{.ID}}/chat" hx-target="#editor" hx-swap="morph:innerHTML"
       hx-on::after-request="this.reset()">
   <input name="message" placeholder="Ask the editor to change something…" aria-label="message to the editor" autocomplete="off" autofocus style="width:70%">
   <button>send</button>

@@ -162,6 +162,129 @@ func TestScrollPreserveWiring(t *testing.T) {
 	}
 }
 
+// TestMorphSwapWiring locks session-poll-dom-morph's core contract: every
+// htmx-polled pane morphs its content in place (hx-ext="morph" declared once,
+// high enough to cover every pane, plus a "morph:innerHTML" hx-swap on the
+// pane itself) instead of replacing it wholesale with a plain innerHTML swap.
+// Covers all five panes the task names: the session transcript, the sessions
+// list, the single-file editor, the bootstrap/chat editor, and the
+// human-resolve agent panel.
+func TestMorphSwapWiring(t *testing.T) {
+	s, _ := setup(t)
+
+	// hx-ext="morph" lives on <html> so every polled pane (and every
+	// button/form that swaps into one) inherits it — htmx resolves hx-ext from
+	// the target's ancestors, not just the target itself.
+	page := get(t, s, "/").Body.String()
+	if !strings.Contains(page, `hx-ext="morph"`) {
+		t.Fatalf("layout does not declare hx-ext=\"morph\":\n%s", page)
+	}
+
+	cases := []struct {
+		name string
+		tmpl string
+		data interface{}
+		want string // the poll target's id, to anchor the swap check
+	}{
+		{"session transcript", "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x"}, "session-body"},
+		{"sessions list", "session_list.html", map[string]interface{}{"Name": "alpha"}, "session-list"},
+		{"single-file editor", "editor.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"}, "editor"},
+		{"bootstrap/chat editor", "bootstrap_agent.html", map[string]interface{}{"ID": "b1"}, "chatedit"},
+		{"human resolve agent", "human_resolve.html", map[string]interface{}{"Sub": "alpha", "Item": PlanItem{ID: "t1"}, "SessID": "s1"}, "resolve"},
+	}
+	for _, c := range cases {
+		out := renderTmpl(t, s, c.tmpl, c.data)
+		if !strings.Contains(out, `id="`+c.want+`"`) {
+			t.Fatalf("%s (%s): missing poll target #%s:\n%s", c.name, c.tmpl, c.want, out)
+		}
+		if !strings.Contains(out, `hx-swap="morph:innerHTML"`) {
+			t.Fatalf("%s (%s): poll no longer morphs (hx-swap=\"morph:innerHTML\" missing) — full-subtree replace regressed:\n%s", c.name, c.tmpl, out)
+		}
+		if strings.Contains(out, `hx-swap="innerHTML"`) {
+			t.Fatalf("%s (%s): still carries a plain innerHTML swap alongside/instead of the morph:\n%s", c.name, c.tmpl, out)
+		}
+	}
+}
+
+// TestMorphAppliesToPanelActions locks that a panel's OWN swaps (chat
+// send/merge/approve/reject/publish — every button or form that ALSO targets
+// one of the five morphed panes) morph too, not just the poll tick: mixing
+// swap styles into the SAME target would reintroduce the scroll/focus/
+// <details> loss on every non-poll action (send a message, merge, approve,
+// reject, publish).
+func TestMorphAppliesToPanelActions(t *testing.T) {
+	s, _ := setup(t)
+
+	cases := []struct {
+		name string
+		tmpl string
+		data interface{}
+	}{
+		{"editor chat form", "editor.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"}},
+		{"editor merge button", "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"}},
+		{"bootstrap/chat editor chat form", "bootstrap_agent.html", map[string]interface{}{"ID": "b1"}},
+		{"chatedit approve/reject buttons", "chatedit_panel.html", map[string]interface{}{"ID": "c1", "Path": "notes.md", "HasProposal": true}},
+		{"human-resolve message form", "human_resolve.html", map[string]interface{}{"Sub": "alpha", "Item": PlanItem{ID: "t1"}, "SessID": "s1"}},
+		{"human-resolve publish button", "human_resolve_panel.html", map[string]interface{}{"Sub": "alpha", "TaskID": "t1", "SessID": "s1", "HasChange": true}},
+	}
+	for _, c := range cases {
+		out := renderTmpl(t, s, c.tmpl, c.data)
+		if !strings.Contains(out, `hx-swap="morph:innerHTML"`) {
+			t.Fatalf("%s (%s): action swap is not a morph:\n%s", c.name, c.tmpl, out)
+		}
+		if strings.Contains(out, `hx-swap="innerHTML"`) {
+			t.Fatalf("%s (%s): action swap still plain innerHTML:\n%s", c.name, c.tmpl, out)
+		}
+	}
+}
+
+// TestTemplatesGrepMorph is the literal grep session-poll-dom-morph's
+// acceptance criterion names: `grep morph|idiomorph|hx-ext
+// internal/web/templates` must no longer be empty. Reads the embedded
+// template SOURCE (tmplFS), not rendered output, so it fails the same way a
+// plain repo-tree grep would if the wiring regressed.
+func TestTemplatesGrepMorph(t *testing.T) {
+	entries, err := tmplFS.ReadDir("templates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`morph|idiomorph|hx-ext`)
+	hit := false
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		b, err := tmplFS.ReadFile("templates/" + e.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if re.Match(b) {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		t.Fatal(`grep morph|idiomorph|hx-ext internal/web/templates is empty — no morph wiring found`)
+	}
+}
+
+// TestMorphPreservesDetailsOpenState locks that idiomorph is configured to
+// keep a user-expanded <details class="agent-step"> open across a morph: the
+// server never renders the "open" attribute (whether a step is expanded is
+// pure client interaction), so idiomorph's default attribute sync would
+// otherwise treat it as removed on the very next poll tick and silently
+// re-close every step the reader just opened.
+func TestMorphPreservesDetailsOpenState(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String()
+	if !strings.Contains(page, "Idiomorph.defaults.callbacks.beforeAttributeUpdated") {
+		t.Fatalf("layout does not configure idiomorph's beforeAttributeUpdated callback:\n%s", page)
+	}
+	if !strings.Contains(page, `attr === 'open'`) || !strings.Contains(page, `mutationType === 'remove'`) {
+		t.Fatalf("layout's morph config does not veto removal of the <details> open attribute:\n%s", page)
+	}
+}
+
 // TestPollPaneLoadingSkeletons is the core of poll-pane-loading-skeletons: every
 // htmx-polled pane used to open with a bare <p>loading…</p> — no shaped
 // placeholder and, worse, no aria-live, so a screen-reader user got no
@@ -3441,6 +3564,56 @@ func TestLayoutEmbedsHtmxNoCDN(t *testing.T) {
 		if !strings.Contains(page, want) {
 			t.Fatalf("layout missing htmx-polish hook %q:\n%s", want, page)
 		}
+	}
+}
+
+// TestAssetsMorphExtServed locks the single-binary embed contract for the
+// vendored morph extension (session-poll-dom-morph): idiomorph plus its htmx
+// extension ship under assets/ and are served at
+// /assets/idiomorph-ext.min.js (no CDN), exactly like htmx itself
+// (TestAssetsHtmxServed above). It must be the real library, not a stub.
+func TestAssetsMorphExtServed(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/assets/idiomorph-ext.min.js")
+	if w.Code != 200 {
+		t.Fatalf("idiomorph-ext.min.js status %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Fatalf("content-type = %q, want javascript", ct)
+	}
+	body := w.Body.String()
+	if len(body) < 5000 {
+		t.Fatalf("idiomorph-ext.min.js is %d bytes — too small to be the real library", len(body))
+	}
+	if !strings.Contains(body, "Idiomorph") || !strings.Contains(body, `defineExtension("morph"`) {
+		t.Fatalf("idiomorph-ext.min.js missing the expected Idiomorph / htmx-extension markers")
+	}
+}
+
+// TestLayoutEmbedsMorphExtNoCDN proves the layout loads the EMBEDDED morph
+// extension (no CDN) strictly AFTER htmx, and declares hx-ext="morph" so
+// every polled pane's "morph:innerHTML" hx-swap (TestMorphSwapWiring) actually
+// resolves to the vendored idiomorph instead of silently no-op'ing as an
+// unknown extension name.
+func TestLayoutEmbedsMorphExtNoCDN(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String()
+	if !strings.Contains(page, `src="/assets/idiomorph-ext.min.js"`) {
+		t.Fatalf("layout does not reference the embedded morph ext asset:\n%s", page)
+	}
+	if !strings.Contains(page, `hx-ext="morph"`) {
+		t.Fatalf("layout does not declare hx-ext=\"morph\":\n%s", page)
+	}
+	if strings.Contains(page, "unpkg.com") || strings.Contains(page, "//cdn.") {
+		t.Fatalf("layout still references a CDN (must be a single-binary embed):\n%s", page)
+	}
+	// The ext calls htmx.defineExtension at script-eval time, so it MUST load
+	// after htmx.min.js defines the global — the wrong order throws and
+	// silently breaks every morph swap on the page.
+	htmxAt := strings.Index(page, `src="/assets/htmx.min.js"`)
+	morphAt := strings.Index(page, `src="/assets/idiomorph-ext.min.js"`)
+	if htmxAt < 0 || morphAt < 0 || htmxAt > morphAt {
+		t.Fatalf("idiomorph-ext must load AFTER htmx.min.js (htmx=%d morph=%d):\n%s", htmxAt, morphAt, page)
 	}
 }
 

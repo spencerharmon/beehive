@@ -5,7 +5,7 @@
      role="status" aria-live="polite"
      hx-get="/submodule/{{.Name}}/session/{{.Branch}}/body"
      hx-trigger="load, every 2s"
-     hx-swap="innerHTML">
+     hx-swap="morph:innerHTML">
   <div id="session-loading">{{template "skeleton-transcript"}}</div>
 </div>
 {{if .Live}}
