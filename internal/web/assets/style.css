@@ -819,9 +819,13 @@ pre.diff .ln.del .chg { background: var(--diff-chg-del-bg); }
 }
 
 /* Visually-hidden utility: text kept off-screen for assistive tech only. Used for
-   the skeletons' "Loading…" text equivalent (the bars are aria-hidden) and for
+   the skeletons' "Loading…" text equivalent (the bars are aria-hidden), for
    sr-only <label>s that give placeholder-only form fields a programmatic name
-   (a placeholder is not a reliable accessible name). */
+   (a placeholder is not a reliable accessible name), and — grouped in below — as
+   the hidden BASE of the .skip-link skip-to-content control, which reveals itself
+   on focus (see .skip-link:focus). Reusing the one rule keeps a single
+   hidden-text definition rather than a second, colliding one. */
+.skip-link,
 .sr-only {
   position: absolute;
   width: 1px;
@@ -832,6 +836,37 @@ pre.diff .ln.del .chg { background: var(--diff-chg-del-bg); }
   clip: rect(0 0 0 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* Skip-to-content link (skip-to-content-link): the FIRST focusable element in
+   <body>. Hidden exactly like .sr-only above (grouped, so there is no second
+   hidden-text rule) until it receives keyboard focus, when it un-clips to a
+   normal, visible control pinned at the top-left — letting a keyboard/AT user
+   jump straight past the 7 repeated top-nav links to <main id="main"> on every
+   page. Built only from existing design tokens (no new color token); the reveal
+   is a discrete state change (no transition/animation, so prefers-reduced-motion
+   is respected by construction), and the shown control picks up the shared
+   a:focus-visible outline convention above. z-index clears the sticky topbar
+   (10), the htmx progress bar (50) and toast (60). */
+.skip-link:focus {
+  position: fixed;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: 100;
+  width: auto;
+  height: auto;
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
+  overflow: visible;
+  clip: auto;
+  white-space: nowrap;
+  background: var(--surface);
+  color: var(--accent);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  font-size: var(--text-sm);
+  font-weight: 600;
 }
 
 /* Error toast: a failed htmx request that is not swapped in (non-2xx / network)
