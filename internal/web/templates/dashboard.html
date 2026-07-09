@@ -25,7 +25,7 @@
   <div class="card-meta">
     <span class="badge{{if eq .State "active"}} live{{end}}" title="swarm status">{{.State}}</span>
     {{if .Env}}<a class="badge {{.EnvClass}}" title="active deploy env — manage this submodule's blue/green" href="/submodule/{{.Name}}/env">{{.Env}}</a>{{end}}
-    <span class="badge bees{{if .Working}} bees-live{{end}}" title="honeybees actively working this submodule right now (fresh PLAN-task claims + live claimless reconcile/bootstrap sessions)">🐝 {{.Bees}}</span>
+    <span class="badge bees{{if .Working}} bees-live{{end}}" title="honeybees actively working this submodule right now (fresh PLAN-task claims + live claimless reconcile/bootstrap sessions)">bees {{.Bees}}</span>
     <span class="badge" title="tasks not DONE">pending {{.Pending}}</span>
     {{if .Human}}<a class="badge human" href="/human" title="tasks needing a human">needs-human {{.Human}}</a>{{end}}
   </div>
