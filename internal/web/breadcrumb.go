@@ -61,6 +61,35 @@ func commitCrumbs(name, sha string) []Crumb {
 		{Label: "commits", Href: "/submodule/" + name + "/branches"}, {Label: sha}}
 }
 
+// envCrumbs: dashboard > <name> > env — the submodule's blue/green deploy panel
+// (/submodule/<name>/env), a child of the submodule explorer like plan/docs, so
+// it threads the same crumbSubmodule ancestor. The leaf label mirrors the route
+// segment and the dashboard/explorer's lowercase "…deploy env" navigation.
+func envCrumbs(name string) []Crumb {
+	return []Crumb{crumbDashboard(), crumbSubmodule(name), {Label: "env"}}
+}
+
+// roiCrumbs: dashboard > <name> > roi — the submodule's intent editor. Its route
+// is top-level (/roi/<name>) rather than under /submodule/<name>/, but the ROI is
+// a property OF that submodule, so it hangs off the submodule explorer exactly
+// like the other scoped pages. The leaf label is the lowercase "roi" the
+// dashboard card links it as (the leaf convention mirrors the card's nav labels).
+func roiCrumbs(name string) []Crumb {
+	return []Crumb{crumbDashboard(), crumbSubmodule(name), {Label: "roi"}}
+}
+
+// humanResolveCrumbs: dashboard > human > <sub>/<id> — the per-task resolution
+// workspace (/human/<sub>/<id>). Unlike the submodule-scoped pages it hangs off
+// the GLOBAL NEEDS-HUMAN queue (/human, the page it is reached from), NOT a
+// submodule crumb: the queue spans every submodule, so the leaf names <sub>/<id>
+// to disambiguate which blocked task. The "human" ancestor stays a link back to
+// the queue — the same drill-down shape sessionCrumbs uses for its listing
+// ancestor.
+func humanResolveCrumbs(sub, id string) []Crumb {
+	return []Crumb{crumbDashboard(),
+		{Label: "human", Href: "/human"}, {Label: sub + "/" + id}}
+}
+
 // docCrumbs builds the doc viewer's trail, whose intermediate crumb reflects the
 // page the reader ACTUALLY came from (the `from` query token threaded by every
 // caller) rather than the old hardcoded "<name> commits" back-link — which was

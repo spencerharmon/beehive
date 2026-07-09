@@ -1087,7 +1087,7 @@ func (s *Server) roiGet(w http.ResponseWriter, r *http.Request) {
 	// preview renders the same source to sanitized HTML for reading.
 	s.render(w, "roi_editor.html", map[string]interface{}{
 		"Name": sm.Name, "Body": string(b), "Rendered": renderMarkdown(string(b)),
-		"Title": pageTitle("roi", sm.Name),
+		"Title": pageTitle("roi", sm.Name), "Crumbs": roiCrumbs(sm.Name),
 	})
 }
 
@@ -1106,7 +1106,7 @@ func (s *Server) roiPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.render(w, "roi_editor.html", map[string]interface{}{"Name": sm.Name, "Body": body, "Saved": true, "Rendered": renderMarkdown(body), "Title": pageTitle("roi", sm.Name)})
+	s.render(w, "roi_editor.html", map[string]interface{}{"Name": sm.Name, "Body": body, "Saved": true, "Rendered": renderMarkdown(body), "Title": pageTitle("roi", sm.Name), "Crumbs": roiCrumbs(sm.Name)})
 }
 
 // secretsGet lists the ACTIVE repo's secret KEYS (never values). s is the
@@ -1336,7 +1336,7 @@ func (s *Server) envGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	env, _ := parseEnv(filepath.Join(sm.Path, repo.InfraFile))
-	s.render(w, "env_panel.html", map[string]interface{}{"Name": sm.Name, "Env": env, "Title": pageTitle("env", sm.Name)})
+	s.render(w, "env_panel.html", map[string]interface{}{"Name": sm.Name, "Env": env, "Title": pageTitle("env", sm.Name), "Crumbs": envCrumbs(sm.Name)})
 }
 
 // envDeploy switches ONE submodule's active env, writing only that submodule's

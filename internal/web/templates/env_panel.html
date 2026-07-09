@@ -1,7 +1,7 @@
 {{template "header" .}}
+{{template "breadcrumb" .Crumbs}}
 <div id="env-panel">
 <h1>Environments — {{.Name}}</h1>
-<p><a href="/submodule/{{.Name}}">&larr; {{.Name}}</a></p>
 <p>active: <b>{{.Env.Active}}</b></p>
 <form method="post" action="/submodule/{{.Name}}/env/deploy"
       hx-post="/submodule/{{.Name}}/env/deploy" hx-target="#env-panel" hx-select="#env-panel" hx-swap="outerHTML"

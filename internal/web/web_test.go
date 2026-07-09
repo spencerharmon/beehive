@@ -2818,6 +2818,63 @@ func TestSessionViewBreadcrumbDeep(t *testing.T) {
 	}
 }
 
+// TestEnvPanelBreadcrumb (breadcrumb-coverage-gap): the deploy-env panel is a
+// submodule-scoped page one level below the explorer, so it renders the trail
+// dashboard > <name> > env with each ancestor a working link and env the
+// aria-current leaf — matching the other submodule-scoped pages exactly. Its old
+// ad hoc "← <name>" back-link (the same shape breadcrumb-trail-landing's message
+// claimed to have eliminated) must be gone. The trail sits OUTSIDE #env-panel so
+// the deploy htmx fragment swap never disturbs it.
+func TestEnvPanelBreadcrumb(t *testing.T) {
+	s, _ := setup(t)
+	body := get(t, s, "/submodule/alpha/env").Body.String()
+	bc := breadcrumbHTML(t, body)
+	if bc == "" {
+		t.Fatalf("env panel missing breadcrumb landmark:\n%s", body)
+	}
+	for _, want := range []string{
+		`<a href="/">dashboard</a>`,
+		`<a href="/submodule/alpha">alpha</a>`,
+		`<span aria-current="page">env</span>`,
+	} {
+		if !strings.Contains(bc, want) {
+			t.Fatalf("env breadcrumb missing %q:\n%s", want, bc)
+		}
+	}
+	if n := strings.Count(bc, "aria-current"); n != 1 {
+		t.Fatalf("aria-current count = %d, want 1:\n%s", n, bc)
+	}
+	if strings.Contains(body, "&larr;") {
+		t.Fatalf("env panel still carries the old ad hoc back-link:\n%s", body)
+	}
+}
+
+// TestRoiEditorBreadcrumb (breadcrumb-coverage-gap): the ROI editor previously had
+// NO back-link at all; it now renders the submodule-scoped trail dashboard >
+// <name> > roi (its top-level /roi/<name> route still hangs off the submodule
+// explorer, as the ROI is that submodule's intent), with roi the aria-current
+// leaf.
+func TestRoiEditorBreadcrumb(t *testing.T) {
+	s, _ := setup(t)
+	body := get(t, s, "/roi/alpha").Body.String()
+	bc := breadcrumbHTML(t, body)
+	if bc == "" {
+		t.Fatalf("roi editor missing breadcrumb landmark:\n%s", body)
+	}
+	for _, want := range []string{
+		`<a href="/">dashboard</a>`,
+		`<a href="/submodule/alpha">alpha</a>`,
+		`<span aria-current="page">roi</span>`,
+	} {
+		if !strings.Contains(bc, want) {
+			t.Fatalf("roi breadcrumb missing %q:\n%s", want, bc)
+		}
+	}
+	if n := strings.Count(bc, "aria-current"); n != 1 {
+		t.Fatalf("aria-current count = %d, want 1:\n%s", n, bc)
+	}
+}
+
 // TestDocExplorerListsWholeTree proves submodule-doc-explorer's core contract:
 // every file under docs/ — a top-level change doc, an audit report under
 // docs/audit/, and a task design doc under docs/tasks/ — is listed with a

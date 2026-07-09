@@ -120,6 +120,42 @@ func TestHumanResolvePageStaleLink404(t *testing.T) {
 	}
 }
 
+// TestHumanResolveBreadcrumb (breadcrumb-coverage-gap): the per-task resolution
+// workspace hangs off the GLOBAL NEEDS-HUMAN queue, not a submodule, so its trail
+// is dashboard > human > <sub>/<id> — the "human" ancestor a working link back to
+// the queue (the old ad hoc "← NEEDS-HUMAN" back-link it replaces), the <sub>/<id>
+// leaf the aria-current current page. The deliberately-kept "plan" convenience
+// link stays reachable below the trail (it is a sibling cross-link, not an
+// ancestor, so it does not belong in the trail itself).
+func TestHumanResolveBreadcrumb(t *testing.T) {
+	_, _, ts := humanFixture(t, "")
+	body := httpGet(t, ts.URL+"/human/alpha/needs-token")
+	bc := breadcrumbHTML(t, body)
+	if bc == "" {
+		t.Fatalf("human resolve page missing breadcrumb landmark:\n%s", body)
+	}
+	for _, want := range []string{
+		`<a href="/">dashboard</a>`,
+		`<a href="/human">human</a>`,
+		`<span aria-current="page">alpha/needs-token</span>`,
+	} {
+		if !strings.Contains(bc, want) {
+			t.Fatalf("human resolve breadcrumb missing %q:\n%s", want, bc)
+		}
+	}
+	if n := strings.Count(bc, "aria-current"); n != 1 {
+		t.Fatalf("aria-current count = %d, want 1:\n%s", n, bc)
+	}
+	// The old ad hoc "← NEEDS-HUMAN" back-link is now the trail's "human" crumb.
+	if strings.Contains(body, "← NEEDS-HUMAN") {
+		t.Fatalf("human resolve still carries the old ad hoc back-link:\n%s", body)
+	}
+	// The kept "plan" convenience link survives (below the trail).
+	if !strings.Contains(body, `href="/submodule/alpha/plan"`) {
+		t.Fatalf("human resolve dropped the kept plan convenience link:\n%s", body)
+	}
+}
+
 // TestResolvePublishLandsChangesOnMain: a coordination-layer change made in the
 // agent's worktree is published to the hive main by the Publish action, so it is
 // live for the swarm. (The fake client makes no edits, so the test writes the

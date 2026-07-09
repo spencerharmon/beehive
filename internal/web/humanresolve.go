@@ -80,6 +80,7 @@ func (s *Server) humanResolvePage(w http.ResponseWriter, r *http.Request) {
 		"Item":   it,
 		"SessID": sess.ID,
 		"Title":  pageTitle("resolve", it.ID, sm.Name),
+		"Crumbs": humanResolveCrumbs(sm.Name, it.ID),
 	})
 }
 
