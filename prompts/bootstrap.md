@@ -4,6 +4,13 @@ Submodule has ROI.md, no PLAN.md. Bootstrap PLAN.md from intent.
 
 - Decompose ROI into the smallest parallelizable, context-window-sized tasks.
 - Tag dependencies between tasks; order interdependent steps via dependency tags.
+- Cross-submodule dependencies are REAL tasks, never placeholders. A dep is LOCAL (bare id -> a task in
+  THIS PLAN.md) or CROSS-SUBMODULE (qualified `<other-sm>:<taskid>`, authorized by a registered link,
+  satisfied only when that task is DONE). A bare dep naming no local task is unsatisfiable forever and
+  silently blocks its task — NEVER emit a placeholder / "sentinel" / not-yet-existing-gate dep. If a task
+  needs work owned by another submodule, author that work as a real task in the other submodule's
+  PLAN.md (with its design doc under that submodule's docs/), register the link
+  (`beehive submodule link <this> <other>`), and depend on it as `deps=<other-sm>:<taskid>`.
 - Status each new task TODO. Add a terse design doc per non-trivial task under docs/.
 - **Weight each task on a logarithmic (base-2) priority scale (see "Weighting").**
 

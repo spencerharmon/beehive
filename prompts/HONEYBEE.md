@@ -51,6 +51,13 @@ worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` �
   investigate, re-derive via git archaeology, or flag. Recognize the shape and proceed straight to
   judging the actual code diff.
 - No shortcuts. Compute real values. No placeholders, no swallowed errors, no fake "done".
+- Cross-submodule deps are REAL or they do not exist. A dep is LOCAL (a bare id naming a task in THIS
+  `PLAN.md`) or CROSS-SUBMODULE (qualified `<other-sm>:<taskid>`, authorized by a registered link and
+  satisfied only when that task is DONE). A bare dep naming no local task is unsatisfiable FOREVER — the
+  selector silently never runs the task. So NEVER invent a placeholder / "sentinel" /
+  "deliberately-not-yet-existing gate" dep, no matter how well commented. Work owned by another
+  submodule is a REAL TASK IN THAT SUBMODULE, depended on as `<other-sm>:<taskid>` via a registered link
+  (see Reconcile task). Cannot name that task honestly yet → `beehive task human`, never a dangling dep.
 - Every plan item you add ships a terse, LLM-targeted doc under `submodules/<sm>/docs/`.
 - Keep `PLAN.md`, `ARTIFACTS.md`, `INFRASTRUCTURE.md` current.
 - Every submodule code commit carries the stamp line `Beehive: <task-id> <doc-path>` so the frontend
@@ -121,6 +128,20 @@ range.
   while in flight → `NEEDS-REVIEW` with a doc, not a silent delete.
 - Add design docs for new tasks, tag dependencies, and reweight tasks if the priority order moved
   (`beehive help` for the weighting scale).
+- **Cross-submodule needs — author the real task in the OTHER submodule, never a placeholder.** If new
+  intent means a task here needs work owned by another submodule, do NOT fake it with a local
+  bare/sentinel dep. Create that work as a real task in the other submodule's `PLAN.md` (with its design
+  doc under that submodule's `docs/`), register the link (`beehive submodule link <this> <other>` if not
+  already linked), and reference it as `deps=<other-sm>:<taskid>` — the qualified, colon form the
+  selector gates on.
+- **Leave cross-repo-linked tasks alone.** Before you retire / rename / rewrite ANY task in this plan,
+  check whether another submodule's `PLAN.md` depends on it (its id appears there as
+  `<this-sm>:<taskid>`). If so it is a cross-repo contract that this ROI reconcile does NOT own — do not
+  delete, rename, or repurpose it. Your reconcile folds only THIS submodule's ROI diff into THIS plan.
+- **Cross-repo intent conflict → NEEDS-HUMAN.** If this submodule's new ROI genuinely contradicts what a
+  dependent submodule needs from such a linked task, do not resolve it unilaterally: `beehive task human
+  <sm> <task-id> --reason "..."` naming both conflicting intents. Never silently break the contract or
+  "convert"/guess a dangling dep into a real one.
 - Restamp `PLAN.md` to the current ROI commit: `<!-- Beehive-ROI: <sha> -->`. Commit to main; conflict
   → stop, the runner reselects.
 - Do NOT implement tasks. Do NOT edit `ROI.md`. Done when the stamp matches ROI HEAD.
