@@ -1372,13 +1372,16 @@ func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 // git cruft that accumulates under updateInstead (stale worktrees, orphan
 // submodule gitlinks, drifted submodule checkouts, unexpected remotes), counts
 // with a drill-down, and the beehive-hygiene cleanup skill as the remediation
-// pointer. The handler is strictly diagnostic — scanHygiene mutates nothing.
+// pointer. It also surfaces the frontend's own view-cache health (CacheWidget) —
+// a second, unrelated diagnostic that shares this "operational health,
+// diagnostic only" page. The handler is strictly diagnostic — scanHygiene
+// mutates nothing and cacheWidget only reads s.cache's counters.
 func (s *Server) hygiene(w http.ResponseWriter, r *http.Request) {
 	hyg, err := scanHygiene(r.Context(), s.repo.Root, s.git)
 	if err != nil {
 		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
 	}
-	s.render(w, "hygiene_panel.html", map[string]interface{}{"Hygiene": hyg, "Title": pageTitle("hygiene"), "Nav": "hygiene"})
+	s.render(w, "hygiene_panel.html", map[string]interface{}{"Hygiene": hyg, "Cache": cacheWidget(s.cache), "Title": pageTitle("hygiene"), "Nav": "hygiene"})
 }
 
 // ttl is the resolved claim heartbeat TTL: a task's session+heartbeat is "active"

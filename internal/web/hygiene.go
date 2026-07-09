@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,38 @@ func (h Hygiene) Total() int {
 
 // Clean reports whether the scan found no cruft at all (and did not error).
 func (h Hygiene) Clean() bool { return h.Err == "" && h.Total() == 0 }
+
+// CacheWidget is the read-only view-cache performance snapshot rendered
+// alongside the git-cruft scan on the /hygiene page. It is a DIFFERENT
+// diagnostic than Hygiene above (an in-process memo's health, not git cruft),
+// sharing only the page: viewCache (cache.go) memoizes the frontend's
+// PLAN.md/ROI parses per repo-HEAD generation, and until this widget existed
+// its Misses() counter was computed but rendered nowhere (grep for "Misses()"
+// hit only the test file) — so an operator could never see the parse cache
+// degrading. A live process-lifetime gauge: it resets on restart, is never
+// persisted, and reads no data beyond the *viewCache Server already holds
+// (s.cache) — no new external data source.
+type CacheWidget struct {
+	Lookups int
+	Hits    int
+	Misses  int
+	// HitRate is pre-formatted ("83.3%") since the html/template set here
+	// carries no arithmetic FuncMap; "n/a" before any cache-participating
+	// lookup has happened (Lookups == 0, nothing to divide).
+	HitRate string
+}
+
+// cacheWidget snapshots c's counters into the widget's render shape. Read-only:
+// it only ever calls viewCache's own exported readers (Lookups/Hits/Misses),
+// never touches ents/gen, and increments nothing.
+func cacheWidget(c *viewCache) CacheWidget {
+	lookups, hits, misses := c.Lookups(), c.Hits(), c.Misses()
+	rate := "n/a"
+	if lookups > 0 {
+		rate = fmt.Sprintf("%.1f%%", float64(hits)/float64(lookups)*100)
+	}
+	return CacheWidget{Lookups: lookups, Hits: hits, Misses: misses, HitRate: rate}
+}
 
 // scanHygiene performs a READ-ONLY sweep of the beehive repo for the git cruft
 // that accumulates under updateInstead, returning a per-class drill-down. It

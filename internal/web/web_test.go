@@ -850,6 +850,85 @@ func TestPlanViewCacheHitAndCommitInvalidation(t *testing.T) {
 	}
 }
 
+// TestViewCacheLookupsAndHits proves the Lookups()/Hits() counters added
+// alongside Misses(): every cache-participating planView call increments
+// Lookups (hit or miss), Hits is always Lookups-Misses, and the head=="" bypass
+// (no HEAD to key on) touches neither. Mirrors
+// TestPlanViewCacheHitAndCommitInvalidation's read pattern so the two stay
+// consistent with each other.
+func TestViewCacheLookupsAndHits(t *testing.T) {
+	s, root := setup(t)
+	path := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	now := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
+	ttl := time.Hour
+
+	// No commit yet: HEAD is unresolvable, so cachedView's head=="" bypass runs
+	// and must not touch Lookups/Hits/Misses at all.
+	if _, err := s.planView(s.headSHA(context.Background()), path, now, ttl); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cache.Lookups(); got != 0 {
+		t.Fatalf("lookups before any HEAD = %d, want 0 (bypass path)", got)
+	}
+	if got := s.cache.Hits(); got != 0 {
+		t.Fatalf("hits before any HEAD = %d, want 0", got)
+	}
+
+	commitAll(t, root, "init") // give the repo a HEAD so the cache engages
+	head := s.headSHA(context.Background())
+	if head == "" {
+		t.Fatal("no HEAD after seed commit")
+	}
+
+	// First real read: a miss. lookups=1, misses=1, hits=0.
+	if _, err := s.planView(head, path, now, ttl); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cache.Lookups(); got != 1 {
+		t.Fatalf("lookups after 1st read = %d, want 1", got)
+	}
+	if got := s.cache.Misses(); got != 1 {
+		t.Fatalf("misses after 1st read = %d, want 1", got)
+	}
+	if got := s.cache.Hits(); got != 0 {
+		t.Fatalf("hits after 1st read = %d, want 0", got)
+	}
+
+	// Second read, same HEAD: a hit. lookups=2, misses=1, hits=1.
+	if _, err := s.planView(head, path, now, ttl); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cache.Lookups(); got != 2 {
+		t.Fatalf("lookups after 2nd read = %d, want 2", got)
+	}
+	if got := s.cache.Misses(); got != 1 {
+		t.Fatalf("misses after 2nd read = %d, want 1", got)
+	}
+	if got := s.cache.Hits(); got != 1 {
+		t.Fatalf("hits after 2nd read = %d, want 1", got)
+	}
+	if lu, hi, mi := s.cache.Lookups(), s.cache.Hits(), s.cache.Misses(); hi+mi != lu {
+		t.Fatalf("Hits()+Misses() = %d, want Lookups() = %d", hi+mi, lu)
+	}
+
+	// A commit advances HEAD -> the next read is a miss again: lookups=3,
+	// misses=2, hits=1.
+	commitAll(t, root, "advance")
+	head2 := s.headSHA(context.Background())
+	if _, err := s.planView(head2, path, now, ttl); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cache.Lookups(); got != 3 {
+		t.Fatalf("lookups after commit+read = %d, want 3", got)
+	}
+	if got := s.cache.Misses(); got != 2 {
+		t.Fatalf("misses after commit+read = %d, want 2", got)
+	}
+	if got := s.cache.Hits(); got != 1 {
+		t.Fatalf("hits after commit+read = %d, want 1", got)
+	}
+}
+
 // TestPlanViewMatchesParsePlan proves the cache changes only WHEN the read+parse
 // runs, never WHAT the view contains: planView equals the uncached parsePlan
 // baseline for the same HEAD/now/ttl.
@@ -3436,6 +3515,60 @@ func TestHygieneCleanAndWidget(t *testing.T) {
 	dash := get(t, s, "/")
 	if !strings.Contains(dash.Body.String(), `id="hygiene-widget"`) {
 		t.Fatalf("dashboard does not embed the hygiene widget:\n%s", dash.Body)
+	}
+}
+
+// TestHygieneViewCacheWidget proves /hygiene surfaces the frontend's own
+// view-cache performance (lookups, misses, hits, a derived hit-rate) sourced
+// from Server.cache's counters — the ROI gap this task closes: viewCache's
+// Misses() was computed (cache.go) but rendered nowhere (grep for "Misses()"
+// hit only the test file), so an operator could never see the parse cache
+// degrading. Numbers must reflect the ACTUAL counters driven just before the
+// request, not a static placeholder, and the widget must be /hygiene-only —
+// the dashboard's shared "hygiene-widget" define never embeds it.
+func TestHygieneViewCacheWidget(t *testing.T) {
+	s, root := setup(t)
+	commitAll(t, root, "init") // give the repo a HEAD so the cache engages
+	path := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	head := s.headSHA(context.Background())
+
+	// Drive the cache directly: one miss (first parse) + one hit (repeat read
+	// at the same HEAD) -> lookups=2, misses=1, hits=1, hit-rate=50.0%.
+	if _, err := s.planView(head, path, time.Now(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.planView(head, path, time.Now(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cache.Lookups(); got != 2 {
+		t.Fatalf("lookups = %d, want 2", got)
+	}
+	if got := s.cache.Misses(); got != 1 {
+		t.Fatalf("misses = %d, want 1", got)
+	}
+	if got := s.cache.Hits(); got != 1 {
+		t.Fatalf("hits = %d, want 1", got)
+	}
+
+	w := get(t, s, "/hygiene")
+	if w.Code != 200 {
+		t.Fatalf("hygiene %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`id="view-cache-widget"`, "view cache",
+		"lookups 2", "misses 1", "hits 1", "hit-rate 50.0%",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("hygiene page missing view-cache metric %q:\n%s", want, body)
+		}
+	}
+
+	// /hygiene-only: the dashboard's shared hygiene-widget define never
+	// renders this widget.
+	dash := get(t, s, "/")
+	if strings.Contains(dash.Body.String(), `id="view-cache-widget"`) {
+		t.Fatalf("dashboard unexpectedly embeds the view-cache widget:\n%s", dash.Body)
 	}
 }
 
