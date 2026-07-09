@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -36,6 +37,16 @@ const (
 	// is generous relative to how long `git gc` takes on a hive-sized repo, and git's
 	// own gc.pid lock is the hard backstop against true concurrency regardless.
 	DefaultGCLockTTL = 30 * time.Minute
+
+	// gcStaleTempAge is how old a leftover repack temp file (tmp_pack_*/tmp_idx_*/
+	// tmp_rev_*) must be before MaybeGC sweeps it. A single runner gc is crash-safe
+	// (new pack written before old packs are dropped), so an interrupted gc — from an
+	// external kill (operator stop, host reboot, OOM) or the 2026-07-08 concurrent
+	// auto-gc storm — leaves only these cosmetic temps, never lost objects. The
+	// threshold is far longer than any legitimate in-flight `index-pack`/fetch (which
+	// finishes in seconds on these repos) so a temp being actively written is never
+	// deleted, yet short enough that killed-gc debris is reclaimed on the next gc.
+	gcStaleTempAge = 3 * time.Hour
 
 	cfgGCAuto       = "gc.auto"
 	cfgMaintAuto    = "maintenance.auto"
@@ -153,6 +164,11 @@ func (r *Repo) MaybeGC(ctx context.Context, sessionID string, cfg GCConfig) (ran
 		r.configUnsetLocal(ctx, cfgGCLockedAt)
 	}()
 
+	// Sweep leftover repack temp files from any previously-interrupted gc BEFORE
+	// running ours (best-effort). Only files older than gcStaleTempAge are removed,
+	// so a temp an in-flight fetch/index-pack is actively writing is never touched.
+	r.sweepStaleGCTemp(ctx, gcStaleTempAge)
+
 	// Single gc, default prune expiry (2 weeks) — never removes objects a concurrent
 	// pass just created. --quiet keeps the pass log clean.
 	if _, gerr := r.Run(ctx, "gc", "--quiet"); gerr != nil {
@@ -200,4 +216,44 @@ func parseUnixTime(s string) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(n, 0)
+}
+
+// sweepStaleGCTemp deletes leftover repack temp files (tmp_pack_*, tmp_idx_*,
+// tmp_rev_*) in the repo's pack dir whose mtime is older than olderThan, and returns
+// how many it removed. These are the only residue a single interrupted `git gc`
+// leaves (git writes the new pack fully before dropping old packs, so objects are
+// never lost); this reclaims that space so an external kill or a historical storm
+// self-heals on the next gc. Best-effort: any error (unreadable dir, racing removal)
+// is ignored. The age gate is the safety guard — a temp younger than olderThan may be
+// an in-flight fetch/index-pack mid-write, so it is left alone.
+func (r *Repo) sweepStaleGCTemp(ctx context.Context, olderThan time.Duration) int {
+	packDir, err := r.Run(ctx, "rev-parse", "--git-path", "objects/pack")
+	if err != nil {
+		return 0
+	}
+	if !filepath.IsAbs(packDir) {
+		packDir = filepath.Join(r.Dir, packDir)
+	}
+	ents, err := os.ReadDir(packDir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-olderThan)
+	removed := 0
+	for _, e := range ents {
+		name := e.Name()
+		if !strings.HasPrefix(name, "tmp_pack_") &&
+			!strings.HasPrefix(name, "tmp_idx_") &&
+			!strings.HasPrefix(name, "tmp_rev_") {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil || !info.ModTime().Before(cutoff) {
+			continue // unreadable, or fresh (possibly an in-flight write) — never touch
+		}
+		if os.Remove(filepath.Join(packDir, name)) == nil {
+			removed++
+		}
+	}
+	return removed
 }

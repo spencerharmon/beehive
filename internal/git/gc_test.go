@@ -2,6 +2,8 @@ package git
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -71,6 +73,48 @@ func TestMaybeGCIntervalGate(t *testing.T) {
 	}
 	if !ran {
 		t.Error("MaybeGC #3: expected gc to run once the interval elapsed")
+	}
+}
+
+func TestSweepStaleGCTemp(t *testing.T) {
+	r := initRepo(t)
+	ctx := context.Background()
+	packDir := filepath.Join(r.Dir, ".git", "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(name string, age time.Duration) string {
+		p := filepath.Join(packDir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mt := time.Now().Add(-age)
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	stalePack := write("tmp_pack_STALE", 5*time.Hour)   // older than gate -> removed
+	staleIdx := write("tmp_idx_STALE", 5*time.Hour)     // older than gate -> removed
+	staleRev := write("tmp_rev_STALE", 5*time.Hour)     // older than gate -> removed
+	freshPack := write("tmp_pack_FRESH", 1*time.Minute) // in-flight -> kept
+	realPack := write("pack-abc123.pack", 5*time.Hour)  // not a temp -> kept
+
+	n := r.sweepStaleGCTemp(ctx, gcStaleTempAge)
+	if n != 3 {
+		t.Errorf("swept %d, want 3 (the three stale tmp_* files)", n)
+	}
+	for _, p := range []string{stalePack, staleIdx, staleRev} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("stale temp not removed: %s", filepath.Base(p))
+		}
+	}
+	for _, p := range []string{freshPack, realPack} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("non-stale file wrongly removed: %s (%v)", filepath.Base(p), err)
+		}
 	}
 }
 
