@@ -62,7 +62,7 @@ func (s *Server) editorPanel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "editor_panel.html", s.panelData(r.Context(), sess))
+	s.renderConditional(w, r, "editor_panel.html", s.panelData(r.Context(), sess))
 }
 
 func (s *Server) editorChat(w http.ResponseWriter, r *http.Request) {
