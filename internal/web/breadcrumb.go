@@ -1,5 +1,7 @@
 package web
 
+import "strings"
+
 // Crumb is one node in a page's breadcrumb trail (breadcrumb-trail-landing,
 // landing breadcrumb-nav-trail's never-merged design). Href is the link target
 // for an ANCESTOR crumb; the terminal (current-page) crumb has an empty Href and
@@ -113,4 +115,47 @@ func docCrumbs(name, from, file string) []Crumb {
 	default:
 		return []Crumb{root, sub, leaf}
 	}
+}
+
+// editorCrumbs builds the AI-edit chat shell's trail (editor-breadcrumb-trail).
+// Every "edit with AI" link across the UI (dashboard, explorer, roi_editor)
+// funnels through the SAME /edit?path=... entry point regardless of which page
+// it started from, so — unlike docCrumbs, which threads a `from` referrer
+// token through each of its distinct callers — rooting the trail in the
+// REFERRER would be ambiguous here (pass 9 deferred this page for exactly that
+// reason). ui-audit-010 resolves it by rooting the trail in the EDIT TARGET's
+// real repo location instead: a target under submodules/<name>/ hangs off that
+// submodule's explorer page, exactly like the other submodule-scoped trails
+// (reusing crumbSubmodule); a repo-root target (e.g. INFRASTRUCTURE.md) hangs
+// directly off the dashboard — mirroring how explorer/roi root their own
+// trails. The leaf names the file under edit; its empty Href marks it the
+// current page, the same invariant every other builder here follows.
+func editorCrumbs(file string) []Crumb {
+	if name, rest, ok := splitSubmodulePath(file); ok {
+		return []Crumb{crumbDashboard(), crumbSubmodule(name), {Label: "edit " + rest}}
+	}
+	return []Crumb{crumbDashboard(), {Label: "edit " + file}}
+}
+
+// splitSubmodulePath reports whether p (a repo-relative path, e.g. a
+// session's editor.Session.File) lies under submodules/<name>/, returning that
+// submodule's name and p's remainder relative to the submodule root. Unlike
+// the other crumb builders above, editorCrumbs has no route/referrer to draw a
+// submodule name from — only the bare edit-target path — so it derives scope
+// by parsing the path itself.
+func splitSubmodulePath(p string) (name, rest string, ok bool) {
+	const prefix = "submodules/"
+	if !strings.HasPrefix(p, prefix) {
+		return "", "", false
+	}
+	trimmed := strings.TrimPrefix(p, prefix)
+	i := strings.Index(trimmed, "/")
+	if i <= 0 {
+		return "", "", false
+	}
+	name, rest = trimmed[:i], trimmed[i+1:]
+	if rest == "" {
+		return "", "", false
+	}
+	return name, rest, true
 }

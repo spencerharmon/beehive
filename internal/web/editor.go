@@ -49,7 +49,10 @@ func (s *Server) editorPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "editor.html", map[string]interface{}{"ID": sess.ID, "File": sess.File, "Title": pageTitle("edit", sess.File)})
+	s.render(w, "editor.html", map[string]interface{}{
+		"ID": sess.ID, "File": sess.File, "Title": pageTitle("edit", sess.File),
+		"Crumbs": editorCrumbs(sess.File),
+	})
 }
 
 // editorPanel renders the live chat log, diff, state indicator and merge button.
