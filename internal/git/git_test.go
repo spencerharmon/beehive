@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -206,6 +208,54 @@ func TestRemoteRoundTrip(t *testing.T) {
 	}
 	if got := readFile(t, a, "f"); got != "v2\n" {
 		t.Fatalf("Pull content not updated: %q", got)
+	}
+}
+
+// TestListRemoteBranchesMatching proves the pattern-scoped listing finds only
+// matching branches on the remote (never main or an unrelated branch) and does
+// not fetch any objects or create tracking refs as a side effect.
+func TestListRemoteBranchesMatching(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "f", "v1\n", "v1")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push main: %v", err)
+	}
+	// b clones BEFORE the edit-*/bee-* branches exist on origin, so it starts
+	// with no tracking refs for them at all — the precondition that makes the
+	// "no tracking ref created" assertion below meaningful.
+	b := cloneOf(t, origin, "b")
+	for _, branch := range []string{"edit-foo-100", "edit-bar-200", "bee-something-300"} {
+		if _, err := a.Run(ctx, "checkout", "-q", "-b", branch, "main"); err != nil {
+			t.Fatalf("checkout %s: %v", branch, err)
+		}
+		if err := a.Push(ctx, "origin", branch); err != nil {
+			t.Fatalf("push %s: %v", branch, err)
+		}
+	}
+
+	got, err := b.ListRemoteBranchesMatching(ctx, "origin", "edit-*")
+	if err != nil {
+		t.Fatalf("ListRemoteBranchesMatching: %v", err)
+	}
+	sort.Strings(got)
+	want := []string{"edit-bar-200", "edit-foo-100"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	// Pure ref advertisement: no fetch performed, no tracking ref created.
+	if _, err := b.RevParse(ctx, "origin/edit-foo-100"); err == nil {
+		t.Fatalf("ListRemoteBranchesMatching must not create a tracking ref")
+	}
+
+	// No matches -> nil, nil (not an error).
+	none, err := b.ListRemoteBranchesMatching(ctx, "origin", "nope-*")
+	if err != nil {
+		t.Fatalf("no-match: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("want no matches, got %v", none)
 	}
 }
 
