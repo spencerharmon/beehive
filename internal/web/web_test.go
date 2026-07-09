@@ -4273,6 +4273,46 @@ func TestHygienePackPanelRender(t *testing.T) {
 	}
 }
 
+// TestHygienePacksTableResponsiveAndScoped is the core of
+// hygiene-packs-table-polish: gc-storm-visibility added the pack-dir health
+// table AFTER responsive-table-overflow and table-header-scope locked in their
+// conventions (every OTHER data table wrapped in `.table-scroll` with
+// scope="col" headers), so this table fell through both. It asserts the
+// hygiene-packs table is wrapped `<div class="table-scroll"><table
+// class="hygiene-packs">…` like every other data table AND each of its 5
+// <thead> <th> cells carries scope="col" — no scope="row" (the leading repo
+// <td> stays a data cell) — while the PackWarn-driven open <details> and the
+// row data are unchanged. No visual/layout change at desktop: scope is
+// non-rendering and .table-scroll only adds scroll behavior + margin
+// bookkeeping (see style.css).
+func TestHygienePacksTableResponsiveAndScoped(t *testing.T) {
+	s, root := setup(t)
+	seedPackDir(t, root, 4, 1) // nonzero temps -> PackWarn() true -> <details open>
+
+	w := get(t, s, "/hygiene")
+	if w.Code != 200 {
+		t.Fatalf("hygiene %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+
+	if !strings.Contains(body, `<div class="table-scroll">`+"\n"+`<table class="hygiene-packs">`) {
+		t.Fatalf("hygiene_panel.html hygiene-packs table not wrapped in .table-scroll:\n%s", body)
+	}
+	if !strings.Contains(body, `<thead><tr><th scope="col">repo</th><th scope="col">pack-dir size</th><th scope="col">packs</th><th scope="col">temps</th><th scope="col">state</th></tr></thead>`) {
+		t.Fatalf("hygiene_panel.html hygiene-packs headers missing scope=\"col\":\n%s", body)
+	}
+	if strings.Contains(body, "<th>") {
+		t.Fatalf("hygiene_panel.html hygiene-packs table has a <th> with no scope:\n%s", body)
+	}
+	// The PackWarn-driven open <details> and row rendering stay unchanged.
+	if !strings.Contains(body, `<details class="hygiene-class" id="hygiene-packs" open>`) {
+		t.Fatalf("hygiene_panel.html pack-dir health <details> should be open on PackWarn:\n%s", body)
+	}
+	if !strings.Contains(body, `<td><code>hive</code></td>`) {
+		t.Fatalf("hygiene_panel.html pack-dir health row data missing:\n%s", body)
+	}
+}
+
 // TestComputeStats checks the git-derived honeybee-performance figures behind the
 // /stats view: delivered = PLAN [DONE], sessions = transcript files, distinct
 // tasks and the derived ratios — all read live, nothing stored.
