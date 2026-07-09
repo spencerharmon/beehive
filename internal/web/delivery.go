@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -229,13 +230,21 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 	for len(f) < 3 {
 		f = append(f, "")
 	}
-	// Scoped to this submodule's PLAN.md only — never a whole-commit diff —
-	// so the page can never leak an unrelated file from elsewhere in the hive.
-	patch, err := s.git.Run(r.Context(), "show", "--format=", full, "--", planRelPath(sm))
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
+	// Scoped to this submodule's PLAN.md only — never a whole-commit diff — so
+	// the page can never leak an unrelated file from elsewhere in the hive. Both
+	// blobs are read best-effort: a missing side (this commit ADDS PLAN.md so the
+	// parent lacks it, a ROOT commit has no parent, or the commit DELETES
+	// PLAN.md) resolves to "" and the shared renderer shows that side as a
+	// whole-file add/delete — the same root/add/delete edge the editor/chat/skill
+	// panels already tolerate. Routing through editor.RenderDiffHTML gives this
+	// diff (an operator reads it to see WHY a task went DONE) the same per-line
+	// add/del coloring and markdown highlighting as every other diff surface,
+	// instead of a raw uncolored patch.
+	planPath := planRelPath(sm)
+	oldPlan, _ := s.git.Show(r.Context(), full+"^", planPath)
+	newPlan, _ := s.git.Show(r.Context(), full, planPath)
+	lexer := lexerFor(planPath)
+	rows := editor.RenderDiffHTML(oldPlan, newPlan, highlightLines(oldPlan, lexer), highlightLines(newPlan, lexer))
 	shortSHA := full[:min(12, len(full))]
 	s.render(w, "commit_view.html", map[string]interface{}{
 		"Name":    sm.Name,
@@ -243,7 +252,7 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 		"Author":  f[0],
 		"Date":    f[1],
 		"Subject": f[2],
-		"Patch":   patch,
+		"Rows":    rows,
 		"Title":   pageTitle("commit", shortSHA, sm.Name),
 	})
 }

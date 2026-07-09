@@ -2712,8 +2712,20 @@ func TestCommitView(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("commit view %d: %s", w.Code, w.Body)
 	}
-	if body := w.Body.String(); !strings.Contains(body, "dt1-done") || !strings.Contains(body, "[DONE]") {
+	body := w.Body.String()
+	if !strings.Contains(body, "dt1-done") || !strings.Contains(body, "[DONE]") {
 		t.Fatalf("commit view missing subject/diff:\n%s", body)
+	}
+	// diff-view-colorize-consistency: the PLAN.md flip (TODO->DONE header line)
+	// renders through the shared DiffRow renderer as per-line add/del rows like
+	// the editor/chat/skill panels, not a raw uncolored patch.
+	for _, want := range []string{`class="ln del"`, `class="ln add"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("commit view diff not colorized, missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "{{.Patch}}") {
+		t.Fatalf("commit view still emits a raw patch:\n%s", body)
 	}
 
 	if w := get(t, s, "/submodule/alpha/commit/"+strings.Repeat("0", 12)); w.Code != http.StatusNotFound {
@@ -2741,6 +2753,42 @@ func TestEditorDiffAddDelClasses(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("editor diff missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestHumanResolvePanelDiffColorized locks diff-view-colorize-consistency for the
+// human-resolve panel: its multi-file resolution diff renders through the shared
+// renderFileDiff/editor.RenderDiffHTML renderer as <span class="ln {kind}"> rows
+// (per-line add/del) like the editor/chat/skill panels — no raw {{.Patch}} <pre>
+// — while keeping the scroll-preserving #resolve-diff container and per-file
+// path headers for a multi-file change.
+func TestHumanResolvePanelDiffColorized(t *testing.T) {
+	s, _ := setup(t)
+	// Build the rows through the real render helper (lexerFor + highlightLines +
+	// editor.RenderDiffHTML), so a regression in that path — not only the
+	// template — is caught.
+	diffs := []fileDiff{{
+		Path: "INFRASTRUCTURE.md",
+		Rows: renderFileDiff("INFRASTRUCTURE.md", "keep\nold line\n", "keep\nnew line\n"),
+	}}
+	out := renderTmpl(t, s, "human_resolve_panel.html", map[string]interface{}{
+		"SessID": "r1", "Sub": "alpha", "TaskID": "t2",
+		"Diffs": diffs, "HasChange": true,
+	})
+	for _, want := range []string{`class="ln del"`, `class="ln add"`, `id="resolve-diff"`, "data-scroll-preserve", "INFRASTRUCTURE.md"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("resolve panel diff not colorized, missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "{{.Patch}}") {
+		t.Fatalf("resolve panel still emits a raw patch:\n%s", out)
+	}
+	// The empty state still shows its muted prompt (not a stray raw patch).
+	empty := renderTmpl(t, s, "human_resolve_panel.html", map[string]interface{}{
+		"SessID": "r1", "Sub": "alpha", "TaskID": "t2", "HasChange": false,
+	})
+	if !strings.Contains(empty, "no changes made yet") {
+		t.Fatalf("resolve panel empty state missing prompt:\n%s", empty)
 	}
 }
 

@@ -3,5 +3,6 @@
 <h1>{{.Name}} <code>{{.SHA}}</code></h1>
 <p class="muted">{{.Subject}}</p>
 <p class="muted">{{.Author}} &middot; {{.Date}}</p>
-<pre class="diff">{{.Patch}}</pre>
+<pre class="diff">{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
+{{else}}<span class="muted">no PLAN.md change in this commit</span>{{end}}</pre>
 {{template "footer"}}

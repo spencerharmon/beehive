@@ -256,21 +256,51 @@ func (s *resolveSession) setErr(msg string) {
 	s.mu.Unlock()
 }
 
-// diff returns the accumulated multi-file change of the session branch against
-// main: a --stat summary and the full unified patch. Both are "" when the agent
-// has made no committed change yet. Serialized on wtMu against the turn commit.
-func (s *resolveSession) diff(ctx context.Context) (stat, patch string, err error) {
+// resolveFile is one changed file on the session branch: its repo-relative path
+// and its before/after content (base = the main...HEAD merge-base blob, proposed
+// = HEAD's blob). The panel renders each through the shared colorized DiffRow
+// renderer, so the resolution diff reads like every other diff surface instead
+// of a raw uncolored patch.
+type resolveFile struct {
+	Path          string
+	Before, After string
+}
+
+// changedFiles returns the session branch's committed change against main as a
+// --stat summary plus one resolveFile per changed path. It reconstructs each
+// side's content that the raw `git diff main...HEAD` patch is derived from: the
+// base is the main...HEAD MERGE-BASE (so a main that advanced under the session
+// still shows only the agent's own change, matching the three-dot patch) and the
+// proposed side is HEAD. A side absent at its ref (an add has no base blob, a
+// delete no HEAD blob) reads as "" — a whole-file add/delete the renderer
+// tolerates. files is nil when the agent has committed no change yet. Serialized
+// on wtMu against the turn commit, exactly as the raw diff was.
+func (s *resolveSession) changedFiles(ctx context.Context) (stat string, files []resolveFile, err error) {
 	s.wtMu.Lock()
 	defer s.wtMu.Unlock()
 	stat, err = s.wt.Run(ctx, "diff", "--stat", "main...HEAD")
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
-	patch, err = s.wt.Run(ctx, "diff", "main...HEAD")
+	names, err := s.wt.Run(ctx, "diff", "--name-only", "main...HEAD")
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
-	return strings.TrimSpace(stat), patch, nil
+	base, err := s.wt.Run(ctx, "merge-base", "main", "HEAD")
+	if err != nil {
+		return "", nil, err
+	}
+	base = strings.TrimSpace(base)
+	for _, p := range strings.Split(strings.TrimSpace(names), "\n") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		before, _ := s.wt.Show(ctx, base, p)  // "" when p is added (absent in base)
+		after, _ := s.wt.Show(ctx, "HEAD", p) // "" when p is deleted (absent in HEAD)
+		files = append(files, resolveFile{Path: p, Before: before, After: after})
+	}
+	return strings.TrimSpace(stat), files, nil
 }
 
 // hasChanges reports whether the branch carries any committed change over main.

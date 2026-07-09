@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
@@ -160,17 +161,39 @@ func (s *Server) humanResolveDiscard(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/human", http.StatusSeeOther)
 }
 
+// fileDiff is one changed file's rendered diff for the resolve panel: its path
+// and the per-line DiffRows, so a multi-file resolution change previews each
+// file under its own path — colorized through the shared renderer like the
+// editor/chat/skill panels, never a raw patch.
+type fileDiff struct {
+	Path string
+	Rows []editor.DiffRow
+}
+
+// renderFileDiff renders one file's before->after change as unified DiffRows,
+// syntax-highlighted through the file's chroma lexer when its name matches one
+// (else the plain char-diff fallback) — identical to how the chat-diff editor
+// colorizes a file (chatPanelData), so every resolve-panel file reads the same.
+func renderFileDiff(path, before, after string) []editor.DiffRow {
+	lexer := lexerFor(path)
+	return editor.RenderDiffHTML(before, after, highlightLines(before, lexer), highlightLines(after, lexer))
+}
+
 // resolvePanelData projects a resolution session into the panel template model.
 func (s *Server) resolvePanelData(ctx context.Context, sess *resolveSession) map[string]interface{} {
-	stat, patch, err := sess.diff(ctx)
+	stat, files, err := sess.changedFiles(ctx)
+	diffs := make([]fileDiff, 0, len(files))
+	for _, f := range files {
+		diffs = append(diffs, fileDiff{Path: f.Path, Rows: renderFileDiff(f.Path, f.Before, f.After)})
+	}
 	data := map[string]interface{}{
 		"SessID":    sess.ID,
 		"Sub":       sess.Sub,
 		"TaskID":    sess.TaskID,
 		"Log":       sess.logCopy(),
 		"Stat":      stat,
-		"Patch":     patch,
-		"HasChange": strings.TrimSpace(patch) != "",
+		"Diffs":     diffs,
+		"HasChange": len(diffs) > 0,
 		"Busy":      sess.isBusy(),
 		"Published": sess.isPublished(),
 		"Error":     sess.errText(),
