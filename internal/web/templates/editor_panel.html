@@ -16,3 +16,9 @@
 {{else}}<span class="muted">no changes proposed yet</span>{{end}}</pre>
   </div>
 </div>
+{{/* Self-perpetuating poll: present ONLY while a turn is in flight (.Busy), this
+   inert node re-fetches the panel into #editor after a 1.5s delay, so the loop
+   continues as long as the agent is working and stops the moment it settles
+   (the next panel renders without this node). Same target/innerHTML swap as the
+   old shell poll — no visible output, no scroll-preserve change. */}}
+{{if .Busy}}<div hx-get="/editor/{{.ID}}/panel" hx-trigger="load delay:1500ms" hx-target="#editor" hx-swap="innerHTML" hidden></div>{{end}}

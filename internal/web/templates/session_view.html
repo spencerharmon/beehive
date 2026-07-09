@@ -2,10 +2,15 @@
 {{template "breadcrumb" .Crumbs}}
 <h1>{{.Name}} · {{.Branch}}</h1>
 <p>{{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">ended</span>{{end}}</p>
+{{/* Poll cadence follows liveness: a LIVE session polls every 2s (the SSE stream
+   below supersedes it while connected and this is its fallback); an ENDED session
+   (.Live false) has no stream and a durable, never-again-changing final
+   transcript, so it fetches ONCE on load and stops — no forever 2s poll of
+   identical bytes. */}}
 <div id="session-body"
      role="status" aria-live="polite"
      hx-get="/submodule/{{.Name}}/session/{{.Branch}}/body"
-     hx-trigger="load, every 2s"
+     hx-trigger="{{if .Live}}load, every 2s{{else}}load{{end}}"
      hx-swap="innerHTML">
   <div id="session-loading">{{template "skeleton-transcript"}}</div>
 </div>
