@@ -2,7 +2,7 @@
   <div id="chatedit"
        role="status" aria-live="polite"
        hx-get="/edit/{{.ID}}/panel"
-       hx-trigger="load"
+       hx-trigger="load, every 1500ms"
        hx-swap="innerHTML">
     {{template "skeleton-transcript"}}
   </div>

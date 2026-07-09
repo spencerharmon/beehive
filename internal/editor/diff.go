@@ -11,10 +11,16 @@ import (
 	"strings"
 )
 
-// diffOp is one step of the line-level edit script.
+// diffOp is one step of the line-level edit script. ai/bi are the source line
+// indices this op came from (into the a/b slices diffLines was called with),
+// -1 when not applicable (an insert has no ai, a delete has no bi) — chat-
+// editor-snappy-polish's RenderDiffHTML uses them to look up a precomputed
+// syntax-highlighted rendering of the SAME line instead of the plain escape.
 type diffOp struct {
 	kind byte // 'e' equal, '-' delete (old only), '+' insert (new only)
 	text string
+	ai   int
+	bi   int
 }
 
 // diffLines returns the line edit script transforming a into b, computed by a
@@ -43,22 +49,22 @@ func diffLines(a, b []string) []diffOp {
 	for i < n && j < m {
 		switch {
 		case a[i] == b[j]:
-			ops = append(ops, diffOp{'e', a[i]})
+			ops = append(ops, diffOp{'e', a[i], i, j})
 			i++
 			j++
 		case lcs[i+1][j] >= lcs[i][j+1]:
-			ops = append(ops, diffOp{'-', a[i]})
+			ops = append(ops, diffOp{'-', a[i], i, -1})
 			i++
 		default:
-			ops = append(ops, diffOp{'+', b[j]})
+			ops = append(ops, diffOp{'+', b[j], -1, j})
 			j++
 		}
 	}
 	for ; i < n; i++ {
-		ops = append(ops, diffOp{'-', a[i]})
+		ops = append(ops, diffOp{'-', a[i], i, -1})
 	}
 	for ; j < m; j++ {
-		ops = append(ops, diffOp{'+', b[j]})
+		ops = append(ops, diffOp{'+', b[j], -1, j})
 	}
 	return ops
 }
@@ -137,11 +143,46 @@ type DiffRow struct {
 // RenderDiff produces a unified-diff rendering of the change from old to new:
 // equal lines as context, deletions and additions highlighted, and adjacent
 // delete/insert runs paired so the changed columns within a line are marked.
+// Equivalent to RenderDiffHTML(old, new, nil, nil) — every existing caller (the
+// single-file editor, the skills diff view) keeps this exact character-diff
+// rendering.
 func RenderDiff(old, new string) []DiffRow {
+	return RenderDiffHTML(old, new, nil, nil)
+}
+
+// RenderDiffHTML is RenderDiff plus OPTIONAL precomputed per-line HTML (e.g. from
+// a syntax-highlighting tokenizer): oldHTML[i] backs old's line i, newHTML[j]
+// backs new's line j (see splitLines for the line-index convention). Chat-
+// editor-snappy-polish uses it so the chat-diff view can show colorized/
+// language-highlighted lines; when a language/tokenizer is not available for a
+// given line, or oldHTML/newHTML are both nil (RenderDiff's case), the row falls
+// back to today's plain-escaped / intra-line character-diff rendering unchanged.
+//
+// Highlighted lines are shown WHOLE (no intra-line character-diff span) — mixing
+// per-token syntax spans with the rune-level replace highlighting below is not
+// attempted, so a highlighted row always renders its own precomputed HTML
+// verbatim, add/del/eq context coming from the row's CSS background alone.
+func RenderDiffHTML(old, new string, oldHTML, newHTML []template.HTML) []DiffRow {
 	ops := diffLines(splitLines(old), splitLines(new))
+	highlighted := oldHTML != nil || newHTML != nil
+	lineHTML := func(ai, bi int) (template.HTML, bool) {
+		if ai >= 0 && ai < len(oldHTML) {
+			return oldHTML[ai], true
+		}
+		if bi >= 0 && bi < len(newHTML) {
+			return newHTML[bi], true
+		}
+		return "", false
+	}
 	var rows []DiffRow
 	for k := 0; k < len(ops); k++ {
 		op := ops[k]
+		if highlighted {
+			if h, ok := lineHTML(op.ai, op.bi); ok {
+				rows = append(rows, DiffRow{diffRowKind(op.kind), h})
+				continue
+			}
+		}
 		switch op.kind {
 		case 'e':
 			rows = append(rows, DiffRow{"eq", template.HTML(template.HTMLEscapeString(op.text))})
@@ -178,6 +219,18 @@ func RenderDiff(old, new string) []DiffRow {
 		}
 	}
 	return rows
+}
+
+// diffRowKind maps a diffOp's kind byte to DiffRow's Kind string.
+func diffRowKind(kind byte) string {
+	switch kind {
+	case 'e':
+		return "eq"
+	case '-':
+		return "del"
+	default:
+		return "add"
+	}
 }
 
 func splitLines(s string) []string {
