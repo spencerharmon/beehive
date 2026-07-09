@@ -21,8 +21,8 @@
 <div class="table-scroll">
 <table>
 <tr><th scope="col">sha</th><th scope="col">refs</th><th scope="col">subject</th><th scope="col">author</th><th scope="col">change doc</th><th scope="col">delivered</th></tr>
-{{range .Commits}}<tr>
-<td class="sha-cell"><code>{{.SHA}}</code><button type="button" class="copy-btn" data-copy="{{.SHA}}" aria-label="Copy commit {{.SHA}} to clipboard">copy</button></td>
+{{range .Commits}}<tr id="commit-{{.SHA}}">
+<td class="sha-cell"><a href="#commit-{{.SHA}}"><code>{{.SHA}}</code></a><button type="button" class="copy-btn" data-copy="{{.SHA}}" aria-label="Copy commit {{.SHA}} to clipboard">copy</button></td>
 <td>{{if .Refs}}<span class="badge">{{.Refs}}</span>{{end}}</td>
 <td>{{.Subject}}</td>
 <td class="muted">{{.Author}}</td>
