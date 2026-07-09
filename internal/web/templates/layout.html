@@ -5,8 +5,8 @@
    "") falls back to the bare site name — the dashboard's default, since the
    root page needs no extra context. Nav (optional) names which top-nav link
    is the current section ("dashboard"/"stats"/"secrets"/"merge"/"human"/
-   "hygiene"/"skills"); only handlers routed straight off one of those 7 links
-   set it, so a submodule-scoped page (plan/session/explorer/...) leaves every
+   "hygiene"/"skills"/"links"); only handlers routed straight off one of those 8
+   links set it, so a submodule-scoped page (plan/session/explorer/...) leaves every
    nav link unmarked rather than guessing a parent section. */}}
 {{define "header"}}<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{if .Title}}{{.Title}}{{else}}beehive{{end}}</title>
@@ -17,7 +17,7 @@
 <a class="skip-link" href="#main">Skip to content</a>
 <div id="htmx-progress" class="htmx-indicator" role="status" aria-live="polite" aria-label="working"><span class="bar"></span><span class="spin" aria-hidden="true"></span></div>
 <div id="htmx-toast" role="alert" aria-live="assertive" hidden></div>
-<header class="topbar"><nav class="nav"><a class="brand" href="/">beehive</a><span class="nav-links"><a href="/"{{if eq .Nav "dashboard"}} aria-current="page"{{end}}>dashboard</a><a href="/stats"{{if eq .Nav "stats"}} aria-current="page"{{end}}>stats</a><a href="/secrets"{{if eq .Nav "secrets"}} aria-current="page"{{end}}>secrets</a><a href="/merge"{{if eq .Nav "merge"}} aria-current="page"{{end}}>merge</a><a href="/human"{{if eq .Nav "human"}} aria-current="page"{{end}}>human</a><a href="/hygiene"{{if eq .Nav "hygiene"}} aria-current="page"{{end}}>hygiene</a><a href="/skills"{{if eq .Nav "skills"}} aria-current="page"{{end}}>skills</a></span></nav></header>
+<header class="topbar"><nav class="nav"><a class="brand" href="/">beehive</a><span class="nav-links"><a href="/"{{if eq .Nav "dashboard"}} aria-current="page"{{end}}>dashboard</a><a href="/stats"{{if eq .Nav "stats"}} aria-current="page"{{end}}>stats</a><a href="/secrets"{{if eq .Nav "secrets"}} aria-current="page"{{end}}>secrets</a><a href="/merge"{{if eq .Nav "merge"}} aria-current="page"{{end}}>merge</a><a href="/human"{{if eq .Nav "human"}} aria-current="page"{{end}}>human</a><a href="/hygiene"{{if eq .Nav "hygiene"}} aria-current="page"{{end}}>hygiene</a><a href="/skills"{{if eq .Nav "skills"}} aria-current="page"{{end}}>skills</a><a href="/submodule/link"{{if eq .Nav "links"}} aria-current="page"{{end}}>links</a></span></nav></header>
 <main class="container" id="main" tabindex="-1">{{end}}
 {{/* breadcrumb (breadcrumb-trail-landing): an ancestor trail rooted at the
    dashboard, rendered on every non-dashboard page as a

@@ -362,6 +362,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /merge", b((*Server).mergeGet))
 	mux.HandleFunc("POST /merge", b((*Server).mergePost))
 	mux.HandleFunc("POST /submodule/add", b((*Server).submoduleAdd))
+	mux.HandleFunc("GET /submodule/link", b((*Server).submoduleLinksGet))
 	mux.HandleFunc("POST /submodule/link", b((*Server).submoduleLink))
 	// Refresh the managed repo-ROOT instruction files (AGENTS/HONEYBEE/BOOTSTRAP)
 	// to the binary's embedded defaults via the SAME installer the CLI uses
@@ -1272,6 +1273,19 @@ func (s *Server) submoduleAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// submoduleLinksGet renders the GET (render) half of /submodule/link — the
+// "link two submodules" form — which previously had only a POST (submit) half
+// (submoduleLink), leaving a real, backend-complete feature unreachable through
+// the shipped UI. Like the other global utility pages (secrets/merge), it seeds
+// no dynamic state — the form carries none — beyond the shared chrome: a "links"
+// browser title and the "links" top-nav section so the eighth nav entry lights
+// up. A read-view of SUBMODULE-LINKS.yaml's current edges is deliberately out of
+// scope here; a future pass may fold one in. The POST half's
+// validation/AddDep/publish/redirect behavior is untouched.
+func (s *Server) submoduleLinksGet(w http.ResponseWriter, r *http.Request) {
+	s.render(w, "links_editor.html", map[string]interface{}{"Title": pageTitle("links"), "Nav": "links"})
 }
 
 // submoduleLink records a from->to dependency through the cycle-checked links

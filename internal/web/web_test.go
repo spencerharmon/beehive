@@ -1701,6 +1701,51 @@ func TestSubmoduleLinkRejectsCycle(t *testing.T) {
 	}
 }
 
+// TestSubmoduleLinksGetRouted closes the links-editor-route-gap: the
+// link-two-submodules form is now reachable through a REAL HTTP GET round-trip,
+// not only a direct renderTmpl call — the isolation gap (see the "links_editor
+// .html link form" case in the accessible-labels table above, which renders the
+// template with no route) that let a fully backend-complete but 100%
+// undiscoverable page survive three audit passes. It asserts GET /submodule/link
+// 200s and actually renders links_editor's form, that visiting it marks EXACTLY
+// the new eighth "links" top-nav entry aria-current (same convention as the
+// other 7, none of which light up here), and that the sibling POST half still
+// binds to the same path — proving the GET registration did not shadow it.
+func TestSubmoduleLinksGetRouted(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/submodule/link")
+	if w.Code != 200 {
+		t.Fatalf("GET /submodule/link = %d, want 200: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	// The links_editor template really rendered (not a bare/blank 200): its
+	// heading and the form posting back to the same path are both present.
+	if !strings.Contains(body, `<h1>Submodule links</h1>`) ||
+		!strings.Contains(body, `action="/submodule/link"`) {
+		t.Fatalf("GET /submodule/link did not render the link form:\n%s", body)
+	}
+	// Exactly the links nav entry is current, scoped to the top-nav <nav> the
+	// same way the sibling nav-aria tests scope theirs. This global page renders
+	// no breadcrumb landmark, so the only aria-current anywhere is the nav one.
+	topnav := body
+	if i := strings.Index(topnav, `<nav class="nav">`); i >= 0 {
+		if j := strings.Index(topnav[i:], "</nav>"); j >= 0 {
+			topnav = topnav[i : i+j]
+		}
+	}
+	if !strings.Contains(topnav, `<a href="/submodule/link" aria-current="page">links</a>`) {
+		t.Fatalf("links nav entry not marked current on GET /submodule/link:\n%s", topnav)
+	}
+	if n := strings.Count(topnav, "aria-current"); n != 1 {
+		t.Fatalf("top-nav aria-current count = %d, want exactly 1 (only the links entry):\n%s", n, topnav)
+	}
+	// Method-based routing coexistence: the POST (submit) half still resolves on
+	// the identical path and redirects, unshadowed by the new GET registration.
+	if p := postForm(t, s, "/submodule/link", url.Values{"from": {"m"}, "to": {"n"}}); p.Code != http.StatusSeeOther {
+		t.Fatalf("POST /submodule/link after adding GET = %d, want %d: %s", p.Code, http.StatusSeeOther, p.Body)
+	}
+}
+
 // TestAssetsStyleServed locks the design-system contract: the stylesheet is
 // still embedded and served at /assets/style.css, exposes a token root with a
 // dark-mode override, and defines a status pill class per task state plus the
