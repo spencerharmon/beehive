@@ -242,9 +242,7 @@ func (r *Repo) sweepStaleGCTemp(ctx context.Context, olderThan time.Duration) in
 	removed := 0
 	for _, e := range ents {
 		name := e.Name()
-		if !strings.HasPrefix(name, "tmp_pack_") &&
-			!strings.HasPrefix(name, "tmp_idx_") &&
-			!strings.HasPrefix(name, "tmp_rev_") {
+		if !isGCTemp(name) {
 			continue
 		}
 		info, ierr := e.Info()
@@ -256,4 +254,66 @@ func (r *Repo) sweepStaleGCTemp(ctx context.Context, olderThan time.Duration) in
 		}
 	}
 	return removed
+}
+
+// isGCTemp reports whether name is a leftover git repack temp file — the
+// tmp_pack_*/tmp_idx_*/tmp_rev_* residue an interrupted `git gc`/repack leaves in
+// the pack dir. It is the single source of truth shared by the sweeper (which
+// deletes stale ones) and the read-only hygiene stat (which counts them) so both
+// always agree on exactly what a repack temp is.
+func isGCTemp(name string) bool {
+	return strings.HasPrefix(name, "tmp_pack_") ||
+		strings.HasPrefix(name, "tmp_idx_") ||
+		strings.HasPrefix(name, "tmp_rev_")
+}
+
+// PackStat is the READ-ONLY footprint of a repo's pack directory
+// (.git/objects/pack): total byte size, the live pack-*.pack count, and the count
+// of leftover repack temp files (tmp_pack_*/tmp_idx_*/tmp_rev_*). It STATS ONLY and
+// never repacks, prunes, or removes anything (that is MaybeGC's job) — the hygiene
+// panel uses it to surface a repack storm (dozens of orphan packs, a growing temp
+// pile from a repack killed mid-flight) in minutes instead of only when a ref stops
+// resolving. Reading objects/pack is an in-repo read (the object store IS the repo),
+// not an out-of-repo data source.
+type PackStat struct {
+	SizeBytes int64 // total bytes across every regular file in the pack dir
+	Packs     int   // live pack-*.pack count
+	Temps     int   // leftover tmp_pack_*/tmp_idx_*/tmp_rev_* count
+}
+
+// PackDirStat reports the read-only PackStat for this repo's own object store. The
+// pack dir is resolved via `git rev-parse --git-path objects/pack`, so it is correct
+// whether .git is a real directory (the hive root) or a gitfile pointing into
+// .git/modules/<name> (a submodule checkout) — the same resolution sweepStaleGCTemp
+// uses. A pack dir that does not exist yet (a fresh repo with nothing packed) is not
+// an error: it reports a zero PackStat. Nothing here is ever mutated.
+func (r *Repo) PackDirStat(ctx context.Context) (PackStat, error) {
+	packDir, err := r.Run(ctx, "rev-parse", "--git-path", "objects/pack")
+	if err != nil {
+		return PackStat{}, err
+	}
+	if !filepath.IsAbs(packDir) {
+		packDir = filepath.Join(r.Dir, packDir)
+	}
+	ents, err := os.ReadDir(packDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return PackStat{}, nil // nothing packed yet
+		}
+		return PackStat{}, err
+	}
+	var st PackStat
+	for _, e := range ents {
+		name := e.Name()
+		if info, ierr := e.Info(); ierr == nil && info.Mode().IsRegular() {
+			st.SizeBytes += info.Size()
+		}
+		switch {
+		case isGCTemp(name):
+			st.Temps++
+		case strings.HasPrefix(name, "pack-") && strings.HasSuffix(name, ".pack"):
+			st.Packs++
+		}
+	}
+	return st, nil
 }
