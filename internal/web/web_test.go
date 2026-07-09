@@ -1249,9 +1249,10 @@ func TestPlanRowDeepAnchors(t *testing.T) {
 		t.Fatalf("anchor was not prefixed (bare numeric id used directly):\n%s", out)
 	}
 
-	// Columns/data/order unchanged: still the 6-col header, still exactly one
+	// Columns/data/order unchanged: still the 6-col header (now carrying
+	// table-header-scope's scope="col" on every column), still exactly one
 	// anchored row per item.
-	if !strings.Contains(out, "<tr><th>id</th><th>status</th><th>desc</th><th>deps</th><th>claim</th><th>change doc</th></tr>") {
+	if !strings.Contains(out, `<tr><th scope="col">id</th><th scope="col">status</th><th scope="col">desc</th><th scope="col">deps</th><th scope="col">claim</th><th scope="col">change doc</th></tr>`) {
 		t.Fatalf("table header changed:\n%s", out)
 	}
 	if n := strings.Count(out, `<tr id="task-`); n != 2 {
@@ -1718,9 +1719,10 @@ func TestTableScrollWrapsDataTables(t *testing.T) {
 	}
 
 	// (4) human.html — the pending-human table, through the real handler
-	// (setup's fixture plan already carries a NEEDS-HUMAN task, t2).
+	// (setup's fixture plan already carries a NEEDS-HUMAN task, t2). The
+	// header now carries table-header-scope's scope="col".
 	humanOut := get(t, s, "/human").Body.String()
-	if !strings.Contains(humanOut, "<div class=\"table-scroll\">\n<table><tr><th>submodule</th>") {
+	if !strings.Contains(humanOut, `<div class="table-scroll">`+"\n"+`<table><tr><th scope="col">submodule</th>`) {
 		t.Fatalf("human.html table not wrapped in .table-scroll:\n%s", humanOut)
 	}
 
@@ -1758,6 +1760,123 @@ func TestTableScrollWrapsDataTables(t *testing.T) {
 	groupedOut := renderTmpl(t, s, "stats.html", groupedData)
 	if !strings.Contains(groupedOut, "<div class=\"table-scroll\">\n<table>") {
 		t.Fatalf("stats.html grouped view table not wrapped in .table-scroll:\n%s", groupedOut)
+	}
+}
+
+// TestTableHeaderScopeAssociatesColumns is the core of table-header-scope:
+// every data-table <th> renders bare with no scope attribute, so a screen
+// reader cannot associate a data cell with its column/row header and the
+// densest tables (plan_items's 6-col task table, stats's dynamic group-by
+// headers, branch_view's commit table, human's blocked-task table) read as
+// unlabeled cell soup to AT users. It asserts scope="col" on every column
+// header — including stats.html's dynamic per-GroupBy-key headers — across
+// all four templates, plus stats.html's default view (top-level table and
+// its by-model/deliveries/total-by-model nested drill-downs). None of these
+// tables has a leading <th> row header, so no scope="row" is expected
+// anywhere. No visual change — scope is a non-rendering attribute.
+func TestTableHeaderScopeAssociatesColumns(t *testing.T) {
+	s, _ := setup(t)
+
+	// (1) plan_items.html — the 6-col task table, most-visited.
+	pl := Plan{ROIStamp: "abc123", Items: []PlanItem{{ID: "t1", Status: StatusTODO, Desc: "x"}}}
+	planOut := renderTmpl(t, s, "plan_items.html", map[string]interface{}{"Name": "alpha", "Plan": pl})
+	for _, want := range []string{
+		`<th scope="col">id</th>`, `<th scope="col">status</th>`, `<th scope="col">desc</th>`,
+		`<th scope="col">deps</th>`, `<th scope="col">claim</th>`, `<th scope="col">change doc</th>`,
+	} {
+		if !strings.Contains(planOut, want) {
+			t.Fatalf("plan_items.html missing %q:\n%s", want, planOut)
+		}
+	}
+	if strings.Contains(planOut, "<th>") {
+		t.Fatalf("plan_items.html has a <th> with no scope:\n%s", planOut)
+	}
+
+	// (2) branch_view.html — the commit table.
+	branchOut := renderTmpl(t, s, "branch_view.html", map[string]interface{}{
+		"Name": "alpha",
+		"Sections": []Section{{Date: "2026-07-01", Commits: []Commit{
+			{SHA: "abc1234", Subject: "a commit", Author: "bee"},
+		}}},
+		"HasPrev": false, "HasNext": false,
+	})
+	for _, want := range []string{
+		`<th scope="col">sha</th>`, `<th scope="col">refs</th>`, `<th scope="col">subject</th>`,
+		`<th scope="col">author</th>`, `<th scope="col">change doc</th>`, `<th scope="col">delivered</th>`,
+	} {
+		if !strings.Contains(branchOut, want) {
+			t.Fatalf("branch_view.html missing %q:\n%s", want, branchOut)
+		}
+	}
+	if strings.Contains(branchOut, "<th>") {
+		t.Fatalf("branch_view.html has a <th> with no scope:\n%s", branchOut)
+	}
+
+	// (3) human.html — the blocked-task table, through the real handler
+	// (setup's fixture plan already carries a NEEDS-HUMAN task, t2). The
+	// trailing action column's header is empty but still a <th>, so it
+	// carries scope="col" too.
+	humanOut := get(t, s, "/human").Body.String()
+	for _, want := range []string{
+		`<th scope="col">submodule</th>`, `<th scope="col">id</th>`, `<th scope="col">reason</th>`,
+		`<th scope="col">desc</th>`, `<th scope="col"></th>`,
+	} {
+		if !strings.Contains(humanOut, want) {
+			t.Fatalf("human.html missing %q:\n%s", want, humanOut)
+		}
+	}
+	if strings.Contains(humanOut, "<th>") {
+		t.Fatalf("human.html has a <th> with no scope:\n%s", humanOut)
+	}
+
+	// (4) stats.html grouped (Filtered) view — the dynamic per-GroupBy-key
+	// header column(s) plus the fixed aggregate columns.
+	groupedData := map[string]interface{}{
+		"Filters": nil, "GroupBy": []string{"kind"}, "GroupBySet": toSet([]string{"kind"}),
+		"BuiltinTags": builtinFacets, "ExtraGroupBy": "", "Filtered": true,
+		"Grouped": []groupStat{{Values: []string{"work"}, DeliveredTasks: 1, Honeybees: 1}},
+	}
+	groupedOut := renderTmpl(t, s, "stats.html", groupedData)
+	for _, want := range []string{
+		`<th scope="col">kind</th>`, `<th scope="col">delivered tasks</th>`,
+		`<th scope="col">honeybees</th>`, `<th scope="col">✅/🐝</th>`, `<th scope="col">stranded</th>`,
+	} {
+		if !strings.Contains(groupedOut, want) {
+			t.Fatalf("stats.html grouped view missing %q:\n%s", want, groupedOut)
+		}
+	}
+	if strings.Contains(groupedOut, "<th>") {
+		t.Fatalf("stats.html grouped view has a <th> with no scope:\n%s", groupedOut)
+	}
+
+	// (5) stats.html default view — the per-submodule table plus both nested
+	// drill-downs (by-model, deliveries) and the total-by-model table.
+	statsData := map[string]interface{}{
+		"Filters": nil, "GroupBy": []string(nil), "GroupBySet": toSet(nil),
+		"BuiltinTags": builtinFacets, "ExtraGroupBy": "", "Filtered": false,
+		"Subs": []subStat{{
+			Name: "alpha", DeliveredTasks: 1, Honeybees: 2,
+			Models:     []modelStat{{Model: "m1", DeliveredTasks: 1, Honeybees: 1}},
+			Deliveries: []DeliveryLink{{TaskID: "t1", FlipSHA: "abc", FlipHref: "/x"}},
+		}},
+		"Total": subStat{
+			DeliveredTasks: 1, Honeybees: 2,
+			Models: []modelStat{{Model: "m1", DeliveredTasks: 1, Honeybees: 1}},
+		},
+	}
+	statsOut := renderTmpl(t, s, "stats.html", statsData)
+	for _, want := range []string{
+		`<th scope="col">submodule</th>`, `<th scope="col">delivered tasks</th>`, `<th scope="col">honeybees</th>`,
+		`<th scope="col">✅/🐝</th>`, `<th scope="col">active now</th>`, `<th scope="col">stranded</th>`,
+		`<th scope="col">model</th>`, `<th scope="col">delivered</th>`,
+		`<th scope="col">task</th>`, `<th scope="col">hive PLAN flip</th>`, `<th scope="col">submodule change doc</th>`,
+	} {
+		if !strings.Contains(statsOut, want) {
+			t.Fatalf("stats.html default view missing %q:\n%s", want, statsOut)
+		}
+	}
+	if strings.Contains(statsOut, "<th>") {
+		t.Fatalf("stats.html default view has a <th> with no scope:\n%s", statsOut)
 	}
 }
 

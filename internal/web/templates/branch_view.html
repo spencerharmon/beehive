@@ -19,7 +19,7 @@
 <h2>{{.Date}}</h2>
 <div class="table-scroll">
 <table>
-<tr><th>sha</th><th>refs</th><th>subject</th><th>author</th><th>change doc</th><th>delivered</th></tr>
+<tr><th scope="col">sha</th><th scope="col">refs</th><th scope="col">subject</th><th scope="col">author</th><th scope="col">change doc</th><th scope="col">delivered</th></tr>
 {{range .Commits}}<tr>
 <td><code>{{.SHA}}</code></td>
 <td>{{if .Refs}}<span class="badge">{{.Refs}}</span>{{end}}</td>
