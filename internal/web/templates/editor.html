@@ -1,10 +1,15 @@
 {{template "header" .}}
 <h1>edit · {{.File}}</h1>
 <p><a href="/">dashboard</a> · chatting with the AI editor on its own branch. Changes are not live until merged.</p>
+{{/* Poll only while a turn is in flight: the shell fetches the panel ONCE on
+   load, and editor_panel.html re-arms this poll (a hidden load-delay fetch) only
+   while .Busy. An idle editor (agent waiting for the next message) therefore
+   stops polling instead of re-rendering an unchanged diff every 1.5s; sending a
+   message makes the panel Busy again, which restarts the poll. */}}
 <div id="editor"
      role="status" aria-live="polite"
      hx-get="/editor/{{.ID}}/panel"
-     hx-trigger="load, every 1500ms"
+     hx-trigger="load"
      hx-swap="innerHTML">
   {{template "skeleton-transcript"}}
 </div>

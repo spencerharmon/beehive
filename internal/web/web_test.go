@@ -284,6 +284,71 @@ func TestPollPaneLoadingSkeletons(t *testing.T) {
 	}
 }
 
+// TestPollBackoffWhenEndedOrIdle is the poll-backoff-ended-content lock: a
+// polled pane must never re-fetch an unchanging fragment forever. It asserts
+// three cadence contracts:
+//
+//  1. session_view.html gates its transcript poll on liveness — the required
+//     ended-vs-live hx-trigger difference. A LIVE session keeps the every-2s
+//     poll (the SSE stream supersedes it while connected; this is its fallback);
+//     an ENDED session (durable final transcript, no stream) fetches once on
+//     load and then STOPS, so a left-open tab no longer polls identical bytes
+//     every 2s forever. The poll target and swap are unchanged in both states.
+//  2. editor.html polls the panel once on load and editor_panel.html re-arms the
+//     poll ONLY while a turn is in flight (.Busy) — an idle editor stops.
+//  3. human_resolve.html / human_resolve_panel.html apply the same idle backoff
+//     to the resolution agent.
+func TestPollBackoffWhenEndedOrIdle(t *testing.T) {
+	s, _ := setup(t)
+
+	// (1) session_view: a live pane keeps every-2s; an ended pane fetches once.
+	live := renderTmpl(t, s, "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x", "Live": true})
+	if !strings.Contains(live, `hx-trigger="load, every 2s"`) {
+		t.Errorf("live session_view must keep the every-2s poll (SSE fallback):\n%s", live)
+	}
+	ended := renderTmpl(t, s, "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x", "Live": false})
+	if !strings.Contains(ended, `hx-trigger="load"`) {
+		t.Errorf("ended session_view must fetch once on load:\n%s", ended)
+	}
+	if strings.Contains(ended, "every") {
+		t.Errorf("ended session_view must NOT poll on an interval (no every-2s):\n%s", ended)
+	}
+	// Only the cadence changes: the poll target and swap are identical either way.
+	for _, v := range []string{live, ended} {
+		if !strings.Contains(v, `id="session-body"`) || !strings.Contains(v, `hx-swap="innerHTML"`) {
+			t.Errorf("session_view poll target/swap must be unchanged:\n%s", v)
+		}
+	}
+
+	// (2) editor: the shell polls once; the panel self-perpetuates only while Busy.
+	eShell := renderTmpl(t, s, "editor.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"})
+	if !strings.Contains(eShell, `hx-trigger="load"`) || strings.Contains(eShell, "every") {
+		t.Errorf("editor.html shell must poll once on load, not on an interval:\n%s", eShell)
+	}
+	eIdle := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Busy": false})
+	if strings.Contains(eIdle, "hx-trigger") {
+		t.Errorf("idle editor_panel must carry NO poller (nothing to watch):\n%s", eIdle)
+	}
+	eBusy := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Busy": true})
+	if !strings.Contains(eBusy, `hx-trigger="load delay:1500ms"`) || !strings.Contains(eBusy, `hx-target="#editor"`) {
+		t.Errorf("busy editor_panel must re-arm the poll while a turn is in flight:\n%s", eBusy)
+	}
+
+	// (3) human_resolve: the same idle/busy backoff for the resolution agent.
+	rShell := renderTmpl(t, s, "human_resolve.html", map[string]interface{}{"Sub": "alpha", "Item": PlanItem{ID: "t1"}, "SessID": "s1"})
+	if !strings.Contains(rShell, `hx-trigger="load"`) || strings.Contains(rShell, "every") {
+		t.Errorf("human_resolve.html shell must poll once on load, not on an interval:\n%s", rShell)
+	}
+	rIdle := renderTmpl(t, s, "human_resolve_panel.html", map[string]interface{}{"Sub": "alpha", "TaskID": "t1", "SessID": "s1", "Busy": false})
+	if strings.Contains(rIdle, "hx-trigger") {
+		t.Errorf("idle human_resolve_panel must carry NO poller:\n%s", rIdle)
+	}
+	rBusy := renderTmpl(t, s, "human_resolve_panel.html", map[string]interface{}{"Sub": "alpha", "TaskID": "t1", "SessID": "s1", "Busy": true})
+	if !strings.Contains(rBusy, `hx-trigger="load delay:2s"`) || !strings.Contains(rBusy, `hx-target="#resolve"`) {
+		t.Errorf("busy human_resolve_panel must re-arm the poll while a turn is in flight:\n%s", rBusy)
+	}
+}
+
 // TestFormInputsHaveAccessibleNames locks form-input-accessible-labels: every
 // placeholder-only text/password input across these forms now also carries a
 // programmatic accessible name. Two paired patterns, both computed by the
