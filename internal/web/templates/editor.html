@@ -1,6 +1,7 @@
 {{template "header" .}}
+{{template "breadcrumb" .Crumbs}}
 <h1>edit · {{.File}}</h1>
-<p><a href="/">dashboard</a> · chatting with the AI editor on its own branch. Changes are not live until merged.</p>
+<p>chatting with the AI editor on its own branch. Changes are not live until merged.</p>
 {{/* Poll only while a turn is in flight: the shell fetches the panel ONCE on
    load, and editor_panel.html re-arms this poll (a hidden load-delay fetch) only
    while .Busy. An idle editor (agent waiting for the next message) therefore

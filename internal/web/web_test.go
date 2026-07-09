@@ -2875,6 +2875,68 @@ func TestRoiEditorBreadcrumb(t *testing.T) {
 	}
 }
 
+// TestEditorPageBreadcrumb (editor-breadcrumb-trail) covers the AI-edit chat
+// shell's trail, the last substantive content page breadcrumb-coverage-gap left
+// on a bare dashboard back-link. Unlike every other page's trail, the editor has
+// no single referrer to root against — dashboard, explorer, and roi_editor all
+// funnel here through the same /edit?path=... entry point — so it is rooted in
+// the EDIT TARGET's own repo location instead: a submodules/<name>/ target hangs
+// off that submodule's explorer page (dashboard > <name> > edit <file>), and a
+// repo-root target hangs directly off the dashboard (dashboard > edit <file>).
+// Both shapes are asserted, plus the removal of the old bare back-link paragraph.
+func TestEditorPageBreadcrumb(t *testing.T) {
+	s, root := setup(t)
+	commitAndNormalizeMain(t, root)
+
+	// Submodule-scoped target: dashboard > alpha > edit ROI.md, the alpha crumb
+	// a working link back to /submodule/alpha (reusing crumbSubmodule).
+	subID := openEditorSession(t, s, "submodules/alpha/"+repo.ROIFile)
+	subBody := get(t, s, "/editor/"+subID).Body.String()
+	subBC := breadcrumbHTML(t, subBody)
+	if subBC == "" {
+		t.Fatalf("editor page missing breadcrumb landmark:\n%s", subBody)
+	}
+	for _, want := range []string{
+		`<a href="/">dashboard</a>`,
+		`<a href="/submodule/alpha">alpha</a>`,
+		`<span aria-current="page">edit ` + repo.ROIFile + `</span>`,
+	} {
+		if !strings.Contains(subBC, want) {
+			t.Fatalf("submodule-scoped editor breadcrumb missing %q:\n%s", want, subBC)
+		}
+	}
+	if n := strings.Count(subBC, "aria-current"); n != 1 {
+		t.Fatalf("aria-current count = %d, want 1:\n%s", n, subBC)
+	}
+
+	// Repo-root target: dashboard > edit INFRASTRUCTURE.md, no submodule crumb.
+	rootID := openEditorSession(t, s, repo.InfraFile)
+	rootBody := get(t, s, "/editor/"+rootID).Body.String()
+	rootBC := breadcrumbHTML(t, rootBody)
+	if rootBC == "" {
+		t.Fatalf("editor page missing breadcrumb landmark:\n%s", rootBody)
+	}
+	if !strings.Contains(rootBC, `<a href="/">dashboard</a>`) {
+		t.Fatalf("repo-root editor breadcrumb not rooted at the dashboard:\n%s", rootBC)
+	}
+	if !strings.Contains(rootBC, `<span aria-current="page">edit `+repo.InfraFile+`</span>`) {
+		t.Fatalf("repo-root editor breadcrumb missing terminal crumb:\n%s", rootBC)
+	}
+	if strings.Contains(rootBC, `<a href="/submodule/`) {
+		t.Fatalf("repo-root editor breadcrumb must not carry a submodule crumb:\n%s", rootBC)
+	}
+	if n := strings.Count(rootBC, "aria-current"); n != 1 {
+		t.Fatalf("aria-current count = %d, want 1:\n%s", n, rootBC)
+	}
+
+	// The old bare "dashboard" back-link paragraph must be gone (replaced by the
+	// trail); the breadcrumb's own dashboard <li> link is a distinct, allowed
+	// match this check must not trip on.
+	if strings.Contains(subBody, `<p><a href="/">dashboard</a>`) {
+		t.Fatalf("editor page still carries the old bare dashboard back-link:\n%s", subBody)
+	}
+}
+
 // TestDocExplorerListsWholeTree proves submodule-doc-explorer's core contract:
 // every file under docs/ — a top-level change doc, an audit report under
 // docs/audit/, and a task design doc under docs/tasks/ — is listed with a
