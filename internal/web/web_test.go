@@ -6850,3 +6850,207 @@ func TestNavAriaCurrentOptional(t *testing.T) {
 		t.Fatalf("breadcrumb terminal crumb should carry aria-current on the plan page:\n%s", plan)
 	}
 }
+
+// TestTaskIDForSessionAndDisplayName is the unit core of
+// session-list-links-labels' shortening rule: taskIDForSession/
+// sessionDisplayName strip the "bee-" prefix and the "-<epoch>-<pid>" suffix
+// swarm.SessionID always stamps onto a modern session id — the SAME split
+// stats.go's own sessionNameRE already relies on, so the two can never
+// disagree about what task a stem names — and fall back to the id UNCHANGED,
+// never a mangled guess, for a shape that carries no such trailing pid (a
+// legacy pre-pid stem, or a bare id with no epoch at all).
+func TestTaskIDForSessionAndDisplayName(t *testing.T) {
+	cases := []struct {
+		id       string
+		wantTask string
+		wantDisp string
+	}{
+		{"bee-t1-1700000000-1234", "t1", "t1"},
+		{"bee-links-graph-enforcement-1782767318-999", "links-graph-enforcement", "links-graph-enforcement"},
+		{"bee-ui-audit-002-1783542067-2897785", "ui-audit-002", "ui-audit-002"},
+		// Legacy pre-pid shape (session naming added the trailing -<pid> after
+		// some history had already accumulated, see swarm.SessionID): no
+		// second numeric group to anchor the split, so left unresolved/
+		// unshortened rather than guessed.
+		{"bee-bootstrap-1782766865", "", "bee-bootstrap-1782766865"},
+		{"bee-reconcile-1782772649", "", "bee-reconcile-1782772649"},
+		// No epoch at all.
+		{"bee-t1", "", "bee-t1"},
+	}
+	for _, c := range cases {
+		if got := taskIDForSession(c.id); got != c.wantTask {
+			t.Errorf("taskIDForSession(%q) = %q, want %q", c.id, got, c.wantTask)
+		}
+		if got := sessionDisplayName(c.id); got != c.wantDisp {
+			t.Errorf("sessionDisplayName(%q) = %q, want %q", c.id, got, c.wantDisp)
+		}
+	}
+}
+
+// TestSessionListLinksTaskDocCommit is session-list-links-labels' end-to-end
+// assertion: a session names a task (via its bee-<task>-<epoch>-<pid> file
+// stem) that is present in the CURRENT plan, has reached DONE in the hive
+// PLAN.md history (delivery-traceability's hiveDoneFlips), and whose code was
+// stamped with a change doc (branch-graph-sectioned's changeDocsByTask) —
+// both the session-list row and the session page link to all three (task/
+// doc/commit), the list additionally shows the kind+model tags (stats-tag-
+// model's sessionTags) and the shortened display name, and the page shows the
+// full session id as smaller, secondary text.
+func TestSessionListLinksTaskDocCommit(t *testing.T) {
+	s, root := setup(t)
+	const model = "github-copilot/claude-opus-4.8"
+
+	// Hive-side: t1 reaches DONE, so delivery-traceability's flip resolves.
+	writeHivePlan(t, root, "alpha", "t1", "TODO")
+	commitAll(t, root, "t1-todo")
+	writeHivePlan(t, root, "alpha", "t1", "NEEDS-REVIEW")
+	commitAll(t, root, "t1-review")
+	writeHivePlan(t, root, "alpha", "t1", "DONE")
+	commitAll(t, root, "t1-done")
+	flipSHA := hygGit(t, root, "rev-parse", "--short=12", "HEAD")
+
+	// Submodule-side: the implementing commit stamps the change doc.
+	docsDir := filepath.Join(root, "submodules", "alpha", "docs")
+	if err := os.MkdirAll(docsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(docsDir, "bee-t1.md"), []byte("# t1 doc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitRepoAt(t, filepath.Join(root, "submodules", "alpha", "repo"), "impl t1\n\nBeehive: t1 bee-t1.md")
+
+	// The session itself: a finalized "work" pass on t1.
+	const stem = "bee-t1-1700000000-11111"
+	writeTranscript(t, root, stem, "work", model)
+
+	// (1) Session list: shortened name, kind+model tags, task/doc/commit links.
+	list := get(t, s, "/submodule/alpha/sessions/body")
+	if list.Code != 200 {
+		t.Fatalf("sessions/body status %d: %s", list.Code, list.Body)
+	}
+	lb := list.Body.String()
+	for _, want := range []string{
+		`<a href="/submodule/alpha/session/` + stem + `">t1</a>`, // shortened display name, full id in the href
+		`<span class="badge">work</span>`,
+		`<span class="badge">` + model + `</span>`,
+		`<a href="/submodule/alpha/plan#task-t1">task</a>`,
+		`<a href="/submodule/alpha/doc/bee-t1.md">doc</a>`,
+		`<a href="/submodule/alpha/commit/` + flipSHA + `">commit</a>`,
+	} {
+		if !strings.Contains(lb, want) {
+			t.Errorf("sessions list missing %q:\n%s", want, lb)
+		}
+	}
+	// The raw, un-shortened stem must not appear as the link's own text node.
+	if strings.Contains(lb, ">"+stem+"<") {
+		t.Errorf("sessions list should show the SHORTENED name, not the raw stem, as link text:\n%s", lb)
+	}
+
+	// (2) Session page: same three links, plus the shortened name as the H1
+	// and the full raw id as smaller, secondary text.
+	view := get(t, s, "/submodule/alpha/session/"+stem)
+	if view.Code != 200 {
+		t.Fatalf("session view status %d: %s", view.Code, view.Body)
+	}
+	vb := view.Body.String()
+	for _, want := range []string{
+		"<h1>alpha · t1</h1>",
+		`<p class="muted small">branch <code>` + stem + `</code></p>`,
+		`<a href="/submodule/alpha/plan#task-t1">task</a>`,
+		`<a href="/submodule/alpha/doc/bee-t1.md">change doc</a>`,
+		`<a href="/submodule/alpha/commit/` + flipSHA + `">hive <code>` + flipSHA + `</code></a>`,
+	} {
+		if !strings.Contains(vb, want) {
+			t.Errorf("session view missing %q:\n%s", want, vb)
+		}
+	}
+}
+
+// TestSessionListLinksDegradeGracefully is session-list-links-labels'
+// negative control: a session whose file stem names a task with NO plan row,
+// NO stamped doc, and NO DONE flip anywhere renders with no task/doc/commit
+// link and no error — degrading gracefully rather than a dead link or a 500
+// — and, separately, a session id that does not carry the modern
+// bee-<task>-<epoch>-<pid> shape (a legacy pre-pid stem) shows its full id
+// UNCHANGED (never a mangled guess) and likewise carries no task/doc/commit
+// link, even though its kind tag (independent of the shortening logic) still
+// resolves.
+func TestSessionListLinksDegradeGracefully(t *testing.T) {
+	s, root := setup(t) // alpha PLAN has only t1/t2/t3 — "neverexists" names nothing
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A task-shaped id naming nothing resolvable anywhere (no plan row, no doc,
+	// no flip).
+	const orphanStem = "bee-neverexists-1700000001-22222"
+	writeTranscript(t, root, orphanStem, "review", "")
+
+	// A legacy pre-pid id: a real, parseable transcript (its header/name
+	// cross-check still holds) that just predates the -<pid> suffix.
+	const legacyStem = "bee-oldstyle-1700000002"
+	if err := os.WriteFile(filepath.Join(sessDir, legacyStem+".md"), []byte(
+		"# session\n\nsubmodule: alpha · kind: bootstrap · branch: bee-oldstyle\n\n## turn 1\nwork\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	list := get(t, s, "/submodule/alpha/sessions/body")
+	if list.Code != 200 {
+		t.Fatalf("sessions/body status %d: %s", list.Code, list.Body)
+	}
+	lb := list.Body.String()
+
+	// The orphan session: shortened (task-shaped) display name and kind tag,
+	// but no resolvable link at all.
+	if !strings.Contains(lb, `<a href="/submodule/alpha/session/`+orphanStem+`">neverexists</a>`) {
+		t.Errorf("orphan session should still show its shortened display name:\n%s", lb)
+	}
+	if !strings.Contains(lb, `<span class="badge">review</span>`) {
+		t.Errorf("orphan session should still show its kind tag:\n%s", lb)
+	}
+
+	// The legacy session: unshortened (full stem, unchanged) display name,
+	// kind tag still resolves.
+	if !strings.Contains(lb, `<a href="/submodule/alpha/session/`+legacyStem+`">`+legacyStem+`</a>`) {
+		t.Errorf("legacy pre-pid session should show its FULL id unshortened:\n%s", lb)
+	}
+	if !strings.Contains(lb, `<span class="badge">bootstrap</span>`) {
+		t.Errorf("legacy session should still show its kind tag:\n%s", lb)
+	}
+
+	// Neither session resolves ANY task/doc/commit link anywhere in the list.
+	for _, unwanted := range []string{
+		`href="/submodule/alpha/plan#task-`,
+		`href="/submodule/alpha/doc/`,
+		`href="/submodule/alpha/commit/`,
+	} {
+		if strings.Contains(lb, unwanted) {
+			t.Errorf("neither session should carry a task/doc/commit link, found %q:\n%s", unwanted, lb)
+		}
+	}
+
+	// Session page for the orphan: 200 OK, shortened H1, full id as secondary
+	// text, no link, no error surfaced.
+	view := get(t, s, "/submodule/alpha/session/"+orphanStem)
+	if view.Code != 200 {
+		t.Fatalf("orphan session view status %d: %s", view.Code, view.Body)
+	}
+	vb := view.Body.String()
+	if !strings.Contains(vb, "<h1>alpha · neverexists</h1>") {
+		t.Errorf("orphan session view should show the shortened name as H1:\n%s", vb)
+	}
+	if !strings.Contains(vb, `<p class="muted small">branch <code>`+orphanStem+`</code></p>`) {
+		t.Errorf("orphan session view should show the full id as secondary text:\n%s", vb)
+	}
+	for _, unwanted := range []string{
+		`href="/submodule/alpha/plan#task-`,
+		`href="/submodule/alpha/doc/`,
+		`href="/submodule/alpha/commit/`,
+	} {
+		if strings.Contains(vb, unwanted) {
+			t.Errorf("orphan session view must carry no task/doc/commit link, found %q:\n%s", unwanted, vb)
+		}
+	}
+}

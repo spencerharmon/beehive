@@ -1,7 +1,13 @@
 {{template "header" .}}
 {{template "breadcrumb" .Crumbs}}
-<h1>{{.Name}} · {{.Branch}}</h1>
-<p>{{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">ended</span>{{end}}</p>
+<h1>{{.Name}} · {{if .Display}}{{.Display}}{{else}}{{.Branch}}{{end}}</h1>
+<p class="muted small">branch <code>{{.Branch}}</code></p>
+<p>
+{{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">ended</span>{{end}}
+{{if .TaskHref}} <a href="{{.TaskHref}}">task</a>{{end}}
+{{if .DocHref}} <a href="{{.DocHref}}">change doc</a>{{else if .DocPath}} <span class="muted">{{.DocPath}}</span>{{end}}
+{{if .FlipHref}} <a href="{{.FlipHref}}">hive <code>{{.FlipSHA}}</code></a>{{end}}
+</p>
 {{/* Poll cadence follows liveness: a LIVE session polls every 2s (the SSE stream
    below supersedes it while connected and this is its fallback); an ENDED session
    (.Live false) has no stream and a durable, never-again-changing final
