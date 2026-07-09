@@ -517,13 +517,13 @@ func TestDashboardCards(t *testing.T) {
 	// Rendered card grid: the env badge, the NEEDS-HUMAN count linking /human, the
 	// swarm-state badges, the pending count, and the honeybee count are all present
 	// in the HTML. This body is rendered at real time.Now(), where the fixture's
-	// 2026-06-30 claim is long stale, so every card reads "🐝 0" (the badge renders
+	// 2026-06-30 claim is long stale, so every card reads "bees 0" (the badge renders
 	// its count regardless of liveness; the live count is asserted off subViews with
 	// the fixed now above, and the lit-bee markup in TestDashboardCardPolish).
 	body := get(t, s, "/").Body.String()
 	for _, want := range []string{
 		"card-meta", "green", "needs-human 1", `href="/human"`,
-		"bootstrap", "dormant", "pending 2", "🐝 0",
+		"bootstrap", "dormant", "pending 2", "bees 0",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("dashboard HTML missing %q:\n%s", want, body)
@@ -532,7 +532,7 @@ func TestDashboardCards(t *testing.T) {
 }
 
 // TestDashboardCardPolish locks the dashboard-card-polish refinements on top of
-// dashboard-cards: every card shows a 🐝 honeybee count (the live claim count,
+// dashboard-cards: every card shows a "bees" honeybee count (the live claim count,
 // teal-lit when bees are working); the commit/branch-graph link reads "commits",
 // not "branches"; the ROI links are ONE labelled view/edit pair per card (no
 // duplicate roi links); and the ROI stamp is rendered in a truncating cell whose
@@ -543,11 +543,11 @@ func TestDashboardCardPolish(t *testing.T) {
 	s, root := setup(t)
 
 	// IDLE: the fixture's t1 heartbeat (2026-06-30) is long stale at real now, so
-	// alpha has no live bee. The 🐝 count still renders (as 0) and must NOT carry
+	// alpha has no live bee. The "bees" count still renders (as 0) and must NOT carry
 	// the lit "bees-live" modifier.
 	idle := get(t, s, "/").Body.String()
-	if !strings.Contains(idle, "🐝 0") {
-		t.Errorf("idle dashboard missing the 🐝 honeybee count (should render 0 for a stale claim):\n%s", idle)
+	if !strings.Contains(idle, "bees 0") {
+		t.Errorf("idle dashboard missing the \"bees\" honeybee count (should render 0 for a stale claim):\n%s", idle)
 	}
 	if strings.Contains(idle, "bees-live") {
 		t.Errorf("idle dashboard lit the bee badge with no fresh claim:\n%s", idle)
@@ -590,7 +590,7 @@ func TestDashboardCardPolish(t *testing.T) {
 
 	// LIVE: rewrite alpha's PLAN.md so t1 carries a heartbeat fresh at real now
 	// (well within the 60m TTL). alpha now has exactly one live bee, so its card
-	// shows "🐝 1" with the teal "bees-live" modifier. The no-commit fixture has an
+	// shows "bees 1" with the teal "bees-live" modifier. The no-commit fixture has an
 	// empty HEAD, so planView bypasses the cache and re-reads this on next render.
 	fresh := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
 	if err := os.WriteFile(filepath.Join(root, "submodules", "alpha", repo.PlanFile), []byte(
@@ -601,8 +601,8 @@ func TestDashboardCardPolish(t *testing.T) {
 		t.Fatal(err)
 	}
 	live := get(t, s, "/").Body.String()
-	if !strings.Contains(live, "🐝 1") {
-		t.Errorf("live dashboard missing the 🐝 1 honeybee count for the working alpha card:\n%s", live)
+	if !strings.Contains(live, "bees 1") {
+		t.Errorf("live dashboard missing the \"bees 1\" honeybee count for the working alpha card:\n%s", live)
 	}
 	if !strings.Contains(live, "badge bees bees-live") {
 		t.Errorf("live dashboard missing the teal bees-live modifier on the working alpha card:\n%s", live)
