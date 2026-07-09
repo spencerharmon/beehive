@@ -1910,6 +1910,210 @@ func TestRunSuccessfulPublishLeavesNoTranscriptWarning(t *testing.T) {
 	}
 }
 
+// TestRunDetectsLostClaimRaceBeforePublish is the claim-ttl-wallcap-race-guard
+// regression (session-audit-013 F1, the "clean self-reported delivery, then a
+// fresh redispatch of the identical task" pattern confirmed three times in one
+// window). It reproduces the exact gap: this pass's own turn reaches LOCAL
+// completion (status flipped NEEDS-REVIEW + doc written, committed to its own
+// not-yet-published beehive worktree branch) at the precise moment a PEER
+// session has ALREADY claimed the identical task on PUBLISHED main — the shape
+// a heartbeat that only refreshes at the top of a turn lets happen when that
+// turn's own duration (or, in production, finish()'s own conflict-retry
+// sub-turns) runs long enough. Before the guard, the runner trusted the local
+// "done" unconditionally and published straight over the peer. It must instead
+// detect the loss (Lost=true), durably warn the transcript (mirroring the
+// established publish-fail-durable-warning precedent), never report Completed,
+// and never touch the peer's claim already sitting on main.
+func TestRunDetectsLostClaimRaceBeforePublish(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	git.New(repoDir).Commit(context.Background(), "base")
+	// A real .gitmodules entry (url = the local repoDir) so that the SEPARATE
+	// beehive worktree created below (unlike every other Work-kind test in this
+	// file, which runs directly at root and so never needs one) can successfully
+	// `git submodule update --init` its own copy of submodules/sm/repo.
+	gm := "[submodule \"sm\"]\n\tpath = submodules/sm/repo\n\turl = " + repoDir + "\n"
+	os.WriteFile(filepath.Join(root, ".gitmodules"), []byte(gm), 0o644)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	ctx := context.Background()
+	// This honeybee's OWN isolated beehive-layer worktree, exactly as
+	// cmd/honeybee creates it — physically separate from "main" (root/g), so the
+	// test can commit a competing peer claim directly to main untouched by
+	// anything this worktree does.
+	wtPath := filepath.Join(root, ".worktrees", "bee-A")
+	if err := g.WorktreeAdd(ctx, wtPath, "bee-A", "main"); err != nil {
+		t.Fatal(err)
+	}
+	wrp, _ := repo.Open(wtPath)
+	wg := git.New(wtPath)
+	subs, _ := wrp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	cl := &scriptClient{}
+	cl.onPrompt = func() {
+		// A PEER session (bee-B) claims the SAME task and lands it directly on
+		// published main — simulating the exact gap a stale, unrefreshed heartbeat
+		// opens while this pass's turn is (conceptually) still in flight.
+		peerPlan := filepath.Join(root, "submodules", "sm", "PLAN.md")
+		if err := os.WriteFile(peerPlan, []byte(
+			"## T1 [TODO] <!-- attempts=0 deps= session=bee-B heartbeat="+
+				time.Now().UTC().Format(time.RFC3339)+" -->\ngo\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Commit(ctx, "peer bee-B claims T1"); err != nil {
+			t.Fatal(err)
+		}
+
+		// This pass's own agent, unaware of the peer, finishes its turn: it flips
+		// the task NEEDS-REVIEW and writes the doc, entirely within its own
+		// not-yet-published worktree branch. git never tracks the empty seeded
+		// docs/ dir, so this worktree checkout does not have it on disk yet.
+		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		os.MkdirAll(filepath.Join(subs[0].Path, "docs"), 0o755)
+		os.WriteFile(filepath.Join(subs[0].Path, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		if err := wg.CommitPaths(ctx, "plan: needs-review T1",
+			"submodules/sm/PLAN.md", "submodules/sm/docs/bee-T1-T1.md"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := &Runner{
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Session: "bee-A",
+		Publish: func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
+	}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("must NOT report Completed: a peer already owns this task, got %+v", res)
+	}
+	if !res.Lost {
+		t.Fatalf("want Lost=true (the race must be DETECTED, not silently completed), got %+v", res)
+	}
+	if !contains(res.Warning, "another session already claimed it") {
+		t.Fatalf("warning must name the lost claim race, got %q", res.Warning)
+	}
+	// Main must still show the PEER's claim untouched, and must NOT carry our
+	// lost pass's status flip — the whole point of the guard.
+	body, err := g.Show(ctx, "main", "submodules/sm/PLAN.md")
+	if err != nil {
+		t.Fatalf("show main PLAN.md: %v", err)
+	}
+	if !strings.Contains(body, "session=bee-B") {
+		t.Fatalf("peer's claim must survive untouched on main, got:\n%s", body)
+	}
+	if strings.Contains(body, "NEEDS-REVIEW") {
+		t.Fatalf("our lost pass's status flip must NOT have reached main, got:\n%s", body)
+	}
+	// The loss must be durably recorded in the transcript, exactly like the
+	// established publish-fail-durable-warning precedent (recordPublishFailureWarning).
+	transcriptPath := filepath.Join(wtPath, "submodules", "sm", "sessions", res.SessionID+".md")
+	s, aerr := audit.ParseFile(transcriptPath)
+	if aerr != nil {
+		t.Fatalf("audit.ParseFile: %v", aerr)
+	}
+	if !s.Heuristics.Aborted {
+		t.Fatalf("want the transcript classified Aborted, got %+v", s.Heuristics)
+	}
+}
+
+// TestRacePeerOwnsTaskFailsOpen proves the guard never falsely blocks a clean,
+// uncontested completion: no Publish wired (no shared main to race against, the
+// same convention mainAdvanced uses), a task absent from main, and a foreign
+// but STALE (TTL-expired) claim must all read as "not lost".
+func TestRacePeerOwnsTaskFailsOpen(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	ctx := context.Background()
+
+	t.Run("no-publish-wired", func(t *testing.T) {
+		os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= session=bee-B heartbeat="+time.Now().UTC().Format(time.RFC3339)+" -->\ngo\n"), 0o644)
+		g.Commit(ctx, "seed")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+		r := &Runner{Repo: rp, Git: g, Session: "bee-A", TTL: time.Hour}
+		if r.racePeerOwnsTask(ctx, sel) {
+			t.Fatal("must fail open with no Publish wired")
+		}
+	})
+
+	t.Run("task-absent-from-main", func(t *testing.T) {
+		os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## OTHER [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		g.Commit(ctx, "no T1")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+		r := &Runner{
+			Repo: rp, Git: g, Session: "bee-A", TTL: time.Hour,
+			Publish: func(context.Context) error { return nil },
+		}
+		if r.racePeerOwnsTask(ctx, sel) {
+			t.Fatal("must fail open when the task is absent from published main")
+		}
+	})
+
+	t.Run("stale-foreign-claim-not-lost", func(t *testing.T) {
+		old := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+		os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= session=bee-B heartbeat="+old+" -->\ngo\n"), 0o644)
+		g.Commit(ctx, "stale peer claim")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+		r := &Runner{
+			Repo: rp, Git: g, Session: "bee-A", TTL: time.Hour,
+			Publish: func(context.Context) error { return nil },
+		}
+		if r.racePeerOwnsTask(ctx, sel) {
+			t.Fatal("a STALE foreign claim (past TTL) must not report lost — it is GC-reclaimable, not a live peer")
+		}
+	})
+
+	t.Run("own-session-not-lost", func(t *testing.T) {
+		os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= session=bee-A heartbeat="+time.Now().UTC().Format(time.RFC3339)+" -->\ngo\n"), 0o644)
+		g.Commit(ctx, "our own claim")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+		r := &Runner{
+			Repo: rp, Git: g, Session: "bee-A", TTL: time.Hour,
+			Publish: func(context.Context) error { return nil },
+		}
+		if r.racePeerOwnsTask(ctx, sel) {
+			t.Fatal("our OWN session's claim must never read as a foreign race")
+		}
+	})
+
+	t.Run("live-foreign-claim-lost", func(t *testing.T) {
+		os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [TODO] <!-- attempts=0 deps= session=bee-B heartbeat="+time.Now().UTC().Format(time.RFC3339)+" -->\ngo\n"), 0o644)
+		g.Commit(ctx, "live peer claim")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+		r := &Runner{
+			Repo: rp, Git: g, Session: "bee-A", TTL: time.Hour,
+			Publish: func(context.Context) error { return nil },
+		}
+		if !r.racePeerOwnsTask(ctx, sel) {
+			t.Fatal("a LIVE foreign claim (fresh heartbeat, different session) must report lost")
+		}
+	})
+}
+
 // TestWorkSyncsWorktreeBaseToTrackedTip proves the Work setup fetches and
 // hard-resets the submodule checkout to the tracked-branch tip BEFORE branching
 // the code worktree, so a honeybee starts from the live code rather than the

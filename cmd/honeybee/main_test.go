@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/instruct"
@@ -244,4 +245,44 @@ func TestInstructionDriftWarning(t *testing.T) {
 			t.Fatal("uninstalled root produced no warning, want one")
 		}
 	})
+}
+
+// TestWallCapFor is the claim-ttl-wallcap-race-guard regression for layer one
+// (see wallCapFor's doc comment): WallCap must be a DISTINCT, strictly smaller
+// value than the shared claim ttl — never numerically equal to it (the exact
+// coupling session-audit-013 F1 traced the race to) — and must never just
+// collapse ttl itself (raising/lowering ttl trades away GC recovery speed,
+// which the task instructions explicitly rule out as a fix).
+func TestWallCapFor(t *testing.T) {
+	cases := []struct {
+		name string
+		ttl  time.Duration
+		want time.Duration
+	}{
+		{"default-60min", 60 * time.Minute, 45 * time.Minute},
+		{"120min", 120 * time.Minute, 90 * time.Minute},
+		{"zero-passthrough", 0, 0},
+		{"negative-passthrough", -time.Minute, -time.Minute},
+		// A sub-4-unit ttl rounds its quarter margin down to 0 (integer division),
+		// so cap == ttl here — not a special fallback, just the natural floor; it
+		// must still return a sane, non-negative value rather than invert.
+		{"sub-margin-ttl-keeps-cap-positive", 3 * time.Nanosecond, 3 * time.Nanosecond},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := wallCapFor(c.ttl); got != c.want {
+				t.Fatalf("wallCapFor(%s) = %s, want %s", c.ttl, got, c.want)
+			}
+		})
+	}
+	// The general invariant every realistic (positive, minute-or-larger) ttl must
+	// satisfy: WallCap is strictly less than ttl, so a pass's own execution budget
+	// always leaves SOME margin before its last heartbeat (stamped at the top of
+	// whatever turn is running at the deadline) could go stale purely from
+	// cumulative turn time.
+	for _, ttl := range []time.Duration{time.Minute, 30 * time.Minute, 60 * time.Minute, 4 * time.Hour} {
+		if got := wallCapFor(ttl); got >= ttl {
+			t.Fatalf("wallCapFor(%s) = %s, want strictly < ttl (the WallCap=TTL coupling this guard exists to break)", ttl, got)
+		}
+	}
 }

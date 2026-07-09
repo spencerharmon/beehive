@@ -945,11 +945,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if sel.Kind == selectt.Work && wtAbs != "" {
 		progressGit = git.New(wtAbs)
 	}
-	// finish stops the recorder, optionally records an abort warning to the
-	// transcript (so it shows in the UI), commits the final transcript to the
-	// session branch, then squashes+merges the durable final to main once and
-	// publishes the agent's branch.
-	finish := func(warning string) error {
+	// finishTranscript stops the recorder, optionally records an abort warning to
+	// the transcript (so it shows in the UI), and commits the final transcript to
+	// the session branch. Split out of finish so the claim-ttl-wallcap race guard
+	// (abandonForRace, below) can durably record its warning WITHOUT the
+	// publish-the-branch step finish() always does next — see abandonForRace's own
+	// doc comment for why that step must never run there.
+	finishTranscript := func(warning string) error {
 		recStop()
 		<-recDone
 		if err := rec.snapshot(ctx); err != nil { // final flush after the last turn settles
@@ -965,6 +967,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		if err := r.streamSession(ctx, sessionRel); err != nil { // durable final transcript on the session branch (beehived's live source)
 			return sessionTranscriptError{err: fmt.Errorf("stream final session transcript: %w", err)}
+		}
+		return nil
+	}
+	// finish stops the recorder, optionally records an abort warning to the
+	// transcript (so it shows in the UI), commits the final transcript to the
+	// session branch, then squashes+merges the durable final to main once and
+	// publishes the agent's branch.
+	finish := func(warning string) error {
+		if err := finishTranscript(warning); err != nil {
+			return err
 		}
 		// Publish the WORK first and let its result gate completion. The work is what
 		// the task exists to produce; a convenience artifact must never block it.
@@ -985,6 +997,31 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			res.SessionPublished = true
 		}
 		return ferr
+	}
+	// abandonForRace durably records the claim-ttl-wallcap race-guard warning
+	// (racePeerOwnsTask, below) to the session transcript exactly like finish()
+	// does, but DELIBERATELY skips finish()'s publishWithResolution step: at this
+	// call site the agent already committed this pass's own status-flip edit to
+	// the SAME PLAN.md task line a peer's now-published, active claim also owns,
+	// so publishing here could only ever (a) spuriously conflict — burning
+	// MergeRetries agent turns on a resolution for a task we no longer own and
+	// must not complete — or (b) land a redundant/confusing no-op alongside the
+	// peer's real claim. A peer already legitimately holds this task, so nothing
+	// on this pass's worktree branch is worth landing; only the (separate-path,
+	// conflict-free) session transcript remains worth publishing for
+	// observability. The whole worktree/branch is discarded by the caller
+	// regardless once Run returns (cmd/honeybee's own worktree teardown), so
+	// leaving the branch unpublished here loses nothing.
+	abandonForRace := func(warning string) error {
+		if err := finishTranscript(warning); err != nil {
+			return err
+		}
+		if terr := r.finalizeSession(ctx, sid, sessionRel, stubCommit); terr != nil {
+			fmt.Fprintf(os.Stderr, "honeybee: WARNING session transcript publish to main failed (non-fatal; transcript kept on branch %s): %v\n", r.SessionBranch, terr)
+		} else {
+			res.SessionPublished = true
+		}
+		return nil
 	}
 	cleanup := func() {
 		if wg != nil {
@@ -1217,6 +1254,27 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				gateHint = hint
 				sel.Task.Status = plan.NeedsReview
 			}
+		}
+		// Claim-ttl-wallcap race guard (session-audit-013 F1): the heartbeat above
+		// only refreshed at the TOP of THIS turn, before sess.Prompt ran — so a turn
+		// (or, below, finish()'s own conflict-retry sub-turns) that runs long enough
+		// since that stamp can reach this point with a stale claim a peer has
+		// already, correctly, taken over. Re-verify ownership against PUBLISHED main
+		// (never merged into our own branch) before trusting this local "done" and
+		// publishing over — or getting silently superseded by — a live peer. Scoped
+		// to task-bearing kinds; Bootstrap/Reconcile hold no per-task claim and are
+		// already covered by mainAdvanced below.
+		if done && hasTask(sel) && r.racePeerOwnsTask(ctx, sel) {
+			res.Lost = true
+			res.Warning = fmt.Sprintf(
+				"task %s reached completion locally but another session already claimed it first (claim-ttl-wallcap race); reselecting",
+				taskID(sel))
+			if ferr := abandonForRace(res.Warning); ferr != nil {
+				cleanup()
+				return res, ferr
+			}
+			cleanup()
+			return res, nil
 		}
 		if done {
 			// Completion is only real once the work lands on main. Publish first; if it
@@ -1589,12 +1647,18 @@ func (r *Runner) reconciled(sel *selectt.Selection) (bool, error) {
 // overlap.
 //
 // Scope: bootstrap/reconcile only — the beehive-layer kinds whose entire output
-// is a stamp/plan on main. Work/Review/Arbitrate are already gated by guard (1)
-// (a rejected publish returns an error from finish and blocks completion) and
-// reach completion via the task-bearing done path, so they return true here. The
-// no-publish local mode (Publish == nil; tests / single-host with no convergence)
-// has no separate "main" to advance beyond the local commit, so it also returns
-// true. Every git failure is surfaced (fail-closed: the caller treats an error
+// is a stamp/plan on main. Work/Review/Arbitrate reach completion via the
+// task-bearing done path instead, gated by their OWN two dedicated checks: a
+// rejected publish returns an error from finish and blocks completion, and
+// racePeerOwnsTask (below) re-verifies this pass still owns the claim on
+// published main before finish() ever runs — the claim-ttl-wallcap-race-guard
+// fix for the gap a plain publish-conflict check cannot catch (a peer's claim
+// that does not textually conflict with this pass's own edit). So Work/Review/
+// Arbitrate return true here unconditionally; this function owns only the
+// bootstrap/reconcile stamp-on-main shape. The no-publish local mode
+// (Publish == nil; tests / single-host with no convergence) has no separate
+// "main" to advance beyond the local commit, so it also returns true. Every git
+// failure is surfaced (fail-closed: the caller treats an error
 // as "not advanced" and re-drives), never swallowed into a false "done".
 func (r *Runner) mainAdvanced(ctx context.Context, sel *selectt.Selection) (bool, error) {
 	if r.Publish == nil {
@@ -1641,6 +1705,79 @@ func (r *Runner) mainAdvanced(ctx context.Context, sel *selectt.Selection) (bool
 	}
 	stamp := p.ROIStamp()
 	return stamp != "" && strings.HasPrefix(head, stamp), nil
+}
+
+// racePeerOwnsTask is the claim-ttl-wallcap race guard: it reports whether a
+// DIFFERENT, currently-ACTIVE session has claimed sel's task on the PUBLISHED
+// main, read directly off that ref via `git show` — never merged into this
+// honeybee's own worktree branch, so the check can never be confused with (or
+// conflict against) this pass's own not-yet-published status-flip commit sitting
+// uncommitted-to-main in the same worktree.
+//
+// The race (session-audit-013 F1, confirmed three times in one window: 243
+// wasted turns, the largest single-pass total that series has measured): the
+// unified claim protocol's heartbeat only refreshes at the TOP of a turn loop
+// iteration, immediately before that turn's sess.Prompt call (see Run). Once a
+// turn's local worktree shows the task done, the runner previously trusted that
+// local read unconditionally and went straight to finish()'s publish — with NO
+// re-check that this pass still owns the claim. So a pass whose tail — the
+// CURRENT turn's own duration (turn timeouts default to 3x the default claim
+// TTL: 180 vs 60 minutes, so a single slow turn can alone outlive the claim),
+// or finish()'s own publishWithResolution conflict-retry sub-turns, which run
+// with NO heartbeat refresh of their own — happens to run long enough since
+// that last stamp can complete every one of its own steps (commit, push,
+// status flip, zero warnings) while a peer's Claim()/Heartbeat() has ALREADY,
+// and CORRECTLY per the exact same TTL, taken over the identical task and
+// started (or finished) its own independent implementation. Neither side ever
+// saw an error — exactly the "clean self-reported delivery, then a fresh
+// redispatch of the identical task" shape the audit traced through
+// PushBranchReconciled silently absorbing a live peer's branch under its
+// documented-but-now-violated "only one live session at a time" assumption.
+//
+// Calling this immediately before trusting a local "done" as real, durable
+// completion turns that silent race into a DETECTED, durably-warned Lost pass
+// (the caller folds a positive result into the exact res.Lost handling the
+// per-turn heartbeat's own ErrLost case already uses) instead of two sessions
+// both silently believing they finished the same task. This is deliberately a
+// separate, narrowly-scoped read rather than a reuse of Claimer.Heartbeat:
+// Heartbeat's syncMain merges main INTO this worktree's branch and compares
+// status against an expected `from`, which — called this late, AFTER our own
+// turn already rewrote the local status — would either false-positive
+// claim.ErrResolved on our OWN not-yet-published edit or spuriously conflict
+// merging a peer's line change into our branch before we've even decided
+// whether to keep going; a pure read of published main sidesteps both.
+//
+// Fails OPEN (false) on any uncertainty — no Publish wired (unit tests with no
+// concept of a shared main), an unreadable ref, a task absent from the
+// published plan (taskRemoved already owns genuine removal) — so a transient
+// git hiccup can never falsely abort a good completion; only a POSITIVE,
+// git-confirmed foreign active claim reports lost, mirroring
+// bounceIfUnreachable's own fail-open contract.
+func (r *Runner) racePeerOwnsTask(ctx context.Context, sel *selectt.Selection) bool {
+	if r.Publish == nil {
+		return false // no shared main to race against (unit tests / no-publish mode)
+	}
+	ref := "main"
+	if r.Remote != "" {
+		if err := r.Git.Fetch(ctx, r.Remote, "main"); err != nil {
+			return false
+		}
+		ref = r.Remote + "/main"
+	}
+	planRel := "submodules/" + sel.Submodule.Name + "/" + repo.PlanFile
+	body, err := r.Git.Show(ctx, ref, planRel)
+	if err != nil {
+		return false // no published PLAN.md to compare against: nothing to detect
+	}
+	p, err := plan.Parse(body)
+	if err != nil {
+		return false
+	}
+	t := p.Find(taskID(sel))
+	if t == nil {
+		return false // removed on main; taskRemoved's own guard owns this shape
+	}
+	return t.Session != "" && t.Session != r.Session && t.Active(r.now(), r.TTL)
 }
 
 // workDone verifies the PLAN.md status transitioned to a terminal/handoff state
