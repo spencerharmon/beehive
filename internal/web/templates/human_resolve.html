@@ -30,10 +30,15 @@
 <div class="card">
   <h2>AI resolution agent</h2>
   <p class="muted">A general agent with full read/inspect/edit tools, working in its own branch of the coordination repo. It investigates the blocker and makes multi-file beehive-layer changes; nothing is live until you <strong>Publish</strong>. It cannot edit the target's <code>repo/</code> source or run destructive/external commands — code goes through a swarm work task.</p>
+  {{/* Poll only while a turn is in flight: the shell fetches the panel ONCE on
+     load, and human_resolve_panel.html re-arms this poll (a hidden load-delay
+     fetch) only while .Busy. An idle resolution agent stops polling instead of
+     re-rendering an unchanged diff every 2s; sending a message makes it Busy
+     again, which restarts the poll. */}}
   <div id="resolve"
        role="status" aria-live="polite"
        hx-get="/human/{{.Sub}}/{{.Item.ID}}/panel/{{.SessID}}"
-       hx-trigger="load, every 2s"
+       hx-trigger="load"
        hx-swap="innerHTML">
     {{template "skeleton-transcript"}}
   </div>

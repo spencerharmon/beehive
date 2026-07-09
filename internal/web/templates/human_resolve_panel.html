@@ -14,3 +14,9 @@
     <pre class="diff" id="resolve-diff" data-scroll-preserve>{{if .HasChange}}{{.Patch}}{{else}}<span class="muted">no changes made yet</span>{{end}}</pre>
   </div>
 </div>
+{{/* Self-perpetuating poll: present ONLY while a turn is in flight (.Busy), this
+   inert node re-fetches the panel into #resolve after a 2s delay, so the loop
+   continues while the agent works and stops the moment it settles (the next
+   panel renders without this node). Same target/innerHTML swap as the old shell
+   poll — no visible output, no scroll-preserve change. */}}
+{{if .Busy}}<div hx-get="/human/{{.Sub}}/{{.TaskID}}/panel/{{.SessID}}" hx-trigger="load delay:2s" hx-target="#resolve" hx-swap="innerHTML" hidden></div>{{end}}
