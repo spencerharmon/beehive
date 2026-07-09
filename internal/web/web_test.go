@@ -3136,6 +3136,143 @@ func TestCommitView(t *testing.T) {
 	}
 }
 
+// TestBranchViewSHACopyControl locks the commit-sha-deep-links copy affordance on
+// the per-submodule branches view. A branch_view.html row sha is a SUBMODULE
+// commit (commitGraph reads sm.RepoDir(), a separate object store from the hive
+// superproject commitView resolves against — see TestCommitViewCannotResolve
+// SubmoduleSHA), so linking it to commitView would 404. It stays plain,
+// selectable <code> text (the no-JS fallback) and instead gains a
+// progressively-enhanced .copy-btn carrying the sha in data-copy plus an
+// accessible label. The sha itself must never become a dead deep link.
+func TestBranchViewSHACopyControl(t *testing.T) {
+	s, _ := setup(t)
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	out := renderTmpl(t, s, "branch_view.html", map[string]interface{}{
+		"Name": "alpha",
+		"Sections": []Section{{
+			Date:    "2026-07-08",
+			Commits: []Commit{{SHA: sha, Subject: "do a thing", Author: "t"}},
+		}},
+	})
+	// Plain, selectable fallback: the sha renders as bare <code> text.
+	if !strings.Contains(out, "<code>"+sha+"</code>") {
+		t.Fatalf("branch view sha not plain <code> fallback:\n%s", out)
+	}
+	// Progressive-enhancement copy control carrying the sha + an a11y label.
+	for _, want := range []string{
+		`class="copy-btn"`,
+		`data-copy="` + sha + `"`,
+		`aria-label="Copy commit ` + sha + ` to clipboard"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("branch view copy control missing %q:\n%s", want, out)
+		}
+	}
+	// The submodule sha must NOT be a (dead) hive commitView link.
+	if strings.Contains(out, `href="/submodule/alpha/commit/`+sha+`"`) {
+		t.Fatalf("submodule sha must not deep-link to hive commitView (would 404):\n%s", out)
+	}
+}
+
+// TestCommitViewCopyControl locks the same copy affordance on the single-commit
+// page heading: the sha stays plain, selectable <code> text and carries the
+// progressively-enhanced .copy-btn (data-copy + accessible label). This IS the
+// hive commit page (commitView), so the heading sha is the page's own identity,
+// not a link.
+func TestCommitViewCopyControl(t *testing.T) {
+	s, _ := setup(t)
+	const sha = "0123456789ab"
+	out := renderTmpl(t, s, "commit_view.html", map[string]interface{}{
+		"Name":    "alpha",
+		"SHA":     sha,
+		"Subject": "impl thing",
+		"Author":  "t",
+		"Date":    "2026-07-08",
+		"Patch":   "diff --git a b",
+	})
+	if !strings.Contains(out, "<code>"+sha+"</code>") {
+		t.Fatalf("commit view sha not plain <code> fallback:\n%s", out)
+	}
+	for _, want := range []string{
+		`class="copy-btn"`,
+		`data-copy="` + sha + `"`,
+		`aria-label="Copy commit ` + sha + ` to clipboard"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("commit view copy control missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestCopyClipboardScriptEmbedded locks that the commit-sha-deep-links copy
+// script and its shared aria-live region ship on a real full-page response (the
+// layout footer), progressively enhanced and dependency-free. It is what turns
+// every [data-copy] sha into a one-click copy without leaving a dead control
+// when JS is off. Mirrors TestScrollPreserveScriptEmbedded-style embed checks.
+func TestCopyClipboardScriptEmbedded(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String() // dashboard renders the layout header+footer
+	for _, want := range []string{
+		`<div id="copy-live" role="status" aria-live="polite" class="sr-only">`, // shared spoken-confirmation region
+		"classList.add('js')", // progressive-enhancement gate (reveals .copy-btn)
+		".copy-btn",           // event-delegated selector (covers htmx-swapped content)
+		"data-copy",           // the attribute the handler copies
+		"navigator.clipboard", // Clipboard API — no external lib
+		"writeText",           // the actual copy call
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("embedded copy-to-clipboard script missing %q", want)
+		}
+	}
+}
+
+// TestCommitViewCannotResolveSubmoduleSHA independently re-verifies (rather than
+// trusting the ROI note) THIS repo's actual current resolution scope: commitView
+// runs entirely against the HIVE superproject's own git history (s.git, rooted
+// at the beehive repo, never a submodule checkout — see Server.git in New()), so
+// a sha that exists only in a submodule's OWN object store (commitGraph reads
+// sm.RepoDir(), a completely separate repository) can never resolve there and
+// correctly 404s instead of ever rendering wrong content. This is why
+// branch_view.html's submodule shas get the copy-to-clipboard control above
+// instead of a commitView link.
+func TestCommitViewCannotResolveSubmoduleSHA(t *testing.T) {
+	s, root := setup(t)
+	// A real, well-formed commit sha — but from the ALPHA SUBMODULE's own repo,
+	// never introduced into the hive superproject's object database.
+	repoDir := filepath.Join(root, "submodules", "alpha", "repo")
+	commitRepoAt(t, repoDir, "submodule code change")
+	subSHA := hygGit(t, repoDir, "rev-parse", "HEAD")
+	if w := get(t, s, "/submodule/alpha/commit/"+subSHA); w.Code != http.StatusNotFound {
+		t.Fatalf("submodule-only sha must 404 from hive-scoped commitView, got %d:\n%s", w.Code, w.Body)
+	}
+}
+
+// TestStatsDeliveryFlipSHALinksToCommitView locks the one place a commit sha IS a
+// legitimate deep link (the delivery-traceability wiring this task builds on and
+// re-verifies rather than assuming still correct): the /stats deliveries column
+// renders the hive flip sha as the CLICKABLE anchor text of a link to that
+// commit's commitView — the visible sha is itself the deep link, not a separate
+// label. (Submodule shas, by contrast, get the copy control above because they
+// have no hive commitView target.)
+func TestStatsDeliveryFlipSHALinksToCommitView(t *testing.T) {
+	s, root := setup(t)
+	writeHivePlan(t, root, "alpha", "dt1", "TODO")
+	commitAll(t, root, "dt1-todo")
+	writeHivePlan(t, root, "alpha", "dt1", "DONE")
+	commitAll(t, root, "dt1-done")
+	flipSHA := hygGit(t, root, "rev-parse", "--short=12", "HEAD")
+
+	w := get(t, s, "/stats")
+	if w.Code != 200 {
+		t.Fatalf("stats %d: %s", w.Code, w.Body)
+	}
+	// The sha is BOTH the link target and its visible <code> anchor text.
+	want := `<a href="/submodule/alpha/commit/` + flipSHA + `"><code>` + flipSHA + `</code></a>`
+	if body := w.Body.String(); !strings.Contains(body, want) {
+		t.Fatalf("stats deliveries sha not a commitView deep link (%s):\n%s", want, body)
+	}
+}
+
 // TestEditorDiffAddDelClasses confirms the chat-diff pane renders unified-diff
 // rows with add/del/eq classes (styled by the design-system --diff-* tokens).
 func TestEditorDiffAddDelClasses(t *testing.T) {

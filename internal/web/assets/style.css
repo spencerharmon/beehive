@@ -469,6 +469,37 @@ button.danger { background: var(--danger); margin-top: var(--space-3); }
 button.merge { background: var(--success); }
 button.merge.merged { background: var(--surface-2); color: var(--text-muted); }
 
+/* commit-sha-deep-links: copy-to-clipboard control. Progressive enhancement —
+ * hidden until the footer copy script sets `.js` on <html>, so with JS off the
+ * sha stays plain, selectable text with NO dead button as the fallback.
+ * Overrides the big accent `button` above to a small, quiet inline pill that
+ * sits next to a <code> sha; `.copied` is the transient success state (the
+ * spoken confirmation rides the shared #copy-live aria-live region). */
+.sha-cell { white-space: nowrap; }
+.copy-btn { display: none; }
+.js .copy-btn {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  margin-left: 0.4em;
+  padding: 0.1em 0.5em;
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-muted);
+  background: var(--surface-2);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+.js .copy-btn:hover { color: var(--text); border-color: var(--text-muted); filter: none; }
+.js .copy-btn.copied {
+  color: #fff;
+  background: var(--badge-solid-green);
+  border-color: transparent;
+}
+
 input, select, textarea {
   font: inherit;
   font-size: var(--text-sm);
