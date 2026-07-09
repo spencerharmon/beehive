@@ -5281,6 +5281,59 @@ func TestStatsDefaultUnchanged(t *testing.T) {
 	}
 }
 
+// TestStatsActiveNowNoBareBeeGlyph locks stats-active-now-bee-label: the
+// per-submodule "active now" cell renders the active-honeybee COUNT with no
+// bare 🐝 glyph prefix — presented consistently with the total row (stats.html's
+// {{.Total.ActiveNow}}, a plain number) and the dashboard's text-label
+// "bees {{.Bees}}" form, not the pre-fix "🐝 {{.ActiveNow}}". The count keeps
+// its live-badge highlight + title and the {{else}}0{{end}} zero case; the
+// intentionally-kept ✅/🐝 ratio header/badge/legend (an accepted
+// emoji-glyph-cleanup keep, NOT a gap) stay UNCHANGED.
+func TestStatsActiveNowNoBareBeeGlyph(t *testing.T) {
+	s, _ := setup(t)
+	statsData := map[string]interface{}{
+		"Filters": nil, "GroupBy": []string(nil), "GroupBySet": toSet(nil),
+		"BuiltinTags": builtinFacets, "ExtraGroupBy": "", "Filtered": false,
+		"Subs": []subStat{
+			{Name: "alpha", DeliveredTasks: 1, Honeybees: 2, ActiveNow: 3},
+			{Name: "beta", DeliveredTasks: 1, Honeybees: 1, ActiveNow: 0},
+		},
+		"Total": subStat{DeliveredTasks: 2, Honeybees: 3, ActiveNow: 3},
+	}
+	out := renderTmpl(t, s, "stats.html", statsData)
+
+	// The active-now cell renders the count inside the live badge with its
+	// title preserved — and with NO bare 🐝 glyph prefix on the count.
+	const wantCell = `<span class="badge live" title="honeybees actively working this submodule right now">3</span>`
+	if !strings.Contains(out, wantCell) {
+		t.Fatalf("active-now cell must render the count in a live badge without a bare 🐝 prefix; want %q:\n%s", wantCell, out)
+	}
+	// The exact pre-fix bare-glyph form must be GONE.
+	const bareCell = `<span class="badge live" title="honeybees actively working this submodule right now">🐝 `
+	if strings.Contains(out, bareCell) {
+		t.Fatalf("active-now cell still renders the bare 🐝 glyph prefix %q:\n%s", bareCell, out)
+	}
+	// Belt-and-suspenders: no "🐝 " (glyph + trailing space) survives anywhere in
+	// the default view — every kept 🐝 is the ✅/🐝 ratio construct, where the
+	// glyph is always followed by "<", never a space.
+	if strings.Contains(out, "🐝 ") {
+		t.Fatalf("a bare 🐝 glyph prefix (\"🐝 \") still renders in the default stats view:\n%s", out)
+	}
+	// The intentionally-kept ✅/🐝 ratio badge (h1) + column header
+	// (emoji-glyph-cleanup's accepted keep) must NOT be stripped by this fix.
+	if !strings.Contains(out, `<span class="badge">✅/🐝</span>`) {
+		t.Fatalf("the intentionally-kept ✅/🐝 ratio badge (h1) must remain:\n%s", out)
+	}
+	if !strings.Contains(out, `<th scope="col">✅/🐝</th>`) {
+		t.Fatalf("the intentionally-kept ✅/🐝 ratio column header must remain:\n%s", out)
+	}
+	// The {{else}}0{{end}} zero case (beta, ActiveNow=0) still renders a plain 0,
+	// never a live badge wrapping it.
+	if strings.Contains(out, `<span class="badge live" title="honeybees actively working this submodule right now">0</span>`) {
+		t.Fatalf("ActiveNow=0 must render a plain 0, not a live badge:\n%s", out)
+	}
+}
+
 // TestStatsGroupedUnknownTagFilter is stats-filter-groupby's negative control:
 // an unknown tag=value filter must yield an EMPTY result set with NO error —
 // never a 500, never a Go error return.
