@@ -93,7 +93,7 @@ func (s *Server) humanResolvePanel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "human_resolve_panel.html", s.resolvePanelData(r.Context(), sess))
+	s.renderConditional(w, r, "human_resolve_panel.html", s.resolvePanelData(r.Context(), sess))
 }
 
 // humanResolveMessage runs one agent turn in the background (tool-using turns can

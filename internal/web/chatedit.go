@@ -611,7 +611,7 @@ func (s *Server) chatPanel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "chatedit_panel.html", s.chatPanelData(r.Context(), sess))
+	s.renderConditional(w, r, "chatedit_panel.html", s.chatPanelData(r.Context(), sess))
 }
 
 // chatMessage records the user's message and runs the turn in the BACKGROUND

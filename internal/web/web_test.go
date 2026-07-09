@@ -4222,6 +4222,93 @@ func TestFragmentETag304(t *testing.T) {
 	}
 }
 
+// TestPolledPanelFragmentETag304 (poll-fragment-etag-widen) extends the
+// conditional-GET contract poll-fragment-etag-304 built to the three remaining
+// self-re-arming polled panel fragments — editorPanel (/editor/{id}/panel),
+// chatPanel (/edit/{id}/panel) and humanResolvePanel
+// (/human/{sub}/{id}/panel/{sid}) — each now on renderConditional. Unlike the
+// session-list fragment there is no wall-clock field in panelData/
+// chatPanelData/resolvePanelData, so an idle panel's bytes are byte-identical
+// across ticks: the first GET must set a strong ETag on its 200 and a repeat
+// carrying that validator in If-None-Match must short-circuit to a 304 with an
+// empty body, while a stale/foreign validator still gets the full 200.
+func TestPolledPanelFragmentETag304(t *testing.T) {
+	ctx := context.Background()
+
+	assertETag304 := func(t *testing.T, s *Server, path string) {
+		t.Helper()
+		first := get(t, s, path)
+		if first.Code != 200 {
+			t.Fatalf("%s: first GET status = %d, want 200 (body: %s)", path, first.Code, first.Body)
+		}
+		etag := first.Header().Get("ETag")
+		if etag == "" {
+			t.Fatalf("%s: first GET carries no ETag header", path)
+		}
+		if first.Body.Len() == 0 {
+			t.Fatalf("%s: first GET has an empty body", path)
+		}
+		if cc := first.Header().Get("Cache-Control"); cc == "" {
+			t.Errorf("%s: first GET carries no Cache-Control header", path)
+		}
+
+		inm := func(v string) *httptest.ResponseRecorder {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", path, nil)
+			req.Header.Set("If-None-Match", v)
+			s.Routes().ServeHTTP(w, req)
+			return w
+		}
+
+		second := inm(etag)
+		if second.Code != http.StatusNotModified {
+			t.Fatalf("%s: repeat GET with matching If-None-Match status = %d, want 304", path, second.Code)
+		}
+		if second.Body.Len() != 0 {
+			t.Errorf("%s: 304 response carries a non-empty body: %q", path, second.Body.String())
+		}
+		if got := second.Header().Get("ETag"); got != etag {
+			t.Errorf("%s: 304 ETag = %q, want %q", path, got, etag)
+		}
+
+		stale := inm(`"not-the-real-etag"`)
+		if stale.Code != 200 {
+			t.Fatalf("%s: GET with a non-matching If-None-Match status = %d, want 200", path, stale.Code)
+		}
+		if stale.Body.Len() == 0 {
+			t.Errorf("%s: GET with a non-matching If-None-Match has an empty body", path)
+		}
+	}
+
+	t.Run("editorPanel", func(t *testing.T) {
+		s, _ := chatFixture(t, "")
+		sess, err := s.editors.Open(ctx, "submodules/alpha/"+repo.ROIFile)
+		if err != nil {
+			t.Fatalf("open editor session: %v", err)
+		}
+		assertETag304(t, s, "/editor/"+sess.ID+"/panel")
+	})
+
+	t.Run("chatPanel", func(t *testing.T) {
+		s, _ := chatFixture(t, "")
+		sess, err := s.chat.open(ctx, "submodules/alpha/notes.md")
+		if err != nil {
+			t.Fatalf("open chat session: %v", err)
+		}
+		assertETag304(t, s, "/edit/"+sess.ID+"/panel")
+	})
+
+	t.Run("humanResolvePanel", func(t *testing.T) {
+		s, _, _ := humanFixture(t, "")
+		it := PlanItem{ID: "needs-token", Desc: "Wire the client.", HumanReason: "token"}
+		sess, err := s.humans.session(ctx, "alpha", it)
+		if err != nil {
+			t.Fatalf("open resolve session: %v", err)
+		}
+		assertETag304(t, s, "/human/alpha/needs-token/panel/"+sess.ID)
+	})
+}
+
 // TestAssetsHtmxServed locks the single-binary embed contract for htmx itself:
 // the library is vendored under assets/ and served at /assets/htmx.min.js (no
 // CDN), so the frontend works offline/air-gapped. It must be the real,
