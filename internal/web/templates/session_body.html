@@ -1,2 +1,42 @@
+{{/* transcript_pane (session-transcript-toc-relanding): the transcript pane is
+     rendered, structured turns (markdown -> sanitized HTML via renderMarkdown),
+     never a flat text dump, plus a table-of-contents overlay with per-turn jump
+     links and prev/next jump buttons for moving between agent outputs and
+     runner replies (session_view.html's session-toc-nav script). This is the
+     ONE shared template BOTH the htmx-polled body below AND the SSE stream
+     (sessionStream, via Server.renderString — internal/web/transcript.go)
+     execute, so the two transcript delivery paths (agent-output-streaming) can
+     never render different HTML for the same transcript.
+
+     #session-transcript keeps its STABLE id + data-scroll-preserve/
+     data-scroll-pin no matter which branch below fires, so poll-scroll-
+     preserve's save/restore + bottom-pin logic (layout.html) is unaffected by
+     the move from a flat <pre> to structured <section> turns — it keys purely
+     off the id + those two attributes, never the tag name or children. The
+     whole pane is wrapped in #session-pane so a live SSE frame can replace the
+     TOC + transcript together in one DOM operation (session_view.html) without
+     touching the separately-managed #session-sync banner. */}}
+{{define "transcript_pane"}}<div id="session-pane" class="session-pane">
+{{if .Turns}}<details id="session-toc" class="session-toc" open>
+  <summary>Contents · {{len .Turns}} turns <span class="toc-counts">({{.Assistants}} agent · {{.Users}} reply)</span></summary>
+  <div class="session-toc-jumps">
+    <button type="button" class="toc-jump" data-jump="prev-assistant" title="previous agent output">&#9650; agent</button>
+    <button type="button" class="toc-jump" data-jump="next-assistant" title="next agent output">&#9660; agent</button>
+    <button type="button" class="toc-jump" data-jump="prev-user" title="previous runner reply">&#9650; reply</button>
+    <button type="button" class="toc-jump" data-jump="next-user" title="next runner reply">&#9660; reply</button>
+  </div>
+  <ol class="session-toc-list">
+    {{range .Turns}}<li class="toc-{{.Role}}"><a href="#{{.Anchor}}" data-anchor="{{.Anchor}}"><span class="toc-num">{{.Index}}</span> {{.Label}}</a></li>
+    {{end}}
+  </ol>
+</details>{{end}}
+<div id="session-transcript" class="session" data-scroll-preserve data-scroll-pin>
+{{if .Preamble}}<div class="turn turn-preamble">{{.Preamble}}</div>{{end}}
+{{range .Turns}}<section class="turn turn-{{.Role}}" id="{{.Anchor}}">
+  <header class="turn-head"><span class="turn-role">{{.Label}}</span> <span class="turn-idx">#{{.Index}}</span></header>
+  <div class="turn-body">{{.HTML}}</div>
+</section>
+{{end}}</div>
+</div>{{end}}
 {{with .Sync}}<p id="session-sync" class="sync-status{{if .Err}} stale{{end}}">followed {{.Ago}} ago{{if .Err}} · pull stalled: {{.Err}}{{end}}</p>{{end}}
-<pre class="session" id="session-transcript" data-scroll-preserve data-scroll-pin>{{.Body}}</pre>
+{{template "transcript_pane" .Transcript}}
