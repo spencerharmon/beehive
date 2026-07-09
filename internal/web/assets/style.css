@@ -315,6 +315,11 @@ small, .small { font-size: var(--text-sm); }
 .badge.drift-clean { background: var(--badge-solid-green); border-color: transparent; color: #fff; }
 .badge.drift-drift { background: hsl(var(--hue-review) 70% 34%); border-color: transparent; color: #fff; }
 .badge.drift-missing { background: var(--badge-solid-red); border-color: transparent; color: #fff; }
+/* Object-store warning (hive-hygiene pack census): a killed-mid-flight repack
+   (nonzero tmp_*) or an abnormal live-pack pile. Amber = attention, matching the
+   drift-drift "stale/needs-a-look" hue; the flagged census row is tinted too. */
+.badge.warn { background: hsl(var(--hue-review) 70% 34%); border-color: transparent; color: #fff; }
+.pack-warn td { background: hsl(var(--hue-review) 70% 34% / 0.14); }
 .ago { color: var(--text-muted); font-size: var(--text-xs); }
 .ok { color: var(--success); font-weight: 600; }
 .muted { color: var(--text-muted); }

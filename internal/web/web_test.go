@@ -3340,6 +3340,239 @@ func TestHygieneCleanAndWidget(t *testing.T) {
 	}
 }
 
+// seedPackDir fabricates a repo object-store pack directory at <gitDir>/objects/pack
+// with `packs` live pack-*.pack files (each paired with a same-named .idx that must
+// NOT be counted as a pack) and `tempPack`+`tempIdx` leftover repack temp files
+// (tmp_pack_* / tmp_idx_*). Every file carries a byte so the census size is nonzero.
+// It mutates only the test's own throwaway repo — this is the on-disk shape a killed
+// mid-flight repack (the 2026-07-08 storm) leaves behind.
+func seedPackDir(t *testing.T, gitDir string, packs, tempPack, tempIdx int) string {
+	t.Helper()
+	packDir := filepath.Join(gitDir, "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string) {
+		if err := os.WriteFile(filepath.Join(packDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < packs; i++ {
+		write(fmt.Sprintf("pack-%040d.pack", i))
+		write(fmt.Sprintf("pack-%040d.idx", i)) // paired .idx: must not count as a pack
+	}
+	for i := 0; i < tempPack; i++ {
+		write(fmt.Sprintf("tmp_pack_%d", i))
+	}
+	for i := 0; i < tempIdx; i++ {
+		write(fmt.Sprintf("tmp_idx_%d", i))
+	}
+	return packDir
+}
+
+// TestStatPackDirCensus unit-tests the pure pack-dir counter against a fabricated
+// .git/objects/pack: it counts only pack-*.pack as live packs, sums tmp_pack_*/
+// tmp_idx_* as leftover repack temps, reports a nonzero total size, and treats an
+// absent pack dir (a fresh repo, nothing repacked yet) as a clean zero, not error.
+func TestStatPackDirCensus(t *testing.T) {
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	seedPackDir(t, gitDir, 3, 2, 1) // 3 packs (+3 .idx), 2 tmp_pack_, 1 tmp_idx_
+
+	packs, temp, size, err := statPackDir(filepath.Join(gitDir, "objects", "pack"))
+	if err != nil {
+		t.Fatalf("statPackDir: %v", err)
+	}
+	if packs != 3 {
+		t.Fatalf("packs = %d, want 3 (the .idx files must not count)", packs)
+	}
+	if temp != 3 {
+		t.Fatalf("temp = %d, want 3 (2 tmp_pack_ + 1 tmp_idx_)", temp)
+	}
+	if size <= 0 {
+		t.Fatalf("size = %d, want > 0", size)
+	}
+	// An absent pack dir is a clean zero census, never an error.
+	p2, t2, s2, err2 := statPackDir(filepath.Join(dir, "nope", "pack"))
+	if err2 != nil || p2 != 0 || t2 != 0 || s2 != 0 {
+		t.Fatalf("absent pack dir: got (%d,%d,%d,%v), want (0,0,0,nil)", p2, t2, s2, err2)
+	}
+}
+
+// TestHygienePackStoreCensus is the core of the gc-storm-visibility requirement:
+// the hygiene scan reports a per-managed-repo object-store census (hive + each
+// declared submodule/repo), and a fabricated .git/objects/pack with N packs + M
+// tmp_* files reports packs==N, temp==M, nonzero size, and surfaces the nonzero
+// temp count as a warning that defeats Clean() — while a zero-temp store (normal
+// pack count) reports clean. The stat is read-only: it never repacks.
+func TestHygienePackStoreCensus(t *testing.T) {
+	s, root := setup(t)
+	// A declared, materialized submodule checkout with its own object store.
+	subRepo := filepath.Join(root, "submodules", "beta", "repo")
+	if err := os.MkdirAll(subRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hygGit(t, subRepo, "init", "-q")
+	os.WriteFile(filepath.Join(root, ".gitmodules"), []byte(
+		"[submodule \"beta\"]\n\tpath = submodules/beta/repo\n\turl = ./x\n"), 0o644)
+	const wantPacks, wantTempPack, wantTempIdx = 3, 2, 1
+	const wantTemp = wantTempPack + wantTempIdx
+	seedPackDir(t, filepath.Join(subRepo, ".git"), wantPacks, wantTempPack, wantTempIdx)
+
+	h, err := scanHygiene(context.Background(), root, s.git)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	byName := map[string]PackStat{}
+	for _, p := range h.Packs {
+		byName[p.Name] = p
+	}
+	if _, ok := byName["hive"]; !ok {
+		t.Fatalf("census missing the hive repo: %+v", h.Packs)
+	}
+	beta, ok := byName["beta"]
+	if !ok {
+		t.Fatalf("census missing declared submodule beta: %+v", h.Packs)
+	}
+	if beta.Path != "submodules/beta/repo" {
+		t.Fatalf("beta path = %q, want submodules/beta/repo", beta.Path)
+	}
+	if beta.Packs != wantPacks {
+		t.Fatalf("beta packs = %d, want %d", beta.Packs, wantPacks)
+	}
+	if beta.Temp != wantTemp {
+		t.Fatalf("beta temp = %d, want %d", beta.Temp, wantTemp)
+	}
+	if beta.Bytes <= 0 || beta.Size() == "" {
+		t.Fatalf("beta size = %d (%q), want > 0", beta.Bytes, beta.Size())
+	}
+	if !beta.TempWarn() || !beta.Warn() {
+		t.Fatal("a nonzero tmp_* count must warn")
+	}
+	if !h.PackWarn() || h.Clean() {
+		t.Fatal("a pack storm must set PackWarn and defeat Clean()")
+	}
+
+	// Zero-temp reports clean: drop the temp files, keep the (normal-count) packs.
+	packDir := filepath.Join(subRepo, ".git", "objects", "pack")
+	ents, _ := os.ReadDir(packDir)
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "tmp_") {
+			if err := os.Remove(filepath.Join(packDir, e.Name())); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	h2, err := scanHygiene(context.Background(), root, s.git)
+	if err != nil {
+		t.Fatalf("rescan: %v", err)
+	}
+	for _, p := range h2.Packs {
+		if p.Name != "beta" {
+			continue
+		}
+		if p.Temp != 0 || p.Packs != wantPacks {
+			t.Fatalf("beta after cleanup: temp=%d packs=%d, want temp=0 packs=%d", p.Temp, p.Packs, wantPacks)
+		}
+		if p.Warn() {
+			t.Fatal("a zero-temp, normal-pack-count store must NOT warn")
+		}
+	}
+	if h2.PackWarn() {
+		t.Fatal("no storm => PackWarn must be false")
+	}
+}
+
+// TestPackStoreAbnormalPackCountWarns proves the second warning trigger: an
+// abnormal pile of live packs (>= packCountWarn) flags a warning even with zero
+// leftover temps — the "dozens of orphan pack-*.pack" signature.
+func TestPackStoreAbnormalPackCountWarns(t *testing.T) {
+	s, root := setup(t)
+	seedPackDir(t, filepath.Join(root, ".git"), packCountWarn, 0, 0)
+
+	h, err := scanHygiene(context.Background(), root, s.git)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	var hive PackStat
+	for _, p := range h.Packs {
+		if p.Name == "hive" {
+			hive = p
+		}
+	}
+	if hive.Packs != packCountWarn {
+		t.Fatalf("hive packs = %d, want %d", hive.Packs, packCountWarn)
+	}
+	if hive.Temp != 0 {
+		t.Fatalf("hive temp = %d, want 0", hive.Temp)
+	}
+	if !hive.PackAbnormal() || !hive.Warn() {
+		t.Fatal("an abnormal live-pack count must warn even with zero temps")
+	}
+	if !h.PackWarn() {
+		t.Fatal("Hygiene.PackWarn must be true for an abnormal pack pile")
+	}
+}
+
+// TestPackStoreUnmaterializedRepoMissing proves a declared-but-un-materialized
+// submodule (no repo/.git) is reported Missing with a zero census and never warns
+// — the .git existence guard stops git's upward search from misattributing the
+// parent hive's object store to it.
+func TestPackStoreUnmaterializedRepoMissing(t *testing.T) {
+	s, root := setup(t)
+	// Fabricate a storm in the HIVE store so a leaked misattribution would be loud.
+	seedPackDir(t, filepath.Join(root, ".git"), 2, 3, 0)
+	os.MkdirAll(filepath.Join(root, "submodules", "ghost", "repo"), 0o755)
+	os.WriteFile(filepath.Join(root, ".gitmodules"), []byte(
+		"[submodule \"ghost\"]\n\tpath = submodules/ghost/repo\n\turl = ./x\n"), 0o644)
+
+	h, err := scanHygiene(context.Background(), root, s.git)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	var ghost PackStat
+	found := false
+	for _, p := range h.Packs {
+		if p.Name == "ghost" {
+			ghost, found = p, true
+		}
+	}
+	if !found {
+		t.Fatalf("census dropped the declared ghost submodule: %+v", h.Packs)
+	}
+	if !ghost.Missing || ghost.Warn() {
+		t.Fatalf("un-materialized repo must be Missing and never warn: %+v", ghost)
+	}
+	if ghost.Packs != 0 || ghost.Temp != 0 || ghost.Bytes != 0 {
+		t.Fatalf("Missing repo leaked a non-zero census (upward .git search?): %+v", ghost)
+	}
+}
+
+// TestHygienePackPanelRenders drives GET /hygiene and asserts the per-repo pack
+// census renders on the page with its column headers, the storm badge, and the
+// killed-repack-residue flag on the nonzero-temp row.
+func TestHygienePackPanelRenders(t *testing.T) {
+	s, root := setup(t)
+	seedPackDir(t, filepath.Join(root, ".git"), 2, 1, 0) // 2 packs, 1 tmp_pack_
+
+	w := get(t, s, "/hygiene")
+	if w.Code != 200 {
+		t.Fatalf("hygiene %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"Object-store packs",
+		"pack dir",
+		"tmp_* leftover",
+		"killed-repack residue",
+		"object-store storm",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("hygiene page missing %q:\n%s", want, body)
+		}
+	}
+}
+
 // TestComputeStats checks the git-derived honeybee-performance figures behind the
 // /stats view: delivered = PLAN [DONE], sessions = transcript files, distinct
 // tasks and the derived ratios — all read live, nothing stored.

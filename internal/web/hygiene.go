@@ -2,8 +2,10 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/spencerharmon/beehive/internal/git"
@@ -14,6 +16,16 @@ import (
 // (the routine sweep in skills/cleanup.md) is how the operator clears it. The
 // panel never invokes it — diagnostic only.
 const hygieneSkill = "beehive-hygiene"
+
+// packCountWarn is the live pack-*.pack count at or above which a repo's object
+// store is flagged abnormal. A healthy repo holds a single pack right after gc and
+// only a handful of packs between runs; auto-gc is disabled swarm-wide
+// (git.DisableAutoGC), so nothing self-consolidates a growing pile — the runner's
+// deterministic 6-hourly gc (git.MaybeGC) is what compacts it. The 2026-07-08 storm
+// left DOZENS of orphan pack-*.pack on disk for hours; this threshold sits above
+// normal churn yet well under git's own gc.autoPackLimit default (50) so a genuine
+// pile is surfaced early. The panel only REPORTS the count — it never repacks.
+const packCountWarn = 24
 
 // CruftItem is one flagged piece of git cruft within a class: its identifier
 // (a worktree dir name, a gitlink path, a remote name) plus a short read-only
@@ -33,11 +45,14 @@ type CruftClass struct {
 // Count is the class's flagged-item count (the badge number).
 func (c CruftClass) Count() int { return len(c.Items) }
 
-// Hygiene is the whole read-only scan result: the four cruft classes plus the
-// skill to remediate them, and an optional scan error (surfaced, never swallowed)
-// so the dashboard widget can degrade without failing the whole page.
+// Hygiene is the whole read-only scan result: the four cruft classes, the
+// per-managed-repo object-store census (pack-dir size / live pack count / leftover
+// repack-temp count), the skill to remediate them, and an optional scan error
+// (surfaced, never swallowed) so the dashboard widget can degrade without failing
+// the whole page.
 type Hygiene struct {
 	Classes []CruftClass
+	Packs   []PackStat
 	Skill   string
 	Err     string
 }
@@ -51,14 +66,29 @@ func (h Hygiene) Total() int {
 	return n
 }
 
-// Clean reports whether the scan found no cruft at all (and did not error).
-func (h Hygiene) Clean() bool { return h.Err == "" && h.Total() == 0 }
+// PackWarn reports whether any managed repo's object store looks abnormal (a
+// leftover repack temp file or an abnormal live-pack count — see PackStat.Warn).
+func (h Hygiene) PackWarn() bool {
+	for _, p := range h.Packs {
+		if p.Warn() {
+			return true
+		}
+	}
+	return false
+}
+
+// Clean reports whether the scan found nothing worth surfacing at all (no cruft in
+// any class AND no object-store storm) and did not error.
+func (h Hygiene) Clean() bool { return h.Err == "" && h.Total() == 0 && !h.PackWarn() }
 
 // scanHygiene performs a READ-ONLY sweep of the beehive repo for the git cruft
-// that accumulates under updateInstead, returning a per-class drill-down. It
+// that accumulates under updateInstead, returning a per-class drill-down plus a
+// per-managed-repo object-store census (pack-dir size / live pack count / leftover
+// repack-temp count, for the hive and each declared submodule checkout). It
 // MUTATES NOTHING: every git invocation is a query (worktree list, ls-files,
-// config --get, remote, rev-parse) — never a write, prune, remove, or config
-// change. root is the beehive repo root; g is a git.Repo rooted there.
+// config --get, remote, rev-parse) and the pack census only stat()s each repo's
+// own .git/objects/pack — never a write, prune, remove, repack, or config change.
+// root is the beehive repo root; g is a git.Repo rooted there.
 func scanHygiene(ctx context.Context, root string, g *git.Repo) (Hygiene, error) {
 	worktrees, err := staleWorktrees(ctx, root, g)
 	if err != nil {
@@ -89,6 +119,7 @@ func scanHygiene(ctx context.Context, root string, g *git.Repo) (Hygiene, error)
 			{Key: "checkouts", Title: "Stale submodule checkouts", Items: checkouts},
 			{Key: "remotes", Title: "Unexpected remotes", Items: remotes},
 		},
+		Packs: scanPackStores(ctx, root, g, declared),
 	}, nil
 }
 
@@ -258,4 +289,147 @@ func short(sha string) string {
 		return sha[:7]
 	}
 	return sha
+}
+
+// PackStat is the read-only object-store census for ONE managed repo (the hive
+// itself or a submodule's repo/ checkout): the total on-disk size of its pack
+// directory, the count of live pack-*.pack files, and the count of leftover repack
+// temp files (tmp_pack_*/tmp_idx_*/tmp_rev_*). Reading .git/objects/pack is an
+// IN-repo read (the object store IS the repo) — it stays entirely within the
+// managed repo, so it does NOT violate the submodule "repo is the only data source"
+// invariant, and it is purely descriptive: NOTHING here is ever mutated and this
+// path NEVER repacks (the runner's deterministic git gc owns that).
+type PackStat struct {
+	Name    string // "hive" for the superproject, else the submodule name
+	Path    string // display path: "." for the hive, else submodules/<name>/repo
+	Packs   int    // live pack-*.pack count
+	Temp    int    // leftover tmp_pack_*/tmp_idx_*/tmp_rev_* count (killed-repack residue)
+	Bytes   int64  // total pack-dir size in bytes
+	Missing bool   // repo not materialized (no resolvable object store to stat)
+}
+
+// Warn reports whether this repo's object store looks abnormal: any leftover
+// repack temp file (the 2026-07-08 storm signature — a repack killed mid-flight
+// leaves tmp_* debris) or an abnormally high live-pack count (dozens of orphan
+// packs piling up because nothing consolidated them). A materialized, healthy
+// store warns on neither; a Missing repo never warns (there is nothing to stat).
+func (p PackStat) Warn() bool { return !p.Missing && (p.Temp > 0 || p.Packs >= packCountWarn) }
+
+// TempWarn reports the leftover-repack-temp signal specifically (the strongest
+// mid-flight-kill indicator), so the panel can badge it distinctly.
+func (p PackStat) TempWarn() bool { return p.Temp > 0 }
+
+// PackAbnormal reports the abnormal-live-pack-count signal specifically.
+func (p PackStat) PackAbnormal() bool { return p.Packs >= packCountWarn }
+
+// Size renders Bytes human-readably (B / KiB / MiB / GiB …) for the panel.
+func (p PackStat) Size() string { return humanBytes(p.Bytes) }
+
+// scanPackStores builds the per-repo object-store census for the hive and every
+// declared submodule checkout (submodules/<name>/repo, the same set the runner's
+// deterministic gc maintains), in a stable order: hive first, then submodules by
+// path. Purely read-only; a repo that is not materialized is reported as Missing
+// rather than dropped, so the operator sees the full managed-repo list. declared
+// is the .gitmodules submodule-path set already computed by the caller.
+func scanPackStores(ctx context.Context, root string, g *git.Repo, declared map[string]bool) []PackStat {
+	stats := []PackStat{packStoreStat(ctx, g, "hive", ".")}
+	paths := make([]string, 0, len(declared))
+	for p := range declared {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		stats = append(stats, packStoreStat(ctx, git.New(filepath.Join(root, p)), submoduleName(p), p))
+	}
+	return stats
+}
+
+// submoduleName derives the submodule name from a declared gitlink path
+// (submodules/<name>/repo -> <name>); it falls back to the raw path if the shape
+// is unexpected, so the census is never left with an empty label.
+func submoduleName(path string) string {
+	if n := filepath.Base(filepath.Dir(path)); n != "" && n != "." && n != string(filepath.Separator) {
+		return n
+	}
+	return path
+}
+
+// packStoreStat resolves ONE repo's object-store pack directory and stat()s it,
+// read-only. It resolves the pack dir through git (`rev-parse --git-path
+// objects/pack`) so a submodule's `.git`-file gitdir pointer is followed to the
+// real store under the superproject's .git/modules/<name>; the same idiom the
+// runner's gc sweep uses. A repo with no own .git (an un-materialized submodule
+// checkout) is reported Missing WITHOUT running rev-parse, so git's upward .git
+// search can never misattribute the parent hive's store to it.
+func packStoreStat(ctx context.Context, g *git.Repo, name, path string) PackStat {
+	ps := PackStat{Name: name, Path: path}
+	if _, err := os.Stat(filepath.Join(g.Dir, ".git")); err != nil {
+		ps.Missing = true // no own git dir: not materialized, nothing to stat
+		return ps
+	}
+	out, err := g.Run(ctx, "rev-parse", "--git-path", "objects/pack")
+	if err != nil || strings.TrimSpace(out) == "" {
+		ps.Missing = true
+		return ps
+	}
+	packDir := strings.TrimSpace(out)
+	if !filepath.IsAbs(packDir) {
+		packDir = filepath.Join(g.Dir, packDir)
+	}
+	packs, temp, size, serr := statPackDir(packDir)
+	if serr != nil {
+		ps.Missing = true // pack dir present but unreadable — cannot assert a census
+		return ps
+	}
+	ps.Packs, ps.Temp, ps.Bytes = packs, temp, size
+	return ps
+}
+
+// statPackDir counts the object-store census in an ALREADY-RESOLVED pack directory,
+// read-only: live pack-*.pack files, leftover repack temp files (tmp_pack_*/
+// tmp_idx_*/tmp_rev_*), and the total size of every file in the dir. A pack dir
+// that does not exist yet (a fresh repo with only loose objects, nothing repacked)
+// is not an error — it reports a clean zero census. Split out so the counting logic
+// is unit-testable against a fabricated .git/objects/pack without a git repo.
+func statPackDir(packDir string) (packs, temp int, size int64, err error) {
+	ents, err := os.ReadDir(packDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, 0, nil
+		}
+		return 0, 0, 0, err
+	}
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if info, ierr := e.Info(); ierr == nil {
+			size += info.Size()
+		}
+		switch {
+		case strings.HasPrefix(name, "pack-") && strings.HasSuffix(name, ".pack"):
+			packs++
+		case strings.HasPrefix(name, "tmp_pack_"),
+			strings.HasPrefix(name, "tmp_idx_"),
+			strings.HasPrefix(name, "tmp_rev_"):
+			temp++
+		}
+	}
+	return packs, temp, size, nil
+}
+
+// humanBytes renders a byte count in binary units (B, KiB, MiB, GiB, …) with one
+// decimal place above 1 KiB, for compact display in the pack-store census.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
