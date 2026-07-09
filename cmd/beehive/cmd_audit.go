@@ -79,11 +79,13 @@ func auditCmd() *cobra.Command {
 			// Aggregate over the FULL corpus so reruns/retries are true totals; the
 			// trend is the delivered-only cost gauge at this pass.
 			aggs := audit.Aggregate(sessions, delivered)
+			silentAggs := audit.AggregateSilentLoss(sessions)
 			trend := audit.ComputeTrend(aggs, pass)
 
 			printCensus(census)
 			printWindow(window)
 			printAggregate(aggs)
+			printSilentLoss(silentAggs)
 			printTrend(trend)
 			// Loud, byte-stable corpus-integrity alarm: an empty/sparse window over
 			// a corpus of unfinalized stubs is a finalization defect, not a rest.
@@ -221,7 +223,7 @@ func printWindow(w []audit.Session) {
 	fmt.Println("# window (N-2, un-audited)")
 	fmt.Println(strings.Join([]string{
 		"session_id", "epoch", "kind", "taskid", "model", "bytes", "turns",
-		"aborted", "lost_race", "completion_miss", "reconcile_loop",
+		"aborted", "lost_race", "completion_miss", "reconcile_loop", "silent_loss",
 	}, "\t"))
 	for _, s := range w {
 		h := s.Heuristics
@@ -233,6 +235,7 @@ func printWindow(w []audit.Session) {
 			strconv.FormatInt(s.Bytes, 10), strconv.Itoa(s.Turns),
 			strconv.FormatBool(h.Aborted), strconv.FormatBool(h.LostRace),
 			strconv.FormatBool(h.CompletionMiss), strconv.FormatBool(h.ReconcileLoop),
+			strconv.FormatBool(h.SilentLoss),
 		}, "\t"))
 	}
 }
@@ -244,6 +247,38 @@ func printAggregate(aggs []audit.TaskAgg) {
 		fmt.Println(strings.Join([]string{
 			a.TaskID, strconv.Itoa(a.Reruns), strconv.Itoa(a.Retries),
 			strconv.Itoa(a.Turns), strconv.FormatInt(a.Bytes, 10), strconv.FormatBool(a.Delivered),
+		}, "\t"))
+	}
+}
+
+// printSilentLoss surfaces the cross-session silent-loss finding read-only, so a
+// future audit pass gets it for free instead of reconstructing it by hand from
+// git log. A silent loss is a task-bearing session whose successful status flip
+// never reached main: the immediately-following same-task, same-kind session was
+// re-dispatched at the identical status, so the earlier run was silently
+// discarded — the blind spot the per-session heuristics (all keyed off a
+// session's OWN warning block) structurally cannot see. The summary headline is
+// the reproducible analogue of session-audit-014's manually-derived total.
+func printSilentLoss(aggs []audit.SilentLossAgg) {
+	var losses, turns int
+	var bytes int64
+	for _, a := range aggs {
+		losses += a.Count
+		turns += a.Turns
+		bytes += a.Bytes
+	}
+	fmt.Println("# silent-loss summary (cross-session discarded work, full corpus)")
+	fmt.Println(strings.Join([]string{"tasks", "silent_losses", "turns", "bytes"}, "\t"))
+	fmt.Println(strings.Join([]string{
+		strconv.Itoa(len(aggs)), strconv.Itoa(losses),
+		strconv.Itoa(turns), strconv.FormatInt(bytes, 10),
+	}, "\t"))
+	fmt.Println("# silent-loss per task")
+	fmt.Println(strings.Join([]string{"taskid", "silent_losses", "turns", "bytes", "lost_sessions"}, "\t"))
+	for _, a := range aggs {
+		fmt.Println(strings.Join([]string{
+			a.TaskID, strconv.Itoa(a.Count), strconv.Itoa(a.Turns),
+			strconv.FormatInt(a.Bytes, 10), strings.Join(a.Sessions, ","),
 		}, "\t"))
 	}
 }

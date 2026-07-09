@@ -19,13 +19,40 @@ const (
 )
 
 var (
+	// metricsHdr is the CURRENT metrics.tsv schema. Columns are ONLY EVER
+	// APPENDED (never reordered or removed), keeping the ledger additive:
+	// silent_loss is the newest, appended per the same backward-compatible
+	// discipline audit-tool-abort-stall-guard used to grow the schema without
+	// breaking already-ledgered rows. loadMetrics reads any legacy row that
+	// predates a trailing column by defaulting the missing values (see
+	// appendedMetricsCols / metricsDefaults).
 	metricsHdr = []string{
 		"pass", "session_id", "epoch", "submodule", "kind", "branch", "taskid",
 		"bytes", "turns", "user_turns", "aborted", "lost_race", "completion_miss",
-		"reconcile_loop", "abort_reason",
+		"reconcile_loop", "abort_reason", "silent_loss",
+	}
+	// appendedMetricsCols are the columns added to metrics.tsv AFTER its original
+	// 15-wide schema, in metricsHdr order. A metrics file whose header is that
+	// original schema (or any prefix ending before these) is still read: each
+	// missing trailing column is filled from metricsDefaults, so a row ledgered
+	// before the column existed keeps parsing. This is the additive contract:
+	// append only, default on read, never break an old row.
+	appendedMetricsCols = []string{"silent_loss"}
+	// metricsDefaults supplies the value each appended column takes when a legacy
+	// row predating it is read. silent_loss → "false": a row ledgered before the
+	// column existed carries no verdict and not-flagged is the only safe default;
+	// the next full-corpus pass recomputes the real value.
+	metricsDefaults = map[string]string{
+		"silent_loss": "false",
 	}
 	trendHdr = []string{"pass", "delivered_tasks", "turns", "bytes", "retries"}
 )
+
+// minMetricsCols is the narrowest metrics header loadMetrics will accept: the
+// current schema minus its append-only trailing columns (i.e. the original
+// 15-wide schema). A header narrower than this is a genuinely broken/truncated
+// file, not a clean legacy row, and is rejected.
+func minMetricsCols() int { return len(metricsHdr) - len(appendedMetricsCols) }
 
 // MetricRow is one audited session pinned to the pass that recorded it.
 type MetricRow struct {
@@ -111,7 +138,7 @@ func (l *Ledger) metricRows() [][]string {
 			strconv.FormatInt(s.Bytes, 10), strconv.Itoa(s.Turns), strconv.Itoa(s.UserTurns),
 			strconv.FormatBool(h.Aborted), strconv.FormatBool(h.LostRace),
 			strconv.FormatBool(h.CompletionMiss), strconv.FormatBool(h.ReconcileLoop),
-			tsvSafe(h.AbortReason),
+			tsvSafe(h.AbortReason), strconv.FormatBool(h.SilentLoss),
 		})
 	}
 	return rows
@@ -129,7 +156,7 @@ func (l *Ledger) trendRows() [][]string {
 }
 
 func loadMetrics(path string, l *Ledger) error {
-	recs, err := readTSV(path, metricsHdr)
+	recs, err := readMetricsTSV(path)
 	if err != nil || recs == nil {
 		return err
 	}
@@ -158,6 +185,10 @@ func loadMetrics(path string, l *Ledger) error {
 		if err != nil {
 			return err
 		}
+		silentLoss, err := parseBool(r[15], path)
+		if err != nil {
+			return err
+		}
 		l.Metrics = append(l.Metrics, MetricRow{
 			Pass: pass,
 			Session: Session{
@@ -166,12 +197,95 @@ func loadMetrics(path string, l *Ledger) error {
 				Heuristics: Heuristics{
 					Aborted: aborted, LostRace: lostRace,
 					CompletionMiss: completionMiss, ReconcileLoop: reconcileLoop,
-					AbortReason: r[14],
+					AbortReason: r[14], SilentLoss: silentLoss,
 				},
 			},
 		})
 	}
 	return nil
+}
+
+// readMetricsTSV reads metrics.tsv into rows normalized to the CURRENT metricsHdr
+// width. It is the additive-schema reader: the on-disk header may be the current
+// schema OR any legacy prefix of it no narrower than minMetricsCols (the original
+// 15-wide schema), and every data row must match that on-disk width; each row is
+// then right-padded with metricsDefaults for the append-only columns it predates,
+// so callers can index the full current layout unconditionally. A missing file
+// yields (nil, nil): an empty ledger, not an error.
+func readMetricsTSV(path string) ([][]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	var rows [][]string
+	width := 0
+	first := true
+	for sc.Scan() {
+		line := strings.TrimRight(sc.Text(), "\r")
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if first {
+			w, err := validateMetricsHeader(fields, path)
+			if err != nil {
+				return nil, err
+			}
+			width = w
+			first = false
+			continue
+		}
+		if len(fields) != width {
+			return nil, fmt.Errorf("audit: %s: row has %d cols, want %d", path, len(fields), width)
+		}
+		rows = append(rows, padMetricsRow(fields))
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// validateMetricsHeader accepts the on-disk metrics header iff it is a PREFIX of
+// the current metricsHdr no narrower than minMetricsCols — i.e. exactly the
+// current schema, or a legacy schema missing only the append-only trailing
+// columns — and returns its column count. A header of the wrong width, or whose
+// names diverge from metricsHdr at any shared position (a reorder/rename, not a
+// clean append), is rejected: the additive contract permits appended columns,
+// never a changed prefix.
+func validateMetricsHeader(fields []string, path string) (int, error) {
+	n := len(fields)
+	if n < minMetricsCols() || n > len(metricsHdr) {
+		return 0, fmt.Errorf("audit: %s: header has %d cols, want %d..%d", path, n, minMetricsCols(), len(metricsHdr))
+	}
+	for i := range fields {
+		if fields[i] != metricsHdr[i] {
+			return 0, fmt.Errorf("audit: %s: header col %d = %q, want %q", path, i, fields[i], metricsHdr[i])
+		}
+	}
+	return n, nil
+}
+
+// padMetricsRow right-pads a legacy row to the full current width, filling each
+// appended column from metricsDefaults. A row already at full width is returned
+// unchanged. The input width is header-validated (readMetricsTSV), so this only
+// ever appends the schema's own declared defaults.
+func padMetricsRow(fields []string) []string {
+	if len(fields) == len(metricsHdr) {
+		return fields
+	}
+	row := make([]string, len(metricsHdr))
+	copy(row, fields)
+	for i := len(fields); i < len(metricsHdr); i++ {
+		row[i] = metricsDefaults[metricsHdr[i]]
+	}
+	return row
 }
 
 func loadTrend(path string, l *Ledger) error {
@@ -278,22 +392,30 @@ func atoi64(s, path string) (int64, error) {
 	return n, nil
 }
 
+func parseBool(s, path string) (bool, error) {
+	b, err := strconv.ParseBool(s)
+	if err != nil {
+		return false, fmt.Errorf("audit: %s: bad bool %q: %w", path, s, err)
+	}
+	return b, nil
+}
+
 func parseBools(a, b, c, d, path string) (bool, bool, bool, bool, error) {
-	pa, err := strconv.ParseBool(a)
+	pa, err := parseBool(a, path)
 	if err != nil {
-		return false, false, false, false, fmt.Errorf("audit: %s: bad bool %q: %w", path, a, err)
+		return false, false, false, false, err
 	}
-	pb, err := strconv.ParseBool(b)
+	pb, err := parseBool(b, path)
 	if err != nil {
-		return false, false, false, false, fmt.Errorf("audit: %s: bad bool %q: %w", path, b, err)
+		return false, false, false, false, err
 	}
-	pc, err := strconv.ParseBool(c)
+	pc, err := parseBool(c, path)
 	if err != nil {
-		return false, false, false, false, fmt.Errorf("audit: %s: bad bool %q: %w", path, c, err)
+		return false, false, false, false, err
 	}
-	pd, err := strconv.ParseBool(d)
+	pd, err := parseBool(d, path)
 	if err != nil {
-		return false, false, false, false, fmt.Errorf("audit: %s: bad bool %q: %w", path, d, err)
+		return false, false, false, false, err
 	}
 	return pa, pb, pc, pd, nil
 }

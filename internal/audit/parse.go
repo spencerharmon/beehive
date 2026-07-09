@@ -114,6 +114,7 @@ func ParseDirCensus(dir string) (Census, error) {
 	}
 	sortByEpoch(c.Sessions)
 	markReconcileLoops(c.Sessions)
+	markSilentLosses(c.Sessions)
 	sortStubs(c.Stubs)
 	return c, nil
 }
