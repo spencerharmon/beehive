@@ -38,7 +38,7 @@ func TestPrintWindowModelColumn(t *testing.T) {
 	}
 	wantHeader := []string{
 		"session_id", "epoch", "kind", "taskid", "model", "bytes", "turns",
-		"aborted", "lost_race", "completion_miss", "reconcile_loop",
+		"aborted", "lost_race", "completion_miss", "reconcile_loop", "silent_loss",
 	}
 	if header := strings.Split(lines[1], "\t"); !reflect.DeepEqual(header, wantHeader) {
 		t.Fatalf("header=%v want %v", header, wantHeader)
@@ -106,7 +106,7 @@ func TestAuditCommandModelColumnEndToEnd(t *testing.T) {
 	header, rows := windowSection(t, out)
 	wantHeader := []string{
 		"session_id", "epoch", "kind", "taskid", "model", "bytes", "turns",
-		"aborted", "lost_race", "completion_miss", "reconcile_loop",
+		"aborted", "lost_race", "completion_miss", "reconcile_loop", "silent_loss",
 	}
 	if !reflect.DeepEqual(header, wantHeader) {
 		t.Fatalf("window header=%v want %v\nfull output:\n%s", header, wantHeader, out)

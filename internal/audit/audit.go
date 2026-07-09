@@ -48,6 +48,31 @@
 // a merely-quoted abort line never mis-flags. reconcile-loop is a corpus-level
 // property (adjacent reconcile sessions in epoch order) set by ParseDir, not by
 // a single file.
+//
+// # Cross-session silent loss (a session that fully completes but is discarded)
+//
+// Every heuristic above keys off a session's OWN transcript, so none can fire for
+// a session that cleanly completes every one of its own steps (commit, push,
+// status flip, zero warnings) and THEN has its deliverable silently discarded or
+// superseded out of band — the victim's transcript never narrates the loss. The
+// SilentLoss flag catches exactly that, as a CORPUS-level property (like
+// ReconcileLoop): for each task, among its task-bearing sessions in epoch order,
+// a session is a silent loss when the immediately-following same-task session was
+// re-dispatched at the SAME kind. Kind is the header-authoritative proxy for the
+// status a session was dispatched at (work⟺TODO, review⟺NEEDS-REVIEW,
+// arbitrate⟺NEEDS-ARBITRATION), so a same-kind successor means the earlier
+// session's own status flip never reached main — the task was handed out again at
+// the identical status and the earlier run's entire cost was wasted. Using the
+// header kind (not a body scan for the injected "[STATUS]" token) keeps this
+// immune to the same prompt-pollution that constrains the abort heuristics. Set
+// by markSilentLosses in ParseDirCensus over the epoch-sorted corpus; it is
+// deliberately transcript-only (no git access — internal/audit reads only the
+// beehive layer), which reproduces the session-audit-014 finding without manual
+// git-log cross-referencing. A git-reachability refinement (confirm the earlier
+// session's flip commit never reached main, filtering the one known
+// false-positive class — a reconcile that reopens an already-delivered task) is a
+// documented future enhancement, injectable from cmd/beehive via a hook mirroring
+// BranchResolver rather than by giving this package a git dependency.
 package audit
 
 // Session kinds, mirroring internal/swarm selection kinds as written into the
@@ -106,4 +131,14 @@ type Heuristics struct {
 	// this flag only records WHICH rule fired. Set by parseTranscript/scanBody,
 	// never persisted to the ledger (the derived Aborted/CompletionMiss are).
 	HarnessAbortStall bool
+	// SilentLoss marks a task-bearing session whose successful status flip never
+	// reached main: the immediately-following same-task session was re-dispatched
+	// at the SAME kind (identical dispatch status), so this session's entire run
+	// was silently discarded out of band — a cross-session waste the per-session
+	// abort heuristics structurally cannot see (this session's OWN transcript
+	// narrates a clean completion). Like ReconcileLoop it is a corpus-level
+	// property, set by markSilentLosses over the epoch-sorted corpus, not by a
+	// single file — parseTranscript never sets it. It IS persisted to the ledger
+	// (its own silent_loss column) so a future pass gets the finding for free.
+	SilentLoss bool
 }
