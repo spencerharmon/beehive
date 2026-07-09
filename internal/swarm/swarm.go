@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/claim"
@@ -144,6 +145,22 @@ type Runner struct {
 	// away to a transient upstream hang. 0 = the historical behavior: the first idle
 	// stall abandons immediately.
 	TurnIdleRetries int
+
+	// PredicatePoll sets the mid-turn completion-predicate watchdog cadence: while
+	// a turn is in flight (sess.Prompt blocked) the runner polls the SAME
+	// deterministic check r.complete uses (a committed status flip to a terminal
+	// state, plus the change doc for a Work task) and, the instant it is observed,
+	// cancels the turn ctx so no further tool call is solicited from the agent.
+	// This closes the gap session-audit-014/015 found twice: opencode settles a
+	// turn only when the model goes idle, and a single turn can chain many tool
+	// calls, so an agent that delivers the terminal flip and then keeps calling
+	// tools ran to completion before the runner's between-turn check ever saw it —
+	// corrupting the audit's completion_miss signal on a session that had actually
+	// delivered. 0 -> default 500ms. It is fail-open: absent a positive complete()
+	// read the watchdog makes no decision and never touches the turn ctx, so a
+	// turn that has not yet reached its predicate always runs to its normal
+	// settle/TurnTimeout unchanged.
+	PredicatePoll time.Duration
 
 	// LeanInject trims the per-pass injected system prompt to only what this pass's
 	// kind acts on (trimProtocol) and defers the Work completion rule from the
@@ -1171,15 +1188,43 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// already polling, so even the long bootstrap turn streams to the UI/debug.
 		// Bound the turn: a stalled opencode call is canceled at TurnTimeout and the
 		// task abandoned for GC, never a multi-hour zombie blocked on a dead socket.
-		turnCtx := ctx
-		cancelTurn := func() {}
+		var turnCtx context.Context
+		var cancelTurn context.CancelFunc
 		if r.TurnTimeout > 0 {
 			turnCtx, cancelTurn = context.WithTimeout(ctx, r.TurnTimeout)
+		} else {
+			// Always a real cancellable child (never the bare, uncancelable ctx): the
+			// mid-turn completion-predicate watchdog below needs a ctx it can cancel
+			// to hard-stop JUST this turn without also canceling the whole run.
+			turnCtx, cancelTurn = context.WithCancel(ctx)
+		}
+		// Mid-turn completion-predicate hard stop (see Runner.PredicatePoll /
+		// predicateWatch): while this turn streams, poll for the agent having
+		// already driven the task to its terminal predicate and, the instant it is
+		// observed, cancel turnCtx so opencode solicits no further tool call. Scoped
+		// to task-bearing kinds (Work/Review/Arbitrate) via hasTask — Bootstrap/
+		// Reconcile have no per-task terminal flip for this to race past.
+		var predHit *atomic.Bool
+		if hasTask(sel) {
+			predHit = r.predicateWatch(turnCtx, cancelTurn, sel, res.Branch)
 		}
 		_, perr := sess.Prompt(turnCtx, prompt)
 		timedOut := r.TurnTimeout > 0 && turnCtx.Err() == context.DeadlineExceeded
 		idleStalled := errors.Is(perr, ErrTurnIdle)
 		cancelTurn()
+		// The watchdog's cancel surfaces here as a plain ctx-cancellation error, not
+		// ErrTurnIdle/DeadlineExceeded, so it falls through neither existing branch
+		// above. Recognize it explicitly and treat it as an ordinary, successful
+		// turn settle — never as the fatal/timeout/idle paths below — since the
+		// predicate it fired on is the SAME deterministic check the normal
+		// post-turn r.complete call just below re-confirms.
+		hardStopped := predHit != nil && predHit.Load() && errors.Is(perr, context.Canceled)
+		if hardStopped {
+			perr = nil
+			timedOut = false
+			idleStalled = false
+			r.logConcise("[honeybee] turn %d: completion predicate observed mid-turn; hard-stopping the turn\n", res.Turns)
+		}
 		// In-place idle recovery: a wedged upstream turn (github-copilot holding the
 		// stream open with zero output, no error, and no opencode read-timeout) is
 		// probabilistic. With retry budget and wall time left, abort the dead turn
@@ -1556,6 +1601,48 @@ func (r *Runner) taskRemoved(ctx context.Context, sel *selectt.Selection) (bool,
 			sel.Task.ID, sel.Submodule.Name, ref), nil
 	}
 	return false, "", nil
+}
+
+// predicateWatch starts the mid-turn completion-predicate hard-stop watchdog
+// (see Runner.PredicatePoll) and returns a flag the caller reads AFTER the turn
+// returns to tell "we hard-stopped it here" apart from a normal settle, a
+// TurnTimeout, or an idle-stall. It polls the EXACT SAME check r.complete uses
+// at the top of the next turn — so the predicate observed here is never looser
+// than the one that already gates completion — on turnCtx (never the caller's
+// unbounded ctx), so it exits the instant the turn ends for any reason and never
+// outlives it. On a positive read it cancels turnCtx (aborting the in-flight
+// opencode POST, which unblocks sess.Prompt promptly the same way TurnTimeout
+// already does) and stops; it deliberately never re-checks after that, since one
+// positive, deterministic read is a complete signal, not a fingerprint to
+// debounce. Fails OPEN: a complete() error or a not-yet-met predicate is treated
+// identically to "keep waiting" — the watchdog never cancels on uncertainty, so
+// a turn that never reaches its predicate runs to its normal settle/TurnTimeout
+// exactly as before this existed.
+func (r *Runner) predicateWatch(turnCtx context.Context, cancel context.CancelFunc, sel *selectt.Selection, branch string) *atomic.Bool {
+	interval := r.PredicatePoll
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	hit := &atomic.Bool{}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-turnCtx.Done():
+				return
+			case <-t.C:
+			}
+			done, err := r.complete(sel, branch)
+			if err != nil || !done {
+				continue // fail open: not yet met (or transiently unreadable) -> keep watching
+			}
+			hit.Store(true)
+			cancel()
+			return
+		}
+	}()
+	return hit
 }
 
 // complete is the deterministic per-turn completion check.
