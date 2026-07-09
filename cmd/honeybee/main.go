@@ -48,7 +48,18 @@ func run() error {
 		return err
 	}
 	ctx := context.Background()
+	// ttl is the shared, swarm-wide claim-staleness/GC threshold: EVERY honeybee's
+	// selector and claimer must agree on the identical value (it is what lets a
+	// peer decide whether another session's claim is still live), so it stays a
+	// single flat, host-level knob — never resolved per-submodule. wallCap is this
+	// process's OWN execution budget only (never compared against by a peer), kept
+	// a DISTINCT value with a safety margin below ttl (claim-ttl-wallcap-race-guard):
+	// see wallCapFor and swarm.Runner.racePeerOwnsTask, the authoritative fix that
+	// DETECTS a race that slips past this margin (e.g. a single turn alone
+	// outliving it), which this margin only makes less frequent, never raising ttl
+	// itself — that would just slow recovery from a genuinely abandoned task.
 	ttl := time.Duration(c.TTLMinutes) * time.Minute
+	wallCap := wallCapFor(ttl)
 
 	// Each honeybee works in its own worktree of the beehive repo on a private
 	// branch, then merges to main and pushes — no shared index, no write lock,
@@ -259,7 +270,7 @@ func run() error {
 	session := wtBranch
 
 	runner := &swarm.Runner{
-		Repo: rp, Git: gitRepo, MaxTurns: eff.MaxTurns, MergeRetries: eff.MergeRetries, WallCap: ttl, TTL: ttl, Publish: publish,
+		Repo: rp, Git: gitRepo, MaxTurns: eff.MaxTurns, MergeRetries: eff.MergeRetries, WallCap: wallCap, TTL: ttl, Publish: publish,
 		// RejectLimit bounds how many times a Work task's implementer commit can
 		// fail to land on the submodule's origin (landSourceBranch/demoteUnpushed)
 		// before it escalates to NEEDS-HUMAN instead of recycling to TODO yet
@@ -418,6 +429,37 @@ func run() error {
 	}
 	fmt.Println("honeybee: reselect cap reached, exiting")
 	return nil
+}
+
+// wallCapFor derives this honeybee's OWN wall-clock execution budget from the
+// swarm-wide claim-staleness ttl, reserving a 25% safety margin so the pass's
+// own tail — the time left in whatever turn is running when the deadline check
+// next runs, plus finish()'s own publish/conflict-retry work, none of which
+// re-stamps the heartbeat (see swarm.Runner.Run) — cannot by itself outlive the
+// claim before this pass ever reaches its own WallCap deadline check. This is
+// layer one of the claim-ttl-wallcap-race-guard fix (session-audit-013 F1): it
+// only REDUCES how often a pass's own cumulative runtime crowds the claim TTL;
+// it cannot bound a single pathologically long turn (TurnTimeoutMinutes
+// defaults to 180 — 3x the default ttl of 60 — so one slow turn can alone
+// outlive ttl regardless of this margin). Layer two,
+// swarm.Runner.racePeerOwnsTask, is the authoritative, unconditional guard that
+// DETECTS a race that slips past this margin anyway, right before the runner
+// would otherwise trust a local "done" and publish over a peer who has already,
+// and correctly, taken over the identical task. Deliberately NEVER raises ttl
+// itself to buy this margin — that would only slow recovery from a genuinely
+// abandoned task, the exact tradeoff the task instructions rule out; only
+// WallCap moves, and only downward.
+//
+// ttl <= 0 (a degenerate/test config) returns it unchanged rather than invert
+// into a negative or zero budget.
+func wallCapFor(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return ttl
+	}
+	if cap := ttl - ttl/4; cap > 0 {
+		return cap
+	}
+	return ttl
 }
 
 // rebindSelection re-roots a selection made on one repo onto another (the
