@@ -3,5 +3,6 @@
 <h1>{{.Name}} <span class="sha-cell"><code>{{.SHA}}</code><button type="button" class="copy-btn" data-copy="{{.SHA}}" aria-label="Copy commit {{.SHA}} to clipboard">copy</button></span></h1>
 <p class="muted">{{.Subject}}</p>
 <p class="muted">{{.Author}} &middot; {{.Date}}</p>
-<pre class="diff">{{.Patch}}</pre>
+<pre class="diff">{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
+{{else}}<span class="muted">no changes</span>{{end}}</pre>
 {{template "footer"}}

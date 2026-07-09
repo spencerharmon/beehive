@@ -3475,6 +3475,74 @@ func TestEditorDiffAddDelClasses(t *testing.T) {
 	}
 }
 
+// TestCommitViewDiffAddDelClasses (diff-view-colorize-consistency) locks that
+// the hive commitView page renders its scoped PLAN.md diff through the SAME
+// editor.RenderDiff/RenderDiffHTML row renderer as the editor/chat/skill
+// panels — colorized add/del/eq .ln rows for a real TODO -> DONE status flip —
+// instead of a raw {{.Patch}} <pre> of unified-diff text.
+func TestCommitViewDiffAddDelClasses(t *testing.T) {
+	s, root := setup(t)
+	writeHivePlan(t, root, "alpha", "dt1", "TODO")
+	commitAll(t, root, "dt1-todo")
+	writeHivePlan(t, root, "alpha", "dt1", "DONE")
+	commitAll(t, root, "dt1-done")
+	sha := hygGit(t, root, "rev-parse", "--short=12", "HEAD")
+
+	w := get(t, s, "/submodule/alpha/commit/"+sha)
+	if w.Code != 200 {
+		t.Fatalf("commit view %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`class="ln add"`, `class="ln del"`, `class="ln eq"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("commit view missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestHumanResolvePanelDiffAddDelClasses (diff-view-colorize-consistency) locks
+// that the human-resolve panel renders its (potentially multi-file) session
+// diff through editor.RenderDiff/RenderDiffHTML — colorized add/del .ln rows —
+// for a real committed change on the resolution agent's branch, instead of a
+// raw {{.Patch}} <pre> of unified-diff text. The #resolve-diff container id and
+// data-scroll-preserve poll wiring stay exactly as before.
+func TestHumanResolvePanelDiffAddDelClasses(t *testing.T) {
+	s, root, ts := humanFixture(t, "")
+	// Seed a tracked file with real content on main BEFORE cutting the
+	// resolution worktree, so the session branch's change has a genuine base
+	// to diff against (not a from-nothing add).
+	infraPath := filepath.Join(root, "submodules", "alpha", "INFRASTRUCTURE.md")
+	if err := os.MkdirAll(filepath.Dir(infraPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(infraPath, []byte("# alpha infra\nold line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := git.New(root).Commit(context.Background(), "seed infra doc"); err != nil {
+		t.Fatal(err)
+	}
+
+	it := PlanItem{ID: "needs-token", Desc: "Wire the client.", HumanReason: "token"}
+	sess, err := s.humans.session(context.Background(), "alpha", it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(sess.wtPath, "submodules", "alpha", "INFRASTRUCTURE.md")
+	if err := os.WriteFile(target, []byte("# alpha infra\nnew line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.wt.Commit(context.Background(), "resolve: agent turn"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := httpGet(t, ts.URL+"/human/alpha/needs-token/panel/"+sess.ID)
+	for _, want := range []string{`class="ln add"`, `class="ln del"`, `id="resolve-diff"`, "data-scroll-preserve"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("human resolve panel missing %q:\n%s", want, body)
+		}
+	}
+}
+
 // TestEditorDeleteGuardConfirmButton locks the destructive-deletion UI guard
 // (editor-safety-guards): when the pending proposal would wipe a human-owned
 // file (DeleteRisk), the panel surfaces a warning and a DISTINCT confirm control

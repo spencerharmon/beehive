@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
@@ -161,17 +162,73 @@ func (s *Server) humanResolveDiscard(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/human", http.StatusSeeOther)
 }
 
+// resolveFileDiff is one changed file's colorized rendering within a resolve
+// session's (potentially multi-file) accumulated change, keyed by its beehive-
+// repo-relative path — the human-resolve panel's per-file analogue of
+// skillDiffView (skills.go).
+type resolveFileDiff struct {
+	Path string
+	Rows []editor.DiffRow
+}
+
+// resolveSessionDiffs renders sess's accumulated branch change (the same
+// main...HEAD range diff/hasChanges already use) as one editor.RenderDiff/
+// RenderDiffHTML per changed file, so the human-resolve panel colors add/del
+// lines exactly like the editor/chat/skill diff surfaces (diff-view-colorize-
+// consistency) instead of a raw unified patch. The comparison base is
+// merge-base(main, HEAD), matching git's own "..." triple-dot range semantics
+// (main advancing after the branch forked must not read as the session's own
+// change). Serialized on wtMu against the turn commit, matching sess.diff.
+// Best-effort per file: a path git can't read at either side of the range
+// renders as an empty diff rather than failing the whole panel; a path new on
+// HEAD (before "") or removed on HEAD (after "") is the same root/add/delete
+// edge RenderDiffHTML already tolerates for every other caller.
+func resolveSessionDiffs(ctx context.Context, sess *resolveSession) ([]resolveFileDiff, error) {
+	sess.wtMu.Lock()
+	defer sess.wtMu.Unlock()
+	names, err := sess.wt.Run(ctx, "diff", "--name-only", "main...HEAD")
+	if err != nil {
+		return nil, err
+	}
+	names = strings.TrimSpace(names)
+	if names == "" {
+		return nil, nil
+	}
+	base, err := sess.wt.Run(ctx, "merge-base", "main", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	base = strings.TrimSpace(base)
+	paths := strings.Split(names, "\n")
+	out := make([]resolveFileDiff, 0, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		before, _ := sess.wt.Show(ctx, base, path)  // "" when path is new on HEAD
+		after, _ := sess.wt.Show(ctx, "HEAD", path) // "" when path was deleted on HEAD
+		lexer := lexerFor(path)
+		rows := editor.RenderDiffHTML(before, after, highlightLines(before, lexer), highlightLines(after, lexer))
+		out = append(out, resolveFileDiff{Path: path, Rows: rows})
+	}
+	return out, nil
+}
+
 // resolvePanelData projects a resolution session into the panel template model.
 func (s *Server) resolvePanelData(ctx context.Context, sess *resolveSession) map[string]interface{} {
-	stat, patch, err := sess.diff(ctx)
+	stat, _, err := sess.diff(ctx)
+	diffs, derr := resolveSessionDiffs(ctx, sess)
+	if err == nil {
+		err = derr
+	}
 	data := map[string]interface{}{
 		"SessID":    sess.ID,
 		"Sub":       sess.Sub,
 		"TaskID":    sess.TaskID,
 		"Log":       sess.logCopy(),
 		"Stat":      stat,
-		"Patch":     patch,
-		"HasChange": strings.TrimSpace(patch) != "",
+		"Diffs":     diffs,
+		"HasChange": len(diffs) > 0,
 		"Busy":      sess.isBusy(),
 		"Published": sess.isPublished(),
 		"Error":     sess.errText(),

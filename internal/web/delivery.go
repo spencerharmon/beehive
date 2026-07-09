@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -204,6 +205,11 @@ func safeSHA(s string) bool {
 // against the beehive repo's OWN history, never a mutation. sha is validated
 // as hex and rev-parsed before use, so an invalid or unresolvable sha 404s
 // instead of ever reaching a shell-unsafe or non-existent ref.
+//
+// The diff renders through the shared editor.RenderDiff/RenderDiffHTML row
+// renderer (diff-view-colorize-consistency) — the same per-line add/del
+// coloring (and, where chroma has a lexer for the path, syntax highlighting)
+// as the editor/chat/skill diff panels, instead of a raw unified patch.
 func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -231,11 +237,16 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 	}
 	// Scoped to this submodule's PLAN.md only — never a whole-commit diff —
 	// so the page can never leak an unrelated file from elsewhere in the hive.
-	patch, err := s.git.Run(r.Context(), "show", "--format=", full, "--", planRelPath(sm))
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
+	// before/after each ignore their own error and fall back to "": a root
+	// commit (no "^" parent to resolve) or a commit that ADDED the file both
+	// leave before "" (pure add); a commit that DELETED the file leaves after
+	// "" (pure delete) — the same root/add/delete edge RenderDiffHTML already
+	// tolerates for every other caller (chatedit/skills), never a 404.
+	planPath := planRelPath(sm)
+	before, _ := s.git.Show(r.Context(), full+"^", planPath)
+	after, _ := s.git.Show(r.Context(), full, planPath)
+	lexer := lexerFor(planPath)
+	rows := editor.RenderDiffHTML(before, after, highlightLines(before, lexer), highlightLines(after, lexer))
 	shortSHA := full[:min(12, len(full))]
 	s.render(w, "commit_view.html", map[string]interface{}{
 		"Name":    sm.Name,
@@ -243,7 +254,7 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 		"Author":  f[0],
 		"Date":    f[1],
 		"Subject": f[2],
-		"Patch":   patch,
+		"Rows":    rows,
 		"Title":   pageTitle("commit", shortSHA, sm.Name),
 		"Crumbs":  commitCrumbs(sm.Name, shortSHA),
 	})

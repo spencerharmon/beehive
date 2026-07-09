@@ -11,7 +11,9 @@
       {{else}}<span class="state live">No changes yet</span><button class="merge merged" disabled>Publish → main</button>{{end}}
     </div>
     {{if .Stat}}<pre class="diffstat">{{.Stat}}</pre>{{end}}
-    <pre class="diff" id="resolve-diff" data-scroll-preserve>{{if .HasChange}}{{.Patch}}{{else}}<span class="muted">no changes made yet</span>{{end}}</pre>
+    <pre class="diff" id="resolve-diff" data-scroll-preserve>{{if .HasChange}}{{range .Diffs}}<span class="ln muted">{{.Path}}</span>
+{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
+{{end}}{{end}}{{else}}<span class="muted">no changes made yet</span>{{end}}</pre>
   </div>
 </div>
 {{/* Self-perpetuating poll: present ONLY while a turn is in flight (.Busy), this
