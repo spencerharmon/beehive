@@ -6960,9 +6960,13 @@ func TestSessionListLinksTaskDocCommit(t *testing.T) {
 		`<a href="/submodule/alpha/session/` + stem + `">t1</a>`, // shortened display name, full id in the href
 		`<span class="badge">work</span>`,
 		`<span class="badge">` + model + `</span>`,
-		`<a href="/submodule/alpha/plan#task-t1">task</a>`,
-		`<a href="/submodule/alpha/doc/bee-t1.md">doc</a>`,
-		`<a href="/submodule/alpha/commit/` + flipSHA + `">commit</a>`,
+		// session-list-link-aria-context: each repeated-text deep link carries
+		// a context-specific aria-label naming the session (.Display), so a
+		// screen-reader links-list/rotor disambiguates the otherwise identical
+		// "task"/"doc"/"commit" text down the list. Visible text unchanged.
+		`<a href="/submodule/alpha/plan#task-t1" aria-label="task for t1">task</a>`,
+		`<a href="/submodule/alpha/doc/bee-t1.md" aria-label="change doc for t1">doc</a>`,
+		`<a href="/submodule/alpha/commit/` + flipSHA + `" aria-label="commit for t1">commit</a>`,
 	} {
 		if !strings.Contains(lb, want) {
 			t.Errorf("sessions list missing %q:\n%s", want, lb)

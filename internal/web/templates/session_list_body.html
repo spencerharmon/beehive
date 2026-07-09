@@ -5,9 +5,9 @@
   {{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">idle</span>{{end}}
   {{if .Kind}}<span class="badge">{{.Kind}}</span>{{end}}
   {{if .Model}}<span class="badge">{{.Model}}</span>{{end}}
-  {{if .TaskHref}}<a href="{{.TaskHref}}">task</a>{{end}}
-  {{if .DocHref}}<a href="{{.DocHref}}">doc</a>{{end}}
-  {{if .FlipHref}}<a href="{{.FlipHref}}">commit</a>{{end}}
+  {{if .TaskHref}}<a href="{{.TaskHref}}" aria-label="task for {{.Display}}">task</a>{{end}}
+  {{if .DocHref}}<a href="{{.DocHref}}" aria-label="change doc for {{.Display}}">doc</a>{{end}}
+  {{if .FlipHref}}<a href="{{.FlipHref}}" aria-label="commit for {{.Display}}">commit</a>{{end}}
   <span class="ago">{{.Ago}} ago</span>
 </li>{{else}}<li>no sessions yet</li>{{end}}
 </ul>
