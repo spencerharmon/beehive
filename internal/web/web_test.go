@@ -1214,6 +1214,69 @@ func TestPlanViewPills(t *testing.T) {
 	}
 }
 
+// TestPlanRowDeepAnchors locks plan-row-deep-anchors: every plan row's <tr>
+// carries a stable, PREFIXED per-row anchor id derived from its task id
+// (`task-<id>`, never the bare id — a numeric-looking task id would otherwise
+// produce an id/URL fragment that is not safely selectable/linkable on its
+// own), the id cell self-links to that exact #task-<id> anchor, and the CSS
+// renders a token-driven :target highlight (reusing existing tokens, no new
+// color, no motion) so a reader landing via /submodule/<name>/plan#task-<id>
+// can locate the row after the jump. Columns/data/order are unchanged — see
+// TestPlanViewPills for the full pill/badge/claim/doc-link contract this does
+// not touch.
+func TestPlanRowDeepAnchors(t *testing.T) {
+	s, _ := setup(t)
+	pl := Plan{ROIStamp: "abc123", Items: []PlanItem{
+		{ID: "plan-row-deep-anchors", Status: StatusTODO, Desc: "add anchors"},
+		{ID: "42", Status: StatusDone, Desc: "numeric-looking id"},
+	}}
+	out := renderTmpl(t, s, "plan_items.html", map[string]interface{}{"Name": "alpha", "Plan": pl})
+
+	// Every row's <tr> carries the prefixed anchor id, and the id cell
+	// self-links to that exact anchor.
+	for _, id := range []string{"plan-row-deep-anchors", "42"} {
+		if !strings.Contains(out, `<tr id="task-`+id+`">`) {
+			t.Fatalf("row for %q missing prefixed anchor id:\n%s", id, out)
+		}
+		if !strings.Contains(out, `<a href="#task-`+id+`"><code>`+id+`</code></a>`) {
+			t.Fatalf("row for %q missing self-link to its own anchor:\n%s", id, out)
+		}
+	}
+	// The bare (unprefixed) id must never appear as the anchor itself — e.g. a
+	// numeric task id like "42" is not a safely selectable/linkable fragment on
+	// its own, which is exactly why the id is "task-"-prefixed.
+	if strings.Contains(out, `id="42"`) || strings.Contains(out, `href="#42"`) {
+		t.Fatalf("anchor was not prefixed (bare numeric id used directly):\n%s", out)
+	}
+
+	// Columns/data/order unchanged: still the 6-col header, still exactly one
+	// anchored row per item.
+	if !strings.Contains(out, "<tr><th>id</th><th>status</th><th>desc</th><th>deps</th><th>claim</th><th>change doc</th></tr>") {
+		t.Fatalf("table header changed:\n%s", out)
+	}
+	if n := strings.Count(out, `<tr id="task-`); n != 2 {
+		t.Fatalf("want exactly one anchored row per item, got %d:\n%s", n, out)
+	}
+
+	// The :target highlight: token-driven (reuses the existing --accent /
+	// --surface-2 tokens — no new color literal or custom property) and
+	// static, so unlike .active's claim pulse there is no animation to gate
+	// behind prefers-reduced-motion.
+	css := get(t, s, "/assets/style.css").Body.String()
+	idx := strings.Index(css, "tr:target td {")
+	if idx < 0 {
+		t.Fatalf("style.css missing tr:target row highlight rule:\n%s", css)
+	}
+	end := strings.Index(css[idx:], "}")
+	rule := css[idx : idx+end]
+	if !strings.Contains(rule, "var(--accent)") || !strings.Contains(rule, "var(--surface-2)") {
+		t.Fatalf("tr:target rule must reuse existing tokens:\n%s", rule)
+	}
+	if strings.Contains(rule, "#") {
+		t.Fatalf("tr:target must be token-driven, no new color literal:\n%s", rule)
+	}
+}
+
 // TestPlanChangeDocLink drives the change-doc linkage end-to-end through the
 // handler: it scans the submodule repo's Beehive stamps and links a task to the
 // change doc its implementing commit recorded when that doc exists under the

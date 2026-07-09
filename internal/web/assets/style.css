@@ -475,6 +475,22 @@ th {
 }
 tr:hover td { background: var(--surface-2); }
 
+/* Deep-link row highlight (plan-row-deep-anchors): a plan row's <tr> carries a
+ * stable id (`task-<id>`, see plan_items.html) so /submodule/<name>/plan#task-
+ * <id> can jump straight to it; the id cell self-links to that same anchor.
+ * `:target` then marks whichever row the URL fragment currently points at, so
+ * the linked row is easy to relocate after the jump/scroll — reusing the
+ * existing --accent + --surface-2 tokens (no new color token) rather than the
+ * claim --hue-active teal, which already means something else ("being worked
+ * right now", not "this is what you linked to"). Static, not pulsing: unlike
+ * .active's claim pulse this is not motion, so there is nothing to gate behind
+ * prefers-reduced-motion. Applied to the td children, like tr:hover above,
+ * since border-collapse drops a bare tr's own background/border-left. */
+tr:target td {
+  background: var(--surface-2);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
 /* Responsive table wrapper (responsive-table-overflow): style.css had exactly
  * one width breakpoint (the .editor-grid stack below) and no overflow-x, so a
  * data table (plan/branch/human/stats — some six columns wide) either forced
