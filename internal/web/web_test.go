@@ -3671,6 +3671,33 @@ func TestHumanResolvePanelDiffAddDelClasses(t *testing.T) {
 	}
 }
 
+// TestAssetsStyleDiffAddDelNoncolorMarker (diff-add-del-noncolor-marker, WCAG
+// 1.4.1 Use of Color) locks that pre.diff rows carry a non-color add/delete
+// gutter cue: .ln.add and .ln.del each get a distinct ::before glyph so an
+// added line reads without perceiving the background color alone, while the
+// pre-existing color backgrounds and del's line-through stay unchanged. One
+// shared stylesheet rule covers all five pre.diff views (editor/chat/skill/
+// commit/human-resolve panels all render the same span.ln.{{.Kind}} markup
+// tested elsewhere by TestCommitViewDiffAddDelClasses /
+// TestHumanResolvePanelDiffAddDelClasses above).
+func TestAssetsStyleDiffAddDelNoncolorMarker(t *testing.T) {
+	s, _ := setup(t)
+	css := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		"pre.diff .ln::before",
+		`pre.diff .ln.add::before { content: "+";`,
+		`pre.diff .ln.del::before { content: "-";`,
+		// The pre-existing color backgrounds/syntax highlighting must remain —
+		// this is an ADDITIVE non-color cue, never a replacement for them.
+		"pre.diff .ln.add { background: var(--diff-add-bg); }",
+		"pre.diff .ln.del { background: var(--diff-del-bg); text-decoration: line-through; }",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("style.css missing diff-add-del-noncolor-marker rule %q:\n%s", want, css)
+		}
+	}
+}
+
 // TestEditorDeleteGuardConfirmButton locks the destructive-deletion UI guard
 // (editor-safety-guards): when the pending proposal would wipe a human-owned
 // file (DeleteRisk), the panel surfaces a warning and a DISTINCT confirm control
