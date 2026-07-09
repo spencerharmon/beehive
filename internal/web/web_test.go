@@ -3359,6 +3359,68 @@ func TestBranchViewSHACopyControl(t *testing.T) {
 	}
 }
 
+// TestCommitRowDeepAnchors locks commit-row-deep-anchors: every commit row in
+// branch_view.html's per-date tables renders a stable, PREFIXED per-row anchor
+// id derived from its sha (`commit-<sha>`, mirroring plan-row-deep-anchors'
+// `task-<id>` prefix convention — see TestPlanRowDeepAnchors — even though a
+// commit sha is already unique within one branch-view page), and the sha cell
+// self-links to that exact #commit-<sha> anchor by wrapping the existing
+// <code>{{.SHA}}</code>, alongside — not replacing — commit-sha-deep-links-
+// relanding's .copy-btn (TestBranchViewSHACopyControl above locks that control
+// unmodified and still passing). No new CSS ships: the generic tr:target td
+// rule plan-row-deep-anchors already shipped in style.css applies verbatim to
+// any matching <tr> id, so /submodule/<name>/branches#commit-<sha> highlights
+// the row for free, reused rather than duplicated.
+func TestCommitRowDeepAnchors(t *testing.T) {
+	s, _ := setup(t)
+	const sha1 = "0123456789abcdef0123456789abcdef01234567"
+	const sha2 = "abcdef0123456789abcdef0123456789abcdef01"
+	out := renderTmpl(t, s, "branch_view.html", map[string]interface{}{
+		"Name": "alpha",
+		"Sections": []Section{{
+			Date: "2026-07-08",
+			Commits: []Commit{
+				{SHA: sha1, Subject: "a commit", Author: "bee"},
+				{SHA: sha2, Subject: "another commit", Author: "bee"},
+			},
+		}},
+		"HasPrev": false, "HasNext": false,
+	})
+
+	// Every row's <tr> carries the prefixed anchor id, and the sha cell
+	// self-links to that exact anchor by wrapping the existing <code>.
+	for _, sha := range []string{sha1, sha2} {
+		if !strings.Contains(out, `<tr id="commit-`+sha+`">`) {
+			t.Fatalf("row for %q missing prefixed anchor id:\n%s", sha, out)
+		}
+		if !strings.Contains(out, `<a href="#commit-`+sha+`"><code>`+sha+`</code></a>`) {
+			t.Fatalf("row for %q missing self-link to its own anchor:\n%s", sha, out)
+		}
+	}
+	if n := strings.Count(out, `<tr id="commit-`); n != 2 {
+		t.Fatalf("want exactly one anchored row per commit, got %d:\n%s", n, out)
+	}
+
+	// The existing copy-to-clipboard control is untouched: still present
+	// alongside the new self-link, not replaced by it.
+	for _, want := range []string{
+		`class="copy-btn"`,
+		`data-copy="` + sha1 + `"`,
+		`aria-label="Copy commit ` + sha1 + ` to clipboard"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("commit row copy control missing %q:\n%s", want, out)
+		}
+	}
+
+	// No new CSS: the tr:target td rule appears exactly once in style.css —
+	// plan-row-deep-anchors' generic rule, reused verbatim, not duplicated.
+	css := get(t, s, "/assets/style.css").Body.String()
+	if n := strings.Count(css, "tr:target td {"); n != 1 {
+		t.Fatalf("want tr:target td rule to appear exactly once (reused, not duplicated), got %d:\n%s", n, css)
+	}
+}
+
 // TestCommitViewCopyControl locks the same copy affordance on the single-commit
 // page heading: the sha stays plain, selectable <code> text and carries the
 // progressively-enhanced .copy-btn (data-copy + accessible label). This IS the
