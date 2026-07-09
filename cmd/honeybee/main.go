@@ -97,6 +97,18 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "honeybee: WARNING preflight reset a dirty %s checkout at %s to HEAD before starting; a dirty live checkout is not normal and signals a honeybee/beehived protocol or process bug (or a rogue model writing outside its worktree)\n", mode, primaryRoot)
 	}
 
+	// Deterministic git maintenance, before any tokens are spent. Stock git auto-gc is
+	// disabled on the hive + every declared submodule, and a single interval-gated,
+	// lock-serialized `git gc` is run by the runner itself — the durable fix for the
+	// 2026-07-08 storm where concurrent unsupervised auto-repacks across passes +
+	// beehived corrupted the shared object store. Coordination is uncommitted local
+	// git config (beehive.gc.*), so concurrent honeybees converge on one gc with no
+	// committed lock and no external timer/process. Best-effort: never blocks a pass.
+	maintID := fmt.Sprintf("honeybee-pid-%d", os.Getpid())
+	if merr := primary.MaintainRepos(ctx, maintID, git.GCConfig{}); merr != nil {
+		fmt.Fprintf(os.Stderr, "honeybee: WARNING deterministic git maintenance hit a non-fatal error: %v\n", merr)
+	}
+
 	base := "main"
 	if remote != "" {
 		if err := primary.Fetch(ctx, remote, "main"); err != nil {
