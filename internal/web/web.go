@@ -466,11 +466,11 @@ func (s *Server) submodule(name string) (repo.Submodule, error) {
 // Pending/Human are task counts from the unified parser (internal/plan) so they
 // match what the runner/selector see; Env is the submodule's active blue/green
 // deploy env from the typed artifacts model ("" when it has no
-// INFRASTRUCTURE.md); Working is true when a task is actively claimed (a fresh
-// session+heartbeat), driving the card's live overlay; Bees is HOW MANY tasks
-// carry such a fresh claim — the count of honeybees currently working this
-// submodule (0 when idle, and Working is exactly Bees > 0), surfaced on the card
-// with the 🐝 badge.
+// INFRASTRUCTURE.md); Bees is the canonical active-honeybee-count-unify count
+// (Plan.Bees — see active.go's activeHoneybees), the SAME number the sessions
+// page's active list and /stats' "active now" figure show, including a
+// taskless bootstrap/reconcile pass that carries no PLAN claim at all; Working
+// is exactly Bees > 0, driving the card's live overlay and the 🐝 badge.
 type subView struct {
 	Name    string
 	State   string
@@ -540,16 +540,17 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 // (active/dormant/bootstrap), the ROI Stamp, the Pending/Human task counts from
 // the unified parser (internal/plan via planView — the same parse the
 // runner/selector use), the active blue/green Env from the submodule's own
-// INFRASTRUCTURE.md via the typed artifacts model, and Working (a task carrying a
-// fresh session+heartbeat claim). now/ttl are passed in so the claim-freshness
-// derivation is deterministically testable; the handler supplies time.Now() and
-// the resolved TTL.
+// INFRASTRUCTURE.md via the typed artifacts model, and Bees/Working from the
+// canonical active-honeybee-count-unify count (Plan.Bees). now/ttl are passed
+// in so the claim-freshness derivation is deterministically testable; the
+// handler supplies time.Now() and the resolved TTL.
 //
 // The PLAN.md read+parse is memoized per repo HEAD via planView, but the swarm
 // status stays current: the counts and Working flag are re-projected against
 // now/ttl every call (so a claim still goes stale on TTL expiry with no new
 // commit), and any file change advances HEAD and drops the cache. ctx carries
-// the request's cancellation/deadline into the HEAD lookup.
+// the request's cancellation/deadline into the HEAD lookup and the live-session
+// git checks activeHoneybees makes.
 func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration) ([]subView, error) {
 	subs, err := s.repo.Submodules()
 	if err != nil {
@@ -575,23 +576,22 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 		// task not DONE, Human = NEEDS-HUMAN only. A NEEDS-HUMAN task is BOTH
 		// pending and human — the two counters legitimately overlap, but each task
 		// increments each counter at most once (never double-counted within a
-		// counter). Working = any task with a fresh claim (session+heartbeat within
-		// the TTL); Bees = HOW MANY such fresh claims (the honeybee count on the
-		// card), so Working is exactly Bees > 0. A parse error leaves this
-		// submodule's stamp/counts empty rather than failing the whole dashboard
-		// (mirrors the pre-existing per-submodule resilience).
-		if p, err := s.planView(head, sm.PlanPath(), now, ttl); err == nil {
+		// counter). Bees = p.Bees, the canonical active-honeybee-count-unify
+		// figure (claimed tasks UNION live taskless bootstrap/reconcile passes,
+		// deduped — see active.go), so Working (Bees > 0) can never again disagree
+		// with what the sessions page or /stats show for this submodule. A parse
+		// error leaves this submodule's stamp/counts empty rather than failing the
+		// whole dashboard (mirrors the pre-existing per-submodule resilience).
+		if p, err := s.planView(ctx, head, sm.PlanPath(), now, ttl); err == nil {
 			v.Stamp = p.ROIStamp
+			v.Bees = p.Bees
+			v.Working = p.Bees > 0
 			for _, it := range p.Items {
 				if it.Status != StatusDone {
 					v.Pending++
 				}
 				if it.Status == StatusHuman {
 					v.Human++
-				}
-				if it.Active {
-					v.Working = true
-					v.Bees++
 				}
 			}
 		}
@@ -883,7 +883,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	p, err := s.planView(s.headSHA(r.Context()), sm.PlanPath(), time.Now(), s.ttl())
+	p, err := s.planView(r.Context(), s.headSHA(r.Context()), sm.PlanPath(), time.Now(), s.ttl())
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -1285,7 +1285,7 @@ func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 	var rows []row
 	head := s.headSHA(r.Context())
 	for _, sm := range subs {
-		p, _ := s.planView(head, sm.PlanPath(), time.Now(), s.ttl())
+		p, _ := s.planView(r.Context(), head, sm.PlanPath(), time.Now(), s.ttl())
 		for _, it := range p.Items {
 			if it.Status == StatusHuman {
 				rows = append(rows, row{Sub: sm.Name, Item: it})

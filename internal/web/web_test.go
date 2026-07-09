@@ -654,7 +654,7 @@ func TestPlanViewMissingFile(t *testing.T) {
 	s, root := setup(t)
 	commitAll(t, root, "init")
 	head := s.headSHA(context.Background())
-	p, err := s.planView(head, filepath.Join(root, "submodules", "alpha", "nope.md"), time.Now(), time.Hour)
+	p, err := s.planView(context.Background(), head, filepath.Join(root, "submodules", "alpha", "nope.md"), time.Now(), time.Hour)
 	if err != nil {
 		t.Fatalf("missing file should be empty plan, got err %v", err)
 	}
@@ -680,7 +680,7 @@ func TestPlanViewCacheHitAndCommitInvalidation(t *testing.T) {
 		t.Fatal("no HEAD after seed commit")
 	}
 
-	p1, err := s.planView(head1, path, now, ttl)
+	p1, err := s.planView(context.Background(), head1, path, now, ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +688,7 @@ func TestPlanViewCacheHitAndCommitInvalidation(t *testing.T) {
 		t.Fatalf("first read misses = %d, want 1", got)
 	}
 	// Second read at the same HEAD is served from cache: no additional parse.
-	p2, err := s.planView(head1, path, now, ttl)
+	p2, err := s.planView(context.Background(), head1, path, now, ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -704,7 +704,7 @@ func TestPlanViewCacheHitAndCommitInvalidation(t *testing.T) {
 	if head2 == head1 {
 		t.Fatalf("HEAD did not advance after commit (%q)", head2)
 	}
-	if _, err := s.planView(head2, path, now, ttl); err != nil {
+	if _, err := s.planView(context.Background(), head2, path, now, ttl); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.cache.Misses(); got != 2 {
@@ -726,7 +726,7 @@ func TestPlanViewMatchesParsePlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.planView(s.headSHA(context.Background()), path, now, ttl)
+	got, err := s.planView(context.Background(), s.headSHA(context.Background()), path, now, ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,7 +750,7 @@ func TestPlanViewReprojectsClaimWithoutCommit(t *testing.T) {
 
 	// t1's heartbeat is 2026-06-30T11:00:00Z; 30m later within a 60m ttl => active.
 	fresh := time.Date(2026, 6, 30, 11, 30, 0, 0, time.UTC)
-	p, err := s.planView(head, path, fresh, ttl)
+	p, err := s.planView(context.Background(), head, path, fresh, ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -763,7 +763,7 @@ func TestPlanViewReprojectsClaimWithoutCommit(t *testing.T) {
 	// Same HEAD (no commit), now well past the ttl: the parse is served from cache
 	// yet the claim must read stale / not-active.
 	expired := fresh.Add(48 * time.Hour)
-	p2, err := s.planView(head, path, expired, ttl)
+	p2, err := s.planView(context.Background(), head, path, expired, ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2820,6 +2820,133 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	}
 	if b := finalPage.Body.String(); !strings.Contains(b, `class="badge">ended`) || strings.Contains(b, `>running</span>`) || strings.Contains(b, `>live</span>`) {
 		t.Errorf("final session page should show ended badge only, got: %q", b)
+	}
+}
+
+// TestActiveHoneybeesCanonicalSet is the core of active-honeybee-count-unify:
+// a fixture with three honeybees — (a) a fresh PLAN-task claim (with its own
+// live session), (b) a STALE PLAN claim (heartbeat past TTL, plus an old
+// finished session file for the same task), and (c) a live reconcile pass
+// with NO PLAN task at all — must yield the canonical active set {a, c}: (b)
+// is dropped (stale, and its session is not live), and (c) is COUNTED even
+// though it has no PLAN.md row (today's claim-only dashboard logic misses
+// exactly this — the bug the ROI reported: the sessions page showed the
+// reconcile pass live while the dashboard did not). The test then asserts the
+// dashboard counter (subViews), the sessions page's active list
+// (sessionInfos), and the plan view (planView) all agree with that same set —
+// so all three, plus /stats (computeStats, exercised separately in
+// stats_test.go via the same Plan.Bees), can never again disagree.
+func TestActiveHoneybeesCanonicalSet(t *testing.T) {
+	s, root := setup(t)
+	ctx := context.Background()
+	gitRun := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	// A base commit so the live sessions have real stream branches to point at.
+	os.WriteFile(filepath.Join(root, "seed"), []byte("x"), 0o644)
+	gitRun("add", "-A")
+	gitRun("commit", "-q", "-m", "seed")
+	gitRun("branch", "stream-a-live")         // (a)'s live stream branch
+	gitRun("branch", "stream-reconcile-live") // (c)'s live stream branch — no PLAN task names it
+
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	ttl := time.Hour
+	fresh := "2026-06-30T11:55:00Z" // 5m before now: within a 1h TTL -> active
+	stale := "2026-06-30T08:00:00Z" // 4h before now: past a 1h TTL -> stale
+
+	sm := filepath.Join(root, "submodules", "alpha")
+	planPath := filepath.Join(sm, repo.PlanFile)
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## a [TODO] <!-- attempts=0 deps= session=bee-a heartbeat="+fresh+" -->\nworking a\n\n"+
+			"## b [TODO] <!-- attempts=0 deps= session=bee-b heartbeat="+stale+" -->\nworking b\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sessDir := filepath.Join(sm, "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(sessDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// (a): claimed AND its own live session (the normal, expected pairing).
+	write("bee-a-1750000000-100.md", repo.SessionStub("stream-a-live"))
+	// (b): stale claim, plus an OLD FINISHED (non-stub) session for the same
+	// task — proves a stray finished file never resurrects a stale claim.
+	write("bee-b-1750000001-101.md", "# session bee-b\n\nold finished transcript.\n")
+	// (c): a live reconcile pass — claims NO PLAN task at all.
+	write("bee-reconcile-1750000002-102.md", repo.SessionStub("stream-reconcile-live"))
+
+	parsed, err := readParsePlan(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := s.activeHoneybees(ctx, sessDir, parsed.Tasks, now, ttl)
+	if _, ok := active["a"]; !ok {
+		t.Errorf("active set missing %q (fresh PLAN claim + live session)", "a")
+	}
+	if _, ok := active["b"]; ok {
+		t.Errorf("active set wrongly contains %q (stale claim, no live session)", "b")
+	}
+	if _, ok := active["reconcile"]; !ok {
+		t.Errorf("active set missing %q (live taskless pass) — the exact case a claim-only tally misses", "reconcile")
+	}
+	if len(active) != 2 {
+		t.Fatalf("active set = %+v, want exactly 2 entries ({a, reconcile})", active)
+	}
+
+	// The dashboard counter (subViews/Plan.Bees) must equal the canonical set.
+	views, err := s.subViews(ctx, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alpha subView
+	for _, v := range views {
+		if v.Name == "alpha" {
+			alpha = v
+		}
+	}
+	if alpha.Bees != len(active) {
+		t.Errorf("dashboard Bees = %d, want %d (== canonical set size)", alpha.Bees, len(active))
+	}
+	if !alpha.Working {
+		t.Errorf("dashboard Working = false, want true (Bees > 0)")
+	}
+
+	// The sessions page's active list (sessionInfos) must equal the canonical set.
+	infos := s.sessionInfos(ctx, sessDir, now)
+	liveCount := 0
+	for _, in := range infos {
+		if in.Live {
+			liveCount++
+		}
+	}
+	if liveCount != len(active) {
+		t.Errorf("sessions active list = %d, want %d (== canonical set size)", liveCount, len(active))
+	}
+
+	// The plan view (planView/PlanItem.Active) must agree per-task, and its
+	// Bees figure must equal the canonical set too.
+	p, err := s.planView(ctx, s.headSHA(ctx), planPath, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Bees != len(active) {
+		t.Errorf("plan view Bees = %d, want %d (== canonical set size)", p.Bees, len(active))
+	}
+	if a := itemByID(p, "a"); !a.Active {
+		t.Errorf("plan view: task a should be Active (fresh claim), got %+v", a)
+	}
+	if b := itemByID(p, "b"); b.Active || !b.Stale {
+		t.Errorf("plan view: task b should be !Active and Stale, got %+v", b)
 	}
 }
 

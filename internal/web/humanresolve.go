@@ -44,7 +44,7 @@ func (s *Server) humanTask(ctx context.Context, sub, id string) (repo.Submodule,
 	if err != nil {
 		return repo.Submodule{}, PlanItem{}, false
 	}
-	p, err := s.planView(s.headSHA(ctx), sm.PlanPath(), time.Now(), s.ttl())
+	p, err := s.planView(ctx, s.headSHA(ctx), sm.PlanPath(), time.Now(), s.ttl())
 	if err != nil {
 		return repo.Submodule{}, PlanItem{}, false
 	}

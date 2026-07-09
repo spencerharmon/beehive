@@ -1,8 +1,10 @@
 package web
 
 import (
+	"context"
 	"html/template"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -33,8 +35,11 @@ type Dep struct {
 
 // PlanItem is one task row projected from a plan.Task for the templates. The
 // view needs Desc/Doc, which plan.Task does not carry, so they are derived from
-// the task body (first non-empty line / a "Doc:" convention line). Active/Stale
-// are the unified claim state (session + heartbeat freshness vs the TTL).
+// the task body (first non-empty line / a "Doc:" convention line). Stale is the
+// claim's own past-TTL state (session + heartbeat vs the TTL); Active is the
+// CANONICAL active-honeybee-count-unify determination — membership in the
+// activeHoneybees set (see active.go), not merely this task's own claim — so a
+// task whose live session outruns a lagging heartbeat still reads Active.
 // DepStates and DocHref are view-only enrichments: DepStates marks each dep
 // satisfied/pending against this plan, and DocHref links the change doc the
 // implementing commit stamped (set by the handler, which has the repo + docs/).
@@ -51,7 +56,7 @@ type PlanItem struct {
 	Weight      int
 	Session     string    // claim owner; "" when unclaimed
 	Heartbeat   time.Time // last claim stamp; zero when unclaimed
-	Active      bool      // claim fresh within the TTL (the unified "in progress")
+	Active      bool      // canonical active-honeybee set membership (the unified "in progress")
 	Stale       bool      // claim past the TTL (GC-reclaimable; owner presumed dead)
 	Doc         string    // linked change-doc path from a body "Doc:" line, "" if none
 	DocHref     string    // link to view the change doc (from the commit stamp or the design Doc), "" if unresolved
@@ -132,47 +137,66 @@ func (it PlanItem) Claim() string {
 type Plan struct {
 	ROIStamp string
 	Items    []PlanItem
+	// Bees is the canonical active-honeybee-count-unify count for this
+	// submodule: len(activeHoneybees(...)), INCLUDING a taskless bootstrap/
+	// reconcile pass that carries no PLAN task at all (and so has no row in
+	// Items to set .Active on). This is the ONE number the dashboard 🐝
+	// counter and /stats' "active now" figure both read — never re-derived by
+	// summing Items[i].Active, which would silently drop a taskless pass.
+	Bees int
 }
 
 // parsePlan reads PLAN.md and projects it for the views via internal/plan.Parse
 // (the single PLAN.md parser — the H2 header format `## <id> [STATUS] <!--
 // attempts=N deps=a,b weight=W session=<id> heartbeat=<RFC3339> -->`). A missing
-// file is an empty plan. Each task's active/stale claim state is derived against
-// now and ttl. now/ttl are passed in so the projection is deterministically
-// testable; handlers supply time.Now() and the resolved TTL.
+// file is an empty plan. Each task's stale claim state is derived against now
+// and ttl; Active is claimActiveSet's claim-only projection of the canonical
+// active-honeybee set (see active.go) — this uncached baseline has no git/
+// sessions access, so unlike planView it cannot see a taskless reconcile/
+// bootstrap pass's live session. now/ttl are passed in so the projection is
+// deterministically testable; handlers supply time.Now() and the resolved TTL.
 //
 // This is the UNCACHED baseline (read + parse + project every call); the
-// server's planView memoizes the read+parse half through viewCache. The two must
-// stay equivalent — the cache test asserts planView == parsePlan.
+// server's planView memoizes the read+parse half through viewCache. The two
+// stay equivalent whenever a submodule's sessions/ carries no LIVE taskless
+// pass (the common case, and every existing cache-equivalence test's fixture) —
+// the cache test asserts planView == parsePlan under exactly that condition.
 func parsePlan(path string, now time.Time, ttl time.Duration) (Plan, error) {
 	parsed, err := readParsePlan(path)
 	if err != nil {
 		return Plan{}, err
 	}
-	return projectPlan(parsed, now, ttl), nil
+	return projectPlan(parsed, claimActiveSet(parsed.Tasks, now, ttl), now, ttl), nil
 }
 
 // planView is the cached equivalent of parsePlan: it memoizes the expensive,
 // time-independent read+parse (readParsePlan) through the HEAD-keyed viewCache
 // and recomputes the cheap, time-dependent projection (projectPlan) fresh every
-// call. For any single HEAD generation planView(head, path, now, ttl) equals
-// parsePlan(path, now, ttl) — the cache changes only WHEN the read+parse runs,
-// never WHAT the view contains (the cache test asserts this equivalence, and
-// that a claim still goes stale on TTL expiry with no intervening commit because
-// the projection is never cached).
+// call — including the canonical active-honeybee set (activeHoneybees), which
+// additionally scans sessionsDir + git and so can never be cached (a session's
+// live stream branch can appear/disappear with no beehive-repo commit at all).
+// For any single HEAD generation planView(ctx, head, path, now, ttl) equals
+// parsePlan(path, now, ttl) whenever the submodule's sessions/ has no live
+// taskless pass (see parsePlan's doc) — the cache test asserts this
+// equivalence, and that a claim still goes stale on TTL expiry with no
+// intervening commit because the projection is never cached.
 //
 // head is the beehive repo HEAD short SHA, resolved once per request by the
 // caller (Server.headSHA) and shared across every submodule read; the cache key
 // is the PLAN.md path (unique per submodule), so a commit to any tracked file
-// (which advances head) re-parses on next access.
-func (s *Server) planView(head, path string, now time.Time, ttl time.Duration) (Plan, error) {
+// (which advances head) re-parses on next access. sessionsDir (PLAN.md's sibling
+// sessions/ dir) is derived from path rather than threading a repo.Submodule
+// through, so every existing bare-path caller keeps working unchanged.
+func (s *Server) planView(ctx context.Context, head, path string, now time.Time, ttl time.Duration) (Plan, error) {
 	parsed, err := cachedView(head, s.cache, path, func() (*plan.Plan, error) {
 		return readParsePlan(path)
 	})
 	if err != nil {
 		return Plan{}, err
 	}
-	return projectPlan(parsed, now, ttl), nil
+	sessionsDir := filepath.Join(filepath.Dir(path), "sessions")
+	active := s.activeHoneybees(ctx, sessionsDir, parsed.Tasks, now, ttl)
+	return projectPlan(parsed, active, now, ttl), nil
 }
 
 // readParsePlan reads a PLAN.md and returns the raw internal/plan model. This is
@@ -192,18 +216,24 @@ func readParsePlan(path string) (*plan.Plan, error) {
 	return plan.Parse(string(b))
 }
 
-// projectPlan derives the view Plan from a raw parsed plan, computing each task's
-// active/stale claim state against now/ttl. This is the cheap, TIME-DEPENDENT
-// half — it is recomputed every request (never cached) so a claim goes stale on
-// TTL expiry even when no new commit advanced HEAD.
-func projectPlan(parsed *plan.Plan, now time.Time, ttl time.Duration) Plan {
+// projectPlan derives the view Plan from a raw parsed plan and the canonical
+// active-honeybee set (active, from claimActiveSet or the fuller
+// activeHoneybees — see their callers parsePlan/planView), computing each
+// task's Active (set membership) and Stale (its own claim vs ttl) state, plus
+// the submodule-wide Bees count — active-honeybee-count-unify's canonical
+// figure, len(active), which counts a taskless bootstrap/reconcile pass no
+// task row represents. This is the cheap, TIME-DEPENDENT half — it is
+// recomputed every request (never cached) so a claim goes stale on TTL expiry
+// even when no new commit advanced HEAD.
+func projectPlan(parsed *plan.Plan, active map[string]ActiveHoneybee, now time.Time, ttl time.Duration) Plan {
 	var p Plan
 	if parsed == nil {
 		return p
 	}
 	p.ROIStamp = parsed.ROI
+	p.Bees = len(active)
 	for _, t := range parsed.Tasks {
-		p.Items = append(p.Items, projectTask(t, now, ttl))
+		p.Items = append(p.Items, projectTask(t, active, now, ttl))
 	}
 	resolveDeps(p.Items)
 	return p
@@ -230,9 +260,14 @@ func resolveDeps(items []PlanItem) {
 
 // projectTask maps a plan.Task to the view's PlanItem, deriving Desc (first
 // non-empty body line), Body (the full body verbatim, for the expand-in-place
-// detail view), and Doc (a "Doc:" convention line in the body), and the
-// active/stale claim flags against now/ttl.
-func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
+// detail view), and Doc (a "Doc:" convention line in the body). Active is
+// membership of t.ID in the canonical active-honeybee set (active-honeybee-
+// count-unify), NOT a bare t.Active(now,ttl) call — so a task whose live
+// session outruns a lagging/expired heartbeat still reads Active; Stale
+// remains this task's OWN claim-past-ttl state (GC-reclaimability is a
+// distinct, claim-only notion, independent of the union).
+func projectTask(t *plan.Task, active map[string]ActiveHoneybee, now time.Time, ttl time.Duration) PlanItem {
+	_, isActive := active[t.ID]
 	it := PlanItem{
 		ID:          t.ID,
 		Status:      string(t.Status),
@@ -240,7 +275,7 @@ func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
 		Weight:      t.Weight,
 		Session:     t.Session,
 		Heartbeat:   t.Heartbeat,
-		Active:      t.Active(now, ttl),
+		Active:      isActive,
 		Stale:       t.Stale(now, ttl),
 		HumanReason: t.HumanReason(),
 	}

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/git"
 )
@@ -20,7 +21,12 @@ import (
 //
 //	DeliveredTasks (✅) = tasks at PLAN [DONE] — a task can take more than one
 //	                     merge, so we count the task, not merges.
-//	Honeybees      (🐝) = session transcript files (one per honeybee pass).
+//	Honeybees      (🐝) = session transcript files (one per honeybee pass) —
+//	                     an ALL-TIME historical tally, never "currently active".
+//	Active              = active-honeybee-count-unify's canonical CURRENTLY-
+//	                     working count (Plan.Bees), the SAME figure the
+//	                     dashboard 🐝 badge and the sessions page's active list
+//	                     show for this submodule right now.
 //	Stranded            = tasks with a stamped bee-<task> branch ahead of main that
 //	                     never merged (finished work whose merge didn't land — the
 //	                     wedge indicator; not lost, GC never drops an unmerged branch).
@@ -36,6 +42,7 @@ type subStat struct {
 	Name               string
 	DeliveredTasks     int
 	Honeybees          int
+	Active             int
 	Stranded           int
 	DeliveredPerBeePct float64
 	Models             []modelStat
@@ -86,6 +93,8 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 	// so a multi-submodule /stats render pays a single `rev-parse`, not one per
 	// submodule (mirrors headSHA's own doc comment / the planView cache key).
 	head := s.headSHA(ctx)
+	now := time.Now()
+	ttl := s.ttl()
 	for _, sm := range sms {
 		st := subStat{Name: sm.Name}
 		doneIDs := doneTaskIDs(sm)
@@ -98,6 +107,15 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 		// flipped it (half a) and its submodule code/doc (half b) — see
 		// delivery.go. Best-effort/read-only; never fails the page.
 		st.Deliveries = s.buildDeliveries(ctx, head, sm, doneIDs)
+		// active-honeybee-count-unify: the SAME canonical count (Plan.Bees) the
+		// dashboard 🐝 badge and the sessions page's active list show, so /stats
+		// never shows a third, independently-derived "active" number. Reuses the
+		// HEAD-keyed planView cache (shared with the dashboard), so rendering
+		// both pages around the same commit costs at most one parse. Best-effort:
+		// a parse error (e.g. a not-yet-bootstrapped submodule) leaves Active 0.
+		if p, perr := s.planView(ctx, head, sm.PlanPath(), now, ttl); perr == nil {
+			st.Active = p.Bees
+		}
 		// Per-model tallies for this submodule, plus the model of each task's
 		// most-recent session (epoch then pid) so a DONE task's delivery is
 		// attributed to the model that last drove it.
@@ -155,6 +173,7 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 		subs = append(subs, st)
 		total.DeliveredTasks += st.DeliveredTasks
 		total.Honeybees += st.Honeybees
+		total.Active += st.Active
 		total.Stranded += st.Stranded
 	}
 	total.Models = buildModelStats(totBees, totDelivered)

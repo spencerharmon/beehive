@@ -75,21 +75,19 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// sessionLive reports whether a session page should show the running badge. Only
-// STUB files whose stream branch still exists are live; final transcripts and
-// orphaned stubs whose branch is gone are ended.
+// sessionLive reports whether a session page should show the running badge.
+// Delegates entirely to sessionFileLive (active.go), the ONE stream-branch-
+// liveness check every consumer shares: only STUB files whose stream branch
+// still exists are live; final transcripts and orphaned stubs whose branch is
+// gone are ended.
 func (s *Server) sessionLive(ctx context.Context, dir, id string) bool {
 	raw, err := os.ReadFile(filepath.Join(dir, id+".md"))
 	if err != nil {
 		return false
 	}
-	streamBranch, isStub := repo.ParseSessionStub(string(raw))
-	if !isStub {
-		return false
-	}
 	rem, _ := s.git.Remote(ctx)
-	_, ok := s.branchTipTime(ctx, streamBranch, rem)
-	return ok
+	_, _, live := s.sessionFileLive(ctx, string(raw), rem)
+	return live
 }
 
 // sessionBody returns just the transcript text (the htmx-poll pane). It shares
@@ -284,7 +282,11 @@ func (s *Server) readSessionBranch(ctx context.Context, branch, rel string) (str
 // sessionInfos lists recorded sessions from the committed sessions dir. An entry
 // whose file is a STUB is a running session: its freshness/liveness come from the
 // streaming branch's tip commit time, not the stub's (fixed) mtime. A non-stub
-// entry is a finished session, dated by its file mtime.
+// entry is a finished session, dated by its file mtime. Per-file liveness is
+// sessionFileLive (active.go) — the SAME check activeHoneybees uses when it
+// unions a taskless (bootstrap/reconcile) live session into the canonical
+// active-honeybee set, so this list's count of Live entries and that set's size
+// can never diverge (active-honeybee-count-unify).
 func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []sessionInfo {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -304,18 +306,12 @@ func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []
 		mod := fi.ModTime()
 		live := false
 		if raw, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
-			if branch, isStub := repo.ParseSessionStub(string(raw)); isStub {
-				// A stub streams to an isolated branch that the honeybee deletes on exit
-				// (deferred, even on error/orphaned publish). So branch existence tracks
-				// the live process directly: live iff the branch still exists. Do NOT gate
-				// on tip recency — a running session can go many seconds (a long quiet
-				// turn) without writing transcript, and must not flip to idle meanwhile.
-				if t, ok := s.branchTipTime(ctx, branch, rem); ok {
-					mod = t
-					live = true
-				} else {
-					live = false
-				}
+			// Do NOT gate on tip recency — a running session can go many seconds (a
+			// long quiet turn) without writing transcript, and must not flip to idle
+			// meanwhile; sessionFileLive tracks the live process by branch EXISTENCE.
+			if _, tip, ok := s.sessionFileLive(ctx, string(raw), rem); ok {
+				mod = tip
+				live = true
 			}
 		}
 		out = append(out, sessionInfo{
