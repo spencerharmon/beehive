@@ -1212,10 +1212,26 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if hasTask(sel) {
 			predHit = r.predicateWatch(turnCtx, cancelTurn, sel, res.Branch)
 		}
+		// Mid-turn heartbeat keepalive (duplicate-dispatch-selection-guard,
+		// session-audit-015): the heartbeat just above (and this loop's own
+		// top-of-turn heartbeat, before sess.Prompt started) only refreshes ONCE
+		// per turn, so a turn that legitimately runs long — TurnTimeout defaults
+		// to 3x the default TTL — crosses the TTL staleness line mid-turn and a
+		// peer's Candidates reads this claim as dead. Re-stamp it on a
+		// background ticker for the duration of just this turn so it never
+		// lapses; stopKeepalive blocks until the goroutine has fully exited
+		// before we touch PLAN.md/the claim again below.
+		stopKeepalive := r.heartbeatKeepalive(turnCtx, cl, sel)
 		_, perr := sess.Prompt(turnCtx, prompt)
 		timedOut := r.TurnTimeout > 0 && turnCtx.Err() == context.DeadlineExceeded
 		idleStalled := errors.Is(perr, ErrTurnIdle)
+		// Cancel turnCtx BEFORE waiting on stopKeepalive: the keepalive goroutine
+		// only exits on turnCtx.Done() (or its own tick), so canceling first is
+		// what lets stopKeepalive's wait return promptly instead of blocking
+		// until the next ~TTL/3 tick (or deadlocking outright on a turn that
+		// finished well before any tick was ever due).
 		cancelTurn()
+		stopKeepalive()
 		// The watchdog's cancel surfaces here as a plain ctx-cancellation error, not
 		// ErrTurnIdle/DeadlineExceeded, so it falls through neither existing branch
 		// above. Recognize it explicitly and treat it as an ordinary, successful
@@ -1647,6 +1663,59 @@ func (r *Runner) predicateWatch(turnCtx context.Context, cancel context.CancelFu
 		}
 	}()
 	return hit
+}
+
+// heartbeatKeepalive re-stamps the active claim on a background ticker
+// (~TTL/3) for the duration of exactly one turn, closing the mid-turn
+// liveness gap the per-turn heartbeat leaves open (duplicate-dispatch-
+// selection-guard, session-audit-015): the loop's own heartbeat only refreshes
+// ONCE, at the top of a turn, before sess.Prompt runs — so a turn that
+// legitimately runs long (TurnTimeout defaults to 3x the default TTL) crosses
+// the TTL staleness line mid-turn, is read as dead by a peer's Candidates, and
+// gets duplicate-dispatched despite being fully alive. Reuses the exact same
+// claim.Heartbeat path a normal turn boundary uses, so a keepalive tick is
+// indistinguishable on main from an ordinary heartbeat commit.
+//
+// Scoped to task-bearing kinds (hasTask) and disabled when TTL<=0 (a
+// degenerate/test config with nothing to keep alive). Guarded entirely by
+// turnCtx: the ticker goroutine exits the instant the turn ends — completion,
+// cancellation, or timeout alike — never outliving the turn it was started
+// for. A tick failure (a lock conflict with the agent's OWN concurrent tool
+// calls committing PLAN.md/docs in this exact worktree, an ErrResolved because
+// the agent already flipped the status this same turn, a transient publish
+// hiccup) is swallowed and simply retried next tick — never fatal, never
+// surfaced as a run error, since a missed tick just leaves the NEXT tick (or
+// the following turn's own heartbeat) to refresh it.
+//
+// Returns a stop func the caller MUST invoke once the turn ends, before
+// touching PLAN.md/the claim again: it blocks until the background goroutine
+// has fully exited, so no keepalive tick can still be in flight racing the
+// caller's own next read/write of the same files.
+func (r *Runner) heartbeatKeepalive(turnCtx context.Context, cl *claim.Claimer, sel *selectt.Selection) func() {
+	if !hasTask(sel) || r.TTL <= 0 {
+		return func() {}
+	}
+	interval := r.TTL / 3
+	if interval <= 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-turnCtx.Done():
+				return
+			case <-t.C:
+			}
+			if err := cl.Heartbeat(turnCtx, sel.Task.ID, sel.Task.Status, r.now()); err != nil {
+				r.logConcise("[honeybee] keepalive heartbeat tick failed (non-fatal, retrying): %v\n", err)
+			}
+		}
+	}()
+	return func() { <-done }
 }
 
 // complete is the deterministic per-turn completion check.

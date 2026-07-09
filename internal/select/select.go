@@ -57,11 +57,50 @@ type Selector struct {
 	Git  *git.Repo // beehive repo root, for ROI commit lookup
 	Rand *rand.Rand
 	TTL  time.Duration
+	// TurnTimeout, when set, is the SAME per-turn ceiling swarm.Runner bounds a
+	// single agent turn with. Selection uses it (via staleTTL) to decouple the
+	// Candidates liveness threshold from the raw claim TTL — see staleTTL's own
+	// doc. Zero (the default; every pre-existing caller/test) degrades to the
+	// previous TTL-only behavior, so this is purely additive.
+	TurnTimeout time.Duration
 	// Debug, when non-nil, receives best-effort diagnostics (currently only a
 	// failed pre-selection refresh). Nil in production/tests keeps selection
 	// silent; the refresh miss degrades to evaluating the local tree, so nothing
 	// is lost by not logging it.
 	Debug io.Writer
+}
+
+// staleMargin is added atop TurnTimeout when deriving the selection staleness
+// threshold (see staleTTL) — headroom so a turn that finishes right at its
+// ceiling still has its heartbeat observed as fresh before the threshold line,
+// never cutting it exactly at the wire.
+const staleMargin = 5 * time.Minute
+
+// staleTTL returns the liveness window Candidates uses to decide whether a
+// claimed task is still actively held by a live peer (duplicate-dispatch-
+// selection-guard, session-audit-015). Selection previously reused the raw
+// claim TTL directly for this, which is wrong whenever a single turn can
+// legitimately run longer than TTL — TurnTimeout defaults to 3x the default
+// TTL (180min vs 60min) — so a pass legitimately deep into one long turn
+// crosses the TTL staleness line mid-turn, reads Active()==false to a peer's
+// Candidates, and gets duplicate-dispatched while fully alive. Decoupling the
+// threshold to max(TTL, TurnTimeout+staleMargin) keeps a genuinely dead claim
+// (no heartbeat for the WHOLE window) GC-eligible while never treating a
+// legitimately-running long turn as stale. This is deliberately independent of
+// (and a complement to, not a replacement for) swarm.Runner's mid-turn
+// heartbeat keepalive: the keepalive keeps the heartbeat itself fresh; this
+// keeps selection's OWN threshold from being tighter than the work it must
+// tolerate even if a keepalive tick is ever missed. TurnTimeout<=0 (disabled
+// watchdog, or an older/test caller that never set it) degrades to the
+// previous TTL-only behavior.
+func (s *Selector) staleTTL() time.Duration {
+	if s.TurnTimeout <= 0 {
+		return s.TTL
+	}
+	if want := s.TurnTimeout + staleMargin; want > s.TTL {
+		return want
+	}
+	return s.TTL
 }
 
 // Select walks weighted-random submodules and returns the first workable item.
@@ -126,7 +165,7 @@ func (s *Selector) fromSubmodule(ctx context.Context, sm repo.Submodule, now tim
 	if err != nil {
 		return nil, err
 	}
-	cands := graphGate(sm, pl.Candidates(now, s.TTL), graph)
+	cands := graphGate(sm, pl.Candidates(now, s.staleTTL()), graph)
 	if len(cands) == 0 {
 		return nil, nil
 	}
