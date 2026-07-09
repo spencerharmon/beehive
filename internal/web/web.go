@@ -362,6 +362,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /merge", b((*Server).mergeGet))
 	mux.HandleFunc("POST /merge", b((*Server).mergePost))
 	mux.HandleFunc("POST /submodule/add", b((*Server).submoduleAdd))
+	mux.HandleFunc("GET /submodule/link", b((*Server).submoduleLinksGet))
 	mux.HandleFunc("POST /submodule/link", b((*Server).submoduleLink))
 	// Refresh the managed repo-ROOT instruction files (AGENTS/HONEYBEE/BOOTSTRAP)
 	// to the binary's embedded defaults via the SAME installer the CLI uses
@@ -1272,6 +1273,17 @@ func (s *Server) submoduleAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// submoduleLinksGet renders the "link two submodules" form (links_editor.html)
+// — the GET half of the hive-wide /submodule/link action, matching the
+// GET-renders/POST-submits shape of the sibling /secrets and /merge pages. The
+// form carries no dynamic state to seed (unlike merge's submodule list or
+// secrets' key list), so this is a plain, static render; it is NOT a read-view
+// of SUBMODULE-LINKS.yaml's current contents (a future pass's scope, not this
+// one's — see docs/tasks/links-editor-route-gap.md).
+func (s *Server) submoduleLinksGet(w http.ResponseWriter, r *http.Request) {
+	s.render(w, "links_editor.html", map[string]interface{}{"Title": pageTitle("links"), "Nav": "links"})
 }
 
 // submoduleLink records a from->to dependency through the cycle-checked links

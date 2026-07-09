@@ -1700,6 +1700,32 @@ func TestSubmoduleLinkRejectsCycle(t *testing.T) {
 	}
 }
 
+// TestSubmoduleLinksGetRendersForm closes the links-editor-route-gap finding:
+// links_editor.html was a real, complete, previously a11y-audited template
+// with zero GET route, so every prior pass verified only its markup in
+// isolation via a direct renderTmpl call (white-box) — never a real HTTP
+// round-trip through the mux, exactly how a 100%-unreachable page survived 3
+// audit cycles unnoticed. This test drives the actual route (get() ->
+// s.Routes().ServeHTTP, the same path a browser hits) so a route regression
+// fails here even if renderTmpl alone would still succeed.
+func TestSubmoduleLinksGetRendersForm(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/submodule/link")
+	if w.Code != 200 {
+		t.Fatalf("GET /submodule/link status %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `<form method="post" action="/submodule/link">`) {
+		t.Fatalf("missing the link form:\n%s", body)
+	}
+	if !strings.Contains(body, `name="from"`) || !strings.Contains(body, `name="to"`) {
+		t.Fatalf("missing from/to inputs:\n%s", body)
+	}
+	if want := "links · beehive"; titleOf(t, body) != want {
+		t.Fatalf("<title> = %q, want %q:\n%s", titleOf(t, body), want, body)
+	}
+}
+
 // TestAssetsStyleServed locks the design-system contract: the stylesheet is
 // still embedded and served at /assets/style.css, exposes a token root with a
 // dark-mode override, and defines a status pill class per task state plus the
@@ -6477,7 +6503,7 @@ func TestFaviconEmbeddedAndServed(t *testing.T) {
 // current top-level section carries aria-current="page" and no other link
 // does. It is a distinct <nav> landmark from breadcrumb-nav-trail's own
 // aria-current on its trail's terminal crumb, so the two never collide on the
-// same element. A submodule-scoped page (not one of the 7 top-nav routes)
+// same element. A submodule-scoped page (not one of the 8 top-nav routes)
 // marks no top-nav link current at all.
 func TestNavAriaCurrentOptional(t *testing.T) {
 	s, _ := setup(t)
@@ -6518,5 +6544,33 @@ func TestNavAriaCurrentOptional(t *testing.T) {
 	// collide on the same element.
 	if !strings.Contains(plan, `<span aria-current="page">plan</span>`) {
 		t.Fatalf("breadcrumb terminal crumb should carry aria-current on the plan page:\n%s", plan)
+	}
+}
+
+// TestSubmoduleLinksNavCurrent is links-editor-route-gap's nav half: the new
+// 8th top-nav entry follows the SAME aria-current convention as the existing
+// 7 (TestNavAriaCurrentOptional) — visiting /submodule/link marks only the
+// links link current, and the 7 pre-existing entries stay byte-for-byte
+// unchanged (still present, still unmarked here).
+func TestSubmoduleLinksNavCurrent(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/submodule/link").Body.String()
+	if !strings.Contains(page, `<a href="/submodule/link" aria-current="page">links</a>`) {
+		t.Fatalf("links nav link missing aria-current:\n%s", page)
+	}
+	topnav := page
+	if i := strings.Index(topnav, `<nav class="nav">`); i >= 0 {
+		if j := strings.Index(topnav[i:], "</nav>"); j >= 0 {
+			topnav = topnav[i : i+j]
+		}
+	}
+	if n := strings.Count(topnav, "aria-current"); n != 1 {
+		t.Fatalf("aria-current count in top-nav = %d, want exactly 1 (links only):\n%s", n, topnav)
+	}
+	// The 7 pre-existing entries are still present and unmarked.
+	for _, link := range []string{"dashboard", "stats", "secrets", "merge", "human", "hygiene", "skills"} {
+		if strings.Contains(topnav, `aria-current="page">`+link+`</a>`) {
+			t.Fatalf("%s should not be marked current on the links page:\n%s", link, topnav)
+		}
 	}
 }
