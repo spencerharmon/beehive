@@ -112,11 +112,25 @@ func run() error {
 	base := "main"
 	if remote != "" {
 		if err := primary.Fetch(ctx, remote, "main"); err != nil {
-			// Remote-sharing pull failure: work done without being able to catch up is
-			// invalid, so this is fatal at startup (no LLM is started).
-			return fmt.Errorf("preflight: %s cannot pull %s main (%w); aborting before starting the agent", mode, remote, err)
+			if c.AbortsOnRemoteFailure() {
+				// Remote-sharing pull failure: work done without being able to catch up is
+				// invalid, so this is fatal at startup (no LLM is started).
+				return fmt.Errorf("preflight: %s cannot pull %s main (%w); aborting before starting the agent", mode, remote, err)
+			}
+			// abort_on_remote_failure=false: the operator's escape hatch for a remote
+			// OUTAGE. Instead of aborting the whole swarm, DEGRADE this pass to local-
+			// only convergence by dropping the remote for the pass's entire lifetime.
+			// Setting remote="" (and leaving base="main") makes every downstream site
+			// — publish, session publish/push, the Runner's per-turn taskRemoved pull
+			// and confirmPublished — take the local path automatically, so the honeybee
+			// keeps working and publishes to the local checked-out main. WARN loudly:
+			// this is not normal operation, only a deliberate outage mode.
+			fmt.Fprintf(os.Stderr, "honeybee: WARNING preflight %s cannot reach %s main (%v); abort_on_remote_failure=false — DEGRADING this pass to local-only convergence (publishing to local main; %s's replica re-syncs via the backup push / next healthy pass). Flip abort_on_remote_failure back to true once %s is healthy.\n", mode, remote, err, remote, remote)
+			remote = ""
+			mode = "local-sharing (degraded: " + mode + " remote unreachable)"
+		} else {
+			base = remote + "/main"
 		}
-		base = remote + "/main"
 	}
 	baseMain, err := primary.RevParse(ctx, base)
 	if err != nil {

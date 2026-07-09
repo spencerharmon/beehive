@@ -150,6 +150,7 @@ system install's; a user install substitutes `~/.config/beehive`.
 | `ttl_minutes`   | `60`                 | heartbeat TTL before GC         |
 | `max_turns`     | `15`                 | per-honeybee turn cap           |
 | `reject_limit`  | `3`                  | rejections before NEEDS-HUMAN   |
+| `abort_on_remote_failure` | `true`     | unreachable remote at preflight: `true`=abort the pass, `false`=degrade to local-only (outage escape hatch; see docs/sharing-modes.md) |
 
 Missing file/fields fall back to defaults. The installers write `gpg_recipient:
 beehive@localhost` to match the key they generate, so `beehive secret` works out

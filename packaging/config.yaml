@@ -5,3 +5,13 @@ agent_cmd: opencode
 ttl_minutes: 60
 max_turns: 15
 reject_limit: 3
+
+# abort_on_remote_failure controls what a honeybee does when a configured remote
+# (e.g. a gitea backup) cannot be reached at its startup preflight.
+#   true  (default) — fatal: the pass aborts before spending tokens, so the swarm
+#                     makes no (invalid) progress until the remote is healthy.
+#   false           — degrade: the pass runs local-only (publishes to the local
+#                     checked-out main, no remote fetch/push) and logs a WARNING.
+# Flip to false during a remote OUTAGE so honeybees keep working locally; flip
+# back to true once the remote is healthy. See docs/sharing-modes.md.
+#abort_on_remote_failure: true

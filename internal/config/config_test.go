@@ -31,6 +31,46 @@ func TestTurnIdleRetriesOverride(t *testing.T) {
 	}
 }
 
+// TestAbortOnRemoteFailureDefault: unset => the effective setting is true (the
+// historical fatal-on-unreachable-remote behavior), and the default pointer is
+// non-nil so Load() always resolves it.
+func TestAbortOnRemoteFailureDefault(t *testing.T) {
+	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AbortOnRemoteFailure == nil {
+		t.Fatal("AbortOnRemoteFailure default should be a non-nil pointer")
+	}
+	if !c.AbortsOnRemoteFailure() {
+		t.Fatal("AbortsOnRemoteFailure() should default to true")
+	}
+}
+
+// TestAbortOnRemoteFailureOverride: an explicit `abort_on_remote_failure: false`
+// in a config layer flips the effective setting, and a nil pointer (never set)
+// still reads true via the accessor.
+func TestAbortOnRemoteFailureOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", dir)
+	write(t, filepath.Join(dir, "config.yaml"), "abort_on_remote_failure: false\n")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AbortOnRemoteFailure == nil || *c.AbortOnRemoteFailure {
+		t.Fatalf("abort_on_remote_failure: false not applied: %+v", c.AbortOnRemoteFailure)
+	}
+	if c.AbortsOnRemoteFailure() {
+		t.Fatal("AbortsOnRemoteFailure() should be false after explicit override")
+	}
+	// A bare Config (no layer set the pointer) reads true through the accessor.
+	if !(Config{}).AbortsOnRemoteFailure() {
+		t.Fatal("a nil AbortOnRemoteFailure must read true via the accessor")
+	}
+}
+
 func write(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

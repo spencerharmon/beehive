@@ -144,7 +144,37 @@ type Config struct {
 	// tags is unaffected. Adding a map field keeps Config non-comparable with ==;
 	// callers/tests use reflect.DeepEqual.
 	Tags map[string]map[string]map[string]string `yaml:"tags"`
+
+	// AbortOnRemoteFailure governs whether a configured remote (e.g. a gitea
+	// backup) that CANNOT BE REACHED at a honeybee's startup preflight is fatal.
+	//
+	//   - true (the default, and the historical behavior): a remote-sharing pass
+	//     whose startup `fetch <remote> main` fails ABORTS before spending any
+	//     tokens — work done while unable to catch up to main is invalid, so the
+	//     swarm intentionally makes no progress until the remote is healthy.
+	//   - false: the SAME unreachable-remote preflight is NON-fatal. The pass
+	//     DEGRADES to local-only convergence (it treats the remote as absent for
+	//     its whole lifetime: publishes to the local checked-out main via
+	//     updateInstead, does no remote fetch/push), logs a WARNING, and proceeds.
+	//     This is the deliberate operator escape hatch for a remote OUTAGE: flip it
+	//     false so honeybees keep working locally while the remote is down, then
+	//     flip it back true once the remote is healthy. During a full outage every
+	//     pass degrades uniformly, so convergence is pure local-sharing (the
+	//     documented single-host mode) with no divergence; the remote's replica is
+	//     re-synced by the backup push / next healthy pass on recovery. See
+	//     docs/sharing-modes.md for the caveat under PARTIAL (flaky) connectivity.
+	//
+	// It is a *bool so "unset" (nil, => the true default) is distinguishable from an
+	// explicit `abort_on_remote_failure: false`; read it through
+	// AbortsOnRemoteFailure(). Only the startup preflight consults it — a remote
+	// that is reachable at preflight but fails MID-pass still fails that individual
+	// pass (then retries), independent of this flag.
+	AbortOnRemoteFailure *bool `yaml:"abort_on_remote_failure"`
 }
+
+// boolPtr returns a pointer to b, for *bool config fields whose default is not the
+// bool zero value (so "unset" must be nil, not false).
+func boolPtr(b bool) *bool { return &b }
 
 // Defaults are the lowest layer, applied when no file sets a field.
 func Defaults(dir string) Config {
@@ -157,6 +187,7 @@ func Defaults(dir string) Config {
 		MaxTurns:               15,
 		MergeRetries:           8,
 		RejectLimit:            3,
+		AbortOnRemoteFailure:   boolPtr(true),
 		TurnTimeoutMinutes:     180,
 		TurnIdleTimeoutMinutes: 15,
 		TurnIdleRetries:        2,
@@ -297,6 +328,9 @@ func merge(base, over Config) Config {
 	if over.SessionPullSeconds != 0 {
 		out.SessionPullSeconds = over.SessionPullSeconds
 	}
+	if over.AbortOnRemoteFailure != nil {
+		out.AbortOnRemoteFailure = over.AbortOnRemoteFailure
+	}
 	out.Tags = mergeTags(base.Tags, over.Tags)
 	return out
 }
@@ -313,6 +347,16 @@ func (c Config) ModelFor(kind string) string {
 		return m
 	}
 	return c.Model
+}
+
+// AbortsOnRemoteFailure reports the effective abort_on_remote_failure setting:
+// true (the default) unless a config layer explicitly set it to false. When true,
+// a configured remote that cannot be reached at a honeybee's startup preflight is
+// fatal (the pass aborts before spending tokens); when false, that same failure
+// degrades the pass to local-only convergence instead. A nil pointer (no layer
+// set it) means the default, true.
+func (c Config) AbortsOnRemoteFailure() bool {
+	return c.AbortOnRemoteFailure == nil || *c.AbortOnRemoteFailure
 }
 
 // mergeEnv layers build_env per KEY (not whole-map): over's non-empty keys win,
