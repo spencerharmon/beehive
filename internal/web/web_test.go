@@ -132,7 +132,11 @@ func TestScrollPreserveWiring(t *testing.T) {
 	s, _ := setup(t)
 
 	// Session transcript: stable id, preserve, and pin (it grows at the bottom).
-	body := renderTmpl(t, s, "session_body.html", map[string]interface{}{"Body": "turn\n"})
+	// The body now renders as structured turns (session-transcript-toc-relanding),
+	// but the scroll container must keep the exact scroll-preserve/pin contract.
+	body := renderTmpl(t, s, "session_body.html", map[string]interface{}{
+		"Transcript": parseTranscript("# session s\n\n## user\n\nhello\n\n## assistant\n\nworld\n"),
+	})
 	for _, want := range []string{`id="session-transcript"`, "data-scroll-preserve", "data-scroll-pin"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("session_body.html missing %q:\n%s", want, body)
@@ -159,6 +163,144 @@ func TestScrollPreserveWiring(t *testing.T) {
 	view := renderTmpl(t, s, "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x"})
 	if !strings.Contains(view, `id="session-body"`) {
 		t.Fatalf("session_view.html missing #session-body poll target:\n%s", view)
+	}
+}
+
+// TestSessionTranscriptRendersTurnsAndTOC is the core of
+// session-transcript-toc-relanding: the poll fragment renders the flat
+// transcript as structured, sanitized turn <section>s (markdown -> HTML, NOT a
+// raw dump) and ships a TOC overlay whose jump links/buttons target each turn's
+// anchor — all WITHOUT dropping poll-scroll-preserve's stable id +
+// scroll-preserve/pin contract on the scroll container.
+func TestSessionTranscriptRendersTurnsAndTOC(t *testing.T) {
+	s, _ := setup(t)
+	body := "# session bee-x\n\nsubmodule: alpha · kind: work · branch: bee-x\n\n" +
+		"## user\n\nplease **do** the thing\n\n" +
+		"## assistant\n\nran `go test` and it passed\n"
+	out := renderTmpl(t, s, "session_body.html", map[string]interface{}{
+		"Transcript": parseTranscript(body),
+	})
+
+	// (1) Structured, RENDERED turns — not a raw text dump.
+	for _, want := range []string{
+		`<section class="turn turn-user" id="turn-1"`,      // user turn section + anchor
+		`<section class="turn turn-assistant" id="turn-2"`, // assistant turn section + anchor
+		"<strong>do</strong>",                              // **do** rendered
+		"<code>go test</code>",                             // `go test` rendered
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("session_body.html missing structured/rendered turn markup %q:\n%s", want, out)
+		}
+	}
+	// The raw markdown syntax must be GONE (proves rendering, not a dump), and the
+	// bare marker lines must not survive as literal text.
+	for _, gone := range []string{"**do**", "`go test`", "## assistant\n", "## user\n"} {
+		if strings.Contains(out, gone) {
+			t.Fatalf("session_body.html still contains un-rendered source %q:\n%s", gone, out)
+		}
+	}
+
+	// (2) TOC overlay: the panel, per-turn jump links to the anchors, and the
+	// agent/reply prev-next jump buttons.
+	for _, want := range []string{
+		`id="session-toc"`,
+		`data-anchor="turn-1"`, `data-anchor="turn-2"`, // list links -> anchors
+		`href="#turn-1"`,
+		`data-jump="next-assistant"`, `data-jump="prev-assistant"`,
+		`data-jump="next-user"`, `data-jump="prev-user"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("session_body.html TOC overlay missing %q:\n%s", want, out)
+		}
+	}
+
+	// (3) poll-scroll-preserve contract intact on the scroll container.
+	for _, want := range []string{`id="session-transcript"`, "data-scroll-preserve", "data-scroll-pin"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("session_body.html lost scroll-preserve contract %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestSessionTranscriptSanitizedInTemplate proves the rendered-turn path is safe
+// end to end: a transcript turn carrying raw <script> / a javascript: link comes
+// out of the template with neither an executable <script> tag nor a javascript:
+// href (goldmark drops them; html/template emits the already-sanitized HTML).
+func TestSessionTranscriptSanitizedInTemplate(t *testing.T) {
+	s, _ := setup(t)
+	body := "## assistant\n\n<script>alert('xss')</script>\n\n[evil](javascript:alert(1))\n"
+	out := renderTmpl(t, s, "session_body.html", map[string]interface{}{
+		"Transcript": parseTranscript(body),
+	})
+	if strings.Contains(out, "<script>") {
+		t.Fatalf("transcript turn leaked an executable <script>:\n%s", out)
+	}
+	if strings.Contains(out, "javascript:") {
+		t.Fatalf("transcript turn leaked a javascript: link:\n%s", out)
+	}
+}
+
+// TestSessionBodyHandlerRendersTurns drives the whole poll path through the HTTP
+// handler: a final (non-stub) transcript on disk renders as structured turns +
+// TOC, proving sessionBody wires parseTranscript into the fragment.
+func TestSessionBodyHandlerRendersTurns(t *testing.T) {
+	s, root := setup(t)
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := "# session bee-done\n\nsubmodule: alpha · kind: work · branch: bee-done\n\n" +
+		"## user\n\nstart\n\n## assistant\n\nfinished the **work**\n"
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-done.md"), []byte(transcript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := get(t, s, "/submodule/alpha/session/bee-done/body")
+	if w.Code != 200 {
+		t.Fatalf("body handler %d: %s", w.Code, w.Body)
+	}
+	out := w.Body.String()
+	for _, want := range []string{
+		`<section class="turn turn-assistant" id="turn-2"`,
+		"<strong>work</strong>",
+		`id="session-toc"`,
+		`id="session-transcript"`, "data-scroll-preserve", "data-scroll-pin",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("GET /body missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "**work**") {
+		t.Fatalf("GET /body dumped raw markdown instead of rendering it:\n%s", out)
+	}
+}
+
+// TestSessionViewShipsTOCNavScript proves the session page ships the delegated
+// TOC-navigation script for BOTH a live and an ended session (it is independent
+// of the SSE stream): it scrolls the #session-transcript CONTAINER (not the
+// window) to a turn's anchor, and handles both the [data-anchor] list links and
+// the [data-jump] prev/next buttons. Asserted on surviving JS code (html/template
+// strips comments from a <script> context), and no external library is used.
+func TestSessionViewShipsTOCNavScript(t *testing.T) {
+	s, _ := setup(t)
+	view := renderTmpl(t, s, "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x", "Live": false})
+	for _, want := range []string{
+		"scrollToSection",                      // the nav script's jump entry point (unique to it)
+		"getElementById('session-transcript')", // scroll the container, not the window
+		"[data-anchor]",                        // TOC list links
+		"[data-jump]",                          // prev/next jump buttons
+		"getBoundingClientRect",                // container-relative scroll math
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("session_view.html (ended) TOC-nav script missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "unpkg") || strings.Contains(view, "cdnjs") {
+		t.Fatalf("session_view.html must not reference an external library:\n%s", view)
+	}
+	// The same nav script ships for a live session too (not gated on liveness).
+	live := renderTmpl(t, s, "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x", "Live": true})
+	if !strings.Contains(live, "scrollToSection") {
+		t.Fatalf("session_view.html (live) missing the TOC-nav script:\n%s", live)
 	}
 }
 

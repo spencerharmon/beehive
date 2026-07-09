@@ -253,13 +253,16 @@ func (s *Server) sessionLive(ctx context.Context, sm repo.Submodule, id string, 
 	return ok
 }
 
-// sessionBody returns just the transcript text (the htmx-poll pane). It shares
-// sessionTranscript with the SSE stream, so the poll and the live stream render
-// the identical file-derived transcript and staleness banner. Polled every 2s
-// (session_view.html); renderConditional (web.go) ETags the rendered bytes so
-// a repeat poll of an idle/ended session (the common steady state — most of a
-// transcript's polled lifetime is spent unchanged) 304s instead of re-sending
-// the whole transcript.
+// sessionBody returns the transcript pane (the htmx-poll fragment): the flat
+// transcript rendered as structured, sanitized turns with a table-of-contents
+// overlay (session-transcript-toc-relanding), never a flat text dump. It shares
+// sessionTranscript with the SSE stream, and both render the SAME data through
+// the SAME "transcript_pane" template (transcript.go's Server.renderString), so
+// the poll and the live stream can never disagree on the turn/TOC HTML for a
+// given transcript. Polled every 2s (session_view.html); renderConditional
+// (web.go) ETags the rendered bytes so a repeat poll of an idle/ended session
+// (the common steady state — most of a transcript's polled lifetime is spent
+// unchanged) 304s instead of re-sending the whole transcript.
 func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -276,21 +279,27 @@ func (s *Server) sessionBody(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	s.renderConditional(w, r, "session_body.html", map[string]interface{}{"Body": body, "Sync": sync})
+	s.renderConditional(w, r, "session_body.html", map[string]interface{}{
+		"Transcript": parseTranscript(body),
+		"Sync":       sync,
+	})
 }
 
 // sessionStream pushes the session transcript to the browser over server-sent
 // events, re-reading it on a short cadence and sending it whenever it changes,
-// until the session ends or the client disconnects. It surfaces agent output
-// token-by-token instead of in the 2s poll jumps, and carries the SAME
-// file-derived transcript sessionBody renders (git/disk, never opencode) — so the
-// htmx poll is an interchangeable fallback: the page cancels the poll while this
-// stream is live and resumes it on the "end" event (which also fetches the
-// authoritative final transcript). Because the live page cancels the poll, this
-// loop OWNS following off-box (remote-host) sessions: sessionTranscript
-// fast-forwards local main every tick and the staleness banner is pushed as a
-// `sync` event so it stays fresh under the EventSource. A ResponseWriter that
-// cannot flush (no streaming) is reported so the client keeps polling.
+// until the session ends or the client disconnects. It re-derives the SAME
+// file-derived transcript sessionBody renders (git/disk, never opencode) and
+// renders it through the IDENTICAL "transcript_pane" template (Server.
+// renderString, transcript.go) sessionBody executes, so the htmx poll and this
+// stream can never disagree on the turn/TOC markup for a given transcript
+// (session-transcript-toc-relanding) — the poll is an interchangeable fallback:
+// the page cancels it while this stream is live and resumes it on the "end"
+// event (which also fetches the authoritative final transcript). Because the
+// live page cancels the poll, this loop OWNS following off-box (remote-host)
+// sessions: sessionTranscript fast-forwards local main every tick and the
+// staleness banner is pushed as a `sync` event so it stays fresh under the
+// EventSource. A ResponseWriter that cannot flush (no streaming) is reported so
+// the client keeps polling.
 func (s *Server) sessionStream(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -341,7 +350,18 @@ func (s *Server) sessionStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if first || body != last {
-			writeSSEData(w, body)
+			// Render through the SAME "transcript_pane" template sessionBody executes
+			// (session-transcript-toc-relanding), so this frame and the htmx poll can
+			// never disagree on the turn/TOC HTML for this transcript.
+			html, rerr := s.renderString("transcript_pane", parseTranscript(body))
+			if rerr != nil {
+				// Headers are already committed (200): end the stream and let the htmx
+				// poll fallback surface the real error, same as a transcript read error.
+				writeSSEEvent(w, "end", "")
+				fl.Flush()
+				return
+			}
+			writeSSEData(w, html)
 			fl.Flush()
 			last = body
 			first = false

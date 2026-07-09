@@ -21,13 +21,83 @@
      hx-swap="morph:innerHTML">
   <div id="session-loading">{{template "skeleton-transcript"}}</div>
 </div>
+<script>
+/* session-toc-nav (session-transcript-toc-relanding): the transcript pane
+   renders each turn as a <section class="turn"> with a stable id, and a TOC
+   overlay of [data-anchor] jump links plus [data-jump] prev/next buttons for
+   agent outputs and runner replies. Ships for BOTH a live and an ended session
+   — it is independent of the SSE stream below, since the htmx poll alone
+   renders the very same markup for an ended session. The transcript scrolls
+   INSIDE its own #session-transcript container (not the window), so a plain
+   "#id" href would move the wrong scroller — we scroll the container itself.
+   Delegated off the document so it survives every htmx poll-swap of
+   #session-body AND every SSE frame swap (session-stream below); a no-op when
+   the target is absent (e.g. no turns yet). No external libraries
+   (single-binary embed). */
+(function () {
+  function container() { return document.getElementById('session-transcript'); }
+  function scrollToSection(sec) {
+    var cont = container();
+    if (!cont || !sec) return;
+    // Move the container so the section's top aligns with the container's top,
+    // regardless of offsetParent nesting (getBoundingClientRect is viewport-abs).
+    cont.scrollTop += sec.getBoundingClientRect().top - cont.getBoundingClientRect().top;
+  }
+  function jump(dir, role) {
+    var cont = container();
+    if (!cont) return;
+    var sel = role ? 'section.turn.turn-' + role : 'section.turn';
+    var secs = Array.prototype.slice.call(cont.querySelectorAll(sel));
+    if (!secs.length) return;
+    var ctop = cont.getBoundingClientRect().top, EPS = 2, target = null;
+    if (dir > 0) { // first section starting below the current top edge
+      for (var i = 0; i < secs.length; i++) {
+        if (secs[i].getBoundingClientRect().top - ctop > EPS) { target = secs[i]; break; }
+      }
+    } else { // last section starting above the current top edge
+      for (var j = secs.length - 1; j >= 0; j--) {
+        if (secs[j].getBoundingClientRect().top - ctop < -EPS) { target = secs[j]; break; }
+      }
+    }
+    if (target) scrollToSection(target);
+  }
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    var a = t.closest('[data-anchor]');
+    if (a) { e.preventDefault(); scrollToSection(document.getElementById(a.getAttribute('data-anchor'))); return; }
+    var b = t.closest('[data-jump]');
+    if (b) {
+      e.preventDefault();
+      var spec = b.getAttribute('data-jump').split('-'); // "next-assistant" / "prev-user"
+      jump(spec[0] === 'next' ? 1 : -1, spec[1] || '');
+    }
+  });
+  // The poll (every 2s) and the SSE stream (every ~1s while live) both re-render
+  // the whole pane, which would otherwise re-open a TOC the reader collapsed.
+  // window.__tocOpen remembers the reader's choice across BOTH refresh paths — a
+  // cross-script-block flag (see window.__sseLive below) read by the
+  // htmx:afterSwap listener here and by session-stream's render() below. `toggle`
+  // doesn't bubble, but a capture-phase document listener still sees it.
+  window.__tocOpen = true;
+  document.addEventListener('toggle', function (e) {
+    if (e.target && e.target.id === 'session-toc') window.__tocOpen = e.target.open;
+  }, true);
+  document.addEventListener('htmx:afterSwap', function () {
+    var toc = document.getElementById('session-toc');
+    if (toc) toc.open = window.__tocOpen;
+  });
+})();
+</script>
 {{if .Live}}
 <script>
 /* session-stream: while a honeybee runs, stream its transcript over SSE so agent
-   output appears token-by-token instead of in the 2s poll jumps. The stream
-   carries the SAME file-derived transcript the htmx poll renders (git/disk, never
-   opencode), so it is a drop-in live channel: we cancel the poll while the stream
-   is connected and fall back to it on error or when the browser lacks
+   output appears every ~1s instead of in the 2s poll jumps. The stream renders
+   the SAME file-derived transcript through the SAME "transcript_pane" template
+   the htmx poll renders (sessions.go's sessionStream/sessionBody share
+   Server.renderString — session-transcript-toc-relanding), so it is a drop-in
+   live channel carrying byte-identical turn/TOC markup: we cancel the poll while
+   the stream is connected and fall back to it on error or when the browser lacks
    EventSource. A `sync` event carries the off-box follow staleness banner so it
    stays fresh while the poll (which normally refreshes it) is cancelled. On the
    stream's "end" event (session finished) we close it and do one authoritative
@@ -46,21 +116,28 @@
     if (window.__sseLive && e.detail && e.detail.elt === body) e.preventDefault();
   });
 
-  function render(text) {
-    var pre = document.getElementById('session-transcript');
-    if (!pre) { // the poll hasn't rendered the container yet: create it ourselves
-      var lp = document.getElementById('session-loading');
-      if (lp) lp.remove();
-      pre = document.createElement('pre');
-      pre.className = 'session';
-      pre.id = 'session-transcript';
-      pre.setAttribute('data-scroll-preserve', '');
-      pre.setAttribute('data-scroll-pin', '');
-      body.appendChild(pre);
+  function render(html) {
+    var cont = document.getElementById('session-transcript');
+    var pinned = false, top = 0;
+    if (cont) {
+      pinned = cont.scrollHeight - cont.scrollTop - cont.clientHeight <= SLACK;
+      top = cont.scrollTop;
     }
-    var pinned = pre.scrollHeight - pre.scrollTop - pre.clientHeight <= SLACK;
-    pre.textContent = text;
-    if (pinned) pre.scrollTop = pre.scrollHeight; // follow new output at the bottom
+    var lp = document.getElementById('session-loading');
+    if (lp) lp.remove();
+    // html is the WHOLE rendered "transcript_pane" (TOC overlay + the
+    // #session-transcript container) — replace the pane wholesale so a single
+    // DOM op keeps the two in sync, exactly as a fresh htmx poll swap would.
+    var pane = document.getElementById('session-pane');
+    if (pane) {
+      pane.outerHTML = html;
+    } else {
+      body.insertAdjacentHTML('beforeend', html);
+    }
+    var toc = document.getElementById('session-toc');
+    if (toc) toc.open = window.__tocOpen; // preserve the reader's collapse choice
+    var newCont = document.getElementById('session-transcript');
+    if (newCont) newCont.scrollTop = pinned ? newCont.scrollHeight : top;
   }
 
   function renderSync(st) {

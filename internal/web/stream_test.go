@@ -29,10 +29,12 @@ func gitAt(t *testing.T, dir string, args ...string) {
 }
 
 // TestSessionStreamEndsForFinishedSession locks the SSE end contract: a finished
-// (non-stub) session streams its durable transcript as data: frames and then a
-// single `event: end`, telling the browser to stop streaming and do one
-// authoritative poll. The handler returns promptly (an ended session is not held
-// open), so a buffered ResponseRecorder captures the whole exchange.
+// (non-stub) session streams its RENDERED transcript (session-transcript-toc-
+// relanding: the same "transcript_pane" markup the htmx poll renders, never the
+// raw markdown source) as data: frames and then a single `event: end`, telling
+// the browser to stop streaming and do one authoritative poll. The handler
+// returns promptly (an ended session is not held open), so a buffered
+// ResponseRecorder captures the whole exchange.
 func TestSessionStreamEndsForFinishedSession(t *testing.T) {
 	s, root := setup(t)
 	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
@@ -52,9 +54,15 @@ func TestSessionStreamEndsForFinishedSession(t *testing.T) {
 		t.Fatalf("content-type = %q, want text/event-stream", ct)
 	}
 	body := w.Body.String()
-	// The transcript is delivered line-per-data-field (rejoined by the browser).
-	if !strings.Contains(body, "data: # final transcript") || !strings.Contains(body, "data: all done.") {
-		t.Errorf("stream did not carry the transcript as data frames:\n%s", body)
+	// Sanitized, rendered HTML — not a raw markdown/text dump — carrying the
+	// same #session-transcript pane id the poll path renders.
+	for _, want := range []string{"<h1>final transcript</h1>", "all done.", `id="session-transcript"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stream did not carry the rendered transcript, missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "data: # final transcript") {
+		t.Errorf("stream carried the raw markdown source (# prefix), want rendered HTML:\n%s", body)
 	}
 	// The end event tells the client to stop streaming and poll the final once.
 	if !strings.Contains(body, "event: end") {
@@ -103,11 +111,12 @@ func (n *noFlushRecorder) WriteHeader(c int)           { n.code = c }
 
 // TestSessionStreamLiveStreamsAndCancels is the core streaming test: a running
 // session (a stub on main naming a live branch that carries the transcript)
-// streams its transcript over SSE, pushes a NEW frame when the branch advances
-// (proving it re-reads on cadence and sends on change, not just once), and — the
-// leak guard — returns promptly when the client disconnects (request context
-// cancelled) rather than spinning a goroutine forever. It uses a real server
-// because the stream is held open, which a buffered recorder cannot represent.
+// streams its RENDERED transcript over SSE (session-transcript-toc-relanding),
+// pushes a NEW frame when the branch advances (proving it re-reads on cadence
+// and sends on change, not just once), and — the leak guard — returns promptly
+// when the client disconnects (request context cancelled) rather than spinning
+// a goroutine forever. It uses a real server because the stream is held open,
+// which a buffered recorder cannot represent.
 func TestSessionStreamLiveStreamsAndCancels(t *testing.T) {
 	s, root := setup(t)
 	s.streamInterval = 20 * time.Millisecond // re-read fast so the test stays quick
@@ -203,8 +212,9 @@ func TestSessionStreamLiveStreamsAndCancels(t *testing.T) {
 		}
 	}
 
-	// First frame: the current transcript.
-	waitLine("data: live transcript v1")
+	// First frame: the current transcript, rendered (session-transcript-toc-
+	// relanding: a bare single-line body renders as one <p> paragraph).
+	waitLine("<p>live transcript v1</p>")
 
 	// Advance the live branch (a fresh honeybee commit) via a linked worktree —
 	// the branch ref moves in the shared repo, so the server's next re-read sees
@@ -216,7 +226,9 @@ func TestSessionStreamLiveStreamsAndCancels(t *testing.T) {
 	}
 	gitAt(t, wt, "add", "-A")
 	gitAt(t, wt, "commit", "-q", "-m", "v2")
-	waitLine("data: v2 more output")
+	// The two source lines join into one soft-wrapped paragraph (no blank line
+	// between them), so check the second line's rendered text on its own.
+	waitLine("v2 more output")
 
 	// Leak guard: disconnecting (cancelling the request) must make the SERVER
 	// handler return promptly. handlerDone closing is the direct proof it stopped
@@ -417,10 +429,12 @@ func TestSessionStreamFollowsOffBoxAndBannersSync(t *testing.T) {
 		}
 	}
 
-	// (2) the off-box transcript streamed as a data frame (proving the stream loop
-	// fetched the stub and resolved the branch), and (3) the follow banner arrived
-	// as a `sync` event whose JSON shows a clean fast-forward ("Err":"" — no stall).
-	waitAll("data: hello from off-box", "event: sync", `"Err":""`)
+	// (2) the off-box transcript streamed as a RENDERED data frame (proving the
+	// stream loop fetched the stub, resolved the branch, and rendered it through
+	// the same "transcript_pane" template the poll uses), and (3) the follow
+	// banner arrived as a `sync` event whose JSON shows a clean fast-forward
+	// ("Err":"" — no stall).
+	waitAll("hello from off-box", "event: sync", `"Err":""`)
 
 	// (1) local main was fast-forwarded by the stream loop, so the stub is on disk.
 	if _, err := os.Stat(localSess); err != nil {
@@ -434,4 +448,69 @@ func TestSessionStreamFollowsOffBoxAndBannersSync(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("stream handler did not return within 3s after client disconnect — goroutine leak")
 	}
+}
+
+// TestSessionStreamRendersSameTurnHTMLAsPoll is session-transcript-toc-
+// relanding's no-rendering-drift acceptance: the SSE stream (sessionStream) and
+// the htmx poll (sessionBody) must produce the IDENTICAL turn/TOC HTML for the
+// same transcript, since both execute the same "transcript_pane" template
+// (Server.renderString, transcript.go) — never two independent renderers that
+// could silently diverge.
+func TestSessionStreamRendersSameTurnHTMLAsPoll(t *testing.T) {
+	s, root := setup(t)
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "# session bee-parity\n\nsubmodule: alpha \u00b7 kind: work \u00b7 branch: bee-parity\n\n" +
+		"## user\n\nplease investigate\n\n## assistant\n\nfound it, fixing now\n"
+	if err := os.WriteFile(filepath.Join(sessDir, "bee-parity-200.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pollOut := get(t, s, "/submodule/alpha/session/bee-parity-200/body").Body.String()
+
+	// bee-parity-200 is a finished (non-stub) transcript, so the stream reads
+	// once, sends the rendered frame, emits `event: end`, and returns promptly —
+	// safe to drive synchronously through a buffered recorder (same premise as
+	// TestSessionStreamEndsForFinishedSession).
+	streamRaw := get(t, s, "/submodule/alpha/session/bee-parity-200/stream").Body.String()
+	streamHTML := firstSSEData(t, streamRaw)
+
+	want, err := s.renderString("transcript_pane", parseTranscript(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamHTML != want {
+		t.Fatalf("SSE frame != transcript_pane render:\nSSE:  %q\nwant: %q", streamHTML, want)
+	}
+	if !strings.Contains(pollOut, want) {
+		t.Fatalf("poll body does not contain the SAME transcript_pane render the SSE frame carries:\npoll: %s\nwant substring: %s", pollOut, want)
+	}
+}
+
+// firstSSEData reconstructs the FIRST SSE message's data payload from a raw
+// text/event-stream response body, exactly as a browser's EventSource does:
+// each "data: <line>" field's line is rejoined with "\n", stopping at the
+// blank line that terminates the message (a truly empty raw line — a payload's
+// OWN blank line is still "data: " prefixed, never bare).
+func firstSSEData(t *testing.T, raw string) string {
+	t.Helper()
+	var data []string
+	for _, ln := range strings.Split(raw, "\n") {
+		ln = strings.TrimRight(ln, "\r")
+		if ln == "" {
+			if len(data) > 0 {
+				break
+			}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(ln, "data: "):
+			data = append(data, strings.TrimPrefix(ln, "data: "))
+		case ln == "data:":
+			data = append(data, "")
+		}
+	}
+	return strings.Join(data, "\n")
 }
