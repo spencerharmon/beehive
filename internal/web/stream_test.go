@@ -250,11 +250,15 @@ func TestSessionViewStreamWiring(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sessDir, "bee-final.md"), []byte("# final\ndone\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	sm, err := s.submodule("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Guard the premise: bee-live must actually be live, bee-final ended.
-	if !s.sessionLive(ctx, sessDir, "bee-live") {
+	if !s.sessionLive(ctx, sm, "bee-live", time.Now(), s.ttl()) {
 		t.Fatal("bee-live not live — test premise broken")
 	}
-	if s.sessionLive(ctx, sessDir, "bee-final") {
+	if s.sessionLive(ctx, sm, "bee-final", time.Now(), s.ttl()) {
 		t.Fatal("bee-final should be ended — test premise broken")
 	}
 

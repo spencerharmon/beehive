@@ -51,7 +51,7 @@ func (s *Server) sessionsListBody(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	sync := s.followMain(r.Context(), now)
 	s.renderConditional(w, r, "session_list_body.html", map[string]interface{}{
-		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), sm.SessionsDir(), now), "Sync": sync,
+		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), sm, now, s.ttl()), "Sync": sync,
 	})
 }
 
@@ -73,16 +73,26 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "session_view.html", map[string]interface{}{
 		"Name":   sm.Name,
 		"Branch": branch,
-		"Live":   s.sessionLive(r.Context(), sm.SessionsDir(), branch),
+		"Live":   s.sessionLive(r.Context(), sm, branch, time.Now(), s.ttl()),
 		"Title":  pageTitle(branch, sm.Name),
 	})
 }
 
-// sessionLive reports whether a session page should show the running badge. Only
-// STUB files whose stream branch still exists are live; final transcripts and
-// orphaned stubs whose branch is gone are ended.
-func (s *Server) sessionLive(ctx context.Context, dir, id string) bool {
-	raw, err := os.ReadFile(filepath.Join(dir, id+".md"))
+// sessionLive reports whether a session page should show the running badge:
+// id is active under the SAME canonical rule activeHoneybees/sessionInfos use
+// (active-honeybee-count-unify), never a rule of its own. It first checks
+// whether id currently claims a fresh PLAN task (claimedSessions); only when
+// unclaimed (id has no PLAN task at all — a Bootstrap/Reconcile pass, or a
+// stale/finished claim) does it fall back to the stub's own liveness: a STUB
+// file whose stream branch still exists is live, a final transcript or an
+// orphaned stub whose branch is gone is ended. sm/now/ttl (rather than a bare
+// dir) let it resolve sm's PLAN.md for the claim half.
+func (s *Server) sessionLive(ctx context.Context, sm repo.Submodule, id string, now time.Time, ttl time.Duration) bool {
+	p, _ := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	if claimedSessions(p)[id] {
+		return true
+	}
+	raw, err := os.ReadFile(filepath.Join(sm.SessionsDir(), id+".md"))
 	if err != nil {
 		return false
 	}
@@ -288,15 +298,27 @@ func (s *Server) readSessionBranch(ctx context.Context, branch, rel string) (str
 	return "", false
 }
 
-// sessionInfos lists recorded sessions from the committed sessions dir. An entry
-// whose file is a STUB is a running session: its freshness/liveness come from the
-// streaming branch's tip commit time, not the stub's (fixed) mtime. A non-stub
-// entry is a finished session, dated by its file mtime.
-func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []sessionInfo {
+// sessionInfos lists recorded sessions from the committed sessions dir. Live
+// unions the SAME two canonical signals activeHoneybees does (active-honeybee-
+// count-unify): a fresh PLAN-task claim on this session id (claimed, from sm's
+// own plan view), OR — the only signal available for a claimless Bootstrap/
+// Reconcile pass — a STUB file whose streaming branch still exists. It does not
+// call activeHoneybees directly: this is itself a sessions/ directory walk (run
+// on a 2s poll via sessionsListBody), so re-scanning the same directory a
+// second time would double the I/O for no benefit; claimedSessions (a cheap,
+// no-I/O map over the already-cached plan view) supplies the claim half
+// in-line instead. An entry whose file is a STUB is a running session: its
+// freshness/liveness come from the streaming branch's tip commit time, not the
+// stub's (fixed) mtime. A non-stub entry is a finished session, dated by its
+// file mtime.
+func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.Time, ttl time.Duration) []sessionInfo {
+	dir := sm.SessionsDir()
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
+	p, _ := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	claimed := claimedSessions(p)
 	rem, _ := s.git.Remote(ctx)
 	var out []sessionInfo
 	for _, e := range ents {
@@ -309,7 +331,7 @@ func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []
 		}
 		id := strings.TrimSuffix(e.Name(), ".md")
 		mod := fi.ModTime()
-		live := false
+		live := claimed[id]
 		if raw, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
 			if branch, isStub := repo.ParseSessionStub(string(raw)); isStub {
 				// A stub streams to an isolated branch that the honeybee deletes on exit
@@ -320,8 +342,6 @@ func (s *Server) sessionInfos(ctx context.Context, dir string, now time.Time) []
 				if t, ok := s.branchTipTime(ctx, branch, rem); ok {
 					mod = t
 					live = true
-				} else {
-					live = false
 				}
 			}
 		}

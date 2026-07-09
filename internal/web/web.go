@@ -539,11 +539,14 @@ func (s *Server) submodule(name string) (repo.Submodule, error) {
 // Pending/Human are task counts from the unified parser (internal/plan) so they
 // match what the runner/selector see; Env is the submodule's active blue/green
 // deploy env from the typed artifacts model ("" when it has no
-// INFRASTRUCTURE.md); Working is true when a task is actively claimed (a fresh
-// session+heartbeat), driving the card's live overlay; Bees is HOW MANY tasks
-// carry such a fresh claim — the count of honeybees currently working this
-// submodule (0 when idle, and Working is exactly Bees > 0), surfaced on the card
-// with the 🐝 badge.
+// INFRASTRUCTURE.md); Working is true when a honeybee is actively working this
+// submodule, driving the card's live overlay; Bees is HOW MANY honeybees are
+// actively working it right now (0 when idle, and Working is exactly Bees > 0),
+// surfaced on the card with the 🐝 badge. Both come from the ONE canonical set
+// activeHoneybees derives (active-honeybee-count-unify): a fresh PLAN-task
+// claim UNIONED with a live session with no claim (a Bootstrap/Reconcile pass,
+// which claims no task) — never a task's status, and never a divergent,
+// dashboard-only rule.
 type subView struct {
 	Name    string
 	State   string
@@ -613,16 +616,20 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 // (active/dormant/bootstrap), the ROI Stamp, the Pending/Human task counts from
 // the unified parser (internal/plan via planView — the same parse the
 // runner/selector use), the active blue/green Env from the submodule's own
-// INFRASTRUCTURE.md via the typed artifacts model, and Working (a task carrying a
-// fresh session+heartbeat claim). now/ttl are passed in so the claim-freshness
-// derivation is deterministically testable; the handler supplies time.Now() and
-// the resolved TTL.
+// INFRASTRUCTURE.md via the typed artifacts model, and Working/Bees from
+// activeHoneybees — the canonical active-honeybee set (active-honeybee-count-
+// unify), so the dashboard can never diverge from the sessions page/list or
+// /stats. now/ttl are passed in so the claim-freshness derivation is
+// deterministically testable; the handler supplies time.Now() and the resolved
+// TTL.
 //
 // The PLAN.md read+parse is memoized per repo HEAD via planView, but the swarm
 // status stays current: the counts and Working flag are re-projected against
 // now/ttl every call (so a claim still goes stale on TTL expiry with no new
 // commit), and any file change advances HEAD and drops the cache. ctx carries
-// the request's cancellation/deadline into the HEAD lookup.
+// the request's cancellation/deadline into the HEAD lookup and into
+// activeHoneybees' own git reads (branch existence for a claimless live
+// session).
 func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration) ([]subView, error) {
 	subs, err := s.repo.Submodules()
 	if err != nil {
@@ -648,11 +655,14 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 		// task not DONE, Human = NEEDS-HUMAN only. A NEEDS-HUMAN task is BOTH
 		// pending and human — the two counters legitimately overlap, but each task
 		// increments each counter at most once (never double-counted within a
-		// counter). Working = any task with a fresh claim (session+heartbeat within
-		// the TTL); Bees = HOW MANY such fresh claims (the honeybee count on the
-		// card), so Working is exactly Bees > 0. A parse error leaves this
-		// submodule's stamp/counts empty rather than failing the whole dashboard
-		// (mirrors the pre-existing per-submodule resilience).
+		// counter). Working/Bees come from activeHoneybees, the canonical
+		// active-honeybee set (active-honeybee-count-unify): a fresh PLAN-task
+		// claim UNIONED with a live claimless session (Bootstrap/Reconcile, which
+		// claims no task), deduped by session id — so Bees also counts a
+		// reconcile pass in flight, not just claimed tasks, and Working is
+		// exactly Bees > 0. A parse error leaves this submodule's stamp/counts
+		// empty rather than failing the whole dashboard (mirrors the
+		// pre-existing per-submodule resilience).
 		if p, err := s.planView(head, sm.PlanPath(), now, ttl); err == nil {
 			v.Stamp = p.ROIStamp
 			for _, it := range p.Items {
@@ -662,11 +672,9 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 				if it.Status == StatusHuman {
 					v.Human++
 				}
-				if it.Active {
-					v.Working = true
-					v.Bees++
-				}
 			}
+			v.Bees = len(s.activeHoneybees(ctx, sm, p))
+			v.Working = v.Bees > 0
 		}
 		// Env badge: the submodule's own blue/green deploy state via the typed
 		// artifacts model. An absent INFRASTRUCTURE.md leaves Env "" (no badge)
