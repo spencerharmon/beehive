@@ -1,8 +1,14 @@
 <div class="bootstrap-agent">
+  {{/* Poll only while a turn is in flight: the shell fetches the panel ONCE on
+     load, and chatedit_panel.html re-arms this poll (a hidden load-delay fetch)
+     only while .Busy. An idle chat (agent waiting for the next message) therefore
+     stops polling instead of re-rendering an unchanged transcript every 1.5s;
+     sending a message makes the panel Busy again, which restarts the poll —
+     the same idle backoff editor.html/editor_panel.html already use. */}}
   <div id="chatedit"
        role="status" aria-live="polite"
        hx-get="/edit/{{.ID}}/panel"
-       hx-trigger="load, every 1500ms"
+       hx-trigger="load"
        hx-swap="innerHTML">
     {{template "skeleton-transcript"}}
   </div>

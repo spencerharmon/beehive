@@ -286,7 +286,7 @@ func TestPollPaneLoadingSkeletons(t *testing.T) {
 
 // TestPollBackoffWhenEndedOrIdle is the poll-backoff-ended-content lock: a
 // polled pane must never re-fetch an unchanging fragment forever. It asserts
-// three cadence contracts:
+// four cadence contracts:
 //
 //  1. session_view.html gates its transcript poll on liveness — the required
 //     ended-vs-live hx-trigger difference. A LIVE session keeps the every-2s
@@ -298,6 +298,11 @@ func TestPollPaneLoadingSkeletons(t *testing.T) {
 //     poll ONLY while a turn is in flight (.Busy) — an idle editor stops.
 //  3. human_resolve.html / human_resolve_panel.html apply the same idle backoff
 //     to the resolution agent.
+//  4. bootstrap_agent.html / chatedit_panel.html apply the same idle backoff to
+//     the setup wizard's chat panel — the last polled chat/diff surface still
+//     on an unconditional interval (bootstrap-chat-poll-backoff). The wizard is
+//     chatedit_panel.html's only caller now (web.go's /edit/{id}/* family), so
+//     this closes the one panel poll-backoff-trigger-landing missed.
 func TestPollBackoffWhenEndedOrIdle(t *testing.T) {
 	s, _ := setup(t)
 
@@ -346,6 +351,26 @@ func TestPollBackoffWhenEndedOrIdle(t *testing.T) {
 	rBusy := renderTmpl(t, s, "human_resolve_panel.html", map[string]interface{}{"Sub": "alpha", "TaskID": "t1", "SessID": "s1", "Busy": true})
 	if !strings.Contains(rBusy, `hx-trigger="load delay:2s"`) || !strings.Contains(rBusy, `hx-target="#resolve"`) {
 		t.Errorf("busy human_resolve_panel must re-arm the poll while a turn is in flight:\n%s", rBusy)
+	}
+
+	// (4) bootstrap chat: the wizard's chat shell polls once; chatedit_panel.html
+	// self-perpetuates only while Busy — the same backoff, now on the last polled
+	// chat/diff panel that still lacked it (bootstrap-chat-poll-backoff).
+	bShell := renderTmpl(t, s, "bootstrap_agent.html", map[string]interface{}{"ID": "b1"})
+	if !strings.Contains(bShell, `hx-trigger="load"`) || strings.Contains(bShell, "every") {
+		t.Errorf("bootstrap_agent.html shell must poll once on load, not on an interval:\n%s", bShell)
+	}
+	bIdle := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{"ID": "b1", "Busy": false})
+	if strings.Contains(bIdle, "hx-trigger") {
+		t.Errorf("idle chatedit_panel must carry NO poller (nothing to watch):\n%s", bIdle)
+	}
+	bBusy := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{"ID": "b1", "Busy": true})
+	if !strings.Contains(bBusy, `hx-trigger="load delay:1500ms"`) || !strings.Contains(bBusy, `hx-target="#chatedit"`) {
+		t.Errorf("busy chatedit_panel must re-arm the poll while a turn is in flight:\n%s", bBusy)
+	}
+	// Only the cadence changes: the idle and busy panels swap the same target.
+	if !strings.Contains(bBusy, `hx-swap="innerHTML"`) {
+		t.Errorf("busy chatedit_panel re-arm must keep the innerHTML swap:\n%s", bBusy)
 	}
 }
 

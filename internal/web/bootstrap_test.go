@@ -333,16 +333,20 @@ func TestBootstrapAgentHandlerUnbootstrapped(t *testing.T) {
 	}
 }
 
-// TestBootstrapAgentPanelPollsRepeatedly is the chat-editor-snappy-polish
-// regression lock: the panel's wrapper must re-poll on an interval (not just
-// once on load), or a slow/working turn started via the form leaves the human
-// staring at a stale render forever — the exact "bare spinner" the ROI names.
-// Mirrors editor.html's own "load, every ..." wrapper.
-func TestBootstrapAgentPanelPollsRepeatedly(t *testing.T) {
+// TestBootstrapAgentShellPollsOnceOnLoad locks the served /bootstrap shell to the
+// idle poll backoff (bootstrap-chat-poll-backoff): the #chatedit wrapper fetches
+// the panel ONCE on load, never on an unconditional interval. This supersedes the
+// old chat-editor-snappy-polish "load, every 1500ms" wrapper — a working turn is
+// still followed, but by chatedit_panel.html re-arming the poll ONLY while .Busy
+// (the idle-vs-busy re-arm is locked template-level in TestPollBackoffWhenEndedOrIdle),
+// so an idle wizard tab no longer re-fetches an unchanging transcript every 1.5s —
+// the same backoff editor.html / human_resolve.html already ship. Mirrors
+// editor.html's "load" shell.
+func TestBootstrapAgentShellPollsOnceOnLoad(t *testing.T) {
 	s, _ := chatFixture(t, "")
 	body := get(t, s, "/bootstrap").Body.String()
-	if !strings.Contains(body, `hx-trigger="load, every`) {
-		t.Fatalf("#chatedit must poll on an interval, not just once on load:\n%s", body)
+	if !strings.Contains(body, `hx-trigger="load"`) || strings.Contains(body, "every") {
+		t.Fatalf("#chatedit must poll once on load, not on an interval:\n%s", body)
 	}
 }
 
