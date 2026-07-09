@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/spencerharmon/beehive/internal/git"
@@ -34,11 +35,13 @@ type CruftClass struct {
 // Count is the class's flagged-item count (the badge number).
 func (c CruftClass) Count() int { return len(c.Items) }
 
-// Hygiene is the whole read-only scan result: the four cruft classes plus the
-// skill to remediate them, and an optional scan error (surfaced, never swallowed)
-// so the dashboard widget can degrade without failing the whole page.
+// Hygiene is the whole read-only scan result: the four cruft classes, the
+// per-managed-repo object-store (pack dir) health, the skill to remediate the
+// cruft, and an optional scan error (surfaced, never swallowed) so the dashboard
+// widget can degrade without failing the whole page.
 type Hygiene struct {
 	Classes []CruftClass
+	Packs   []RepoPack
 	Skill   string
 	Err     string
 }
@@ -52,8 +55,83 @@ func (h Hygiene) Total() int {
 	return n
 }
 
-// Clean reports whether the scan found no cruft at all (and did not error).
+// Clean reports whether the scan found no cruft at all (and did not error). It is
+// scoped to the four git-cruft classes only — the object-store (pack dir) health is
+// a distinct diagnostic with its own PackWarn flag, so a repack storm is surfaced by
+// the pack section even while "no git cruft detected" holds.
 func (h Hygiene) Clean() bool { return h.Err == "" && h.Total() == 0 }
+
+// PackWarn reports whether any managed repo's object store is flagged — a repack
+// storm (leftover temps or an abnormal pack count) or a per-repo stat error. It is
+// the summary flag the panel uses to open the pack section and tint its header.
+func (h Hygiene) PackWarn() bool {
+	for _, p := range h.Packs {
+		if p.Warn() {
+			return true
+		}
+	}
+	return false
+}
+
+// packCountWarn is the live pack-*.pack count at or above which a repo's object
+// store is flagged abnormal. It matches git's own default gc.autoPackLimit (50) —
+// the pack count at which git itself considers loose packs overdue for
+// consolidation. With stock auto-gc disabled (the git-disable-auto-gc sibling) and
+// beehive's runner-owned gc the only thing repacking, a repo sitting at or over this
+// has a pack pile that should already have been consolidated: a storm signal.
+const packCountWarn = 50
+
+// RepoPack is one managed repo's object-store (.git/objects/pack) health for the
+// hygiene panel: total pack-dir size, live pack-*.pack count, and leftover
+// tmp_pack_*/tmp_idx_*/tmp_rev_* count, read READ-ONLY from that repo's own pack dir
+// (git.Repo.PackDirStat). It never repacks (that is the beehive gc command); it only
+// surfaces a repack storm — dozens of orphan packs, a growing temp pile from a
+// repack killed mid-flight — so it is caught in minutes, not only when a ref stops
+// resolving. Reading objects/pack is an in-repo read (the object store IS the repo).
+type RepoPack struct {
+	Repo  string // "hive" or the submodule checkout path (submodules/<name>/repo)
+	Size  int64  // total bytes in the pack dir
+	Packs int    // live pack-*.pack count
+	Temps int    // leftover tmp_pack_*/tmp_idx_*/tmp_rev_* count
+	Err   string // per-repo stat error (surfaced, never swallowed); "" when ok
+}
+
+// Warn reports whether this repo's object store looks abnormal: a per-repo stat
+// error, any leftover repack temp (a repack killed mid-flight leaves
+// tmp_pack_*/tmp_idx_*/tmp_rev_*), or a live pack count at/over packCountWarn.
+func (p RepoPack) Warn() bool { return p.Err != "" || p.Temps > 0 || p.Packs >= packCountWarn }
+
+// Detail is the short human reason the row is flagged ("" when healthy).
+func (p RepoPack) Detail() string {
+	if p.Err != "" {
+		return "stat failed: " + p.Err
+	}
+	var parts []string
+	if p.Temps > 0 {
+		parts = append(parts, fmt.Sprintf("%d leftover repack temp file(s) — a repack was killed mid-flight", p.Temps))
+	}
+	if p.Packs >= packCountWarn {
+		parts = append(parts, fmt.Sprintf("%d live packs (>= %d, git's consolidation threshold)", p.Packs, packCountWarn))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// SizeH renders Size as a short human-readable IEC string (B, KiB, MiB, ...).
+func (p RepoPack) SizeH() string { return humanBytes(p.Size) }
+
+// humanBytes renders a byte count as a short IEC string (B, KiB, MiB, GiB, ...).
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
 
 // CacheWidget is the read-only view-cache performance snapshot rendered
 // alongside the git-cruft scan on the /hygiene page. It is a DIFFERENT
@@ -122,7 +200,43 @@ func scanHygiene(ctx context.Context, root string, g *git.Repo) (Hygiene, error)
 			{Key: "checkouts", Title: "Stale submodule checkouts", Items: checkouts},
 			{Key: "remotes", Title: "Unexpected remotes", Items: remotes},
 		},
+		Packs: scanPacks(ctx, root, g, declared),
 	}, nil
+}
+
+// scanPacks stats the object-store (.git/objects/pack) health of every managed repo
+// — the hive (root) plus each declared submodule checkout (submodules/<name>/repo) —
+// READ-ONLY, so a repack storm is caught in minutes. The hive row is always first;
+// declared submodules follow in path order for a stable render. An un-materialized
+// submodule (its checkout dir absent) has no object store to storm and is skipped; a
+// genuine stat failure on a present repo is captured in that row's Err, never
+// dropped and never allowed to fail the whole scan.
+func scanPacks(ctx context.Context, root string, g *git.Repo, declared map[string]bool) []RepoPack {
+	out := []RepoPack{repoPack(ctx, "hive", g)}
+	paths := make([]string, 0, len(declared))
+	for p := range declared {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		dir := filepath.Join(root, p)
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			continue // not materialized: no object store to stat
+		}
+		out = append(out, repoPack(ctx, p, git.New(dir)))
+	}
+	return out
+}
+
+// repoPack runs the read-only PackDirStat for one managed repo and shapes it into a
+// RepoPack row, folding any stat error into the row (surfaced, never swallowed).
+func repoPack(ctx context.Context, name string, g *git.Repo) RepoPack {
+	st, err := g.PackDirStat(ctx)
+	rp := RepoPack{Repo: name, Size: st.SizeBytes, Packs: st.Packs, Temps: st.Temps}
+	if err != nil {
+		rp.Err = err.Error()
+	}
+	return rp
 }
 
 // staleWorktrees flags directories under <root>/.worktrees that look like editor

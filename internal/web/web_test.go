@@ -3621,6 +3621,149 @@ func TestHygieneViewCacheWidget(t *testing.T) {
 	}
 }
 
+// seedPackDir fabricates a repo's own .git/objects/pack with `packs` live
+// pack-*.pack files (each with its .idx sibling) and `temps` leftover repack temps
+// (spread across tmp_pack_/tmp_idx_/tmp_rev_), so a repack storm can be simulated
+// on disk. Returns the pack-dir path. Every file is non-empty so the reported size
+// is nonzero.
+func seedPackDir(t *testing.T, gitRoot string, packs, temps int) string {
+	t.Helper()
+	packDir := filepath.Join(gitRoot, ".git", "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string) {
+		if err := os.WriteFile(filepath.Join(packDir, name), []byte("packdata"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < packs; i++ {
+		write(fmt.Sprintf("pack-%08x.pack", i))
+		write(fmt.Sprintf("pack-%08x.idx", i)) // .idx must NOT be counted as a pack
+	}
+	tmpNames := []string{"tmp_pack_%d", "tmp_idx_%d", "tmp_rev_%d"}
+	for i := 0; i < temps; i++ {
+		write(fmt.Sprintf(tmpNames[i%len(tmpNames)], i))
+	}
+	return packDir
+}
+
+// hivePack returns the "hive" RepoPack row from a scan (fatal if absent).
+func hivePack(t *testing.T, h Hygiene) RepoPack {
+	t.Helper()
+	for _, p := range h.Packs {
+		if p.Repo == "hive" {
+			return p
+		}
+	}
+	t.Fatalf("hive object-store row missing from scan: %+v", h.Packs)
+	return RepoPack{}
+}
+
+// TestRepoPackWarn locks the object-store warning policy: a leftover repack temp,
+// an abnormal live pack count (>= packCountWarn), or a per-repo stat error each
+// flags the row; a healthy store (few packs, no temps) does not.
+func TestRepoPackWarn(t *testing.T) {
+	cases := []struct {
+		name string
+		p    RepoPack
+		warn bool
+	}{
+		{"healthy", RepoPack{Repo: "hive", Packs: 3, Temps: 0}, false},
+		{"one-temp", RepoPack{Repo: "hive", Packs: 3, Temps: 1}, true},
+		{"pack-storm", RepoPack{Repo: "hive", Packs: packCountWarn, Temps: 0}, true},
+		{"just-under", RepoPack{Repo: "hive", Packs: packCountWarn - 1, Temps: 0}, false},
+		{"stat-error", RepoPack{Repo: "hive", Err: "boom"}, true},
+	}
+	for _, c := range cases {
+		if got := c.p.Warn(); got != c.warn {
+			t.Errorf("%s: Warn() = %v, want %v", c.name, got, c.warn)
+		}
+	}
+}
+
+// TestHygienePackStats fabricates a repack storm in the hive's own object store and
+// proves the read-only scan reports it per managed repo: N live packs, M leftover
+// temps, a nonzero pack-dir size, and a warning driven by the nonzero temp count —
+// and that a zero-temp store reports clean (no warning), the core of the
+// gc-storm-visibility requirement. Read-only: the seeded files survive the scan.
+func TestHygienePackStats(t *testing.T) {
+	s, root := setup(t)
+	const wantPacks, wantTemps = 3, 2
+	packDir := seedPackDir(t, root, wantPacks, wantTemps)
+
+	h, err := scanHygiene(context.Background(), root, s.git)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	hp := hivePack(t, h)
+	if hp.Packs != wantPacks {
+		t.Errorf("hive packs = %d, want %d (pack-*.pack only)", hp.Packs, wantPacks)
+	}
+	if hp.Temps != wantTemps {
+		t.Errorf("hive temps = %d, want %d", hp.Temps, wantTemps)
+	}
+	if hp.Size <= 0 {
+		t.Errorf("hive pack-dir size = %d, want nonzero", hp.Size)
+	}
+	if !hp.Warn() {
+		t.Errorf("hive row should warn on %d leftover temps, got Warn()=false", wantTemps)
+	}
+	if !h.PackWarn() {
+		t.Error("Hygiene.PackWarn() = false with a temp storm present")
+	}
+
+	// Read-only: every seeded file is still on disk.
+	ents, _ := os.ReadDir(packDir)
+	if got := len(ents); got != wantPacks*2+wantTemps {
+		t.Errorf("scan mutated the pack dir: %d files remain, want %d", got, wantPacks*2+wantTemps)
+	}
+
+	// Clear the temps: a zero-temp store with a modest pack count reports clean.
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "tmp_") {
+			os.Remove(filepath.Join(packDir, e.Name()))
+		}
+	}
+	h2, err := scanHygiene(context.Background(), root, s.git)
+	if err != nil {
+		t.Fatalf("scan (post-sweep): %v", err)
+	}
+	hp2 := hivePack(t, h2)
+	if hp2.Temps != 0 {
+		t.Errorf("temps after sweep = %d, want 0", hp2.Temps)
+	}
+	if hp2.Warn() {
+		t.Errorf("hive row should be clean with 0 temps and %d packs, got Warn()=true (%s)", hp2.Packs, hp2.Detail())
+	}
+	if h2.PackWarn() {
+		t.Error("Hygiene.PackWarn() = true after the temp storm was swept")
+	}
+}
+
+// TestHygienePackPanelRender drives GET /hygiene with a seeded storm and asserts the
+// pack-dir health section renders per-repo counts and surfaces the temp warning.
+func TestHygienePackPanelRender(t *testing.T) {
+	s, root := setup(t)
+	seedPackDir(t, root, 4, 1)
+
+	w := get(t, s, "/hygiene")
+	if w.Code != 200 {
+		t.Fatalf("hygiene %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"object store", "pack-dir health", // the section header
+		"hive",    // the managed-repo label
+		"warning", // the flagged-row badge
+		"temp",    // the temp-count reason in the detail
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("hygiene page missing pack-health %q:\n%s", want, body)
+		}
+	}
+}
+
 // TestComputeStats checks the git-derived honeybee-performance figures behind the
 // /stats view: delivered = PLAN [DONE], sessions = transcript files, distinct
 // tasks and the derived ratios — all read live, nothing stored.

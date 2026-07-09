@@ -156,3 +156,63 @@ func TestMaybeGCLockHeldByPeer(t *testing.T) {
 		t.Errorf("gc lock not released after stealing: lockedby=%q", got)
 	}
 }
+
+// TestPackDirStat proves the read-only object-store stat behind the hygiene panel:
+// a fresh repo reports a zero PackStat (no error even if objects/pack is absent),
+// and a fabricated pack dir with N live pack-*.pack (each with its .idx), M repack
+// temps (tmp_pack_/tmp_idx_/tmp_rev_) reports Packs==N (only .pack, never .idx),
+// Temps==M, and SizeBytes == the sum of every file. It STATS ONLY: every seeded
+// file is still present afterward.
+func TestPackDirStat(t *testing.T) {
+	r := initRepo(t)
+	ctx := context.Background()
+
+	// Fresh repo: a zero stat, never an error (objects/pack empty or unpopulated).
+	st, err := r.PackDirStat(ctx)
+	if err != nil {
+		t.Fatalf("PackDirStat (fresh): %v", err)
+	}
+	if st.Packs != 0 || st.Temps != 0 {
+		t.Fatalf("fresh repo: packs=%d temps=%d, want 0/0", st.Packs, st.Temps)
+	}
+
+	packDir := filepath.Join(r.Dir, ".git", "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string, size int) {
+		if err := os.WriteFile(filepath.Join(packDir, name), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 2 live packs (each .pack + .idx), plus one leftover of each temp class.
+	write("pack-aaaaaaaa.pack", 100)
+	write("pack-aaaaaaaa.idx", 20)
+	write("pack-bbbbbbbb.pack", 200)
+	write("pack-bbbbbbbb.idx", 20)
+	write("tmp_pack_1", 10)
+	write("tmp_idx_1", 5)
+	write("tmp_rev_1", 5)
+	const wantSize = 100 + 20 + 200 + 20 + 10 + 5 + 5
+
+	st, err = r.PackDirStat(ctx)
+	if err != nil {
+		t.Fatalf("PackDirStat: %v", err)
+	}
+	if st.Packs != 2 {
+		t.Errorf("packs = %d, want 2 (pack-*.pack only, not .idx)", st.Packs)
+	}
+	if st.Temps != 3 {
+		t.Errorf("temps = %d, want 3 (tmp_pack_/tmp_idx_/tmp_rev_)", st.Temps)
+	}
+	if st.SizeBytes != wantSize {
+		t.Errorf("size = %d, want %d (sum of every file)", st.SizeBytes, wantSize)
+	}
+
+	// Read-only: nothing the stat touched was removed.
+	for _, n := range []string{"pack-aaaaaaaa.pack", "tmp_pack_1", "tmp_idx_1", "tmp_rev_1"} {
+		if _, err := os.Stat(filepath.Join(packDir, n)); err != nil {
+			t.Errorf("stat removed %s: %v", n, err)
+		}
+	}
+}

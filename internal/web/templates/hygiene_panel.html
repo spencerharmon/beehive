@@ -3,7 +3,8 @@
 <h3><a href="/hygiene">hive hygiene</a></h3>
 {{if .Err}}
 <p class="muted">scan unavailable: {{.Err}}</p>
-{{else if .Clean}}
+{{else}}
+{{if .Clean}}
 <p><span class="badge live">clean</span> <span class="muted">no git cruft detected</span></p>
 {{else}}
 <p><span class="badge">{{.Total}}</span> item(s) of git cruft &middot; <span class="muted">diagnostic only</span></p>
@@ -16,6 +17,27 @@
 </details>
 {{end}}
 <p class="hygiene-remedy muted">Remediation: run the <code>{{.Skill}}</code> cleanup skill. This panel is read-only and never mutates git state — the operator triggers the fix.</p>
+{{end}}
+{{if .Packs}}
+<details class="hygiene-class" id="hygiene-packs"{{if .PackWarn}} open{{end}}>
+<summary><span class="badge{{if .PackWarn}} drift-missing{{end}}">object store</span> pack-dir health <span class="muted">(per managed repo)</span></summary>
+<table class="hygiene-packs">
+<thead><tr><th>repo</th><th>pack-dir size</th><th>packs</th><th>temps</th><th>state</th></tr></thead>
+<tbody>
+{{range .Packs}}
+<tr>
+<td><code>{{.Repo}}</code></td>
+<td>{{.SizeH}}</td>
+<td>{{.Packs}}</td>
+<td>{{.Temps}}</td>
+<td>{{if .Warn}}<span class="badge drift-missing">warning</span> <span class="muted">{{.Detail}}</span>{{else}}<span class="muted">clean</span>{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+<p class="hygiene-remedy muted">Read-only stat of each managed repo's own <code>.git/objects/pack</code>. A nonzero temp count (a repack killed mid-flight) or an abnormal pack count signals a repack storm; remediation is the runner-owned <code>beehive gc</code> — this panel never repacks.</p>
+</details>
+{{end}}
 {{end}}
 </section>
 {{end}}
