@@ -330,6 +330,21 @@ func TestFormInputsHaveAccessibleNames(t *testing.T) {
 			},
 		},
 		{
+			// env_panel's deploy <select> was the lone unlabeled form control
+			// left after the create/merge/link forms were paired: a bare
+			// combobox announced with no hint it picks a deploy environment.
+			// Same sr-only <label for>/id pairing as merge_panel's name select.
+			name: "env_panel.html deploy form",
+			html: renderTmpl(t, s, "env_panel.html", map[string]interface{}{
+				"Name": "alpha", "Env": Env{Active: "blue", Envs: []string{"blue", "green"}},
+			}),
+			want: []string{
+				`<label class="sr-only" for="env-deploy-target">Deploy environment</label>`,
+				`id="env-deploy-target"`,
+				`name="target"`, // form still posts the same field
+			},
+		},
+		{
 			name: "branch_view.html inline merge form",
 			html: renderTmpl(t, s, "branch_view.html", map[string]interface{}{
 				"Name": "alpha", "Sections": nil, "HasPrev": false, "HasNext": false,
