@@ -421,6 +421,19 @@ func TestFormInputsHaveAccessibleNames(t *testing.T) {
 			},
 		},
 		{
+			// roi_editor's raw-source <textarea> was the last unlabeled form
+			// control on GET /roi/<name>: a bare multi-line field a screen
+			// reader announced with no name. Same sr-only <label for>/id
+			// pairing as the merge/env selects; name="body" (plus rows/cols) is
+			// preserved so the POST still saves the raw source verbatim.
+			name: "roi_editor.html raw-source textarea",
+			html: get(t, s, "/roi/alpha").Body.String(),
+			want: []string{
+				`<label class="sr-only" for="roi-source-body">Edit ROI.md source</label>`,
+				`<textarea id="roi-source-body" name="body" rows="20" cols="80">`, // matching id + preserved name/rows/cols
+			},
+		},
+		{
 			name: "links_editor.html link form",
 			html: renderTmpl(t, s, "links_editor.html", map[string]interface{}{}),
 			want: []string{
