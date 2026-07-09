@@ -1195,6 +1195,234 @@ func TestReviewDispatchDoesNotFinalizeWithoutSourceBranchLocalSharing(t *testing
 	}
 }
 
+// TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestryRemote is the
+// review-finalize-branch-ancestor-gap regression (ui-audit-008): unlike
+// TestReviewDispatchDoesNotFinalizeWithoutSourceBranchRemote (where bee-R1
+// never existed at all), here bee-R1 is a REAL, resolvable pushed branch —
+// sourceBranchExists correctly reports it exists — but its OWN tip was NEVER
+// folded into tracked main (a genuinely unmerged, in-flight implementer
+// commit). Meanwhile the beehive-layer's ambient recorded submodule pointer
+// (whatever some OTHER, already-finalized task's Work pass most recently
+// bumped the single shared gitlink path to) is deliberately seeded at
+// tracked main's OWN current tip — trivially "an ancestor" of itself, the
+// exact triviality that must never be mistaken for "bee-R1 was merged". Pre-
+// fix, finalizeIfAlreadyMerged tested IsAncestor against this ambient pointer
+// instead of bee-R1's own tip and would wrongly auto-finalize DONE with zero
+// agent turns; the fix must test bee-R1's own (fetched) tip, find it NOT an
+// ancestor, and dispatch a completely normal review instead.
+func TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestryRemote(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+	rg := git.New(repoDir)
+
+	// bee-R1: a REAL branch, pushed to origin, whose own tip is a genuinely
+	// UNMERGED commit — diverged from tracked main, never folded in.
+	if _, err := rg.Run(ctx, "checkout", "-q", "-b", "bee-R1"); err != nil {
+		t.Fatalf("checkout bee-R1: %v", err)
+	}
+	os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("unmerged work\n"), 0o644)
+	if err := rg.Commit(ctx, "feat: unmerged work"); err != nil {
+		t.Fatalf("commit bee-R1 work: %v", err)
+	}
+	implSHA, err := rg.RevParse(ctx, "bee-R1")
+	if err != nil {
+		t.Fatalf("rev-parse bee-R1: %v", err)
+	}
+	if _, err := rg.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-R1"); err != nil {
+		t.Fatalf("push bee-R1: %v", err)
+	}
+	if _, err := rg.Run(ctx, "checkout", "-q", "main"); err != nil {
+		t.Fatalf("checkout main: %v", err)
+	}
+
+	// Tracked main advances past bee-R1 entirely (an unrelated, already-
+	// finalized task's follow-up commit) — bee-R1's commit is NOT its ancestor.
+	sc := filepath.Join(t.TempDir(), "push")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+		t.Fatalf("scratch clone: %v", err)
+	}
+	scg := gitConfig(t, sc)
+	os.WriteFile(filepath.Join(sc, "unrelated.txt"), []byte("other\n"), 0o644)
+	if err := scg.Commit(ctx, "unrelated already-finalized task"); err != nil {
+		t.Fatalf("commit unrelated follow-up: %v", err)
+	}
+	if err := scg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push tracked main past bee-R1: %v", err)
+	}
+	mainTip, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse pushed main tip: %v", err)
+	}
+
+	// The ambient beehive-layer gitlink is left at tracked main's OWN current
+	// tip — e.g. some OTHER task's Work-pass completion most recently bumped
+	// this shared gitlink path — trivially an ancestor of itself, but utterly
+	// unrelated to whether bee-R1 (THIS task's implementer branch) was ever
+	// merged.
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+mainTip+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed ambient gitlink at tracked tip: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a normal review should complete, got %+v", res)
+	}
+	if cl.sess.prompts == 0 {
+		t.Fatal("bee-R1's own tip is not an ancestor of tracked main (only the unrelated ambient pointer trivially is): a real review must dispatch, not auto-finalize")
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("R1")
+	if tk == nil || tk.Status != plan.Done {
+		t.Fatalf("status = %+v, want DONE (via normal review, not auto-finalize)", tk)
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if contains(joined, "already merged into tracked") {
+		t.Fatalf("task was wrongly runner-finalized on the ambient pointer's trivial self-ancestry instead of reviewed: body:\n%s", joined)
+	}
+	if contains(joined, implSHA) && contains(joined, "already merged") {
+		t.Fatalf("plan body wrongly claims bee-R1's commit %s was already merged: body:\n%s", implSHA, joined)
+	}
+}
+
+// TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestryLocalSharing mirrors
+// TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestryRemote in
+// local-sharing mode (a submodule checkout with NO remote at all): bee-R1 is a
+// real LOCAL ref whose own tip is genuinely unmerged, while the ambient
+// beehive-layer gitlink is left at local tracked main's own (later-advanced)
+// tip — trivially an ancestor of itself. Must dispatch a completely normal
+// review, never a zero-turn auto-finalize.
+func TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestryLocalSharing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	sg := gitInit(t, repoDir) // a real checkout, deliberately NO remote (local-sharing)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("base\n"), 0o644)
+	if err := sg.Commit(ctx, "base"); err != nil {
+		t.Fatalf("submodule base commit: %v", err)
+	}
+
+	// bee-R1: a real local ref whose own tip diverges from main and is never
+	// merged into it.
+	if _, err := sg.Run(ctx, "checkout", "-q", "-b", "bee-R1"); err != nil {
+		t.Fatalf("checkout bee-R1: %v", err)
+	}
+	os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("unmerged work\n"), 0o644)
+	if err := sg.Commit(ctx, "feat: unmerged work"); err != nil {
+		t.Fatalf("commit bee-R1 work: %v", err)
+	}
+	implSHA, err := sg.RevParse(ctx, "bee-R1")
+	if err != nil {
+		t.Fatalf("rev-parse bee-R1: %v", err)
+	}
+	if _, err := sg.Run(ctx, "checkout", "-q", "main"); err != nil {
+		t.Fatalf("checkout main: %v", err)
+	}
+
+	// Local main advances past bee-R1 with an unrelated (already-finalized)
+	// commit of its own — bee-R1's commit is NOT its ancestor.
+	os.WriteFile(filepath.Join(repoDir, "unrelated.txt"), []byte("other\n"), 0o644)
+	if err := sg.Commit(ctx, "unrelated already-finalized task"); err != nil {
+		t.Fatalf("commit unrelated follow-up: %v", err)
+	}
+	mainTip, err := sg.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatalf("rev-parse main: %v", err)
+	}
+
+	// The ambient beehive-layer gitlink is left at local main's OWN current
+	// tip — trivially an ancestor of itself, unrelated to bee-R1.
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+mainTip+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed ambient gitlink at tracked tip: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a normal review should complete, got %+v", res)
+	}
+	if cl.sess.prompts == 0 {
+		t.Fatal("bee-R1's own tip is not an ancestor of local main (only the unrelated ambient pointer trivially is): a real review must dispatch, not auto-finalize")
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("R1")
+	if tk == nil || tk.Status != plan.Done {
+		t.Fatalf("status = %+v, want DONE (via normal review, not auto-finalize)", tk)
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if contains(joined, "already merged into tracked") {
+		t.Fatalf("task was wrongly runner-finalized on the ambient pointer's trivial self-ancestry instead of reviewed: body:\n%s", joined)
+	}
+	if contains(joined, implSHA) && contains(joined, "already merged") {
+		t.Fatalf("plan body wrongly claims bee-R1's commit %s was already merged: body:\n%s", implSHA, joined)
+	}
+}
+
 // gateClient/gateSession model a turn that is BUSY for a while before going idle:
 // Prompt signals it started, blocks until the test releases it, then produces the
 // completion artifacts and returns. Because ocSession.Prompt now blocks until the
