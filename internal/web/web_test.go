@@ -3517,6 +3517,33 @@ func TestCommitViewCopyControl(t *testing.T) {
 	}
 }
 
+// TestSessionViewBranchCopyControl (session-branch-copy-link) extends the
+// commit-sha-deep-links pattern to the session page's branch name: like a
+// submodule commit sha, a bee-<taskid>-<epoch>-<pid> branch string cannot
+// resolve to anything inside the hive superproject, so it stays plain,
+// selectable <code> text and gains the same progressively-enhanced .copy-btn
+// (data-copy + accessible label), reusing layout.html's generic copy handler
+// and #copy-live region verbatim — no new JS/CSS token.
+func TestSessionViewBranchCopyControl(t *testing.T) {
+	s, _ := setup(t)
+	const branch = "bee-session-branch-copy-link-1234567890-42"
+	out := renderTmpl(t, s, "session_view.html", map[string]interface{}{
+		"Name": "alpha", "Branch": branch,
+	})
+	if !strings.Contains(out, "<code>"+branch+"</code>") {
+		t.Fatalf("session view branch not plain <code> fallback:\n%s", out)
+	}
+	for _, want := range []string{
+		`class="copy-btn"`,
+		`data-copy="` + branch + `"`,
+		`aria-label="Copy branch ` + branch + ` to clipboard"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("session view branch copy control missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // TestCopyClipboardScriptEmbedded locks that the commit-sha-deep-links copy
 // script and its shared aria-live region ship on a real full-page response (the
 // layout footer), progressively enhanced and dependency-free. It is what turns
@@ -7073,7 +7100,7 @@ func TestSessionListLinksTaskDocCommit(t *testing.T) {
 	vb := view.Body.String()
 	for _, want := range []string{
 		"<h1>alpha · t1</h1>",
-		`<p class="muted small">branch <code>` + stem + `</code></p>`,
+		`<p class="muted small">branch <span class="sha-cell"><code>` + stem + `</code><button type="button" class="copy-btn" data-copy="` + stem + `" aria-label="Copy branch ` + stem + ` to clipboard">copy</button></span></p>`,
 		`<a href="/submodule/alpha/plan#task-t1">task</a>`,
 		`<a href="/submodule/alpha/doc/bee-t1.md">change doc</a>`,
 		`<a href="/submodule/alpha/commit/` + flipSHA + `">hive <code>` + flipSHA + `</code></a>`,
@@ -7159,7 +7186,7 @@ func TestSessionListLinksDegradeGracefully(t *testing.T) {
 	if !strings.Contains(vb, "<h1>alpha · neverexists</h1>") {
 		t.Errorf("orphan session view should show the shortened name as H1:\n%s", vb)
 	}
-	if !strings.Contains(vb, `<p class="muted small">branch <code>`+orphanStem+`</code></p>`) {
+	if !strings.Contains(vb, `<p class="muted small">branch <span class="sha-cell"><code>`+orphanStem+`</code><button type="button" class="copy-btn" data-copy="`+orphanStem+`" aria-label="Copy branch `+orphanStem+` to clipboard">copy</button></span></p>`) {
 		t.Errorf("orphan session view should show the full id as secondary text:\n%s", vb)
 	}
 	for _, unwanted := range []string{
