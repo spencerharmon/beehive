@@ -26,6 +26,12 @@ import (
 	"github.com/spencerharmon/beehive/prompts"
 )
 
+// preClaimJitter bounds the randomized pre-claim sleep (duplicate-dispatch-
+// selection-guard item 3): small enough to be inert against a bee's overall
+// budget, large enough to meaningfully de-sync concurrent selectors dispatched
+// on the same schedule (e.g. a scheduler firing several honeybees at once).
+const preClaimJitter = 3 * time.Second
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "honeybee:", err)
@@ -60,6 +66,12 @@ func run() error {
 	// itself — that would just slow recovery from a genuinely abandoned task.
 	ttl := time.Duration(c.TTLMinutes) * time.Minute
 	wallCap := wallCapFor(ttl)
+	// turnTimeout is threaded into both the Selector (decoupled selection
+	// staleness threshold, duplicate-dispatch-selection-guard) and the Runner
+	// (the per-turn ceiling itself) so both derive it from the identical
+	// host-level knob rather than risking drift between two separately-read
+	// copies.
+	turnTimeout := time.Duration(c.TurnTimeoutMinutes) * time.Minute
 
 	// Each honeybee works in its own worktree of the beehive repo on a private
 	// branch, then merges to main and pushes — no shared index, no write lock,
@@ -186,7 +198,7 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "honeybee: %s\n", w)
 	}
 
-	sel0er := &selectt.Selector{Repo: rp0, Git: primary, Rand: rnd, TTL: ttl}
+	sel0er := &selectt.Selector{Repo: rp0, Git: primary, Rand: rnd, TTL: ttl, TurnTimeout: turnTimeout}
 	if debug {
 		sel0er.Debug = os.Stderr
 	}
@@ -255,7 +267,7 @@ func run() error {
 		sessPush = func(ctx context.Context) error { return sessGit.Push(ctx, remote, sessBranch) }
 	}
 
-	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl}
+	selector := &selectt.Selector{Repo: rp, Git: gitRepo, Rand: rnd, TTL: ttl, TurnTimeout: turnTimeout}
 	if debug {
 		selector.Debug = os.Stderr
 	}
@@ -281,7 +293,7 @@ func run() error {
 		SessionGit: sessGit, SessionRoot: sessPath, SessionBranch: sessBranch,
 		SessionPublish: sessPublish, SessionPush: sessPush,
 		RestoreConfig:   restoreRemotes,
-		TurnTimeout:     time.Duration(c.TurnTimeoutMinutes) * time.Minute,
+		TurnTimeout:     turnTimeout,
 		TurnIdleTimeout: time.Duration(eff.TurnIdleTimeoutMinutes) * time.Minute,
 		// In-place recovery budget for idle-stalled turns: abort the wedged upstream
 		// turn and re-drive the same session rather than abandoning the pass to a
@@ -371,6 +383,9 @@ func run() error {
 			cl := &claim.Claimer{
 				Repo: rp, Sub: sel.Submodule, Git: gitRepo, TTL: ttl,
 				Session: session, Publish: publish, Remote: remote,
+				// De-sync concurrent selectors' initial claims (duplicate-dispatch-
+				// selection-guard item 3); see Claimer.Claim's doc.
+				PreClaimJitter: preClaimJitter,
 			}
 			if err := cl.Claim(ctx, sel.Task.ID, time.Now().UTC()); err != nil {
 				if errors.Is(err, claim.ErrLost) {

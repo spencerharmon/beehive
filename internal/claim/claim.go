@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -46,6 +47,13 @@ type Claimer struct {
 	Now     func() time.Time
 	Publish func(ctx context.Context) error
 	Remote  string
+	// PreClaimJitter, when set, is the upper bound of a randomized sleep Claim
+	// takes before its pre-dispatch re-confirm pull (see Claim's doc). De-syncs
+	// concurrent selectors that woke on the same schedule so they don't all
+	// pull/claim in lockstep, thinning out (never eliminating — the publish-
+	// conflict check remains the definitive guard) simultaneous claims on the
+	// same task. Zero (the default; every pre-existing caller/test) disables it.
+	PreClaimJitter time.Duration
 }
 
 func (c *Claimer) now() time.Time {
@@ -99,7 +107,25 @@ func (c *Claimer) syncMain(ctx context.Context) error {
 // Claim stamps taskID with our session + ts (no status change), commits, and
 // publishes. A publish/merge conflict, or another live session owning the task,
 // is a lost race (ErrLost). On success our session owns the task on main.
+//
+// Pre-dispatch re-confirm (session-audit-015 duplicate-dispatch-selection-guard,
+// item 3): before trusting this worktree's LOCAL read of PLAN.md — which may
+// predate a peer's claim published to main moments ago, the initial-claim
+// TOCTOU where two selectors both read Candidates in the same instant, both see
+// the task unclaimed, and race to claim it — pull the freshest published main
+// first via the same syncMain path Heartbeat/verify already use, optionally
+// preceded by a small randomized jitter (PreClaimJitter) so concurrent
+// selectors de-sync instead of pulling/claiming in lockstep. Both are best-
+// effort and fail OPEN exactly like verify()/Heartbeat(): a no-remote hive's
+// syncMain is a local no-op, and any pull error here is swallowed rather than
+// blocking a good claim — the publish-conflict check below remains the
+// definitive, durable race guard; this only reduces how often that guard has
+// to fire.
 func (c *Claimer) Claim(ctx context.Context, taskID string, ts time.Time) error {
+	if c.PreClaimJitter > 0 {
+		time.Sleep(time.Duration(rand.Int63n(int64(c.PreClaimJitter))))
+	}
+	_ = c.syncMain(ctx) // best-effort freshen; see doc above
 	ts = ts.UTC().Truncate(time.Second)
 	p, err := c.load()
 	if err != nil {
