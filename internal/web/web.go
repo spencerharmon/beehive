@@ -1096,7 +1096,7 @@ func (s *Server) roiGet(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "roi_editor.html", map[string]interface{}{
 		"Name": sm.Name, "Body": string(b), "Rendered": renderMarkdown(string(b)),
 		"RemoteURL": strings.TrimSpace(remoteURL),
-		"Title": pageTitle("roi", sm.Name), "Crumbs": roiCrumbs(sm.Name),
+		"Title":     pageTitle("roi", sm.Name), "Crumbs": roiCrumbs(sm.Name),
 	})
 }
 
