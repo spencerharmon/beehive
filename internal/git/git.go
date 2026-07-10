@@ -574,6 +574,18 @@ func (r *Repo) CommitExists(ctx context.Context, sha string) bool {
 	return err == nil
 }
 
+// CommitMessage returns sha's full commit message (subject + body, `%B`), a
+// pure local read (no fetch, no network) requiring sha to already be present
+// in this repo's own object database (see CommitExists). Used to confirm
+// whether a submodule gitlink pointer actually carries a given task's
+// `Beehive: <task-id> <doc-path>` protocol stamp — the deterministic way to
+// tell "this pointer was bumped onto that task's implementer work" from "this
+// pointer is unrelated history that merely happens to still resolve" (e.g. the
+// submodule's pre-work tracked tip, unrelated to a lost bee-<taskid> attempt).
+func (r *Repo) CommitMessage(ctx context.Context, sha string) (string, error) {
+	return r.Run(ctx, "log", "-1", "--format=%B", sha)
+}
+
 // SharesHistory reports whether refs a and b descend from a common ancestor,
 // i.e. they belong to the SAME project history. The editor uses it to tell the
 // repo's OWN remote (whose main shares history with local main) from a foreign /

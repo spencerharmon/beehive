@@ -154,6 +154,43 @@ func (t *Task) BounceUnreachable(reason string) error {
 	return nil
 }
 
+// RecoverLostWork demotes a NEEDS-REVIEW or NEEDS-ARBITRATION task back to a
+// workable status because its implementer commit turned out to be
+// UNRECOVERABLE everywhere this host can see: no bee-<taskid> ref locally, none
+// on the submodule remote either, the submodule gitlink not bumped onto it, and
+// no change doc on disk — the "lost work" shape (a work pass flipped the task
+// out of TODO but the runner's publish of the underlying code/pointer/doc never
+// landed) that today strands the task until an operator hand-resets it
+// (needs-review-auto-recover-lost-work). Unlike BounceUnreachable (which
+// assumes SOMETHING reachable exists to arbitrate over) there is nothing left
+// to review OR arbitrate here, so this goes straight back to TODO for a fresh
+// honeybee to reimplement from intent — never to NEEDS-ARBITRATION, which would
+// only dispatch a dispute over work that no longer exists anywhere. Mirrors
+// Reject/Strand's attempts/limit escalation (past limit -> NEEDS-HUMAN,
+// otherwise TODO) so a task that keeps losing its work in the same way
+// eventually surfaces to an operator instead of looping forever. Valid from
+// NEEDS-REVIEW or NEEDS-ARBITRATION. Releases the active claim.
+func (t *Task) RecoverLostWork(reason string, limit int, now time.Time) error {
+	if t.Status != StatusReview && t.Status != StatusArb {
+		return fmt.Errorf("plan: recover-lost-work on non-reviewable task %s (%s)", t.ID, t.Status)
+	}
+	reason = oneLine(reason)
+	if reason == "" {
+		return fmt.Errorf("plan: recover-lost-work for %s requires a reason", t.ID)
+	}
+	t.Attempts++
+	t.Session = ""
+	t.Heartbeat = time.Time{}
+	if t.Attempts > limit {
+		t.Status = StatusHuman
+		t.setHumanReason(reason)
+	} else {
+		t.Status = StatusTODO
+		t.appendNote("Recovered (lost work, runner): " + reason)
+	}
+	return nil
+}
+
 // FinalizeAlreadyMerged moves a NEEDS-REVIEW task straight to DONE,
 // deterministically and without ever spawning a review session, when its
 // recorded submodule pointer commit is discovered to already be an ancestor of

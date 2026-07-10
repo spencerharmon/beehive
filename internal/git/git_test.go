@@ -868,6 +868,29 @@ func TestCommitExists(t *testing.T) {
 	}
 }
 
+// TestCommitMessage proves CommitMessage returns a real commit's full message
+// (subject + body) — the plumbing needs-review-auto-recover-lost-work's
+// dispatch guard uses to tell whether a submodule gitlink pointer actually
+// carries a given task's `Beehive: <task-id> <doc-path>` protocol stamp.
+func TestCommitMessage(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	sha := commitFile(t, r, "f", "v1\n", "feat: work\n\nBeehive: T1 docs/bee-T1-T1.md")
+
+	msg, err := r.CommitMessage(ctx, sha)
+	if err != nil {
+		t.Fatalf("CommitMessage: %v", err)
+	}
+	if !strings.Contains(msg, "Beehive: T1 docs/bee-T1-T1.md") {
+		t.Fatalf("CommitMessage = %q, want it to contain the Beehive stamp", msg)
+	}
+
+	// An absent sha errors rather than silently returning "".
+	if _, err := r.CommitMessage(ctx, strings.Repeat("a", 40)); err == nil {
+		t.Fatal("CommitMessage on an absent sha should error")
+	}
+}
+
 // TestPushBranchReconciledSupersedesDeadOrphan is the F-LIVE publish-side fix: a
 // prior GC'd attempt of the SAME task left a divergent orphan on
 // origin/bee-<taskid> (no shared ancestry with the new commit), so a plain push

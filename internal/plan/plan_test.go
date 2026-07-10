@@ -211,6 +211,74 @@ func TestStrandGuardedAndRequiresReason(t *testing.T) {
 	}
 }
 
+// TestRecoverLostWorkAttempts mirrors TestStrandAttempts for RecoverLostWork:
+// each recovery bumps Attempts and returns to TODO with the claim released,
+// until attempts exceed the limit, at which point it escalates to
+// NEEDS-HUMAN with the caller's reason recorded verbatim (so a task that keeps
+// losing its work in the same way surfaces to an operator instead of looping
+// forever). Unlike Strand, valid from BOTH NEEDS-REVIEW and NEEDS-ARBITRATION.
+func TestRecoverLostWorkAttempts(t *testing.T) {
+	now := time.Now()
+	tk := &Task{ID: "a", Status: StatusReview, Attempts: 0}
+	for i := 0; i < 3; i++ {
+		tk.Status = StatusReview
+		tk.Session, tk.Heartbeat = "bee-1", now
+		if err := tk.RecoverLostWork("implementer work unrecoverable: no branch anywhere, no doc", 3, now); err != nil {
+			t.Fatal(err)
+		}
+		if tk.Status != StatusTODO {
+			t.Fatalf("attempt %d status %s", i, tk.Status)
+		}
+		if tk.Session != "" || !tk.Heartbeat.IsZero() {
+			t.Fatalf("attempt %d: recover-lost-work must release the claim", i)
+		}
+	}
+	tk.Status = StatusArb // arbitration can also lose its work
+	if err := tk.RecoverLostWork("implementer work unrecoverable: no branch anywhere, no doc", 3, now); err != nil {
+		t.Fatal(err) // 4th > 3
+	}
+	if tk.Status != StatusHuman {
+		t.Fatalf("want NEEDS-HUMAN, got %s", tk.Status)
+	}
+	if got := tk.HumanReason(); got != "implementer work unrecoverable: no branch anywhere, no doc" {
+		t.Fatalf("human reason = %q, want the caller's concrete reason verbatim", got)
+	}
+}
+
+// TestRecoverLostWorkGuardedAndRequiresReason: only legal from NEEDS-REVIEW or
+// NEEDS-ARBITRATION, and always requires a concrete reason.
+func TestRecoverLostWorkGuardedAndRequiresReason(t *testing.T) {
+	for _, st := range []Status{StatusTODO, StatusDone, StatusHuman} {
+		if err := (&Task{ID: "a", Status: st}).RecoverLostWork("reason", 3, time.Now()); err == nil {
+			t.Fatalf("recover-lost-work allowed on %s", st)
+		}
+	}
+	if err := (&Task{ID: "a", Status: StatusReview}).RecoverLostWork("  \t \n ", 3, time.Now()); err == nil {
+		t.Fatal("recover-lost-work allowed with an empty/blank reason")
+	}
+}
+
+// TestRecoverLostWorkFromArbitration proves the NEEDS-ARBITRATION -> TODO edge
+// (needs-review-auto-recover-lost-work explicitly covers arbitration, since a
+// NEEDS-ARBITRATION task's implementer commit can be lost exactly the same
+// way as a NEEDS-REVIEW one's).
+func TestRecoverLostWorkFromArbitration(t *testing.T) {
+	tk := &Task{ID: "a", Status: StatusArb, Session: "bee-1", Heartbeat: time.Now(), Attempts: 1}
+	if err := tk.RecoverLostWork("implementer work unrecoverable: no branch anywhere, no doc", 3, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if tk.Status != StatusTODO {
+		t.Fatalf("status = %s, want TODO", tk.Status)
+	}
+	if tk.Attempts != 2 {
+		t.Fatalf("attempts = %d, want 2 (incremented)", tk.Attempts)
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if !strings.Contains(joined, "Recovered (lost work, runner): implementer work unrecoverable") {
+		t.Fatalf("body missing recovery note:\n%s", joined)
+	}
+}
+
 // TestBounceUnreachable locks the review-dispatch-side deterministic bounce:
 // NEEDS-REVIEW -> NEEDS-ARBITRATION with the reason recorded as a review note,
 // claim released, never touching Attempts (this is not a rejection verdict —
