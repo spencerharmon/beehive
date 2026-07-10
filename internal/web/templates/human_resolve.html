@@ -38,9 +38,10 @@
      again, which restarts the poll. */}}
   <div id="resolve"
        role="status" aria-live="polite"
+       hx-ext="morph"
        hx-get="/human/{{.Sub}}/{{.Item.ID}}/panel/{{.SessID}}"
        hx-trigger="load"
-       hx-swap="innerHTML">
+       hx-swap="morph:innerHTML">
     {{template "skeleton-transcript"}}
   </div>
   <form hx-post="/human/{{.Sub}}/{{.Item.ID}}/message/{{.SessID}}" hx-target="#resolve" hx-swap="innerHTML"

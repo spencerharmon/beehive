@@ -21,4 +21,4 @@
    continues as long as the agent is working and stops the moment it settles
    (the next panel renders without this node). Same target/innerHTML swap as the
    old shell poll — no visible output, no scroll-preserve change. */}}
-{{if .Busy}}<div hx-get="/editor/{{.ID}}/panel" hx-trigger="load delay:1500ms" hx-target="#editor" hx-swap="innerHTML" hidden></div>{{end}}
+{{if .Busy}}<div hx-get="/editor/{{.ID}}/panel" hx-trigger="load delay:1500ms" hx-target="#editor" hx-swap="morph:innerHTML" hidden></div>{{end}}
