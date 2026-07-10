@@ -67,6 +67,18 @@ func (t *Task) Stale(now time.Time, ttl time.Duration) bool {
 	return now.Sub(t.Heartbeat) > ttl
 }
 
+// NotBeforeReached reports whether the task's optional wall-clock `not_before`
+// gate has passed at now: true when no gate is set (zero NotBefore) or when
+// now is at/after it. A future gate holds a TODO task out of the ready set the
+// same way an unmet dep does; deps are gated independently of this. Recovery
+// tiers (review/arbitration) are never gated by not_before.
+func (t *Task) NotBeforeReached(now time.Time) bool {
+	if t.NotBefore.IsZero() {
+		return true
+	}
+	return !now.Before(t.NotBefore)
+}
+
 // Reject records a rejection: bumps attempts, and once attempts exceed limit the
 // task goes NEEDS-HUMAN (no longer auto-recycled). Otherwise it returns to TODO.
 // Valid from NEEDS-REVIEW or NEEDS-ARBITRATION. Releases the active claim.

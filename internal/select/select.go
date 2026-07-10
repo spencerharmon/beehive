@@ -5,8 +5,12 @@
 // NEEDS-HUMAN excluded. Dependency gating spans submodules: a TODO task whose dep
 // names a linked submodule's task ("<submodule>:<taskid>") is held until that
 // task is DONE, and a task on a wait cycle is excluded rather than deadlocked
-// (this package owns the combined cross-submodule graph; see graph.go). The
-// package name avoids the "select" keyword.
+// (this package owns the combined cross-submodule graph; see graph.go). A TODO
+// task carrying a future `not_before=<RFC3339>` wall-clock gate is likewise held
+// out of the ready set until now reaches it (a general delay primitive: backoff,
+// TTL/convergence wait, spaced re-check), independently of its deps; see
+// plan.Task.NotBeforeReached and plan.Plan.Candidates. The package name avoids
+// the "select" keyword.
 package selectt
 
 import (

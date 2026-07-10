@@ -24,6 +24,9 @@ func (p *Plan) ROIStamp() string { return p.ROI }
 // status, and the selecting bee's claim overwrites the dead owner's stamp.
 //
 // Priority: arbitration > review > main (TODO with deps satisfied).
+// A TODO task carrying a future `not_before` wall-clock gate is held out of the
+// main tier until now reaches it (see Task.NotBeforeReached), independently of
+// its deps.
 func (p *Plan) Candidates(now time.Time, ttl time.Duration) []Task {
 	var arb, rev, main []Task
 	for _, t := range p.Tasks {
@@ -36,7 +39,7 @@ func (p *Plan) Candidates(now time.Time, ttl time.Duration) []Task {
 		case StatusReview:
 			rev = append(rev, *t)
 		case StatusTODO:
-			if p.Selectable(t) {
+			if p.Selectable(t) && t.NotBeforeReached(now) {
 				main = append(main, *t)
 			}
 		}

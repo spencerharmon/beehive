@@ -85,6 +85,13 @@ every turn. Your requirements:
 - You never write session/heartbeat yourself.
 - You change only the task STATUS (its work phase). A task whose heartbeat is past the TTL is stale and
   reclaimable by anyone.
+- A task header may carry an optional `not_before=<RFC3339>` stamp: a deterministic, runner-owned
+  wall-clock gate that holds a TODO task OUT of the ready set (exactly like an unmet dep) until
+  wall-clock passes it, then it is normally selectable. It is a general delay primitive — backoff, a
+  TTL/convergence wait, a spaced re-check/retry — not verification-only. Deps still gate independently
+  of it. A work task that must defer its own re-check (or the runner on a failed-but-retryable check)
+  sets/refreshes `not_before` on its task; you never wait/sleep inside a turn for it. Same layer as
+  dep-gating and claim/heartbeat — the selector, not the agent, enforces it.
 
 ## The runner does this — don't redo it
 A deterministic runner wraps your turn-loop and OWNS everything below; never reproduce, re-run, or

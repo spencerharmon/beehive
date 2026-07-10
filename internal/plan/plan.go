@@ -7,7 +7,7 @@
 //	<!-- Beehive-ROI: <sha> -->
 //	# Plan
 //
-//	## <id> [<STATUS>] <!-- attempts=N deps=a,b session=<id> heartbeat=<RFC3339> -->
+//	## <id> [<STATUS>] <!-- attempts=N deps=a,b session=<id> heartbeat=<RFC3339> not_before=<RFC3339> -->
 //	free-form body lines...
 //	Human-needed: concrete blocker/reason (only when status is NEEDS-HUMAN),
 //	  optionally continued by immediately-following non-blank lines (e.g.
@@ -18,7 +18,11 @@
 // "active" (being worked right now) when it carries a session id and a heartbeat
 // fresh within the TTL — independent of its status. There is no IN-PROGRESS
 // status: every status can be actively worked. (Legacy `[IN-PROGRESS]` headers
-// parse as TODO for backward compatibility.)
+// parse as TODO for backward compatibility.) The optional `not_before=<RFC3339>`
+// stamp is a wall-clock gate: a TODO task is held out of selection (same as an
+// unmet dep) until now reaches it, then it is normally selectable — a general
+// delay primitive (backoff, TTL wait, spaced re-check/retry) a task or the runner
+// may set/refresh on itself.
 package plan
 
 import (
@@ -70,7 +74,13 @@ type Task struct {
 	Weight    int       // selection weight, default 1
 	Session   string    // owner's unique claim token; "" when unclaimed
 	Heartbeat time.Time // last claim stamp; zero when unclaimed
-	Body      []string  // body lines verbatim, without trailing blank
+	// NotBefore, when non-zero, is a wall-clock gate: a TODO task is NOT ready
+	// for selection until now >= NotBefore (same effect as an unmet dep), then it
+	// becomes normally selectable. A general delay primitive (backoff, TTL wait,
+	// spaced re-check/retry) a task or the runner may set/refresh on itself. Zero
+	// means no gate. Serialized as `not_before=<RFC3339>` in the header comment.
+	NotBefore time.Time
+	Body      []string // body lines verbatim, without trailing blank
 }
 
 // Plan is a parsed PLAN.md.
@@ -166,6 +176,12 @@ func parseHeader(m []string) (*Task, error) {
 				return nil, fmt.Errorf("plan: bad heartbeat %q for %s", v, t.ID)
 			}
 			t.Heartbeat = ts
+		case "not_before":
+			ts, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				return nil, fmt.Errorf("plan: bad not_before %q for %s", v, t.ID)
+			}
+			t.NotBefore = ts
 		}
 	}
 	return t, nil
@@ -223,6 +239,9 @@ func (t *Task) header() string {
 	}
 	if !t.Heartbeat.IsZero() {
 		meta += " heartbeat=" + t.Heartbeat.UTC().Format(time.RFC3339)
+	}
+	if !t.NotBefore.IsZero() {
+		meta += " not_before=" + t.NotBefore.UTC().Format(time.RFC3339)
 	}
 	return fmt.Sprintf("## %s [%s] <!-- %s -->", t.ID, t.Status, meta)
 }

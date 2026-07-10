@@ -450,6 +450,89 @@ func TestSelectableDefersCrossSubmoduleDeps(t *testing.T) {
 	}
 }
 
+// TestNotBeforeParseRoundTrip proves an optional not_before stamp parses to a
+// time and round-trips through String() byte-for-byte.
+func TestNotBeforeParseRoundTrip(t *testing.T) {
+	src := "<!-- Beehive-ROI: abc -->\n\n## x [TODO] <!-- attempts=0 deps= not_before=2026-07-01T12:00:00Z -->\nbody\n"
+	p, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := p.Task("x")
+	if x.NotBefore.UTC().Format(time.RFC3339) != "2026-07-01T12:00:00Z" {
+		t.Fatalf("not_before parsed wrong: %v", x.NotBefore)
+	}
+	if got := p.String(); got != src {
+		t.Fatalf("round trip mismatch:\n%q\nvs\n%q", got, src)
+	}
+}
+
+// TestNotBeforeMalformedSurfaces proves a malformed not_before timestamp is a
+// parse error, not silently swallowed.
+func TestNotBeforeMalformedSurfaces(t *testing.T) {
+	if _, err := Parse("## x [TODO] <!-- attempts=0 deps= not_before=nonsense -->\n"); err == nil {
+		t.Fatal("expected error for malformed not_before, got nil")
+	}
+}
+
+// TestNotBeforeReached proves the wall-clock gate: no gate or a past gate is
+// ready; a future gate is not.
+func TestNotBeforeReached(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	var none Task
+	if !none.NotBeforeReached(now) {
+		t.Fatal("no gate must be ready")
+	}
+	past := Task{NotBefore: now.Add(-time.Hour)}
+	if !past.NotBeforeReached(now) {
+		t.Fatal("past gate must be ready")
+	}
+	exact := Task{NotBefore: now}
+	if !exact.NotBeforeReached(now) {
+		t.Fatal("gate at exactly now must be ready")
+	}
+	future := Task{NotBefore: now.Add(time.Hour)}
+	if future.NotBeforeReached(now) {
+		t.Fatal("future gate must not be ready")
+	}
+}
+
+// TestCandidatesNotBeforeGate proves the selector's candidate set excludes a
+// TODO task with a future not_before and includes it once wall-clock passes,
+// while deps gate independently.
+func TestCandidatesNotBeforeGate(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	ttl := time.Hour
+	src := "## a [TODO] <!-- attempts=0 deps= not_before=2026-07-01T13:00:00Z -->\n" +
+		"## b [TODO] <!-- attempts=0 deps= -->\n"
+	p, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a is gated in the future; only b is a candidate now.
+	cands := p.Candidates(now, ttl)
+	if len(cands) != 1 || cands[0].ID != "b" {
+		t.Fatalf("expected only b ready, got %+v", cands)
+	}
+	// Once wall-clock passes a's gate, both are candidates.
+	later := now.Add(2 * time.Hour)
+	cands = p.Candidates(later, ttl)
+	if len(cands) != 2 {
+		t.Fatalf("expected a and b ready after gate, got %+v", cands)
+	}
+	// A future not_before must not affect an already-unmet dep path: deps gate
+	// independently. Give a a future gate AND an unmet dep; it stays out even
+	// after the gate passes until the dep is DONE.
+	p2, _ := Parse("## a [TODO] <!-- attempts=0 deps=b not_before=2026-07-01T11:00:00Z -->\n" +
+		"## b [TODO] <!-- attempts=0 deps= -->\n")
+	cands = p2.Candidates(now, ttl) // gate is past, but dep b not done
+	for _, c := range cands {
+		if c.ID == "a" {
+			t.Fatal("a must stay gated by unmet dep b even with past not_before")
+		}
+	}
+}
+
 func TestGolden(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	p, _ := Parse(sample)
