@@ -12,6 +12,13 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{if .Title}}{{.Title}}{{else}}beehive{{end}}</title>
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
 <script src="/assets/htmx.min.js"></script>
+{{/* idiomorph morph extension (session-poll-dom-morph): vendored + embedded
+   right after htmx so htmx.defineExtension("morph") is registered before any
+   pane wires hx-ext="morph". Polled panes swap with hx-swap="morph:innerHTML"
+   so a refresh PATCHES the existing DOM in place (keyed on stable ids) instead
+   of rebuilding the whole subtree — scroll, focus, and <details> open-state
+   survive a tick at the source. Single-binary embed, NO CDN/SPA/framework. */}}
+<script src="/assets/idiomorph-ext.min.js"></script>
 <link rel="stylesheet" href="/assets/style.css"></head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -32,14 +39,20 @@
 {{define "breadcrumb"}}{{if .}}<nav class="breadcrumb" aria-label="breadcrumb"><ol>{{range .}}<li>{{if .Href}}<a href="{{.Href}}">{{.Label}}</a>{{else}}<span aria-current="page">{{.Label}}</span>{{end}}</li>{{end}}</ol></nav>{{end}}{{end}}
 {{define "footer"}}</main>
 <script>
-/* poll-scroll-preserve: an htmx poll-refresh swaps a pane's innerHTML, which
-   destroys its inner scroll container and yanks the reader back to the top
-   mid-read. We save every [data-scroll-preserve] pane's scrollTop before a swap
-   and restore it after (keyed by a STABLE id that re-renders identically), and
-   also restore the window scroll, so a refresh never jumps the viewport. A
-   [data-scroll-pin] pane that was scrolled to its bottom keeps following new
-   output; otherwise the reader's absolute position is held. Anchors on content,
-   not the container. No external libraries (single-binary embed, no CDN). */
+/* poll-scroll-preserve (scoped for session-poll-dom-morph): the polled panes now
+   swap with hx-swap="morph:innerHTML" (idiomorph), which PATCHES the DOM in place
+   — the inner scroll container is the SAME node across a tick, so its scrollTop,
+   focus, and <details> open-state already survive natively. That makes the old
+   save-scrollTop / restore-scrollTop dance redundant AND a fight (it would clobber
+   a mid-morph position), so we no longer restore per-pane scrollTop. Two jobs
+   remain, both things a node-preserving morph does NOT do on its own:
+   (1) [data-scroll-pin] bottom-follow — a pinned pane that was at its bottom
+   should keep following freshly-appended output (a persisted node holds its old
+   scrollTop and would otherwise stop following), and (2) window-scroll restore,
+   so a swap never jumps the viewport. We record only the pinned flag before the
+   swap and, after it, re-pin bottom-followed panes and restore the window scroll.
+   Anchors on content, not the container. No external libraries (single-binary
+   embed, no CDN). */
 (function () {
   var SLACK = 4, saved = {}, wx = 0, wy = 0;
   function target(e) { return (e.detail && e.detail.target) || e.target; }
@@ -56,17 +69,18 @@
   document.addEventListener('htmx:beforeSwap', function (e) {
     wx = window.scrollX; wy = window.scrollY;
     panes(target(e)).forEach(function (el) {
+      // Only the pin decision needs the pre-swap geometry now — morph keeps the
+      // node (and its scrollTop) for us, so we no longer stash/restore top.
       saved[el.id] = {
-        top: el.scrollTop,
-        pinned: el.scrollHeight - el.scrollTop - el.clientHeight <= SLACK
+        pinned: el.hasAttribute('data-scroll-pin') &&
+          el.scrollHeight - el.scrollTop - el.clientHeight <= SLACK
       };
     });
   });
   document.addEventListener('htmx:afterSwap', function (e) {
     panes(target(e)).forEach(function (el) {
       var s = saved[el.id];
-      if (!s) return;
-      el.scrollTop = (el.hasAttribute('data-scroll-pin') && s.pinned) ? el.scrollHeight : s.top;
+      if (s && s.pinned) el.scrollTop = el.scrollHeight; // keep following new output
     });
     window.scrollTo(wx, wy);
   });

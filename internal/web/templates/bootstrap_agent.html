@@ -6,9 +6,10 @@
      1.5s; sending a message makes the panel Busy again, which restarts the poll. */}}
   <div id="chatedit"
        role="status" aria-live="polite"
+       hx-ext="morph"
        hx-get="/edit/{{.ID}}/panel"
        hx-trigger="load"
-       hx-swap="innerHTML">
+       hx-swap="morph:innerHTML">
     {{template "skeleton-transcript"}}
   </div>
   <form hx-post="/edit/{{.ID}}/message" hx-target="#chatedit" hx-swap="innerHTML"

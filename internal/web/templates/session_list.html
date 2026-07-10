@@ -4,9 +4,10 @@
 <div id="session-list"
      role="status" aria-live="polite"
      data-scroll-preserve
+     hx-ext="morph"
      hx-get="/submodule/{{.Name}}/sessions/body"
      hx-trigger="load, every 2s"
-     hx-swap="innerHTML">
+     hx-swap="morph:innerHTML">
   {{template "skeleton-list"}}
 </div>
 {{template "footer"}}

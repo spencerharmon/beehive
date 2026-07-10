@@ -318,7 +318,7 @@ func TestPollBackoffWhenEndedOrIdle(t *testing.T) {
 	}
 	// Only the cadence changes: the poll target and swap are identical either way.
 	for _, v := range []string{live, ended} {
-		if !strings.Contains(v, `id="session-body"`) || !strings.Contains(v, `hx-swap="innerHTML"`) {
+		if !strings.Contains(v, `id="session-body"`) || !strings.Contains(v, `hx-swap="morph:innerHTML"`) {
 			t.Errorf("session_view poll target/swap must be unchanged:\n%s", v)
 		}
 	}
@@ -7235,5 +7235,137 @@ func TestStatusbarRowWraps(t *testing.T) {
 	}
 	if !strings.Contains(rule, "display: flex") {
 		t.Fatalf(".statusbar must remain display: flex:\n%s", rule)
+	}
+}
+
+// TestAssetsIdiomorphServed locks the single-binary embed contract for the
+// idiomorph morph extension (session-poll-dom-morph): the library is vendored
+// under assets/ and served at /assets/idiomorph-ext.min.js (no CDN), and the
+// served bytes are the real library — it registers the htmx "morph" extension —
+// not a stub.
+func TestAssetsIdiomorphServed(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/assets/idiomorph-ext.min.js")
+	if w.Code != 200 {
+		t.Fatalf("idiomorph-ext.min.js status %d", w.Code)
+	}
+	body := w.Body.String()
+	if len(body) < 2000 {
+		t.Fatalf("idiomorph-ext.min.js is %d bytes — too small to be the real library", len(body))
+	}
+	for _, want := range []string{
+		"Idiomorph",               // the vendored library
+		`defineExtension("morph"`, // registers the htmx morph extension
+		"idiomorph 0.3.0",         // pinned version banner
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("idiomorph-ext.min.js missing %q — not the real morph extension", want)
+		}
+	}
+}
+
+// TestLayoutEmbedsIdiomorphNoCDN proves the layout loads the EMBEDDED morph
+// extension right alongside the embedded htmx (so htmx.defineExtension("morph")
+// is registered before any pane wires hx-ext="morph"), and reaches no CDN.
+func TestLayoutEmbedsIdiomorphNoCDN(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String()
+	if !strings.Contains(page, `src="/assets/idiomorph-ext.min.js"`) {
+		t.Fatalf("layout does not reference the embedded idiomorph asset:\n%s", page)
+	}
+	// htmx must be loaded BEFORE idiomorph — the ext calls htmx.defineExtension.
+	hi := strings.Index(page, `src="/assets/htmx.min.js"`)
+	ii := strings.Index(page, `src="/assets/idiomorph-ext.min.js"`)
+	if hi < 0 || ii < 0 || hi > ii {
+		t.Fatalf("htmx must load before idiomorph-ext (htmx=%d idiomorph=%d):\n%s", hi, ii, page)
+	}
+	if strings.Contains(page, "unpkg.com") || strings.Contains(page, "//cdn.") {
+		t.Fatalf("layout still references a CDN (must be a single-binary embed):\n%s", page)
+	}
+}
+
+// TestPollPanesMorphSwap is the core of session-poll-dom-morph: every htmx-polled
+// pane must PATCH its DOM in place with the idiomorph morph swap
+// (hx-ext="morph" + hx-swap="morph:innerHTML") keyed on its stable id, instead of
+// the old full-subtree hx-swap="innerHTML" that rebuilt identical DOM (and its
+// inner scroll container) every tick. Asserted directly off the parsed templates.
+func TestPollPanesMorphSwap(t *testing.T) {
+	s, _ := setup(t)
+	cases := []struct {
+		name string
+		tmpl string
+		data interface{}
+	}{
+		{"session-body", "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x", "Live": true}},
+		{"session-list", "session_list.html", map[string]interface{}{"Name": "alpha"}},
+		{"editor", "editor.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"}},
+		{"chatedit", "bootstrap_agent.html", map[string]interface{}{"ID": "c1"}},
+		{"resolve", "human_resolve.html", map[string]interface{}{"Sub": "alpha", "Item": PlanItem{ID: "t1"}, "SessID": "s1"}},
+	}
+	for _, c := range cases {
+		out := renderTmpl(t, s, c.tmpl, c.data)
+		// Isolate the polled pane's own opening tag (id -> its closing '>') so the
+		// assertion is about the poll wiring, not unrelated form swaps on the page.
+		id := `id="` + c.name + `"`
+		i := strings.Index(out, id)
+		if i < 0 {
+			t.Fatalf("%s (%s) missing polled pane %s:\n%s", c.name, c.tmpl, id, out)
+		}
+		tag := out[i : i+strings.Index(out[i:], ">")]
+		if !strings.Contains(tag, `hx-ext="morph"`) {
+			t.Errorf("%s (%s) pane missing hx-ext=\"morph\" — poll must use the idiomorph extension:\n%s", c.name, c.tmpl, tag)
+		}
+		if !strings.Contains(tag, `hx-swap="morph:innerHTML"`) {
+			t.Errorf("%s (%s) pane missing hx-swap=\"morph:innerHTML\" — poll must patch in place:\n%s", c.name, c.tmpl, tag)
+		}
+		// The old rebuild-everything swap must be gone from the polled pane itself.
+		if strings.Contains(tag, `hx-swap="innerHTML"`) {
+			t.Errorf("%s (%s) pane still carries a full hx-swap=\"innerHTML\" poll:\n%s", c.name, c.tmpl, tag)
+		}
+	}
+}
+
+// TestBusyPanelPollMorphs locks that the self-perpetuating in-flight poll (the
+// hidden load-delay node re-armed while .Busy) also morphs, so a live turn's
+// repeated re-fetch patches the panel in place rather than rebuilding it.
+func TestBusyPanelPollMorphs(t *testing.T) {
+	s, _ := setup(t)
+	for _, c := range []struct {
+		name string
+		tmpl string
+		data interface{}
+	}{
+		{"editor_panel", "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Busy": true}},
+		{"chatedit_panel", "chatedit_panel.html", map[string]interface{}{"ID": "c1", "Busy": true}},
+		{"human_resolve_panel", "human_resolve_panel.html", map[string]interface{}{"Sub": "alpha", "TaskID": "t1", "SessID": "s1", "Busy": true}},
+	} {
+		out := renderTmpl(t, s, c.tmpl, c.data)
+		if !strings.Contains(out, `hx-swap="morph:innerHTML"`) {
+			t.Errorf("busy %s self-poll must morph, not full-innerHTML swap:\n%s", c.name, out)
+		}
+	}
+}
+
+// TestScrollPreserveScopedForMorph locks that the poll-scroll-preserve shim was
+// scoped for the morph swap: because a morph PATCHES nodes in place, the pane's
+// scrollTop already survives, so the shim no longer stashes/restores per-pane
+// scrollTop (which would fight the morph). The two jobs a node-preserving morph
+// does NOT do on its own must remain: the [data-scroll-pin] bottom-follow and the
+// window-scroll restore.
+func TestScrollPreserveScopedForMorph(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String()
+	for _, want := range []string{
+		"data-scroll-pin",                // pin bottom-follow still driven
+		"el.scrollTop = el.scrollHeight", // the pin re-follow after a morph
+		"window.scrollTo",                // window-scroll restore kept
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("scoped scroll-preserve shim missing %q:\n%s", want, page)
+		}
+	}
+	// The redundant per-pane top save/restore must be gone (it would fight morph).
+	if strings.Contains(page, "top: el.scrollTop") {
+		t.Fatalf("scroll-preserve still stashes per-pane scrollTop — morph makes that redundant and it fights the in-place patch:\n%s", page)
 	}
 }

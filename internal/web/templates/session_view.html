@@ -15,9 +15,10 @@
    identical bytes. */}}
 <div id="session-body"
      role="status" aria-live="polite"
+     hx-ext="morph"
      hx-get="/submodule/{{.Name}}/session/{{.Branch}}/body"
      hx-trigger="{{if .Live}}load, every 2s{{else}}load{{end}}"
-     hx-swap="innerHTML">
+     hx-swap="morph:innerHTML">
   <div id="session-loading">{{template "skeleton-transcript"}}</div>
 </div>
 {{if .Live}}

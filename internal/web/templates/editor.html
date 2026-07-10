@@ -9,9 +9,10 @@
    message makes the panel Busy again, which restarts the poll. */}}
 <div id="editor"
      role="status" aria-live="polite"
+     hx-ext="morph"
      hx-get="/editor/{{.ID}}/panel"
      hx-trigger="load"
-     hx-swap="innerHTML">
+     hx-swap="morph:innerHTML">
   {{template "skeleton-transcript"}}
 </div>
 <form hx-post="/editor/{{.ID}}/chat" hx-target="#editor" hx-swap="innerHTML"

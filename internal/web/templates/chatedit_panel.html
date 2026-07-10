@@ -22,7 +22,7 @@
    continues as long as the agent is working and stops the moment it settles (the
    next panel renders without this node). Same target/innerHTML swap as the old
    shell poll — no visible output, no scroll-preserve change. */}}
-{{if .Busy}}<div hx-get="/edit/{{.ID}}/panel" hx-trigger="load delay:1500ms" hx-target="#chatedit" hx-swap="innerHTML" hidden></div>{{end}}
+{{if .Busy}}<div hx-get="/edit/{{.ID}}/panel" hx-trigger="load delay:1500ms" hx-target="#chatedit" hx-swap="morph:innerHTML" hidden></div>{{end}}
 
 {{/* agent-step renders ONE reasoning/tool-call item as a native, expandable
      <details> (no JS, no SPA — same convention as the inline-edit affordances
