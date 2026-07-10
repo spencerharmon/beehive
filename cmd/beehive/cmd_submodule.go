@@ -34,8 +34,35 @@ func findRoot() (string, error) {
 func submoduleCmd() *cobra.Command {
 	c := &cobra.Command{Use: "submodule", Short: "manage beehive submodules"}
 	c.AddCommand(submoduleAddCmd(), submoduleLinkCmd(), submodulePlanCmd(),
-		submoduleWorktreeCmd(), submoduleSyncCmd())
+		submoduleWorktreeCmd(), submoduleSyncCmd(), submoduleRemoteCmd())
 	return c
+}
+
+// submoduleRemoteCmd repoints a submodule's tracked remote URL through the shared
+// submod.SetRemoteURL (the same body the frontend's "change remote" action uses),
+// then commits the .gitmodules rewrite. The checkout's origin and the cached
+// submodule url are updated by `git submodule sync` inside SetRemoteURL.
+func submoduleRemoteCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "remote <submodule> <url>",
+		Short: "change a submodule's tracked remote URL (.gitmodules + submodule sync)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			rel, err := submod.SetRemoteURL(cmd.Context(), root, args[0], args[1])
+			if err != nil {
+				return err
+			}
+			if err := git.New(root).CommitPaths(cmd.Context(), "submodule remote: "+args[0]+" -> "+args[1], ".gitmodules"); err != nil && err != git.ErrNothing {
+				return err
+			}
+			fmt.Printf("%s remote set to %s\n", rel, args[1])
+			return nil
+		},
+	}
 }
 
 // submoduleWorktreeCmd manages worktrees of a submodule's target repo, where a

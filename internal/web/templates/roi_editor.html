@@ -14,5 +14,16 @@
     <button>save</button>
   </form>
 </details>
+<details class="inline-edit">
+  <summary>change remote</summary>
+  <p class="muted">Repoint this submodule's tracked remote (rewrites <code>.gitmodules</code> and runs <code>git submodule sync</code>).</p>
+  <form method="post" action="/submodule/{{.Name}}/remote">
+    <label>remote url
+      <input type="text" name="url" value="{{.RemoteURL}}" size="60" required
+             placeholder="https://git.example.com/owner/repo.git">
+    </label>
+    <button>set remote</button>
+  </form>
+</details>
 </div>
 {{template "footer"}}

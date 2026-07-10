@@ -357,6 +357,9 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /submodule/{name}/session/{branch}/stream", b((*Server).sessionStream))
 	mux.HandleFunc("GET /roi/{name}", b((*Server).roiGet))
 	mux.HandleFunc("POST /roi/{name}", b((*Server).roiPost))
+	// Per-submodule "change remote" action, exposed beside the ROI editor: rewrite
+	// the tracked .gitmodules url + `git submodule sync` via the shared submod lib.
+	mux.HandleFunc("POST /submodule/{name}/remote", b((*Server).submoduleRemote))
 	mux.HandleFunc("GET /secrets", b((*Server).secretsGet))
 	mux.HandleFunc("POST /secrets", b((*Server).secretsPost))
 	mux.HandleFunc("GET /merge", b((*Server).mergeGet))
@@ -1084,10 +1087,15 @@ func (s *Server) roiGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b, _ := os.ReadFile(sm.ROIPath())
+	// The "change remote" action edits this same submodule; prefill its form with
+	// the current tracked url from .gitmodules (empty if unset).
+	rel := filepath.Join("submodules", sm.Name, "repo")
+	remoteURL, _ := s.git.Run(r.Context(), "config", "-f", ".gitmodules", "submodule."+rel+".url")
 	// The textarea carries the RAW source verbatim (the edit round-trip); the
 	// preview renders the same source to sanitized HTML for reading.
 	s.render(w, "roi_editor.html", map[string]interface{}{
 		"Name": sm.Name, "Body": string(b), "Rendered": renderMarkdown(string(b)),
+		"RemoteURL": strings.TrimSpace(remoteURL),
 		"Title": pageTitle("roi", sm.Name), "Crumbs": roiCrumbs(sm.Name),
 	})
 }
@@ -1108,6 +1116,34 @@ func (s *Server) roiPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, "roi_editor.html", map[string]interface{}{"Name": sm.Name, "Body": body, "Saved": true, "Rendered": renderMarkdown(body), "Title": pageTitle("roi", sm.Name), "Crumbs": roiCrumbs(sm.Name)})
+}
+
+// submoduleRemote repoints an existing submodule's tracked remote URL through the
+// shared submod.SetRemoteURL (rewrite .gitmodules + `git submodule sync`), then
+// commits the .gitmodules change via publishMain (whose `git add -A` picks up the
+// unstaged rewrite). It is the per-submodule "change remote" action that sits
+// beside the ROI editor, mirroring submoduleAdd's shared-lib -> error-switch ->
+// publish -> redirect shape. A missing/empty url or bad name is a client error;
+// an unknown submodule is a 404. On success it redirects back to the submodule's
+// ROI editor so the form re-renders prefilled with the new url.
+func (s *Server) submoduleRemote(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, err := submod.SetRemoteURL(r.Context(), s.repo.Root, name, r.FormValue("url")); err != nil {
+		switch {
+		case errors.Is(err, submod.ErrURLRequired), errors.Is(err, submod.ErrInvalidName):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, submod.ErrNotExist):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	if err := s.publishMain(r.Context(), "frontend: set remote "+name); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	http.Redirect(w, r, "/roi/"+name, http.StatusSeeOther)
 }
 
 // secretsGet lists the ACTIVE repo's secret KEYS (never values). s is the

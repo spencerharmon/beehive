@@ -38,6 +38,9 @@ var (
 	ErrCycle = errors.New("submod: dependency would create a cycle")
 	// ErrInvalidLink is returned by LinkSubmodules for empty or self links.
 	ErrInvalidLink = errors.New("submod: link requires two distinct submodule names")
+	// ErrNotExist is returned by SetRemoteURL when the named submodule has no
+	// tracked checkout at submodules/<name>/repo.
+	ErrNotExist = errors.New("submod: submodule does not exist")
 )
 
 // ValidName reports whether name is a usable submodule directory name: a single
@@ -87,6 +90,42 @@ func Add(ctx context.Context, root, url, name, branch string) (string, error) {
 		return "", err
 	}
 	return name, nil
+}
+
+// SetRemoteURL repoints an existing tracked submodule at newURL. It rewrites the
+// submodule's .gitmodules url and runs `git submodule sync` for that path, which
+// propagates the new url into both the superproject's cached
+// submodule.<path>.url (in .git/config) and the checked-out repo's origin remote
+// — the exact configuration a later clone/fetch (and every honeybee worktree,
+// which shares the superproject config) reads. This is the shared body behind the
+// `beehive submodule remote` CLI and the frontend "change remote" action, so the
+// two never diverge. It validates before touching git (empty url / bad name /
+// missing submodule are user-correctable), and leaves the .gitmodules change
+// staged for the caller to commit (matching Add's contract). Returns the
+// submodule's repo-relative path (submodules/<name>/repo).
+func SetRemoteURL(ctx context.Context, root, name, url string) (string, error) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return "", ErrURLRequired
+	}
+	if !ValidName(name) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidName, name)
+	}
+	rel := filepath.Join("submodules", name, "repo")
+	if _, err := os.Stat(filepath.Join(root, rel)); err != nil {
+		return "", fmt.Errorf("%w: %q", ErrNotExist, name)
+	}
+	g := git.New(root)
+	if _, err := g.Run(ctx, "config", "-f", ".gitmodules", "submodule."+rel+".url", url); err != nil {
+		return "", err
+	}
+	// `git submodule sync` reads the just-written .gitmodules url and writes it to
+	// the cached submodule.<path>.url AND the checkout's remote.origin.url, so the
+	// new remote is effective for both submodule updates and in-checkout git ops.
+	if _, err := g.Run(ctx, "submodule", "sync", "--", rel); err != nil {
+		return "", err
+	}
+	return rel, nil
 }
 
 // LinkSubmodules records an undirected link between submodules a and b in each

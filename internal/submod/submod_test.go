@@ -123,6 +123,68 @@ func TestAddRejectsDuplicate(t *testing.T) {
 	}
 }
 
+// TestSetRemoteURLRepoints proves SetRemoteURL rewrites .gitmodules AND syncs the
+// new url into both the cached submodule.<path>.url and the checkout's origin
+// remote (what a later clone/fetch and every honeybee worktree read).
+func TestSetRemoteURLRepoints(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	root := superRepo(t)
+	src := srcRepo(t, "widget")
+	if _, err := Add(context.Background(), root, src, "", "main"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	newURL := srcRepo(t, "widget-moved")
+	rel, err := SetRemoteURL(context.Background(), root, "widget", newURL)
+	if err != nil {
+		t.Fatalf("SetRemoteURL: %v", err)
+	}
+	if rel != filepath.Join("submodules", "widget", "repo") {
+		t.Fatalf("rel = %q", rel)
+	}
+	// .gitmodules rewritten.
+	gm, _ := os.ReadFile(filepath.Join(root, ".gitmodules"))
+	if !strings.Contains(string(gm), "url = "+newURL) {
+		t.Fatalf(".gitmodules not repointed:\n%s", gm)
+	}
+	// Cached superproject config synced.
+	cached := gitOut(t, root, "config", "submodule."+rel+".url")
+	if cached != newURL {
+		t.Fatalf("cached submodule url = %q, want %q", cached, newURL)
+	}
+	// Checkout's origin synced.
+	origin := gitOut(t, filepath.Join(root, rel), "config", "remote.origin.url")
+	if origin != newURL {
+		t.Fatalf("checkout origin = %q, want %q", origin, newURL)
+	}
+}
+
+// TestSetRemoteURLRejects proves the pre-git validation: empty url, bad name, and
+// an unknown submodule are surfaced as distinct sentinels without touching git.
+func TestSetRemoteURLRejects(t *testing.T) {
+	root := superRepo(t)
+	if _, err := SetRemoteURL(context.Background(), root, "widget", ""); !errors.Is(err, ErrURLRequired) {
+		t.Fatalf("empty url: got %v, want ErrURLRequired", err)
+	}
+	if _, err := SetRemoteURL(context.Background(), root, "../evil", "git@h:o/r.git"); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("bad name: got %v, want ErrInvalidName", err)
+	}
+	if _, err := SetRemoteURL(context.Background(), root, "nope", "git@h:o/r.git"); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("unknown submodule: got %v, want ErrNotExist", err)
+	}
+}
+
+// gitOut runs git in dir and returns trimmed stdout, failing the test on error.
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	c := exec.Command("git", args...)
+	c.Dir = dir
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v: %s", args, dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func TestLinkSubmodulesWritesBothFiles(t *testing.T) {
 	root := t.TempDir()
 	for _, n := range []string{"a", "b"} {

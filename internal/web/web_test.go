@@ -1688,6 +1688,67 @@ func TestSubmoduleAddRejectsBadInput(t *testing.T) {
 	}
 }
 
+// TestSubmoduleRemote proves the per-submodule "change remote" action: it
+// repoints .gitmodules, syncs the checkout origin, commits on main, redirects to
+// the ROI editor, and the ROI editor then prefills the new url.
+func TestSubmoduleRemote(t *testing.T) {
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	s, root := setup(t)
+	src := srcRepo(t, "beta")
+	if w := postForm(t, s, "/submodule/add", url.Values{"url": {src}}); w.Code != http.StatusSeeOther {
+		t.Fatalf("add %d: %s", w.Code, w.Body)
+	}
+	moved := srcRepo(t, "beta-moved")
+	w := postForm(t, s, "/submodule/beta/remote", url.Values{"url": {moved}})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("remote %d: %s", w.Code, w.Body)
+	}
+	if loc := w.Header().Get("Location"); loc != "/roi/beta" {
+		t.Fatalf("redirect = %q, want /roi/beta", loc)
+	}
+	gm, _ := os.ReadFile(filepath.Join(root, ".gitmodules"))
+	if !strings.Contains(string(gm), "url = "+moved) {
+		t.Fatalf(".gitmodules not repointed:\n%s", gm)
+	}
+	// The checkout's origin was synced to the new url.
+	origin := runGitOut(t, filepath.Join(root, "submodules", "beta", "repo"), "config", "remote.origin.url")
+	if origin != moved {
+		t.Fatalf("checkout origin = %q, want %q", origin, moved)
+	}
+	// The change was committed on main by publishMain.
+	if subj := runGitOut(t, root, "log", "-1", "--pretty=%s"); subj != "frontend: set remote beta" {
+		t.Fatalf("commit subject = %q, want %q", subj, "frontend: set remote beta")
+	}
+	// The ROI editor prefills the new url in the change-remote form.
+	if body := get(t, s, "/roi/beta").Body.String(); !strings.Contains(body, `value="`+moved+`"`) {
+		t.Fatalf("roi editor did not prefill new remote url:\n%s", body)
+	}
+}
+
+// TestSubmoduleRemoteRejects proves the handler's error mapping: an empty url is
+// a 400 (validated before git), an unknown submodule is a 404.
+func TestSubmoduleRemoteRejects(t *testing.T) {
+	s, _ := setup(t)
+	if w := postForm(t, s, "/submodule/alpha/remote", url.Values{}); w.Code != http.StatusBadRequest {
+		t.Fatalf("empty url: %d", w.Code)
+	}
+	if w := postForm(t, s, "/submodule/nope/remote", url.Values{"url": {"git@h:o/r.git"}}); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown submodule: %d", w.Code)
+	}
+}
+
+// runGitOut runs git in dir and returns trimmed stdout (test helper).
+func runGitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	c := exec.Command("git", args...)
+	c.Dir = dir
+	out, err := c.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v: %s", args, dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // TestSubmoduleLink proves the web link now writes schema-valid YAML through the
 // cycle-checked links API (not a raw `from: [to]` append).
 func TestSubmoduleLink(t *testing.T) {
