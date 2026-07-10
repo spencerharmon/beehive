@@ -645,12 +645,17 @@ func (c *refusingClient) Open(ctx context.Context, cwd, system string) (Session,
 // guard (session-audit-003): a task is NEEDS-REVIEW but the submodule pointer
 // (gitlink) recorded for it — the reviewable commit a Work pass bumps as part
 // of completing to NEEDS-REVIEW — is a PHANTOM sha that exists nowhere: not in
-// the submodule's object database, not on origin. This is the exact
-// "reviewable commit exists nowhere" shape that otherwise spawns a review pass
-// doomed to spelunk git internals and idle-time-out forever. Run() must bounce
-// the task straight to NEEDS-ARBITRATION with a concrete reason (naming the
-// unreachable sha) and NEVER open a session (asserted by refusingClient),
-// reporting Completed so the dispatch itself is not retried.
+// the submodule's object database, not on origin. bee-orphan-x itself DOES
+// exist (a real local ref, just at a DIFFERENT tip than the phantom gitlink) —
+// deliberately distinguishing this from the needs-review-auto-recover-lost-work
+// guard's "branch absent everywhere" shape (recoverIfLost's check 1 finds the
+// local ref present and lets this fall through unchanged), isolating this test
+// to the bounce guard it is named for. This is the "reviewable commit exists
+// nowhere" shape that otherwise spawns a review pass doomed to spelunk git
+// internals and idle-time-out forever. Run() must bounce the task straight to
+// NEEDS-ARBITRATION with a concrete reason (naming the unreachable sha) and
+// NEVER open a session (asserted by refusingClient), reporting Completed so the
+// dispatch itself is not retried.
 func TestReviewDispatchBouncesUnreachableCommit(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -663,12 +668,22 @@ func TestReviewDispatchBouncesUnreachableCommit(t *testing.T) {
 	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
 		t.Fatalf("clone submodule: %v", err)
 	}
-	gitConfig(t, repoDir)
+	sg := gitConfig(t, repoDir)
+	// bee-orphan-x is a REAL local ref (a genuine, if unmerged, prior attempt) —
+	// just not at the sha the (corrupted) gitlink names, so recoverIfLost must
+	// NOT treat this as "lost everywhere" and must fall through to the bounce
+	// guard below.
+	if _, err := sg.Run(ctx, "checkout", "-q", "-b", "bee-orphan-x"); err != nil {
+		t.Fatalf("branch bee-orphan-x: %v", err)
+	}
+	os.WriteFile(filepath.Join(repoDir, "g"), []byte("orphan attempt\n"), 0o644)
+	if err := sg.Commit(ctx, "orphan attempt"); err != nil {
+		t.Fatalf("commit orphan attempt: %v", err)
+	}
 
 	// The gitlink records a PHANTOM commit: the submodule pointer a Work pass
 	// would have bumped for this task, but the commit exists NOWHERE (never
-	// committed anywhere this test keeps; bee-orphan-x is never created either
-	// locally or on origin) — the exact F-LIVE shape.
+	// committed anywhere this test keeps) — the exact F-LIVE shape.
 	phantom := strings.Repeat("f", 40)
 	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+phantom+",submodules/sm/repo"); err != nil {
 		t.Fatalf("seed phantom gitlink: %v", err)
@@ -715,6 +730,213 @@ func TestReviewDispatchBouncesUnreachableCommit(t *testing.T) {
 	joined := strings.Join(tk.Body, "\n")
 	if !contains(joined, "reviewable commit unreachable") || !contains(joined, phantom) {
 		t.Fatalf("plan body missing bounce reason naming the unreachable sha %s:\n%s", phantom, joined)
+	}
+}
+
+// TestReviewDispatchRecoversTrulyLostWork is the needs-review-auto-recover-
+// lost-work guard's core case: a task is NEEDS-REVIEW but its bee-<taskid>
+// branch never landed ANYWHERE — no local ref, no ref on the submodule's
+// remote (even after a prune-fetch), the gitlink was never advanced onto it
+// (still whatever it was before this task's Work pass), and no change doc
+// exists on disk. This is the exact "publish never landed" shape a
+// crash/kill/failed-push leaves behind. Run() must reset the task straight to
+// TODO (claim cleared, attempts incremented) and NEVER open a session
+// (refusingClient) NOR bounce it to NEEDS-ARBITRATION (which would be equally
+// doomed — there is nothing there for an arbitration pass to judge either),
+// reporting Completed so the dispatch itself is not retried.
+func TestReviewDispatchRecoversTrulyLostWork(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	// The gitlink still names the submodule's pre-task base commit (whatever
+	// origin/main resolves to): the Work pass's own publish never landed, so
+	// the gitlink was never bumped onto bee-lost-1 at all. bee-lost-1 is never
+	// created, locally or on origin, and no change doc is written either — the
+	// exact "publish never landed" shape.
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## lost-1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/repo", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "lost-1", Status: plan.NeedsReview}}
+
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a resolved dispatch-time recovery should report Completed, got %+v", res)
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("lost-1")
+	if tk == nil {
+		t.Fatal("task lost-1 vanished from PLAN.md")
+	}
+	if tk.Status != plan.StatusTODO {
+		t.Fatalf("status = %s, want TODO", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("recovery must release the claim")
+	}
+	if tk.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", tk.Attempts)
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if !contains(joined, "unrecoverable") || !contains(joined, "bee-lost-1") {
+		t.Fatalf("plan body missing recovery reason naming bee-lost-1:\n%s", joined)
+	}
+}
+
+// TestArbitrationDispatchRecoversTrulyLostWork proves the guard also covers
+// NEEDS-ARBITRATION dispatch (not just NEEDS-REVIEW): the same "lost
+// everywhere" shape on a task an arbitration pass would otherwise be dispatched
+// against must reset straight to TODO instead.
+func TestArbitrationDispatchRecoversTrulyLostWork(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## lost-2 [NEEDS-ARBITRATION] <!-- attempts=1 deps= -->\narbitrate\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/repo", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Arbitrate, Submodule: subs[0], Task: plan.Task{ID: "lost-2", Status: plan.NeedsArb}}
+
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a resolved dispatch-time recovery should report Completed, got %+v", res)
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("lost-2")
+	if tk == nil {
+		t.Fatal("task lost-2 vanished from PLAN.md")
+	}
+	if tk.Status != plan.StatusTODO {
+		t.Fatalf("status = %s, want TODO", tk.Status)
+	}
+	if tk.Attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", tk.Attempts)
+	}
+}
+
+// TestReviewDispatchDoesNotRecoverWithDocPresent proves recoverIfLost's
+// conservative guard: even with no local branch and no remote branch, a
+// PRESENT change doc is a single positive signal that must abort the recovery
+// (no false-positive data loss) and fall through to the normal reachability
+// guard (bounceIfUnreachable), which — the commit still being unreachable —
+// bounces to NEEDS-ARBITRATION exactly as before this guard existed.
+func TestReviewDispatchDoesNotRecoverWithDocPresent(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	// A change doc DOES exist (as if the work pass wrote it before an
+	// interrupted publish), even though the gitlink names a PHANTOM commit
+	// that exists nowhere (the same unreachable shape
+	// TestReviewDispatchBouncesUnreachableCommit uses) — bounceIfUnreachable is
+	// exactly the guard that must still fire here, once recoverIfLost declines
+	// (a doc is present) and falls through.
+	phantom := strings.Repeat("f", 40)
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+phantom+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed phantom gitlink: %v", err)
+	}
+	os.WriteFile(filepath.Join(sm, "docs", "bee-doc-only-doc-only.md"), []byte("# doc\n"), 0o644)
+
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## doc-only [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md", "submodules/sm/docs"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "doc-only", Status: plan.NeedsReview}}
+
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a resolved dispatch-time bounce should report Completed, got %+v", res)
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("doc-only")
+	if tk == nil {
+		t.Fatal("task doc-only vanished from PLAN.md")
+	}
+	if tk.Status != plan.NeedsArb {
+		t.Fatalf("status = %s, want NEEDS-ARBITRATION (recovery must NOT fire with a doc present)", tk.Status)
 	}
 }
 
@@ -1073,9 +1295,14 @@ func TestReviewDispatchDoesNotFinalizeWithoutSourceBranchRemote(t *testing.T) {
 	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+mainTip+",submodules/sm/repo"); err != nil {
 		t.Fatalf("seed unmoved gitlink: %v", err)
 	}
+	// A zero-diff work pass still writes its change doc per protocol — this is
+	// what distinguishes it from needs-review-auto-recover-lost-work's "truly
+	// lost" shape (no branch, no doc): a doc's presence is one of that guard's
+	// four required-absent signals, so recoverIfLost must fall through here.
+	os.WriteFile(filepath.Join(sm, "docs", "bee-R1-R1.md"), []byte("# R1\nzero-diff\n"), 0o644)
 	planPath := filepath.Join(sm, "PLAN.md")
 	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
-	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md", "submodules/sm/docs"); err != nil {
 		t.Fatalf("add plan: %v", err)
 	}
 	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
@@ -1150,9 +1377,14 @@ func TestReviewDispatchDoesNotFinalizeWithoutSourceBranchLocalSharing(t *testing
 	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+mainTip+",submodules/sm/repo"); err != nil {
 		t.Fatalf("seed unmoved gitlink: %v", err)
 	}
+	// A zero-diff work pass still writes its change doc per protocol — this is
+	// what distinguishes it from needs-review-auto-recover-lost-work's "truly
+	// lost" shape (no branch, no doc): a doc's presence is one of that guard's
+	// four required-absent signals, so recoverIfLost must fall through here.
+	os.WriteFile(filepath.Join(sm, "docs", "bee-R1-R1.md"), []byte("# R1\nzero-diff\n"), 0o644)
 	planPath := filepath.Join(sm, "PLAN.md")
 	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
-	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md", "submodules/sm/docs"); err != nil {
 		t.Fatalf("add plan: %v", err)
 	}
 	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {

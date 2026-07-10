@@ -185,6 +185,39 @@ func (t *Task) FinalizeAlreadyMerged(note string, now time.Time) error {
 	return nil
 }
 
+// RecoverLostWork resets a NEEDS-REVIEW or NEEDS-ARBITRATION task back to TODO
+// (or, past limit, escalates to NEEDS-HUMAN like Reject/Strand) when its
+// implementer commit is confirmed truly unrecoverable — reachable NOWHERE
+// (branch absent both locally and on the submodule remote after a
+// prune-fetch), not reflected in the tracked submodule pointer, and with no
+// change doc on disk. A work pass can flip a task NEEDS-REVIEW/NEEDS-ARBITRATION
+// after authoring in its worktree but before the runner publishes; if that
+// publish never lands (crash, killed at cap, failed push), the task strands at
+// a phantom commit forever without this. Mirrors Reject/Strand's
+// attempts/limit escalation so a task that keeps losing its work does not
+// auto-recycle indefinitely. Valid from NEEDS-REVIEW or NEEDS-ARBITRATION.
+// Releases the active claim.
+func (t *Task) RecoverLostWork(reason string, limit int, now time.Time) error {
+	if t.Status != StatusReview && t.Status != StatusArb {
+		return fmt.Errorf("plan: recover-lost-work on non-reviewable task %s (%s)", t.ID, t.Status)
+	}
+	reason = oneLine(reason)
+	if reason == "" {
+		return fmt.Errorf("plan: recover-lost-work for %s requires a reason", t.ID)
+	}
+	t.Attempts++
+	t.Session = ""
+	t.Heartbeat = time.Time{}
+	if t.Attempts > limit {
+		t.Status = StatusHuman
+		t.setHumanReason(reason)
+	} else {
+		t.Status = StatusTODO
+		t.appendNote("Recovered (runner, lost work): " + reason)
+	}
+	return nil
+}
+
 // appendNote appends line as a new task body line, inserting a blank-line
 // separator first when the body is non-empty and does not already end on a
 // blank line — the same spacing setHumanReason uses when it first adds its

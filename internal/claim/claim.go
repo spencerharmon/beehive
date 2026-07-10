@@ -347,6 +347,41 @@ func (c *Claimer) BounceUnreachable(ctx context.Context, taskID, reason string) 
 	return nil
 }
 
+// RecoverLostWork resets taskID (NEEDS-REVIEW or NEEDS-ARBITRATION) back to
+// TODO — or, past limit, escalates to NEEDS-HUMAN — when its implementer
+// commit is confirmed truly unrecoverable (see swarm.recoverIfLost, the
+// selection-time guard that calls this, and plan.Task.RecoverLostWork for the
+// exact preconditions). Unlike Reject/Strand this commits AND publishes
+// immediately: it runs standalone, before any turn loop or session exists (a
+// dispatch-time short-circuit, mirroring BounceUnreachable/Release). A publish
+// conflict is benign (a peer already resolved this exact task) and is
+// swallowed, matching BounceUnreachable/FinalizeAlreadyMerged/Release.
+func (c *Claimer) RecoverLostWork(ctx context.Context, taskID, reason string, limit int) error {
+	p, err := c.load()
+	if err != nil {
+		return err
+	}
+	t := p.Find(taskID)
+	if t == nil {
+		return fmt.Errorf("recover-lost-work: task %q absent", taskID)
+	}
+	if err := t.RecoverLostWork(reason, limit, c.now()); err != nil {
+		return err
+	}
+	if err := c.save(p); err != nil {
+		return err
+	}
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "recover-lost-work"), c.planRel()); err != nil && err != git.ErrNothing {
+		return err
+	}
+	if c.Publish != nil {
+		if err := c.Publish(ctx); err != nil && !errors.Is(err, git.ErrConflict) {
+			return err
+		}
+	}
+	return nil
+}
+
 // FinalizeAlreadyMerged completes taskID's bookkeeping deterministically,
 // without spawning a review, when its recorded submodule pointer is discovered
 // already merged into the submodule's tracked main — the symmetric counterpart

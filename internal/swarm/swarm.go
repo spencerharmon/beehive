@@ -629,6 +629,37 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 	}
 
+	// Lost-work auto-recovery guard (needs-review-auto-recover-lost-work): the
+	// EARLIEST-stage review/arbitration dispatch check — runs before the
+	// already-merged / reachability split below is even reached, because those
+	// guards assume there is SOMETHING reachable to judge (an ancestor-of-main
+	// commit, or a commit present somewhere). A work pass can flip a task
+	// NEEDS-REVIEW/NEEDS-ARBITRATION after authoring in its worktree but before
+	// the runner publishes; if that publish never lands (crash, killed at cap,
+	// failed push), bee-<taskid> ends up on no local ref, no submodule remote
+	// ref, the gitlink never advanced onto it, and no change doc exists —
+	// nothing for a review/arbitration pass to find, so today it idle-times-out
+	// or strands until an operator hand-resets it. Only when ALL of those are
+	// confirmed absent does this reset the task to TODO (claim cleared, attempts
+	// incremented) so the work is simply reimplemented from intent. Conservative:
+	// a merely-slow fetch, an unpushed-but-local branch, or any single positive
+	// signal (doc present, gitlink already advanced, branch present anywhere)
+	// leaves the task alone. Fails OPEN on any uncertainty, exactly like the
+	// guards below.
+	if sel.Kind == selectt.Review || sel.Kind == selectt.Arbitrate {
+		recovered, rerr := r.recoverIfLost(ctx, sel, res.Branch, absRoot)
+		if rerr != nil && r.Debug != nil {
+			fmt.Fprintf(r.Debug, "[honeybee] lost-work recovery pre-check for %s failed; dispatching normally: %v\n", sel.Task.ID, rerr)
+		}
+		if recovered {
+			res.Completed = true
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] %s implementer commit unrecoverable (no branch, no remote, no doc); reset to TODO instead of dispatching a doomed %s pass\n", sel.Task.ID, sel.Kind)
+			}
+			return res, nil
+		}
+	}
+
 	// Review-dispatch-side already-merged guard (session-audit-005 F-1; the
 	// symmetric counterpart to the reachability guard below): before ever
 	// opening a session for a NEEDS-REVIEW task, check whether bee-<taskid>'s
@@ -2450,6 +2481,135 @@ func (r *Runner) bounceIfUnreachable(ctx context.Context, sel *selectt.Selection
 		return false, err
 	}
 	return true, nil
+}
+
+// recoverIfLost is the earliest-stage review/arbitration dispatch guard
+// (needs-review-auto-recover-lost-work): before the already-merged /
+// reachability split even runs (both of which assume there is SOMETHING
+// reachable — an ancestor of tracked main, or a commit present somewhere),
+// this checks whether there is anything reachable AT ALL. A work pass can
+// flip a task NEEDS-REVIEW/NEEDS-ARBITRATION after authoring in its worktree
+// but before the runner publishes (finish()'s worktree-branch merge + gitlink
+// bump + PLAN.md flip to main); if that publish never lands (crash, killed at
+// a turn/wall-clock cap, a push that never succeeded), bee-<taskid> ends up
+// unreachable in every sense: no local ref, no ref on the submodule's remote,
+// the beehive-layer gitlink was never advanced onto it, and no change doc was
+// ever written to submodules/<sm>/docs/bee-<taskid>-<taskid>.md. That shape is
+// permanently unrecoverable by a review or arbitration pass — there is
+// nothing for either to find — so today the task idle-times-out over and over
+// until an operator hand-resets it (observed live: phantom-library
+// m14-per-user-rig escalated NEEDS-HUMAN purely for this).
+//
+// Checks, ALL of which must confirm absence before recovering:
+//  1. branch (bee-<taskid>) has no local ref in this submodule checkout.
+//  2. branch has no ref on the submodule's configured remote either, after an
+//     explicit prune-fetch (git.Repo.Fetch already passes --prune) — not a
+//     cached/stale view.
+//  3. the beehive-layer gitlink recorded on THIS honeybee's freshly branched
+//     worktree HEAD (submodules/<sm>/repo) is not already this task's commit
+//     — checked implicitly: once checks 1 and 2 confirm bee-<taskid> resolves
+//     NOWHERE, there is no tip left for the gitlink to be pointing at, so it
+//     trivially cannot "already carry this task's work forward" (the shape
+//     finalizeIfAlreadyMerged, which runs for Review right after this guard,
+//     exists to catch: a gitlink that DOES already reflect a completed merge).
+//  4. no change doc exists at submodules/<sm>/docs/bee-<taskid>-<taskid>.md.
+//
+// This is deliberately conservative per its own accept criteria: a merely
+// slow fetch, an unpushed-but-local branch, or a present change doc/gitlink
+// must NOT be reset (no false-positive data loss) — a single positive signal
+// on any of the four checks aborts the recovery and falls through to normal
+// dispatch. Fails OPEN (returns false, err) on any uncertainty (submodule
+// checkout cannot be initialized, remote errors reaching it) exactly like
+// bounceIfUnreachable/finalizeIfAlreadyMerged, so a transient fault never
+// wrongly resets a good task. Recovery is logged by the caller, not silent.
+func (r *Runner) recoverIfLost(ctx context.Context, sel *selectt.Selection, branch, absRoot string) (bool, error) {
+	repoDir := sel.Submodule.RepoDir()
+	rel, err := filepath.Rel(absRoot, repoDir)
+	if err != nil {
+		return false, err
+	}
+	// The submodule pointer recorded on THIS honeybee's beehive worktree HEAD —
+	// the same value bounceIfUnreachable/finalizeIfAlreadyMerged resolve — is
+	// only checked as a sanity precondition below (this submodule does have a
+	// tracked pointer at all, mirroring finalizeIfAlreadyMerged); it is never
+	// itself part of the recoverability test (see check 3's doc comment).
+	if _, err := r.Git.RevParse(ctx, "HEAD:"+rel); err != nil {
+		return false, fmt.Errorf("resolve submodule %s pointer: %w", sel.Submodule.Name, err)
+	}
+	if !isSourceCheckout(ctx, repoDir) {
+		if _, err := r.Git.Run(ctx, "submodule", "update", "--init", "--", rel); err != nil {
+			return false, err
+		}
+	}
+	if !isSourceCheckout(ctx, repoDir) {
+		return false, fmt.Errorf("submodule %s not checked out at %s", sel.Submodule.Name, repoDir)
+	}
+	sg := git.New(repoDir)
+	rem, err := sg.Remote(ctx)
+	if err != nil {
+		return false, err
+	}
+	// Check 1: local ref.
+	if _, err := sg.RevParse(ctx, "refs/heads/"+branch); err == nil {
+		return false, nil // present locally: recoverable, do not reset.
+	}
+	// Check 2: remote ref, after an explicit prune-fetch.
+	if rem != "" {
+		if ferr := sg.Fetch(ctx, rem, branch); ferr != nil && !isRemoteRefMissingFetch(ferr) {
+			return false, ferr // uncertain (network/auth): fail open.
+		}
+		tip, lerr := sg.LsRemoteBranch(ctx, rem, branch)
+		if lerr != nil {
+			return false, lerr
+		}
+		if tip != "" {
+			return false, nil // present on the remote: recoverable, do not reset.
+		}
+	}
+	// Check 3 (see doc comment above): implied by 1+2 both confirming absence.
+	// Check 4: no change doc on disk.
+	docPath := filepath.Join(sel.Submodule.Path, "docs", fmt.Sprintf("bee-%s-%s.md", sel.Task.ID, sel.Task.ID))
+	if _, err := os.Stat(docPath); err == nil {
+		return false, nil // doc exists: recoverable, do not reset.
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	reason := fmt.Sprintf(
+		"implementer commit for bee-%s unrecoverable: no local branch, no branch on the submodule remote%s, and no change doc at docs/bee-%s-%s.md",
+		sel.Task.ID, remoteNoteFor(rem), sel.Task.ID, sel.Task.ID)
+	cl := &claim.Claimer{
+		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
+		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
+	}
+	limit := r.RejectLimit
+	if limit <= 0 {
+		limit = 3
+	}
+	if err := cl.RecoverLostWork(ctx, sel.Task.ID, reason, limit); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// remoteNoteFor renders a clause naming the remote checked, for
+// recoverIfLost's reason string; empty when there is no remote (local sharing).
+func remoteNoteFor(rem string) string {
+	if rem == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (%s, after a prune-fetch)", rem)
+}
+
+// isRemoteRefMissingFetch reports whether a fetch of a specific branch failed
+// only because the remote simply has no such ref — a definitive, confirmed
+// absence distinct from a network/auth failure talking to the remote at all.
+// Mirrors git.isCouldNotFindRemoteRef/isRemoteRefMissing (unexported in
+// package git), re-implemented here against the same git message shapes since
+// CommitReachable's identical fetch-then-check idiom lives in that package,
+// not this one.
+func isRemoteRefMissingFetch(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "couldn't find remote ref") || strings.Contains(msg, "not found in upstream")
 }
 
 // deleteSourceBranch unconditionally removes a task's bee-<taskid> branch from the

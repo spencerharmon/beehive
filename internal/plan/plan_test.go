@@ -288,6 +288,54 @@ func TestFinalizeAlreadyMergedGuardedAndRequiresNote(t *testing.T) {
 	}
 }
 
+// TestRecoverLostWorkAttempts mirrors TestRejectAttempts/TestStrandAttempts:
+// repeated recoveries recycle NEEDS-REVIEW or NEEDS-ARBITRATION back to TODO
+// (claim released, attempts bumped) up to limit, then overflow to NEEDS-HUMAN
+// carrying the caller's concrete reason verbatim.
+func TestRecoverLostWorkAttempts(t *testing.T) {
+	now := time.Now()
+	for _, start := range []Status{StatusReview, StatusArb} {
+		tk := &Task{ID: "a", Status: start, Attempts: 0}
+		for i := 0; i < 3; i++ {
+			tk.Status = start
+			tk.Session, tk.Heartbeat = "bee-1", now
+			if err := tk.RecoverLostWork("implementer commit unrecoverable: no branch, no doc", 3, now); err != nil {
+				t.Fatal(err)
+			}
+			if tk.Status != StatusTODO {
+				t.Fatalf("from %s attempt %d status %s", start, i, tk.Status)
+			}
+			if tk.Session != "" || !tk.Heartbeat.IsZero() {
+				t.Fatalf("from %s attempt %d: recover-lost-work must release the claim", start, i)
+			}
+		}
+		tk.Status = start
+		if err := tk.RecoverLostWork("implementer commit unrecoverable: no branch, no doc", 3, now); err != nil {
+			t.Fatal(err) // 4th > 3
+		}
+		if tk.Status != StatusHuman {
+			t.Fatalf("from %s: want NEEDS-HUMAN, got %s", start, tk.Status)
+		}
+		if got := tk.HumanReason(); got != "implementer commit unrecoverable: no branch, no doc" {
+			t.Fatalf("human reason = %q, want the caller's concrete reason verbatim", got)
+		}
+	}
+}
+
+// TestRecoverLostWorkGuardedAndRequiresReason: only legal from NEEDS-REVIEW or
+// NEEDS-ARBITRATION (never TODO/DONE), and always requires a concrete reason.
+func TestRecoverLostWorkGuardedAndRequiresReason(t *testing.T) {
+	now := time.Now()
+	for _, st := range []Status{StatusTODO, StatusDone, StatusHuman} {
+		if err := (&Task{ID: "a", Status: st}).RecoverLostWork("reason", 3, now); err == nil {
+			t.Fatalf("recover-lost-work allowed on %s", st)
+		}
+	}
+	if err := (&Task{ID: "a", Status: StatusReview}).RecoverLostWork("  \t \n ", 3, now); err == nil {
+		t.Fatal("recover-lost-work allowed with an empty/blank reason")
+	}
+}
+
 func TestRequestHuman(t *testing.T) {
 	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
 	tk := &Task{ID: "a", Status: StatusTODO, Session: "bee-1", Heartbeat: now, Body: []string{"do thing"}}

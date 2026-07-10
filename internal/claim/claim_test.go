@@ -254,6 +254,76 @@ func TestBounceUnreachableGuarded(t *testing.T) {
 	}
 }
 
+// TestRecoverLostWorkPublishesImmediately proves RecoverLostWork — like
+// BounceUnreachable — commits AND publishes on its own (it runs standalone
+// before any turn loop, with no later finish() to piggyback on): the TODO
+// reset must reach the given Publish func synchronously so a peer sees the
+// task ready to reselect right away, never re-dispatching a doomed
+// review/arbitration pass against it again.
+func TestRecoverLostWorkPublishesImmediately(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+	g := git.New(root)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		g.Run(ctx, a...)
+	}
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= session=bee-A heartbeat=2026-01-01T00:00:00Z -->\ndo it\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	wt := filepath.Join(root, ".worktrees", "bee-a")
+	if err := g.WorktreeAdd(ctx, wt, "bee-a", "main"); err != nil {
+		t.Fatal(err)
+	}
+	rp, _ := repo.Open(wt)
+	subs, _ := rp.Submodules()
+	wg := git.New(wt)
+	published := false
+	c := &Claimer{
+		Repo: rp, Sub: subs[0], Git: wg, TTL: time.Hour, Session: "bee-a",
+		Publish: func(ctx context.Context) error {
+			published = true
+			return wg.PublishToMain(ctx, "")
+		},
+	}
+	reason := "implementer commit for bee-T1 unrecoverable: no local branch, no branch on the submodule remote, and no change doc"
+	if err := c.RecoverLostWork(ctx, "T1", reason, 3); err != nil {
+		t.Fatalf("recover-lost-work: %v", err)
+	}
+	if !published {
+		t.Fatal("RecoverLostWork must publish immediately (no later finish() to rely on)")
+	}
+	// Read back from the ORIGINAL (main) checkout, proving the correction
+	// really reached main and not just the worktree branch.
+	mp, err := plan.Parse(mustRead(t, filepath.Join(sm, "PLAN.md")))
+	if err != nil {
+		t.Fatalf("parse main PLAN.md: %v", err)
+	}
+	tk := mp.Find("T1")
+	if tk.Status != plan.StatusTODO {
+		t.Fatalf("main status = %s, want TODO", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("recover-lost-work must release the claim on main")
+	}
+	if tk.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", tk.Attempts)
+	}
+	if joined := strings.Join(tk.Body, "\n"); !strings.Contains(joined, "implementer commit for bee-T1 unrecoverable") {
+		t.Fatalf("main PLAN.md missing recovery reason:\n%s", joined)
+	}
+}
+
+// TestRecoverLostWorkGuarded: only legal from NEEDS-REVIEW/NEEDS-ARBITRATION.
+func TestRecoverLostWorkGuarded(t *testing.T) {
+	c, ctx := setup(t)
+	if err := c.RecoverLostWork(ctx, "T1", "reason", 3); err == nil {
+		t.Fatal("recover-lost-work on TODO must error")
+	}
+}
+
 // TestFinalizeAlreadyMergedPublishesImmediately proves FinalizeAlreadyMerged —
 // like BounceUnreachable — commits AND publishes on its own (it runs standalone
 // before any turn loop, with no later finish() to piggyback on): the DONE
