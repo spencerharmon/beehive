@@ -10,7 +10,8 @@
   <form method="post" action="/roi/{{.Name}}"
         hx-post="/roi/{{.Name}}" hx-target="#roi-panel" hx-select="#roi-panel" hx-swap="outerHTML"
         hx-indicator="#htmx-progress">
-    <textarea name="body" rows="20" cols="80">{{.Body}}</textarea>
+    <label class="sr-only" for="roi-source-body">Edit ROI.md source</label>
+    <textarea id="roi-source-body" name="body" rows="20" cols="80">{{.Body}}</textarea>
     <button>save</button>
   </form>
 </details>

@@ -431,6 +431,19 @@ func TestFormInputsHaveAccessibleNames(t *testing.T) {
 			},
 		},
 		{
+			// roi_editor.html's raw-source <textarea> sits inside a <details><summary>
+			// disclosure with no <label for>/aria-label/id: a <summary> is not a native
+			// label source for a descendant control, so AT announced an anonymous
+			// multi-line field. Same sr-only <label for>/id pairing as the other forms.
+			name: "roi_editor.html source textarea",
+			html: get(t, s, "/roi/alpha").Body.String(),
+			want: []string{
+				`<label class="sr-only" for="roi-source-body">Edit ROI.md source</label>`,
+				`id="roi-source-body"`,
+				`name="body"`, // form still posts the same field
+			},
+		},
+		{
 			name: "branch_view.html inline merge form",
 			html: renderTmpl(t, s, "branch_view.html", map[string]interface{}{
 				"Name": "alpha", "Sections": nil, "HasPrev": false, "HasNext": false,
