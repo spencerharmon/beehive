@@ -35,16 +35,20 @@ Then:
 
 - Land the change now.
 - File a DISTINCT follow-on validation task in `PLAN.md` that `deps=` the landing
-  task (so it can't run until the change is in), optionally `not_before=` a
-  timestamp past expected convergence once that stamp is available in your install.
+  task (so it can't run until the change is in), and set `not_before=<RFC3339>` to
+  a timestamp past expected convergence so the selector holds the task out of the
+  ready set until wall-clock passes it (a future `not_before` gates a TODO task
+  exactly like an unmet dep; deps and `not_before` gate independently).
 - Write that task to **re-defer rather than block** if it runs and the system still
   hasn't converged: it checks, and if not yet converged it re-files/re-defers
   instead of failing or spinning. Verification is thus decoupled from the landing
   pass without ever wedging a pass on an async wait.
 
-This companions the `not_before` runner stamp but does not depend on it: if that
-stamp isn't shipped yet, drop the `not_before=` and rely on `deps=` plus the
-re-defer behavior — it degrades gracefully.
+This companions the `not_before` runner stamp: the header parser accepts an
+optional `not_before=<RFC3339>` on any task and the deterministic selector holds a
+task with a future `not_before` out of the ready set until wall-clock passes it. It
+degrades gracefully — drop the `not_before=` and rely on `deps=` plus the re-defer
+behavior if you don't need a timed delay.
 
 ### NEVER escalate merely because verification is async
 

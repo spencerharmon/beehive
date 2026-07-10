@@ -49,6 +49,20 @@ func (t *Task) Release() {
 // HeartbeatNow re-stamps the active claim's heartbeat to keep it fresh.
 func (t *Task) HeartbeatNow(now time.Time) { t.Heartbeat = now }
 
+// Delayed reports whether the task carries a not_before stamp still in the
+// future at now: a deterministic, runner-owned readiness gate (backoff, TTL
+// wait, spaced re-check/retry) that holds the task out of the ready set exactly
+// like an unmet dependency until wall-clock passes it. A zero (absent)
+// not_before is never delayed. Independent of status and of dep-gating.
+func (t *Task) Delayed(now time.Time) bool {
+	return !t.NotBefore.IsZero() && now.Before(t.NotBefore)
+}
+
+// DelayUntil sets (or refreshes) the task's not_before stamp so it is held out
+// of selection until at least ts — the write side of the delay primitive a task
+// or the runner uses on a failed-but-retryable check.
+func (t *Task) DelayUntil(ts time.Time) { t.NotBefore = ts.UTC() }
+
 // Active reports whether the task is being worked right now: it carries a session
 // id and a heartbeat fresh within ttl. Independent of status.
 func (t *Task) Active(now time.Time, ttl time.Duration) bool {

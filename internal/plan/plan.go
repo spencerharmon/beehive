@@ -13,6 +13,12 @@
 //	  optionally continued by immediately-following non-blank lines (e.g.
 //	  bullets naming the blocker/needed input) up to the next blank line
 //
+// The header metadata comment may also carry an optional `not_before=<RFC3339>`
+// stamp: a task whose not_before is still in the future is deterministically
+// held out of the ready set (like an unmet dep) until wall-clock passes it, then
+// selected normally. It is the general delay primitive (backoff, TTL wait,
+// spaced re-check/retry); a task or the runner may set/refresh its own.
+//
 // The ROI stamp is the first comment; tasks are H2 headers carrying a metadata
 // comment. Body lines between headers belong to the preceding task. A task is
 // "active" (being worked right now) when it carries a session id and a heartbeat
@@ -70,6 +76,7 @@ type Task struct {
 	Weight    int       // selection weight, default 1
 	Session   string    // owner's unique claim token; "" when unclaimed
 	Heartbeat time.Time // last claim stamp; zero when unclaimed
+	NotBefore time.Time // earliest wall-clock the task may be selected; zero = no delay
 	Body      []string  // body lines verbatim, without trailing blank
 }
 
@@ -166,6 +173,12 @@ func parseHeader(m []string) (*Task, error) {
 				return nil, fmt.Errorf("plan: bad heartbeat %q for %s", v, t.ID)
 			}
 			t.Heartbeat = ts
+		case "not_before":
+			ts, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				return nil, fmt.Errorf("plan: bad not_before %q for %s", v, t.ID)
+			}
+			t.NotBefore = ts
 		}
 	}
 	return t, nil
@@ -223,6 +236,9 @@ func (t *Task) header() string {
 	}
 	if !t.Heartbeat.IsZero() {
 		meta += " heartbeat=" + t.Heartbeat.UTC().Format(time.RFC3339)
+	}
+	if !t.NotBefore.IsZero() {
+		meta += " not_before=" + t.NotBefore.UTC().Format(time.RFC3339)
 	}
 	return fmt.Sprintf("## %s [%s] <!-- %s -->", t.ID, t.Status, meta)
 }

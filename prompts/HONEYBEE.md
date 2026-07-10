@@ -90,7 +90,11 @@ every turn. Your requirements:
 A deterministic runner wraps your turn-loop and OWNS everything below; never reproduce, re-run, or
 second-guess it. Each pass the runner has already, or will automatically:
 - **Selected your task and its kind** — you do not choose or re-select. Priority: bootstrap → ROI
-  reconcile → weighted-random ready task; the task's status fixes the kind.
+  reconcile → weighted-random ready task; the task's status fixes the kind. A task is "ready" only when
+  its deps are satisfied AND any optional `not_before=<RFC3339>` stamp in its header has passed
+  wall-clock — a task with a future `not_before` is deterministically held out of the ready set (like an
+  unmet dep) until then, the general delay primitive for backoff / TTL wait / spaced re-check (a task or
+  the runner may set/refresh its own `not_before`; deps and `not_before` gate independently).
 - **Hands you your task description** — for a work/review/arbitration task the full task card is in your
   Context (`## Your task`). You never open `PLAN.md` or `ROI.md` to discover or understand your task;
   you still WRITE `PLAN.md` to record your status transition and unlock dependents.

@@ -469,3 +469,115 @@ func TestGolden(t *testing.T) {
 		t.Fatalf("golden mismatch:\n%s", got)
 	}
 }
+
+// TestNotBeforeParseRoundTrip proves an optional not_before stamp parses to the
+// task field, round-trips through String(), and that a malformed timestamp is a
+// surfaced error rather than a swallowed zero value.
+func TestNotBeforeParseRoundTrip(t *testing.T) {
+	src := "## d [TODO] <!-- attempts=0 deps= not_before=2026-07-01T09:00:00Z -->\nbody\n"
+	p, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk := p.Task("d")
+	if tk.NotBefore.UTC().Format(time.RFC3339) != "2026-07-01T09:00:00Z" {
+		t.Fatalf("not_before=%v", tk.NotBefore)
+	}
+	if got := p.String(); got != "\n"+src {
+		t.Fatalf("round trip mismatch:\n%q\nvs\n%q", got, "\n"+src)
+	}
+	// A task without not_before must not emit the field.
+	p2, _ := Parse("## e [TODO] <!-- attempts=0 deps= -->\n")
+	if strings.Contains(p2.String(), "not_before") {
+		t.Fatalf("absent not_before should not serialize: %q", p2.String())
+	}
+}
+
+func TestNotBeforeMalformedErrors(t *testing.T) {
+	if _, err := Parse("## d [TODO] <!-- attempts=0 deps= not_before=not-a-time -->\n"); err == nil {
+		t.Fatal("want error on malformed not_before")
+	}
+}
+
+// TestDelayedGate proves a future not_before holds a task out of the ready set
+// and that it becomes selectable once wall-clock passes it, independent of deps.
+func TestDelayedGate(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	past := now.Add(-time.Hour)
+
+	tk := &Task{ID: "a", Status: StatusTODO}
+	if tk.Delayed(now) {
+		t.Fatal("absent not_before must never be delayed")
+	}
+	tk.DelayUntil(future)
+	if !tk.Delayed(now) {
+		t.Fatal("future not_before must be delayed")
+	}
+	if tk.Delayed(future) || tk.Delayed(future.Add(time.Second)) {
+		t.Fatal("not_before at/after wall-clock must not be delayed")
+	}
+	tk.DelayUntil(past)
+	if tk.Delayed(now) {
+		t.Fatal("past not_before must not be delayed")
+	}
+}
+
+// TestCandidatesExcludesDelayed proves Candidates skips a TODO task whose
+// not_before is in the future, includes it once passed, and that deps still
+// gate independently of the delay.
+func TestCandidatesExcludesDelayed(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	src := "## a [TODO] <!-- attempts=0 deps= not_before=2026-07-01T18:00:00Z -->\n" +
+		"## b [TODO] <!-- attempts=0 deps= -->\n"
+	p, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := func(ts []Task) map[string]bool {
+		m := map[string]bool{}
+		for _, x := range ts {
+			m[x.ID] = true
+		}
+		return m
+	}
+	got := ids(p.Candidates(now, time.Hour))
+	if got["a"] {
+		t.Fatal("delayed task a must be excluded")
+	}
+	if !got["b"] {
+		t.Fatal("undelayed task b must be a candidate")
+	}
+	// Once wall-clock passes not_before, a is selectable.
+	later := time.Date(2026, 7, 1, 18, 0, 0, 0, time.UTC)
+	if !ids(p.Candidates(later, time.Hour))["a"] {
+		t.Fatal("task a must be selectable once not_before passes")
+	}
+}
+
+// TestCandidatesDelayIndependentOfDeps proves not_before and dep-gating are
+// orthogonal: a task past its not_before is still blocked by an unmet dep, and
+// a task with a satisfied dep is still held by a future not_before.
+func TestCandidatesDelayIndependentOfDeps(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	src := "## dep [TODO] <!-- attempts=0 deps= -->\n" +
+		"## a [TODO] <!-- attempts=0 deps=dep not_before=2026-07-01T06:00:00Z -->\n"
+	p, _ := Parse(src)
+	// not_before already passed, but dep is unmet -> not a candidate.
+	for _, c := range p.Candidates(now, time.Hour) {
+		if c.ID == "a" {
+			t.Fatal("a must stay blocked by unmet dep despite passed not_before")
+		}
+	}
+	// Satisfy dep; now a is selectable.
+	p.Task("dep").Status = StatusDone
+	found := false
+	for _, c := range p.Candidates(now, time.Hour) {
+		if c.ID == "a" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("a must be selectable: dep done and not_before passed")
+	}
+}

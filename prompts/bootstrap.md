@@ -31,5 +31,8 @@ Example for ROI's current 8-tier order (P1 > P2 > correctness > completeness >
 configuration > aesthetics > chat-diff editor > deferred):
 `128, 64, 32, 16, 8, 4, 2, 1`. Emit the integer in the task header
 `<!-- ... weight=N -->`; omit it only for the bottom (weight=1) tier.
+- A task header may also carry an optional `not_before=<RFC3339>` stamp: the selector holds a task with
+  a future `not_before` out of the ready set (like an unmet dep) until wall-clock passes it — the delay
+  primitive for backoff / TTL wait / spaced re-check. Deps and `not_before` gate independently.
 - Commit PLAN.md to main. Race-safe: if another honeybee bootstrapped first, conflict -> reselect.
 - Do NOT begin implementation; bootstrapping ends at a committed PLAN.md.

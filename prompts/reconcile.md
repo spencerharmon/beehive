@@ -33,5 +33,8 @@ You are given the diff of ROI.md from the last-reconciled commit to HEAD (ROI.md
     editor > deferred) -> `128, 64, 32, 16, 8, 4, 2, 1`. Emit `weight=N` in the header; omit only for the
     bottom (weight=1) tier. Re-emit weights for existing tasks when their tier moved.
 - Update the PLAN.md ROI stamp to the current ROI.md commit: `<!-- Beehive-ROI: <sha> -->`.
+- A task header may also carry an optional `not_before=<RFC3339>` stamp: the selector holds a task with
+  a future `not_before` out of the ready set (like an unmet dep) until wall-clock passes it — the delay
+  primitive for backoff / TTL wait / spaced re-check. Deps and `not_before` gate independently.
 - NEVER edit ROI.md. Commit PLAN.md to main; conflict -> reselect.
 - Do NOT implement tasks; reconciliation ends at a committed, restamped PLAN.md.
