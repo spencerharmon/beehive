@@ -1,7 +1,7 @@
 {{template "header" .}}
 {{template "breadcrumb" .Crumbs}}
 <h1>{{.Name}} · {{if .Display}}{{.Display}}{{else}}{{.Branch}}{{end}}</h1>
-<p class="muted small">branch <code>{{.Branch}}</code></p>
+<p class="muted small">branch <span class="sha-cell"><code>{{.Branch}}</code><button type="button" class="copy-btn" data-copy="{{.Branch}}" aria-label="Copy branch {{.Branch}} to clipboard">copy</button></span></p>
 <p>
 {{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">ended</span>{{end}}
 {{if .TaskHref}} <a href="{{.TaskHref}}">task</a>{{end}}
