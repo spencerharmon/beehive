@@ -182,6 +182,7 @@ column below marks who each is for.
 | Bootstrap | standing up a new target or whole install | operator | `skills/bootstrap.md` |
 | Rebootstrap | rebuilding a target's plan from scratch | operator | `skills/rebootstrap.md` |
 | Cleanup | clearing stale worktrees/branches/claims/drift | operator | `skills/cleanup.md` |
+| Repair a corrupt PLAN.md | a plan fails to parse (e.g. `bad heartbeat ""`) after a pass was killed mid-write | operator | `skills/repair-plan.md` |
 | Deferred verification | a work task's effect only shows after an external system converges (GitOps reconcile, CI run, cache/TTL) | honeybee | `skills/deferred-verification.md` |
 | Update instructions | refreshing managed files to new binary defaults | operator | `skills/update-instructions.md` |
 
