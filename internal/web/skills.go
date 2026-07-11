@@ -24,6 +24,7 @@ import (
 
 	"github.com/spencerharmon/beehive/internal/artifacts"
 	"github.com/spencerharmon/beehive/internal/editor"
+	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
@@ -186,7 +187,122 @@ func (s *Server) skills() *skillRegistry {
 	add(s.skillGC())
 	add(s.skillResources())
 	add(s.skillInfraConventions())
+	add(s.skillRepairPlan())
 	return reg
+}
+
+// skillRepairPlan surfaces the plan-repair operation (skills/repair-plan.md) as a
+// deterministic dry-run + confirm-gated apply. It targets exactly one corruption
+// class: a task header carrying an EMPTY-valued session=/heartbeat=/not_before=
+// stamp — the signature a pass killed mid-write (e.g. OOM) leaves behind, which
+// makes time.Parse("") reject the whole document (`plan: bad heartbeat ""`) and
+// blocks selection/reconcile/every view for that submodule. It only ever acts on
+// a PLAN.md that genuinely fails to parse, drops the empty stamps via
+// plan.RepairCorruptStamps (canonical form omits an empty session and a zero
+// heartbeat/not_before, so a dead claim is simply released), and REFUSES to guess
+// at malformed structural counters or discard non-empty real-but-corrupt values —
+// those surface as report items for manual repair. Destructive: it rewrites
+// PLAN.md, so apply is confirm-gated and re-verifies the repaired file parses
+// before writing or publishing.
+func (s *Server) skillRepairPlan() *skill {
+	return &skill{
+		Name:        "repair-plan",
+		Title:       "Repair a corrupt PLAN.md",
+		Summary:     "Surgically drop the empty-valued session=/heartbeat=/not_before= stamp a crashed pass leaves behind (the `plan: bad heartbeat \"\"` corruption) so the submodule's PLAN.md parses again. Refuses to guess at malformed structural counters or discard non-empty real values.",
+		Destructive: true,
+		plan: func(ctx context.Context) (skillPlan, error) {
+			subs, err := s.repo.Submodules()
+			if err != nil {
+				return skillPlan{}, err
+			}
+			var p skillPlan
+			for _, sm := range subs {
+				before, err := readFileOrEmpty(sm.PlanPath())
+				if err != nil {
+					return skillPlan{}, err
+				}
+				if before == "" {
+					continue
+				}
+				// Only act on a genuinely unparseable file — a healthy PLAN.md is
+				// never rewritten by this skill.
+				if _, perr := plan.Parse(before); perr == nil {
+					continue
+				}
+				display := filepath.ToSlash(filepath.Join("submodules", sm.Name, "PLAN.md"))
+				after, changed, unfixable := plan.RepairCorruptStamps(before)
+				for _, u := range unfixable {
+					p.Report = append(p.Report, display+": "+u)
+				}
+				if len(changed) == 0 {
+					if _, perr := plan.Parse(before); perr != nil {
+						p.Report = append(p.Report, fmt.Sprintf("%s: unparseable and not an auto-fixable empty-stamp corruption (%v) — manual repair needed", display, perr))
+					}
+					continue
+				}
+				// Never propose a repair that does not actually restore parseability.
+				if _, perr := plan.Parse(after); perr != nil {
+					p.Report = append(p.Report, fmt.Sprintf("%s: empty stamps dropped but file still unparseable (%v) — manual repair needed", display, perr))
+					continue
+				}
+				p.Diffs = append(p.Diffs, &skillDiff{Path: display, Before: before, After: after})
+				for _, c := range changed {
+					p.Actions = append(p.Actions, skillAction{
+						Op:     "write",
+						Target: fmt.Sprintf("%s:%d", display, c.Line),
+						Detail: fmt.Sprintf("drop empty %s stamp on task %s (releases a dead claim)", strings.Join(c.Dropped, "+"), c.ID),
+					})
+				}
+			}
+			if len(p.Actions) == 0 && len(p.Report) == 0 {
+				p.Report = append(p.Report, "every submodule's PLAN.md parses; nothing to repair")
+			}
+			return p, nil
+		},
+		apply: func(ctx context.Context) (skillResult, error) {
+			subs, err := s.repo.Submodules()
+			if err != nil {
+				return skillResult{}, err
+			}
+			var res skillResult
+			wrote := false
+			for _, sm := range subs {
+				path := sm.PlanPath()
+				before, err := readFileOrEmpty(path)
+				if err != nil {
+					return skillResult{}, err
+				}
+				if before == "" {
+					continue
+				}
+				if _, perr := plan.Parse(before); perr == nil {
+					continue
+				}
+				after, changed, _ := plan.RepairCorruptStamps(before)
+				if len(changed) == 0 {
+					continue
+				}
+				// Refuse to write a file the repair did not actually make parseable.
+				if _, perr := plan.Parse(after); perr != nil {
+					return skillResult{}, fmt.Errorf("submodules/%s/PLAN.md: repair did not restore parseability, not writing: %w", sm.Name, perr)
+				}
+				if err := os.WriteFile(path, []byte(after), 0o644); err != nil {
+					return skillResult{}, err
+				}
+				for _, c := range changed {
+					res.Done = append(res.Done, fmt.Sprintf("submodules/%s/PLAN.md:%d dropped empty %s stamp on task %s", sm.Name, c.Line, strings.Join(c.Dropped, "+"), c.ID))
+				}
+				wrote = true
+			}
+			if !wrote {
+				return skillResult{Done: []string{"no PLAN.md needed empty-stamp repair"}}, nil
+			}
+			if err := s.publishMain(ctx, "frontend: repair corrupt PLAN.md empty stamps"); err != nil {
+				return skillResult{}, err
+			}
+			return res, nil
+		},
+	}
 }
 
 // skillCleanupStale removes the unregistered edit-*/beehive-* worktree

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
@@ -42,7 +43,7 @@ func TestSkillsPageListsSkills(t *testing.T) {
 		t.Fatalf("skills page: got %d", w.Code)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"cleanup-stale", "gc", "resources", "infra-conventions", "Dry-run"} {
+	for _, want := range []string{"cleanup-stale", "gc", "resources", "infra-conventions", "repair-plan", "Dry-run"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("skills page missing %q:\n%s", want, body)
 		}
@@ -210,5 +211,75 @@ func TestSkillInfraConventionsAppliesExactPlan(t *testing.T) {
 	again := postForm(t, s, "/skills/infra-conventions/plan", url.Values{})
 	if b := again.Body.String(); !strings.Contains(b, "already") {
 		t.Fatalf("second plan should be a no-op:\n%s", b)
+	}
+}
+
+// TestSkillRepairPlanFixesCorruptStamp is the plan-repair acceptance: an
+// unparseable PLAN.md carrying the empty session=/heartbeat= OOM-mid-write
+// signature is (a) surfaced by the dry-run with the exact task and dropped
+// stamps, (b) left untouched by an UNCONFIRMED apply (destructive gate), and
+// (c) surgically repaired to a parseable file by a CONFIRMED apply — dropping
+// only the dead claim while preserving attempts/deps/weight/status/body.
+func TestSkillRepairPlanFixesCorruptStamp(t *testing.T) {
+	s, root := setup(t)
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	const corrupt = "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n" +
+		"## broken [DONE] <!-- attempts=2 deps=x,y weight=8 session= heartbeat= -->\nbody stays\nDoc: d.md\n"
+	if err := os.WriteFile(planPath, []byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Parse(corrupt); err == nil {
+		t.Fatal("precondition: fixture must be unparseable")
+	}
+
+	// (a) Dry-run surfaces the task and the exact repair.
+	dry := postForm(t, s, "/skills/repair-plan/plan", url.Values{})
+	if dry.Code != http.StatusOK {
+		t.Fatalf("plan: got %d", dry.Code)
+	}
+	db := dry.Body.String()
+	for _, want := range []string{"broken", "drop empty", "session&#43;heartbeat"} {
+		if !strings.Contains(db, want) {
+			t.Fatalf("dry-run missing %q:\n%s", want, db)
+		}
+	}
+
+	// (b) Unconfirmed apply refuses and mutates nothing (still corrupt on disk).
+	gate := postForm(t, s, "/skills/repair-plan/apply", url.Values{})
+	if gate.Code != http.StatusOK {
+		t.Fatalf("unconfirmed apply: got %d want 200", gate.Code)
+	}
+	if !strings.Contains(strings.ToLower(gate.Body.String()), "confirm") {
+		t.Fatalf("unconfirmed apply must ask to confirm:\n%s", gate.Body.String())
+	}
+	if b, _ := os.ReadFile(planPath); string(b) != corrupt {
+		t.Fatalf("unconfirmed apply mutated the file:\n%s", b)
+	}
+
+	// (c) Confirmed apply repairs the file to a parseable state.
+	done := postForm(t, s, "/skills/repair-plan/apply", url.Values{"confirm": {"on"}})
+	if done.Code != http.StatusOK {
+		t.Fatalf("confirmed apply: got %d body=%s", done.Code, done.Body)
+	}
+	fixed, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := plan.Parse(string(fixed))
+	if err != nil {
+		t.Fatalf("repaired PLAN.md must parse, got %v\n%s", err, fixed)
+	}
+	tk := p.Task("broken")
+	if tk == nil {
+		t.Fatal("task lost during repair")
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatalf("dead claim not released: session=%q heartbeat=%v", tk.Session, tk.Heartbeat)
+	}
+	if tk.Attempts != 2 || tk.Weight != 8 || strings.Join(tk.Deps, ",") != "x,y" || tk.Status != plan.StatusDone {
+		t.Fatalf("surviving metadata corrupted: %+v", tk)
+	}
+	if len(tk.Body) == 0 || tk.Body[0] != "body stays" {
+		t.Fatalf("body corrupted: %v", tk.Body)
 	}
 }

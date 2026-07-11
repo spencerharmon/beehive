@@ -37,7 +37,26 @@ directed, surgical **metadata** repair (the task's status/body content is not
 touched), not a plan-content edit. Keep it that way — fix only the malformed stamp,
 change nothing else.
 
-## Procedure
+## Two ways to repair
+
+**Primary (beehived UI): the `repair-plan` maintenance skill.** The frontend
+`/skills` page carries a deterministic `repair-plan` skill that auto-detects this
+exact corruption class across every submodule's `PLAN.md`, shows a dry-run diff of
+the surgical fix, and applies it behind a destructive-confirm gate
+(`internal/web/skills.go`, backed by `plan.RepairCorruptStamps`). It drops **only**
+the empty-valued `session=`/`heartbeat=`/`not_before=` stamps (releasing a dead
+claim to canonical form), re-verifies the file parses before writing, and publishes
+`PLAN.md` to `main` through the guarded frontend write path. Use it first — it needs
+no worktree. It deliberately **refuses** to guess at a malformed structural counter
+(`attempts=`/`weight=`) or discard a non-empty-but-corrupt timestamp; those surface
+as report items and fall to the manual procedure below.
+
+**Fallback (manual worktree edit):** for corruption the coded skill refuses (a
+non-empty malformed value, a bad `attempts`/`weight`, or any non-empty-stamp parse
+failure), or when `beehived` is unavailable, repair by hand via the worktree
+process below.
+
+## Procedure (manual fallback)
 
 1. **Find the offending header.** The error names the task id:
    `grep -nE '<task-id>.*<!--' submodules/<sm>/PLAN.md`. Confirm the metadata
