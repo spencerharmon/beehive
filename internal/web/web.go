@@ -384,11 +384,15 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /human/{sub}/{id}/discard/{sid}", b((*Server).humanResolveDiscard))
 	mux.HandleFunc("POST /human/{sub}/{id}/resolve", b((*Server).humanResolveApply))
 	mux.HandleFunc("GET /hygiene", b((*Server).hygiene))
-	// Maintenance skills: an index of named actions each with a read-only dry-run
-	// (plan) and a separate apply; destructive skills gate apply on confirm.
-	mux.HandleFunc("GET /skills", b((*Server).skillsPage))
-	mux.HandleFunc("POST /skills/{name}/plan", b((*Server).skillPlanHandler))
-	mux.HandleFunc("POST /skills/{name}/apply", b((*Server).skillApplyHandler))
+	// Maintenance dances: named deterministic actions each with a read-only dry-run
+	// (plan) and a separate apply; destructive dances gate apply on confirm. They
+	// render on the combined hygiene page beneath the cruft scan they remediate.
+	// /skills is the pre-rename URL: redirect it so old links/bookmarks still land.
+	mux.HandleFunc("GET /skills", b(func(s *Server, w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/hygiene", http.StatusMovedPermanently)
+	}))
+	mux.HandleFunc("POST /dances/{name}/plan", b((*Server).dancePlanHandler))
+	mux.HandleFunc("POST /dances/{name}/apply", b((*Server).danceApplyHandler))
 	// AI editor chat (browser): one worktree branch per session. GET /edit is
 	// the ONE entry point for every edit-with-AI link (dashboard/explorer/
 	// roi_editor) and always opens the publish-capable internal/editor Manager
@@ -607,7 +611,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	// dashboard, which is the operator's primary page.
 	hyg, err := scanHygiene(r.Context(), s.repo.Root, s.git)
 	if err != nil {
-		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
+		hyg = Hygiene{Err: err.Error()}
 	}
 	rootFiles := s.rootFileLinks()
 	// No "Title": the dashboard is the root page, and layout.html's own
@@ -1434,20 +1438,21 @@ func (s *Server) human(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "human.html", map[string]interface{}{"Rows": rows, "Title": pageTitle("human"), "Nav": "human"})
 }
 
-// hygiene renders the standalone read-only hive-hygiene page: a full scan of the
+// hygiene renders the combined hive-hygiene page: a full read-only scan of the
 // git cruft that accumulates under updateInstead (stale worktrees, orphan
 // submodule gitlinks, drifted submodule checkouts, unexpected remotes), counts
-// with a drill-down, and the beehive-hygiene cleanup skill as the remediation
-// pointer. It also surfaces the frontend's own view-cache health (CacheWidget) —
-// a second, unrelated diagnostic that shares this "operational health,
-// diagnostic only" page. The handler is strictly diagnostic — scanHygiene
-// mutates nothing and cacheWidget only reads s.cache's counters.
+// with a drill-down, and — beneath it — the deterministic "dances": the named
+// dry-run/apply maintenance actions that remediate that cruft (and more). It also
+// surfaces the frontend's own view-cache health (CacheWidget) — a second,
+// unrelated diagnostic that shares this "operational health" page. The scan itself
+// is strictly diagnostic (scanHygiene/cacheWidget mutate nothing); every mutation
+// is a dance the operator explicitly dry-runs then applies.
 func (s *Server) hygiene(w http.ResponseWriter, r *http.Request) {
 	hyg, err := scanHygiene(r.Context(), s.repo.Root, s.git)
 	if err != nil {
-		hyg = Hygiene{Skill: hygieneSkill, Err: err.Error()}
+		hyg = Hygiene{Err: err.Error()}
 	}
-	s.render(w, "hygiene_panel.html", map[string]interface{}{"Hygiene": hyg, "Cache": cacheWidget(s.cache), "Title": pageTitle("hygiene"), "Nav": "hygiene"})
+	s.render(w, "hygiene_panel.html", map[string]interface{}{"Hygiene": hyg, "Dances": s.dancePanels(), "Cache": cacheWidget(s.cache), "Title": pageTitle("hygiene"), "Nav": "hygiene"})
 }
 
 // ttl is the resolved claim heartbeat TTL: a task's session+heartbeat is "active"

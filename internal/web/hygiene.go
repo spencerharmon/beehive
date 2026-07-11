@@ -11,12 +11,6 @@ import (
 	"github.com/spencerharmon/beehive/internal/git"
 )
 
-// hygieneSkill is the cleanup skill the panel points the operator at as the
-// explicit remediation action. The panel only SURFACES cruft; running this skill
-// (the routine sweep in skills/cleanup.md) is how the operator clears it. The
-// panel never invokes it — diagnostic only.
-const hygieneSkill = "beehive-hygiene"
-
 // CruftItem is one flagged piece of git cruft within a class: its identifier
 // (a worktree dir name, a gitlink path, a remote name) plus a short read-only
 // reason it was flagged. Purely descriptive — nothing here is ever mutated.
@@ -35,14 +29,14 @@ type CruftClass struct {
 // Count is the class's flagged-item count (the badge number).
 func (c CruftClass) Count() int { return len(c.Items) }
 
-// Hygiene is the whole read-only scan result: the four cruft classes, the
-// per-managed-repo object-store (pack dir) health, the skill to remediate the
-// cruft, and an optional scan error (surfaced, never swallowed) so the dashboard
-// widget can degrade without failing the whole page.
+// Hygiene is the whole read-only scan result: the four cruft classes and the
+// per-managed-repo object-store (pack dir) health, plus an optional scan error
+// (surfaced, never swallowed) so the dashboard widget can degrade without failing
+// the whole page. The remediations are the deterministic "dances" rendered beneath
+// this scan on the combined hygiene page — the scan itself never mutates.
 type Hygiene struct {
 	Classes []CruftClass
 	Packs   []RepoPack
-	Skill   string
 	Err     string
 }
 
@@ -193,7 +187,6 @@ func scanHygiene(ctx context.Context, root string, g *git.Repo) (Hygiene, error)
 		return Hygiene{}, err
 	}
 	return Hygiene{
-		Skill: hygieneSkill,
 		Classes: []CruftClass{
 			{Key: "worktrees", Title: "Stale worktrees", Items: worktrees},
 			{Key: "gitlinks", Title: "Orphan submodule gitlinks", Items: orphans},

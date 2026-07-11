@@ -34,41 +34,55 @@ func seedStaleWorktrees(t *testing.T, root string) (stale []string, keep string)
 	return stale, keep
 }
 
-// TestSkillsPageListsSkills locks that the index renders every registered skill
-// with a dry-run control, so each maintenance action is discoverable.
-func TestSkillsPageListsSkills(t *testing.T) {
+// TestDancesRenderOnHygienePage locks that the combined hygiene page renders
+// every registered dance with a dry-run control (discoverable) AND still carries
+// the read-only hygiene scan — the two surfaces are merged onto one page.
+func TestDancesRenderOnHygienePage(t *testing.T) {
 	s, _ := setup(t)
-	w := get(t, s, "/skills")
+	w := get(t, s, "/hygiene")
 	if w.Code != http.StatusOK {
-		t.Fatalf("skills page: got %d", w.Code)
+		t.Fatalf("hygiene page: got %d", w.Code)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"cleanup-stale", "gc", "resources", "infra-conventions", "repair-plan", "Dry-run"} {
+	for _, want := range []string{"cleanup-stale", "gc", "resources", "infra-conventions", "repair-plan", "Dry-run", "Dances", "Hive hygiene"} {
 		if !strings.Contains(body, want) {
-			t.Fatalf("skills page missing %q:\n%s", want, body)
+			t.Fatalf("hygiene page missing %q:\n%s", want, body)
 		}
 	}
 }
 
-// TestSkillUnknownIs404 is the "unknown skill errors" acceptance: neither
+// TestSkillsURLRedirects locks that the pre-rename /skills URL redirects to the
+// combined hygiene page so old links/bookmarks keep working.
+func TestSkillsURLRedirects(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/skills")
+	if w.Code != http.StatusMovedPermanently {
+		t.Fatalf("/skills: got %d want 301", w.Code)
+	}
+	if loc := w.Header().Get("Location"); loc != "/hygiene" {
+		t.Fatalf("/skills redirect Location = %q want /hygiene", loc)
+	}
+}
+
+// TestSkillUnknownIs404 is the "unknown dance errors" acceptance: neither
 // dry-run nor apply resolves an unregistered name.
 func TestSkillUnknownIs404(t *testing.T) {
 	s, _ := setup(t)
-	if w := postForm(t, s, "/skills/nope/plan", url.Values{}); w.Code != http.StatusNotFound {
+	if w := postForm(t, s, "/dances/nope/plan", url.Values{}); w.Code != http.StatusNotFound {
 		t.Fatalf("unknown plan: got %d want 404", w.Code)
 	}
-	if w := postForm(t, s, "/skills/nope/apply", url.Values{"confirm": {"on"}}); w.Code != http.StatusNotFound {
+	if w := postForm(t, s, "/dances/nope/apply", url.Values{"confirm": {"on"}}); w.Code != http.StatusNotFound {
 		t.Fatalf("unknown apply: got %d want 404", w.Code)
 	}
 }
 
-// TestSkillResourcesReportOnly proves a report-only skill produces a dry-run
+// TestSkillResourcesReportOnly proves a report-only dance produces a dry-run
 // inventory and refuses apply (no mutation path at all). It also locks that the
 // inventory is per-submodule: no hive-wide "root" deploy-env line (blue/green is
 // not a global concept).
 func TestSkillResourcesReportOnly(t *testing.T) {
 	s, _ := setup(t)
-	plan := postForm(t, s, "/skills/resources/plan", url.Values{})
+	plan := postForm(t, s, "/dances/resources/plan", url.Values{})
 	if plan.Code != http.StatusOK {
 		t.Fatalf("resources plan: got %d", plan.Code)
 	}
@@ -80,12 +94,12 @@ func TestSkillResourcesReportOnly(t *testing.T) {
 	if strings.Contains(b, "root:") {
 		t.Fatalf("resources plan must not present a hive-wide root deploy line:\n%s", b)
 	}
-	if w := postForm(t, s, "/skills/resources/apply", url.Values{"confirm": {"on"}}); w.Code != http.StatusBadRequest {
+	if w := postForm(t, s, "/dances/resources/apply", url.Values{"confirm": {"on"}}); w.Code != http.StatusBadRequest {
 		t.Fatalf("report-only apply: got %d want 400", w.Code)
 	}
 }
 
-// TestSkillCleanupStaleConfirmGateAndApply is the destructive-skill acceptance:
+// TestSkillCleanupStaleConfirmGateAndApply is the destructive-dance acceptance:
 // the dry-run lists exactly the stale dirs without mutating, an unconfirmed
 // apply refuses (mutating nothing), and only a confirmed apply performs
 // precisely the proposed removals while sparing the non-matching directory.
@@ -98,7 +112,7 @@ func TestSkillCleanupStaleConfirmGateAndApply(t *testing.T) {
 	}
 
 	// Dry-run: lists exactly the stale dirs as remove actions; mutates nothing.
-	plan := postForm(t, s, "/skills/cleanup-stale/plan", url.Values{})
+	plan := postForm(t, s, "/dances/cleanup-stale/plan", url.Values{})
 	if plan.Code != http.StatusOK {
 		t.Fatalf("plan: got %d", plan.Code)
 	}
@@ -116,7 +130,7 @@ func TestSkillCleanupStaleConfirmGateAndApply(t *testing.T) {
 	}
 
 	// Apply WITHOUT confirm: the gate refuses, asks to confirm, mutates nothing.
-	gate := postForm(t, s, "/skills/cleanup-stale/apply", url.Values{})
+	gate := postForm(t, s, "/dances/cleanup-stale/apply", url.Values{})
 	if gate.Code != http.StatusOK {
 		t.Fatalf("unconfirmed apply: got %d want 200", gate.Code)
 	}
@@ -130,7 +144,7 @@ func TestSkillCleanupStaleConfirmGateAndApply(t *testing.T) {
 	}
 
 	// Apply WITH confirm: removes exactly the stale dirs, keeps the non-matching.
-	done := postForm(t, s, "/skills/cleanup-stale/apply", url.Values{"confirm": {"on"}})
+	done := postForm(t, s, "/dances/cleanup-stale/apply", url.Values{"confirm": {"on"}})
 	if done.Code != http.StatusOK {
 		t.Fatalf("confirmed apply: got %d", done.Code)
 	}
@@ -148,7 +162,7 @@ func TestSkillCleanupStaleConfirmGateAndApply(t *testing.T) {
 }
 
 // TestSkillInfraConventionsAppliesExactPlan proves the non-destructive, diff-
-// previewing skill normalizes each SUBMODULE's OWN INFRASTRUCTURE.md and never the
+// previewing dance normalizes each SUBMODULE's OWN INFRASTRUCTURE.md and never the
 // hive coordination root (blue/green is per-submodule, not a global concept). With
 // alpha lacking the markers and bravo already declaring them, the dry-run proposes
 // the markers only for alpha's submodules/alpha/INFRASTRUCTURE.md; apply (no
@@ -156,7 +170,7 @@ func TestSkillCleanupStaleConfirmGateAndApply(t *testing.T) {
 // given deploy markers; and a second dry-run is a no-op.
 func TestSkillInfraConventionsAppliesExactPlan(t *testing.T) {
 	s, root := setup(t)
-	// bravo already declares its own markers -> a no-op the skill must skip.
+	// bravo already declares its own markers -> a no-op the dance must skip.
 	bravo := filepath.Join(root, "submodules", "bravo")
 	if err := os.MkdirAll(bravo, 0o755); err != nil {
 		t.Fatal(err)
@@ -168,7 +182,7 @@ func TestSkillInfraConventionsAppliesExactPlan(t *testing.T) {
 	rootInfra := filepath.Join(root, repo.InfraFile)
 	alphaTarget := filepath.ToSlash(filepath.Join("submodules", "alpha", repo.InfraFile))
 
-	plan := postForm(t, s, "/skills/infra-conventions/plan", url.Values{})
+	plan := postForm(t, s, "/dances/infra-conventions/plan", url.Values{})
 	if plan.Code != http.StatusOK {
 		t.Fatalf("plan: got %d", plan.Code)
 	}
@@ -184,7 +198,7 @@ func TestSkillInfraConventionsAppliesExactPlan(t *testing.T) {
 		t.Fatalf("plan must not propose the already-conventional bravo:\n%s", pb)
 	}
 
-	done := postForm(t, s, "/skills/infra-conventions/apply", url.Values{})
+	done := postForm(t, s, "/dances/infra-conventions/apply", url.Values{})
 	if done.Code != http.StatusOK {
 		t.Fatalf("apply: got %d body=%s", done.Code, done.Body)
 	}
@@ -208,7 +222,7 @@ func TestSkillInfraConventionsAppliesExactPlan(t *testing.T) {
 		t.Fatalf("root INFRASTRUCTURE.md must stay empty (no blue/green markers), got %q err=%v", rb, err)
 	}
 
-	again := postForm(t, s, "/skills/infra-conventions/plan", url.Values{})
+	again := postForm(t, s, "/dances/infra-conventions/plan", url.Values{})
 	if b := again.Body.String(); !strings.Contains(b, "already") {
 		t.Fatalf("second plan should be a no-op:\n%s", b)
 	}
@@ -233,7 +247,7 @@ func TestSkillRepairPlanFixesCorruptStamp(t *testing.T) {
 	}
 
 	// (a) Dry-run surfaces the task and the exact repair.
-	dry := postForm(t, s, "/skills/repair-plan/plan", url.Values{})
+	dry := postForm(t, s, "/dances/repair-plan/plan", url.Values{})
 	if dry.Code != http.StatusOK {
 		t.Fatalf("plan: got %d", dry.Code)
 	}
@@ -245,7 +259,7 @@ func TestSkillRepairPlanFixesCorruptStamp(t *testing.T) {
 	}
 
 	// (b) Unconfirmed apply refuses and mutates nothing (still corrupt on disk).
-	gate := postForm(t, s, "/skills/repair-plan/apply", url.Values{})
+	gate := postForm(t, s, "/dances/repair-plan/apply", url.Values{})
 	if gate.Code != http.StatusOK {
 		t.Fatalf("unconfirmed apply: got %d want 200", gate.Code)
 	}
@@ -257,7 +271,7 @@ func TestSkillRepairPlanFixesCorruptStamp(t *testing.T) {
 	}
 
 	// (c) Confirmed apply repairs the file to a parseable state.
-	done := postForm(t, s, "/skills/repair-plan/apply", url.Values{"confirm": {"on"}})
+	done := postForm(t, s, "/dances/repair-plan/apply", url.Values{"confirm": {"on"}})
 	if done.Code != http.StatusOK {
 		t.Fatalf("confirmed apply: got %d body=%s", done.Code, done.Body)
 	}

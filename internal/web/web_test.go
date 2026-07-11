@@ -4894,7 +4894,7 @@ func TestHygieneScanAllClasses(t *testing.T) {
 }
 
 // TestHygienePanelReadOnly drives GET /hygiene end-to-end: the page renders the
-// counts, the drill-down identifiers, and the beehive-hygiene remediation
+// counts, the drill-down identifiers, and the cleanup-stale dance remediation
 // pointer — and the handler MUTATES NOTHING (no worktree removed, no remote or
 // config touched, the index and the drifted checkout left exactly as found).
 func TestHygienePanelReadOnly(t *testing.T) {
@@ -4919,7 +4919,7 @@ func TestHygienePanelReadOnly(t *testing.T) {
 		"Orphan submodule gitlinks", "submodules/orphan/worktrees/bee-x",
 		"Stale submodule checkouts", "submodules/drift/repo",
 		"Unexpected remotes", "weird",
-		"beehive-hygiene", // the remediation skill pointer
+		"cleanup-stale", // the remediation dance pointer
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("hygiene page missing %q:\n%s", want, body)

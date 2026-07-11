@@ -1,16 +1,16 @@
 package web
 
-// This file implements chat-skills: a registry of named, invocable maintenance
-// skills surfaced on the beehive frontend. Each skill offers a deterministic,
+// This file implements chat-dances: a registry of named, invocable maintenance
+// dances surfaced on the beehive frontend. Each dance offers a deterministic,
 // read-only DRY-RUN (a plan of exactly what it would change) and a separate APPLY
-// that performs precisely that change. Destructive skills refuse to apply without
-// an explicit confirmation, and an unknown skill name is a hard error — the four
+// that performs precisely that change. Destructive dances refuse to apply without
+// an explicit confirmation, and an unknown dance name is a hard error — the four
 // acceptance guarantees for this feature.
 //
-// The registry is the single lookup/dispatch point: plan() stamps a skill's
+// The registry is the single lookup/dispatch point: plan() stamps a dance's
 // identity onto its dry-run and apply() enforces the invocation contract
 // (unknown -> error, report-only -> no apply, destructive -> confirm-gated)
-// before any mutation runs. Skills close over *Server so their plans are live
+// before any mutation runs. Dances close over *Server so their plans are live
 // scans and their applies reuse the server's guarded git write path.
 
 import (
@@ -30,27 +30,27 @@ import (
 
 // The invocation-guard errors. They are sentinels (wrapped, matched with
 // errors.Is) so the HTTP layer maps each to a distinct status without string
-// matching, and so a caller can tell "no such skill" apart from "you must
+// matching, and so a caller can tell "no such dance" apart from "you must
 // confirm" — the difference between a 404 and a refusal-to-mutate.
 var (
-	errUnknownSkill    = errors.New("unknown skill")
-	errReportOnly      = errors.New("skill is report-only and has no apply action")
-	errConfirmRequired = errors.New("skill is destructive and requires explicit confirmation")
+	errUnknownDance    = errors.New("unknown dance")
+	errReportOnly      = errors.New("dance is report-only and has no apply action")
+	errConfirmRequired = errors.New("dance is destructive and requires explicit confirmation")
 )
 
-// skillAction is one concrete mutation a skill's apply would perform, surfaced in
+// danceAction is one concrete mutation a dance's apply would perform, surfaced in
 // the dry-run so an operator sees exactly what will change before approving.
-type skillAction struct {
+type danceAction struct {
 	Op     string // "remove" | "reclaim" | "write"
 	Target string // the path / branch / id acted on
 	Detail string // human explanation (no action implied by itself)
 }
 
-// skillDiff is a proposed whole-file rewrite of ONE target's file (e.g. a single
+// danceDiff is a proposed whole-file rewrite of ONE target's file (e.g. a single
 // submodule's INFRASTRUCTURE.md), rendered as a unified diff so a file-editing
-// skill previews its change like the chat editor. A plan carries one per file it
+// dance previews its change like the chat editor. A plan carries one per file it
 // would touch, each scoped to exactly that target.
-type skillDiff struct {
+type danceDiff struct {
 	Path   string
 	Before string
 	After  string
@@ -58,26 +58,26 @@ type skillDiff struct {
 
 // changed reports whether the proposed rewrite actually differs from the current
 // file — a no-op normalization proposes nothing.
-func (d *skillDiff) changed() bool { return d != nil && d.Before != d.After }
+func (d *danceDiff) changed() bool { return d != nil && d.Before != d.After }
 
-// skillPlan is the deterministic dry-run of a skill: a read-only description of
+// dancePlan is the deterministic dry-run of a dance: a read-only description of
 // what applying WOULD do, computed without mutating anything. The identity/flag
 // fields are stamped by the registry, not the plan closure.
-type skillPlan struct {
-	Skill       string
+type dancePlan struct {
+	Dance       string
 	Title       string
 	Summary     string
 	Destructive bool
 	ReportOnly  bool
 
-	Report  []string      // informational findings (report-only skills, or "nothing to do")
-	Actions []skillAction // the concrete mutations apply would perform
-	Diffs   []*skillDiff  // proposed file rewrites, one per target file the skill would edit
+	Report  []string      // informational findings (report-only dances, or "nothing to do")
+	Actions []danceAction // the concrete mutations apply would perform
+	Diffs   []*danceDiff  // proposed file rewrites, one per target file the dance would edit
 }
 
 // Empty reports whether the plan would change nothing: no actions and no real
 // diff. The panel uses it to show "already clean" and suppress the apply control.
-func (p skillPlan) Empty() bool {
+func (p dancePlan) Empty() bool {
 	if len(p.Actions) > 0 {
 		return false
 	}
@@ -89,109 +89,109 @@ func (p skillPlan) Empty() bool {
 	return true
 }
 
-// skillResult is the outcome of applying a skill: the concrete changes made.
-type skillResult struct {
-	Skill string
+// danceResult is the outcome of applying a dance: the concrete changes made.
+type danceResult struct {
+	Dance string
 	Done  []string
 }
 
-// skill is one named, invocable maintenance action. plan computes the read-only
-// dry-run; apply performs it. A destructive skill's apply is gated on an explicit
-// confirm by the REGISTRY (apply below), never by the closure, so every skill's
+// dance is one named, invocable maintenance action. plan computes the read-only
+// dry-run; apply performs it. A destructive dance's apply is gated on an explicit
+// confirm by the REGISTRY (apply below), never by the closure, so every dance's
 // mutation path is protected uniformly.
-type skill struct {
+type dance struct {
 	Name        string
 	Title       string
 	Summary     string
 	Destructive bool
 	ReportOnly  bool
-	plan        func(ctx context.Context) (skillPlan, error)
-	apply       func(ctx context.Context) (skillResult, error)
+	plan        func(ctx context.Context) (dancePlan, error)
+	apply       func(ctx context.Context) (danceResult, error)
 }
 
-// skillRegistry is the ordered set of skills with name lookup. It is rebuilt per
+// danceRegistry is the ordered set of dances with name lookup. It is rebuilt per
 // request (cheap: just closures) so every plan is a live scan.
-type skillRegistry struct {
+type danceRegistry struct {
 	order  []string
-	byName map[string]*skill
+	byName map[string]*dance
 }
 
-// list returns the skills in registration order (deterministic for the index).
-func (r *skillRegistry) list() []*skill {
-	out := make([]*skill, 0, len(r.order))
+// list returns the dances in registration order (deterministic for the index).
+func (r *danceRegistry) list() []*dance {
+	out := make([]*dance, 0, len(r.order))
 	for _, n := range r.order {
 		out = append(out, r.byName[n])
 	}
 	return out
 }
 
-// lookup resolves a skill by name, returning errUnknownSkill (wrapped with the
-// name) when absent — the acceptance's "unknown skill errors".
-func (r *skillRegistry) lookup(name string) (*skill, error) {
+// lookup resolves a dance by name, returning errUnknownDance (wrapped with the
+// name) when absent — the acceptance's "unknown dance errors".
+func (r *danceRegistry) lookup(name string) (*dance, error) {
 	sk, ok := r.byName[name]
 	if !ok {
-		return nil, fmt.Errorf("%q: %w", name, errUnknownSkill)
+		return nil, fmt.Errorf("%q: %w", name, errUnknownDance)
 	}
 	return sk, nil
 }
 
-// plan runs a skill's dry-run and stamps the skill's identity/flags onto the
+// plan runs a dance's dry-run and stamps the dance's identity/flags onto the
 // result, so plan closures compute only Report/Actions/Diff. It mutates nothing.
-func (r *skillRegistry) plan(ctx context.Context, name string) (*skill, skillPlan, error) {
+func (r *danceRegistry) plan(ctx context.Context, name string) (*dance, dancePlan, error) {
 	sk, err := r.lookup(name)
 	if err != nil {
-		return nil, skillPlan{}, err
+		return nil, dancePlan{}, err
 	}
 	p, err := sk.plan(ctx)
 	if err != nil {
-		return sk, skillPlan{}, err
+		return sk, dancePlan{}, err
 	}
-	p.Skill, p.Title, p.Summary = sk.Name, sk.Title, sk.Summary
+	p.Dance, p.Title, p.Summary = sk.Name, sk.Title, sk.Summary
 	p.Destructive, p.ReportOnly = sk.Destructive, sk.ReportOnly
 	return sk, p, nil
 }
 
-// apply runs a skill's mutation AFTER enforcing the invocation contract: an
-// unknown skill errors, a report-only skill has nothing to apply, and a
-// destructive skill refuses without an explicit confirm. Each guard returns its
+// apply runs a dance's mutation AFTER enforcing the invocation contract: an
+// unknown dance errors, a report-only dance has nothing to apply, and a
+// destructive dance refuses without an explicit confirm. Each guard returns its
 // sentinel error with NO side effect, so "no destructive action without
 // approval" holds structurally — the closure never runs on a guard failure.
-func (r *skillRegistry) apply(ctx context.Context, name string, confirm bool) (*skill, skillResult, error) {
+func (r *danceRegistry) apply(ctx context.Context, name string, confirm bool) (*dance, danceResult, error) {
 	sk, err := r.lookup(name)
 	if err != nil {
-		return nil, skillResult{}, err
+		return nil, danceResult{}, err
 	}
 	if sk.ReportOnly || sk.apply == nil {
-		return sk, skillResult{}, errReportOnly
+		return sk, danceResult{}, errReportOnly
 	}
 	if sk.Destructive && !confirm {
-		return sk, skillResult{}, errConfirmRequired
+		return sk, danceResult{}, errConfirmRequired
 	}
 	res, err := sk.apply(ctx)
 	if err != nil {
-		return sk, skillResult{}, err
+		return sk, danceResult{}, err
 	}
-	res.Skill = sk.Name
+	res.Dance = sk.Name
 	return sk, res, nil
 }
 
-// skills builds the maintenance-skill registry over this server. The set and
-// order are deterministic; each skill closes over s for its live scan/apply.
-func (s *Server) skills() *skillRegistry {
-	reg := &skillRegistry{byName: map[string]*skill{}}
-	add := func(sk *skill) {
+// dances builds the maintenance-dance registry over this server. The set and
+// order are deterministic; each dance closes over s for its live scan/apply.
+func (s *Server) dances() *danceRegistry {
+	reg := &danceRegistry{byName: map[string]*dance{}}
+	add := func(sk *dance) {
 		reg.order = append(reg.order, sk.Name)
 		reg.byName[sk.Name] = sk
 	}
-	add(s.skillCleanupStale())
-	add(s.skillGC())
-	add(s.skillResources())
-	add(s.skillInfraConventions())
-	add(s.skillRepairPlan())
+	add(s.danceCleanupStale())
+	add(s.danceGC())
+	add(s.danceResources())
+	add(s.danceInfraConventions())
+	add(s.danceRepairPlan())
 	return reg
 }
 
-// skillRepairPlan surfaces the plan-repair operation (skills/repair-plan.md) as a
+// danceRepairPlan surfaces the plan-repair operation (dances/repair-plan.md) as a
 // deterministic dry-run + confirm-gated apply. It targets exactly one corruption
 // class: a task header carrying an EMPTY-valued session=/heartbeat=/not_before=
 // stamp — the signature a pass killed mid-write (e.g. OOM) leaves behind, which
@@ -204,28 +204,28 @@ func (s *Server) skills() *skillRegistry {
 // those surface as report items for manual repair. Destructive: it rewrites
 // PLAN.md, so apply is confirm-gated and re-verifies the repaired file parses
 // before writing or publishing.
-func (s *Server) skillRepairPlan() *skill {
-	return &skill{
+func (s *Server) danceRepairPlan() *dance {
+	return &dance{
 		Name:        "repair-plan",
 		Title:       "Repair a corrupt PLAN.md",
 		Summary:     "Surgically drop the empty-valued session=/heartbeat=/not_before= stamp a crashed pass leaves behind (the `plan: bad heartbeat \"\"` corruption) so the submodule's PLAN.md parses again. Refuses to guess at malformed structural counters or discard non-empty real values.",
 		Destructive: true,
-		plan: func(ctx context.Context) (skillPlan, error) {
+		plan: func(ctx context.Context) (dancePlan, error) {
 			subs, err := s.repo.Submodules()
 			if err != nil {
-				return skillPlan{}, err
+				return dancePlan{}, err
 			}
-			var p skillPlan
+			var p dancePlan
 			for _, sm := range subs {
 				before, err := readFileOrEmpty(sm.PlanPath())
 				if err != nil {
-					return skillPlan{}, err
+					return dancePlan{}, err
 				}
 				if before == "" {
 					continue
 				}
 				// Only act on a genuinely unparseable file — a healthy PLAN.md is
-				// never rewritten by this skill.
+				// never rewritten by this dance.
 				if _, perr := plan.Parse(before); perr == nil {
 					continue
 				}
@@ -245,9 +245,9 @@ func (s *Server) skillRepairPlan() *skill {
 					p.Report = append(p.Report, fmt.Sprintf("%s: empty stamps dropped but file still unparseable (%v) — manual repair needed", display, perr))
 					continue
 				}
-				p.Diffs = append(p.Diffs, &skillDiff{Path: display, Before: before, After: after})
+				p.Diffs = append(p.Diffs, &danceDiff{Path: display, Before: before, After: after})
 				for _, c := range changed {
-					p.Actions = append(p.Actions, skillAction{
+					p.Actions = append(p.Actions, danceAction{
 						Op:     "write",
 						Target: fmt.Sprintf("%s:%d", display, c.Line),
 						Detail: fmt.Sprintf("drop empty %s stamp on task %s (releases a dead claim)", strings.Join(c.Dropped, "+"), c.ID),
@@ -259,18 +259,18 @@ func (s *Server) skillRepairPlan() *skill {
 			}
 			return p, nil
 		},
-		apply: func(ctx context.Context) (skillResult, error) {
+		apply: func(ctx context.Context) (danceResult, error) {
 			subs, err := s.repo.Submodules()
 			if err != nil {
-				return skillResult{}, err
+				return danceResult{}, err
 			}
-			var res skillResult
+			var res danceResult
 			wrote := false
 			for _, sm := range subs {
 				path := sm.PlanPath()
 				before, err := readFileOrEmpty(path)
 				if err != nil {
-					return skillResult{}, err
+					return danceResult{}, err
 				}
 				if before == "" {
 					continue
@@ -284,10 +284,10 @@ func (s *Server) skillRepairPlan() *skill {
 				}
 				// Refuse to write a file the repair did not actually make parseable.
 				if _, perr := plan.Parse(after); perr != nil {
-					return skillResult{}, fmt.Errorf("submodules/%s/PLAN.md: repair did not restore parseability, not writing: %w", sm.Name, perr)
+					return danceResult{}, fmt.Errorf("submodules/%s/PLAN.md: repair did not restore parseability, not writing: %w", sm.Name, perr)
 				}
 				if err := os.WriteFile(path, []byte(after), 0o644); err != nil {
-					return skillResult{}, err
+					return danceResult{}, err
 				}
 				for _, c := range changed {
 					res.Done = append(res.Done, fmt.Sprintf("submodules/%s/PLAN.md:%d dropped empty %s stamp on task %s", sm.Name, c.Line, strings.Join(c.Dropped, "+"), c.ID))
@@ -295,35 +295,35 @@ func (s *Server) skillRepairPlan() *skill {
 				wrote = true
 			}
 			if !wrote {
-				return skillResult{Done: []string{"no PLAN.md needed empty-stamp repair"}}, nil
+				return danceResult{Done: []string{"no PLAN.md needed empty-stamp repair"}}, nil
 			}
 			if err := s.publishMain(ctx, "frontend: repair corrupt PLAN.md empty stamps"); err != nil {
-				return skillResult{}, err
+				return danceResult{}, err
 			}
 			return res, nil
 		},
 	}
 }
 
-// skillCleanupStale removes the unregistered edit-*/beehive-* worktree
+// danceCleanupStale removes the unregistered edit-*/beehive-* worktree
 // directories under .worktrees that dead editor sessions and capped passes leave
 // behind (the "stale worktrees" hygiene class). Destructive: it deletes
 // directories, so its apply is confirm-gated and recomputes the stale set under
 // the git lock before touching disk.
-func (s *Server) skillCleanupStale() *skill {
-	return &skill{
+func (s *Server) danceCleanupStale() *dance {
+	return &dance{
 		Name:        "cleanup-stale",
 		Title:       "Remove stale worktrees",
 		Summary:     "Delete unregistered edit-*/beehive-* worktree directories left under .worktrees by dead editor sessions and capped passes.",
 		Destructive: true,
-		plan: func(ctx context.Context) (skillPlan, error) {
+		plan: func(ctx context.Context) (dancePlan, error) {
 			items, err := staleWorktrees(ctx, s.repo.Root, s.git)
 			if err != nil {
-				return skillPlan{}, err
+				return dancePlan{}, err
 			}
-			var p skillPlan
+			var p dancePlan
 			for _, it := range items {
-				p.Actions = append(p.Actions, skillAction{
+				p.Actions = append(p.Actions, danceAction{
 					Op:     "remove",
 					Target: filepath.ToSlash(filepath.Join(".worktrees", it.Name)),
 					Detail: it.Detail,
@@ -334,7 +334,7 @@ func (s *Server) skillCleanupStale() *skill {
 			}
 			return p, nil
 		},
-		apply: func(ctx context.Context) (skillResult, error) {
+		apply: func(ctx context.Context) (danceResult, error) {
 			// Serialize against every other primary-checkout mutation, then
 			// RECOMPUTE the stale set under the lock so the apply acts on the live
 			// state, never a plan that raced a concurrent publish.
@@ -342,9 +342,9 @@ func (s *Server) skillCleanupStale() *skill {
 			defer s.gitMu.Unlock()
 			items, err := staleWorktrees(ctx, s.repo.Root, s.git)
 			if err != nil {
-				return skillResult{}, err
+				return danceResult{}, err
 			}
-			var res skillResult
+			var res danceResult
 			for _, it := range items {
 				// Guard: a bare basename under .worktrees, never a path — the scan
 				// only ever yields basenames, so anything else is not ours to touch.
@@ -352,7 +352,7 @@ func (s *Server) skillCleanupStale() *skill {
 					continue
 				}
 				if err := os.RemoveAll(filepath.Join(s.repo.Root, ".worktrees", it.Name)); err != nil {
-					return skillResult{}, err
+					return danceResult{}, err
 				}
 				res.Done = append(res.Done, "removed .worktrees/"+it.Name)
 			}
@@ -364,24 +364,24 @@ func (s *Server) skillCleanupStale() *skill {
 	}
 }
 
-// skillGC reclaims abandoned editor worktrees: the edit-* worktrees that are both
+// danceGC reclaims abandoned editor worktrees: the edit-* worktrees that are both
 // stale (no fresh session record) and clean (no pending unpublished change),
 // exactly what the editor's startup Reload prunes. Destructive: it removes
 // worktrees + branches, so its apply is confirm-gated and runs under the git lock.
-func (s *Server) skillGC() *skill {
-	return &skill{
+func (s *Server) danceGC() *dance {
+	return &dance{
 		Name:        "gc",
 		Title:       "Reclaim abandoned editor worktrees",
 		Summary:     "Remove edit-* editor worktrees that are stale (no fresh session) and clean (no pending change), mirroring the editor's startup reclaim.",
 		Destructive: true,
-		plan: func(ctx context.Context) (skillPlan, error) {
+		plan: func(ctx context.Context) (dancePlan, error) {
 			branches, err := s.editors.Reclaimable(ctx)
 			if err != nil {
-				return skillPlan{}, err
+				return dancePlan{}, err
 			}
-			var p skillPlan
+			var p dancePlan
 			for _, b := range branches {
-				p.Actions = append(p.Actions, skillAction{
+				p.Actions = append(p.Actions, danceAction{
 					Op:     "reclaim",
 					Target: b,
 					Detail: "stale editor worktree with no pending change",
@@ -392,7 +392,7 @@ func (s *Server) skillGC() *skill {
 			}
 			return p, nil
 		},
-		apply: func(ctx context.Context) (skillResult, error) {
+		apply: func(ctx context.Context) (danceResult, error) {
 			// Under the primary-checkout lock (Reload removes worktrees + deletes
 			// branches). Snapshot the exact reclaim set first (read-only), then let
 			// Reload perform the identical stale/clean reclaim AND re-register the
@@ -403,12 +403,12 @@ func (s *Server) skillGC() *skill {
 			defer s.gitMu.Unlock()
 			branches, err := s.editors.Reclaimable(ctx)
 			if err != nil {
-				return skillResult{}, err
+				return danceResult{}, err
 			}
 			if err := s.editors.Reload(ctx); err != nil {
-				return skillResult{}, err
+				return danceResult{}, err
 			}
-			var res skillResult
+			var res danceResult
 			for _, b := range branches {
 				res.Done = append(res.Done, "reclaimed "+b)
 			}
@@ -420,23 +420,23 @@ func (s *Server) skillGC() *skill {
 	}
 }
 
-// skillResources is a read-only inventory of each submodule target's deploy state
+// danceResources is a read-only inventory of each submodule target's deploy state
 // (INFRASTRUCTURE.md) and produced artifacts (ARTIFACTS.md). Blue/green is a
 // per-submodule property, so the report scopes every deploy-env line to a named
 // submodule and never presents a hive-wide "active env" for the coordination root
 // (which is not a deployable target). Report-only: it has no apply, so the
 // registry refuses to "apply" it.
-func (s *Server) skillResources() *skill {
-	return &skill{
+func (s *Server) danceResources() *dance {
+	return &dance{
 		Name:       "resources",
 		Title:      "Report infrastructure & artifacts",
 		Summary:    "Read-only inventory of each submodule: its own active blue/green deploy env and the produced artifacts.",
 		ReportOnly: true,
-		plan: func(ctx context.Context) (skillPlan, error) {
-			var p skillPlan
+		plan: func(ctx context.Context) (dancePlan, error) {
+			var p dancePlan
 			subs, err := s.repo.Submodules()
 			if err != nil {
-				return skillPlan{}, err
+				return dancePlan{}, err
 			}
 			for _, sm := range subs {
 				p.Report = append(p.Report, infraLine(sm.Name, filepath.Join(sm.Path, repo.InfraFile)))
@@ -447,7 +447,7 @@ func (s *Server) skillResources() *skill {
 	}
 }
 
-// skillInfraConventions normalizes each SUBMODULE's own INFRASTRUCTURE.md so it
+// danceInfraConventions normalizes each SUBMODULE's own INFRASTRUCTURE.md so it
 // declares the blue/green deploy markers (Active + Environments), filling in the
 // conventional defaults only for markers that are ABSENT. Blue/green is a
 // per-submodule property, so it acts on every submodule's
@@ -455,30 +455,30 @@ func (s *Server) skillResources() *skill {
 // root (which is not a deployable target). It is non-destructive (it never removes
 // or rewrites an existing marker) and idempotent, so it applies without a confirm —
 // but it still previews each edit as a diff and writes via the guarded publish path.
-func (s *Server) skillInfraConventions() *skill {
-	return &skill{
+func (s *Server) danceInfraConventions() *dance {
+	return &dance{
 		Name:    "infra-conventions",
 		Title:   "Normalize infrastructure conventions",
 		Summary: "Ensure each submodule's INFRASTRUCTURE.md declares its own blue/green deploy markers (Active + Environments), adding the conventional defaults when absent.",
-		plan: func(ctx context.Context) (skillPlan, error) {
+		plan: func(ctx context.Context) (dancePlan, error) {
 			subs, err := s.repo.Submodules()
 			if err != nil {
-				return skillPlan{}, err
+				return dancePlan{}, err
 			}
-			var p skillPlan
+			var p dancePlan
 			for _, sm := range subs {
 				path := filepath.Join(sm.Path, repo.InfraFile)
 				before, err := readFileOrEmpty(path)
 				if err != nil {
-					return skillPlan{}, err
+					return dancePlan{}, err
 				}
 				after := normalizeInfraConventions(before)
 				if after == before {
 					continue
 				}
 				display := filepath.ToSlash(filepath.Join("submodules", sm.Name, repo.InfraFile))
-				p.Diffs = append(p.Diffs, &skillDiff{Path: display, Before: before, After: after})
-				p.Actions = append(p.Actions, skillAction{
+				p.Diffs = append(p.Diffs, &danceDiff{Path: display, Before: before, After: after})
+				p.Actions = append(p.Actions, danceAction{
 					Op:     "write",
 					Target: display,
 					Detail: "add " + sm.Name + "'s missing blue/green deploy markers",
@@ -489,34 +489,34 @@ func (s *Server) skillInfraConventions() *skill {
 			}
 			return p, nil
 		},
-		apply: func(ctx context.Context) (skillResult, error) {
+		apply: func(ctx context.Context) (danceResult, error) {
 			subs, err := s.repo.Submodules()
 			if err != nil {
-				return skillResult{}, err
+				return danceResult{}, err
 			}
-			var res skillResult
+			var res danceResult
 			wrote := false
 			for _, sm := range subs {
 				path := filepath.Join(sm.Path, repo.InfraFile)
 				before, err := readFileOrEmpty(path)
 				if err != nil {
-					return skillResult{}, err
+					return danceResult{}, err
 				}
 				after := normalizeInfraConventions(before)
 				if after == before {
 					continue
 				}
 				if err := os.WriteFile(path, []byte(after), 0o644); err != nil {
-					return skillResult{}, err
+					return danceResult{}, err
 				}
 				res.Done = append(res.Done, "wrote "+filepath.ToSlash(filepath.Join("submodules", sm.Name, repo.InfraFile))+" with the conventional deploy markers")
 				wrote = true
 			}
 			if !wrote {
-				return skillResult{Done: []string{"every submodule's INFRASTRUCTURE.md already follows conventions"}}, nil
+				return danceResult{Done: []string{"every submodule's INFRASTRUCTURE.md already follows conventions"}}, nil
 			}
 			if err := s.publishMain(ctx, "frontend: normalize submodule INFRASTRUCTURE conventions"); err != nil {
-				return skillResult{}, err
+				return danceResult{}, err
 			}
 			return res, nil
 		},
@@ -577,7 +577,7 @@ func artifactsLine(label, path string) string {
 }
 
 // readFileOrEmpty reads path, treating a missing file as empty content (not an
-// error), so a normalization skill can propose creating a file from scratch.
+// error), so a normalization dance can propose creating a file from scratch.
 func readFileOrEmpty(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -601,27 +601,27 @@ func isTrue(v string) bool {
 	}
 }
 
-// skillDiffView is one file's rendered diff for the panel: the target path plus
+// danceDiffView is one file's rendered diff for the panel: the target path plus
 // the diff rows, so a multi-file plan (e.g. per-submodule normalization) previews
 // each file's change under its own path.
-type skillDiffView struct {
+type danceDiffView struct {
 	Path string
 	Rows []editor.DiffRow
 }
 
-// skillPanel is the view model for one skill's card/panel: identity + flags plus,
+// dancePanel is the view model for one dance's card/panel: identity + flags plus,
 // once a dry-run or apply has run, the plan, the rendered per-file diffs, the
 // result, and any note/error to surface.
-type skillPanel struct {
+type dancePanel struct {
 	Name        string
 	Title       string
 	Summary     string
 	Destructive bool
 	ReportOnly  bool
 
-	Plan   *skillPlan
-	Diffs  []skillDiffView
-	Result *skillResult
+	Plan   *dancePlan
+	Diffs  []danceDiffView
+	Result *danceResult
 	Note   string
 	Err    string
 
@@ -632,9 +632,9 @@ type skillPanel struct {
 	Confirming bool
 }
 
-// newSkillPanel seeds a panel from a skill's static identity (no plan/result yet).
-func newSkillPanel(sk *skill) skillPanel {
-	return skillPanel{
+// newDancePanel seeds a panel from a dance's static identity (no plan/result yet).
+func newDancePanel(sk *dance) dancePanel {
+	return dancePanel{
 		Name:        sk.Name,
 		Title:       sk.Title,
 		Summary:     sk.Summary,
@@ -644,55 +644,57 @@ func newSkillPanel(sk *skill) skillPanel {
 }
 
 // withPlan attaches a plan (and its rendered per-file diffs) to the panel.
-func (p skillPanel) withPlan(plan skillPlan) skillPanel {
+func (p dancePanel) withPlan(plan dancePlan) dancePanel {
 	p.Plan = &plan
 	for _, d := range plan.Diffs {
 		if d.changed() {
-			p.Diffs = append(p.Diffs, skillDiffView{Path: d.Path, Rows: editor.RenderDiff(d.Before, d.After)})
+			p.Diffs = append(p.Diffs, danceDiffView{Path: d.Path, Rows: editor.RenderDiff(d.Before, d.After)})
 		}
 	}
 	return p
 }
 
-// skillsPage renders the maintenance-skills index: every registered skill as a
-// card with a dry-run control. Read-only — it runs no skill's plan on load.
-func (s *Server) skillsPage(w http.ResponseWriter, r *http.Request) {
-	panels := make([]skillPanel, 0)
-	for _, sk := range s.skills().list() {
-		panels = append(panels, newSkillPanel(sk))
+// dancePanels builds the view model for every registered dance (identity + a
+// dry-run control, no plan run on load). The combined hygiene page renders these
+// beneath the read-only cruft scan, so the diagnostic and its deterministic
+// remediations live on one page.
+func (s *Server) dancePanels() []dancePanel {
+	panels := make([]dancePanel, 0)
+	for _, sk := range s.dances().list() {
+		panels = append(panels, newDancePanel(sk))
 	}
-	s.render(w, "skills.html", map[string]interface{}{"Skills": panels, "Title": pageTitle("skills"), "Nav": "skills"})
+	return panels
 }
 
-// skillPlanHandler runs a skill's deterministic dry-run and renders its panel with
-// the plan. An unknown skill is a 404. It mutates nothing.
-func (s *Server) skillPlanHandler(w http.ResponseWriter, r *http.Request) {
+// dancePlanHandler runs a dance's deterministic dry-run and renders its panel with
+// the plan. An unknown dance is a 404. It mutates nothing.
+func (s *Server) dancePlanHandler(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	reg := s.skills()
+	reg := s.dances()
 	sk, plan, err := reg.plan(r.Context(), name)
 	if err != nil {
-		if errors.Is(err, errUnknownSkill) {
+		if errors.Is(err, errUnknownDance) {
 			http.NotFound(w, r)
 			return
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.render(w, "skill_panel.html", newSkillPanel(sk).withPlan(plan))
+	s.render(w, "dance_panel.html", newDancePanel(sk).withPlan(plan))
 }
 
-// skillApplyHandler applies a skill after the registry's invocation guards. An
-// unknown skill is a 404, a report-only skill is a 400, and a destructive skill
+// danceApplyHandler applies a dance after the registry's invocation guards. An
+// unknown dance is a 404, a report-only dance is a 400, and a destructive dance
 // invoked WITHOUT confirm re-renders the plan with a confirmation prompt and
 // performs NO mutation. On success it renders the result plus a fresh post-apply
 // plan so the panel reflects the new (typically now-clean) state.
-func (s *Server) skillApplyHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) danceApplyHandler(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	reg := s.skills()
+	reg := s.dances()
 	sk, res, err := reg.apply(r.Context(), name, isTrue(r.FormValue("confirm")))
 	if err != nil {
 		switch {
-		case errors.Is(err, errUnknownSkill):
+		case errors.Is(err, errUnknownDance):
 			http.NotFound(w, r)
 		case errors.Is(err, errReportOnly):
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -701,22 +703,22 @@ func (s *Server) skillApplyHandler(w http.ResponseWriter, r *http.Request) {
 			// so applying takes a deliberate second, explicit action; 200 so htmx
 			// swaps the gate panel in (the confirm requirement is the message, not
 			// an error state).
-			panel := newSkillPanel(sk)
+			panel := newDancePanel(sk)
 			panel.Confirming = true
 			panel.Note = "Confirmation required: this action is destructive. Confirm to apply."
 			if _, plan, perr := reg.plan(r.Context(), name); perr == nil {
 				panel = panel.withPlan(plan)
 			}
-			s.render(w, "skill_panel.html", panel)
+			s.render(w, "dance_panel.html", panel)
 		default:
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 		return
 	}
-	panel := newSkillPanel(sk)
+	panel := newDancePanel(sk)
 	panel.Result = &res
 	if _, plan, perr := reg.plan(r.Context(), name); perr == nil {
 		panel = panel.withPlan(plan)
 	}
-	s.render(w, "skill_panel.html", panel)
+	s.render(w, "dance_panel.html", panel)
 }

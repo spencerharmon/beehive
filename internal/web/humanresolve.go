@@ -165,7 +165,7 @@ func (s *Server) humanResolveDiscard(w http.ResponseWriter, r *http.Request) {
 // resolveFileDiff is one changed file's colorized rendering within a resolve
 // session's (potentially multi-file) accumulated change, keyed by its beehive-
 // repo-relative path — the human-resolve panel's per-file analogue of
-// skillDiffView (skills.go).
+// danceDiffView (dances.go).
 type resolveFileDiff struct {
 	Path string
 	Rows []editor.DiffRow
@@ -174,7 +174,7 @@ type resolveFileDiff struct {
 // resolveSessionDiffs renders sess's accumulated branch change (the same
 // main...HEAD range diff/hasChanges already use) as one editor.RenderDiff/
 // RenderDiffHTML per changed file, so the human-resolve panel colors add/del
-// lines exactly like the editor/chat/skill diff surfaces (diff-view-colorize-
+// lines exactly like the editor/chat/dance diff surfaces (diff-view-colorize-
 // consistency) instead of a raw unified patch. The comparison base is
 // merge-base(main, HEAD), matching git's own "..." triple-dot range semantics
 // (main advancing after the branch forked must not read as the session's own

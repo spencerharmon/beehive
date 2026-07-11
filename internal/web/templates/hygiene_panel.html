@@ -16,7 +16,7 @@
 {{else}}<p class="muted">none</p>{{end}}
 </details>
 {{end}}
-<p class="hygiene-remedy muted">Remediation: run the <code>{{.Skill}}</code> cleanup skill. This panel is read-only and never mutates git state — the operator triggers the fix.</p>
+<p class="hygiene-remedy muted">Remediation: run the <code>cleanup-stale</code> dance on the <a href="/hygiene">hygiene page</a>. This panel is read-only and never mutates git state — the operator dry-runs then applies the dance.</p>
 {{end}}
 {{if .Packs}}
 <details class="hygiene-class" id="hygiene-packs"{{if .PackWarn}} open{{end}}>
@@ -37,7 +37,7 @@
 </tbody>
 </table>
 </div>
-<p class="hygiene-remedy muted">Read-only stat of each managed repo's own <code>.git/objects/pack</code>. A nonzero temp count (a repack killed mid-flight) or an abnormal pack count signals a repack storm; remediation is the runner-owned <code>beehive gc</code> — this panel never repacks.</p>
+<p class="hygiene-remedy muted">Read-only stat of each managed repo's own <code>.git/objects/pack</code>. A nonzero temp count (a repack killed mid-flight) or an abnormal pack count signals a repack storm; remediation is the <code>gc</code> dance below (runner-owned <code>beehive gc</code>) — this panel never repacks.</p>
 </details>
 {{end}}
 {{end}}
@@ -57,6 +57,22 @@
 {{end}}
 {{template "header" .}}
 <h1>Hive hygiene</h1>
-<p class="muted">Read-only scan of the git cruft that accumulates under updateInstead. Diagnostic only — nothing here is mutated; the operator triggers any fix.</p>
+<p class="muted">Read-only scan of the git cruft that accumulates under updateInstead. Diagnostic only — nothing here is mutated; the operator triggers any fix via a dance below.</p>
 <div class="cards">{{template "hygiene-widget" .Hygiene}}{{template "view-cache-widget" .Cache}}</div>
+<h1 id="dances">Dances</h1>
+<p class="muted">Named deterministic maintenance actions — the frontend's waggle dances. Each offers a read-only <b>dry-run</b> that shows exactly what it would change; <b>apply</b> then performs precisely that. Destructive dances require an explicit confirmation before anything is mutated.</p>
+<div class="cards">
+{{range .Dances}}
+<section class="card dance-card" aria-label="{{.Title}}">
+  <h3>{{.Title}} <code class="dance-name">{{.Name}}</code></h3>
+  <p class="muted">{{.Summary}}</p>
+  <p class="dance-flags">
+    {{if .Destructive}}<span class="badge danger">destructive</span>{{end}}
+    {{if .ReportOnly}}<span class="badge">report-only</span>{{end}}
+    {{if not .Destructive}}{{if not .ReportOnly}}<span class="badge live">safe</span>{{end}}{{end}}
+  </p>
+  <div id="dance-panel-{{.Name}}" class="dance-panel" data-scroll-preserve>{{template "dance_panel.html" .}}</div>
+</section>
+{{end}}
+</div>
 {{template "footer"}}
