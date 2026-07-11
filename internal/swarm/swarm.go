@@ -21,6 +21,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 	selectt "github.com/spencerharmon/beehive/internal/select"
+	"github.com/spencerharmon/beehive/internal/version"
 )
 
 // Session is one opencode conversation; context persists across Prompt calls.
@@ -937,10 +938,18 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if passModel != "" {
 		modelTag = " · model: " + passModel
 	}
+	// Stamp the runner binary's build SHA (internal/version) into the header so a
+	// future audit pass can determine which commit produced a session from the
+	// repo alone — no out-of-repo host read. Fall back to "dev" for an unstamped
+	// build exactly like version.String()'s rule; never fabricate a SHA.
+	runnerTag := " · runner: dev"
+	if sha, ok := version.Build(); ok {
+		runnerTag = " · runner: " + sha
+	}
 	rec := &recorder{
 		sess:    sess,
 		path:    sessionFile,
-		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s%s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch, modelTag),
+		header:  fmt.Sprintf("# session %s\n\nsubmodule: %s · kind: %s · branch: %s%s%s\n", sid, sel.Submodule.Name, sel.Kind, res.Branch, modelTag, runnerTag),
 		concise: r.Concise,
 		debug:   r.Debug,
 		toolSt:  map[string]string{},

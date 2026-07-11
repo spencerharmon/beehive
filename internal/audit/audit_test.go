@@ -553,6 +553,50 @@ func TestParseHeaderModel(t *testing.T) {
 	}
 }
 
+// TestParseHeaderRunner pins the session-runner-commit-stamp addition: the
+// runner now stamps its build SHA (internal/version) as a trailing "· runner:
+// <sha>" header field so a future audit pass can determine which commit
+// produced a session from the repo alone. It parses back into Session.Runner,
+// coexists with the model field in any trailing order, and — matching
+// audit-parse-model-header's backward-compat precedent — a legacy transcript
+// with no runner field still parses cleanly with Runner left empty (no corpus
+// census regression).
+func TestParseHeaderRunner(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	// A stamped-build session: model then runner.
+	const withRunner = "# x\n\nsubmodule: beehive \u00b7 kind: work \u00b7 branch: bee-x \u00b7 model: github-copilot/claude-opus-4.8 \u00b7 runner: " + sha + "\n"
+	s, err := parseTranscript("bee-x-5.md", []byte(withRunner))
+	if err != nil {
+		t.Fatalf("runner-header transcript: %v", err)
+	}
+	if s.Model != "github-copilot/claude-opus-4.8" {
+		t.Errorf("model=%q want github-copilot/claude-opus-4.8", s.Model)
+	}
+	if s.Runner != sha {
+		t.Errorf("runner=%q want %q", s.Runner, sha)
+	}
+
+	// An unstamped ("dev") build honestly records "runner: dev".
+	const devRunner = "# x\n\nsubmodule: beehive \u00b7 kind: work \u00b7 branch: bee-x \u00b7 runner: dev\n"
+	sd, err := parseTranscript("bee-x-5.md", []byte(devRunner))
+	if err != nil {
+		t.Fatalf("dev-runner header: %v", err)
+	}
+	if sd.Runner != "dev" {
+		t.Errorf("runner=%q want dev", sd.Runner)
+	}
+
+	// A legacy transcript predating the runner field still parses, Runner "".
+	const legacy = "# x\n\nsubmodule: beehive \u00b7 kind: work \u00b7 branch: bee-x \u00b7 model: github-copilot/claude-opus-4.8\n"
+	sl, err := parseTranscript("bee-x-5.md", []byte(legacy))
+	if err != nil {
+		t.Fatalf("legacy (no runner) header: %v", err)
+	}
+	if sl.Runner != "" {
+		t.Errorf("legacy header runner=%q want \"\"", sl.Runner)
+	}
+}
+
 // TestParsePidSuffixName pins the live-runner naming fix: session files are now
 // "<branch>-<epoch>-<pid>.md" (internal/swarm.SessionID appends a per-process
 // suffix for fan-out). The epoch must be the FIRST numeric segment after the

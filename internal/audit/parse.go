@@ -197,6 +197,7 @@ func parseTranscript(name string, data []byte) (*Session, error) {
 		Branch:    hdr.Branch,
 		TaskID:    strings.TrimPrefix(hdr.Branch, "bee-"),
 		Model:     hdr.Model,
+		Runner:    hdr.Runner,
 		Bytes:     int64(len(data)),
 		Turns:     turns,
 		UserTurns: userTurns,
@@ -286,10 +287,12 @@ func splitName(name, branch string) (stem string, epoch int64, err error) {
 }
 
 // header is the parsed transcript metadata line: "submodule: <sm> · kind:
-// <kind> · branch: <branch>[ · <key>: <value> ...]".
+// <kind> · branch: <branch>[ · <key>: <value> ...]" (recognised trailing keys:
+// "model", "runner").
 type header struct {
 	Submodule, Kind, Branch string
 	Model                   string // "model:" field (commit 248e967); "" if absent
+	Runner                  string // "runner:" field (build SHA / "dev"); "" if absent (legacy)
 }
 
 // headerKeys are the REQUIRED leading "key: value" segments, in this exact
@@ -351,6 +354,9 @@ func parseHeaderLine(line string) (header, error) {
 		}
 		if key == "model" {
 			h.Model = val
+		}
+		if key == "runner" {
+			h.Runner = val
 		}
 		// Any other trailing key is a future field this parser does not yet know
 		// about: ignore it, do not reject the line.

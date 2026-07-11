@@ -97,6 +97,7 @@ type Session struct {
 	Branch    string // header "branch:" field (authoritative; the file name's prefix)
 	TaskID    string // Branch minus the "bee-" prefix (the -<pid> suffix is never folded in)
 	Model     string // header "model:" field (commit 248e967); "" for a legacy/unstamped session
+	Runner    string // header "runner:" field (build SHA / "dev"); "" for a legacy transcript predating the field
 	Bytes     int64  // file size in bytes
 	Turns     int    // count of "## assistant" lines (PINNED turn rule)
 	UserTurns int    // count of "## user" lines (informational)
