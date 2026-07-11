@@ -54,6 +54,7 @@ type PlanItem struct {
 	Weight      int
 	Session     string    // claim owner; "" when unclaimed
 	Heartbeat   time.Time // last claim stamp; zero when unclaimed
+	NotBefore   time.Time // optional wall-clock selection gate; zero when no gate set
 	Active      bool      // claim fresh within the TTL (the unified "in progress")
 	Stale       bool      // claim past the TTL (GC-reclaimable; owner presumed dead)
 	Doc         string    // linked change-doc path from a body "Doc:" line, "" if none
@@ -115,6 +116,17 @@ func (it PlanItem) HeartbeatLabel() string {
 		return ""
 	}
 	return it.Heartbeat.UTC().Format("2006-01-02 15:04Z")
+}
+
+// NotBeforeLabel renders the task's optional not_before wall-clock gate as a
+// compact UTC timestamp for the plan view (shown greyed at the top of the task
+// description), or "" when the task carries no gate (zero NotBefore). Same
+// format as HeartbeatLabel so the two read consistently.
+func (it PlanItem) NotBeforeLabel() string {
+	if it.NotBefore.IsZero() {
+		return ""
+	}
+	return it.NotBefore.UTC().Format("2006-01-02 15:04Z")
 }
 
 // Claim renders the unified claim state for the plan view's claim column:
@@ -243,6 +255,7 @@ func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
 		Weight:      t.Weight,
 		Session:     t.Session,
 		Heartbeat:   t.Heartbeat,
+		NotBefore:   t.NotBefore,
 		Active:      t.Active(now, ttl),
 		Stale:       t.Stale(now, ttl),
 		HumanReason: t.HumanReason(),

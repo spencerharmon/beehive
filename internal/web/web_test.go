@@ -991,7 +991,7 @@ func TestParsePlanRealFormat(t *testing.T) {
 	// t2: claimed, heartbeat 3h before now => STALE (past TTL).
 	// t3: NEEDS-HUMAN, unclaimed. t4: DONE, unclaimed.
 	src := "<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n" +
-		"## t1 [TODO] <!-- attempts=0 deps=t0,t9 weight=16 session=bee-A heartbeat=2026-06-30T11:30:00Z -->\n" +
+		"## t1 [TODO] <!-- attempts=0 deps=t0,t9 weight=16 session=bee-A heartbeat=2026-06-30T11:30:00Z not_before=2026-07-01T00:00:00Z -->\n" +
 		"implement t1\nFiles: a.go\nDoc: docs/tasks/t1.md\n\n" +
 		"## t2 [NEEDS-REVIEW] <!-- attempts=1 deps= session=bee-B heartbeat=2026-06-30T09:00:00Z -->\n" +
 		"review me\nDoc: docs/tasks/t2.md\n\n" +
@@ -1033,6 +1033,12 @@ func TestParsePlanRealFormat(t *testing.T) {
 	}
 	if !t1.Heartbeat.Equal(mustTime(t, "2026-06-30T11:30:00Z")) {
 		t.Fatalf("t1 heartbeat = %v", t1.Heartbeat)
+	}
+	if !t1.NotBefore.Equal(mustTime(t, "2026-07-01T00:00:00Z")) {
+		t.Fatalf("t1 not_before = %v, want 2026-07-01T00:00:00Z", t1.NotBefore)
+	}
+	if got := t1.NotBeforeLabel(); got != "2026-07-01 00:00Z" {
+		t.Fatalf("t1 NotBeforeLabel = %q, want 2026-07-01 00:00Z", got)
 	}
 	// Active vs stale is the session+heartbeat freshness, NOT a status.
 	if !t1.Active || t1.Stale {
@@ -1355,6 +1361,14 @@ func TestPlanItemViewHelpers(t *testing.T) {
 	}
 	if unc := (PlanItem{}); unc.ClaimState() != "" || unc.HeartbeatLabel() != "" {
 		t.Fatalf("unclaimed: state=%q label=%q, want empty", unc.ClaimState(), unc.HeartbeatLabel())
+	}
+	// NotBeforeLabel: a set gate renders as a compact UTC stamp; a zero gate is empty.
+	gated := PlanItem{NotBefore: mustTime(t, "2026-07-12T15:30:00Z")}
+	if got := gated.NotBeforeLabel(); got != "2026-07-12 15:30Z" {
+		t.Fatalf("NotBeforeLabel() = %q, want 2026-07-12 15:30Z", got)
+	}
+	if got := (PlanItem{}).NotBeforeLabel(); got != "" {
+		t.Fatalf("ungated NotBeforeLabel() = %q, want empty", got)
 	}
 }
 
