@@ -168,10 +168,15 @@ type ToolFailTask struct {
 	Fails  int
 }
 
-// ToolFailSummary is the full-corpus tool-call-failure rollup a pass reports.
-// Sessions counts sessions that made at least one tool call; ByCategory and
-// PerTask let a pass rank the recurring, fixable failure classes.
+// ToolFailSummary is the tool-call-failure rollup a pass reports over a RECENT
+// window of sessions (see RecentSessions / DefaultToolFailWindow) rather than the
+// whole corpus, so the ranking tracks the CURRENT failure surface instead of
+// being dominated by already-fixed classes in old sessions. Window is the number
+// of sessions the summary was computed over; Sessions counts the subset of those
+// that made at least one tool call; ByCategory and PerTask let a pass rank the
+// recurring, fixable failure classes.
 type ToolFailSummary struct {
+	Window     int
 	Sessions   int
 	Calls      int
 	Fails      int
@@ -179,12 +184,14 @@ type ToolFailSummary struct {
 	PerTask    []ToolFailTask
 }
 
-// AggregateToolFails rolls tool-call stats up over the WHOLE corpus of finalized
-// sessions (not just the N-2 window), so each pass looks through every mineable
-// session for tool-call waste. PerTask is sorted by Fails desc, then Calls desc,
-// then TaskID, for a stable worst-first ranking.
+// AggregateToolFails rolls tool-call stats up over the sessions it is GIVEN — the
+// caller passes a recent window (audit.RecentSessions), NOT the full corpus, so
+// the result reflects the current failure surface and does not stay biased toward
+// failure classes that were already fixed (their old sessions would otherwise
+// dominate forever). PerTask is sorted by Fails desc, then Calls desc, then
+// TaskID, for a stable worst-first ranking.
 func AggregateToolFails(sessions []Session) ToolFailSummary {
-	s := ToolFailSummary{ByCategory: map[string]int{}}
+	s := ToolFailSummary{Window: len(sessions), ByCategory: map[string]int{}}
 	byTask := map[string]*ToolFailTask{}
 	for _, sess := range sessions {
 		if sess.ToolCalls > 0 {

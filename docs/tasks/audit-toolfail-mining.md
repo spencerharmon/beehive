@@ -10,7 +10,7 @@ Operator-directed (2026-07-11), from the session-corpus tool-failure analysis.
    `unknown-subcommand`, `command-not-found`, `path-missing`, `permission-denied`,
    `fatal-or-panic`, `nonzero-exit`). New per-session fields `ToolCalls`,
    `ToolFails`, `ToolFailCats` (`internal/audit/toolfail.go`,
-   `parse.go`). `cmd/beehive audit` prints a full-corpus
+   `parse.go`). `cmd/beehive audit` prints a RECENT-window
    `# tool-call failure summary` + by-category + worst-first per-task sections,
    and two append-only ledger columns `tool_calls`/`tool_fails` land in
    `metrics.tsv` via the existing additive-schema path (defaults `0` for legacy
@@ -25,9 +25,15 @@ Operator-directed (2026-07-11), from the session-corpus tool-failure analysis.
    a RAW transcript whose output embeds bare ``` lines can desync fence depth —
    rare, since the series mines via `beehive audit` (TSV, no markers).
 
-2. **Full-corpus coverage.** The tool-fail summary aggregates over ALL finalized
-   sessions, not just the incremental N-2 window, so each pass looks through every
-   mineable session for tool-call waste (the N-2 ledger window is unchanged).
+2. **Recent-window coverage (not full corpus).** The tool-fail summary aggregates
+   over a RECENT window of finalized sessions — the `--tool-window N` newest by
+   epoch, default `audit.DefaultToolFailWindow` (50) — NOT every session ever
+   recorded. Mining the whole corpus biases the ranking toward failure classes
+   that were already FIXED: their old sessions dominate by sheer count and never
+   age out. A bounded recent window ages fixed classes out as newer sessions land,
+   so the ranked output tracks the CURRENT failure surface. Pass `--tool-window 0`
+   for the full-corpus view. (The N-2 audit ledger window is a separate concern,
+   unchanged.)
 
 3. **`beehive plan validate <submodule>`.** New read-only subcommand: parses a
    submodule's `PLAN.md`, round-trips it (Parse → String → Parse), and checks the

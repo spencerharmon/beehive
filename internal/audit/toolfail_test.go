@@ -104,6 +104,9 @@ func TestAggregateToolFails(t *testing.T) {
 		{TaskID: "c", ToolCalls: 0, ToolFails: 0},
 	}
 	s := AggregateToolFails(sessions)
+	if s.Window != 4 {
+		t.Errorf("window=%d want 4 (all given sessions)", s.Window)
+	}
 	if s.Sessions != 3 { // c made no tool calls
 		t.Errorf("sessions=%d want 3", s.Sessions)
 	}

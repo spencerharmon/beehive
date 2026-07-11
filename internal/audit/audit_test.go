@@ -246,6 +246,29 @@ func TestWindowTooFew(t *testing.T) {
 	}
 }
 
+// TestRecentSessions: the tool-fail recency gate returns the n newest by epoch,
+// newest-first, and returns all (still newest-first) when n is <=0 or >= len.
+func TestRecentSessions(t *testing.T) {
+	ss := []Session{
+		{ID: "a", Epoch: 10}, {ID: "b", Epoch: 30}, {ID: "c", Epoch: 20},
+		{ID: "d", Epoch: 40}, {ID: "e", Epoch: 5},
+	}
+	if got := ids(RecentSessions(ss, 2)); !reflect.DeepEqual(got, []string{"d", "b"}) {
+		t.Fatalf("recent(2)=%v want [d b] (two newest, newest-first)", got)
+	}
+	wantAll := []string{"d", "b", "c", "a", "e"}
+	if got := ids(RecentSessions(ss, 0)); !reflect.DeepEqual(got, wantAll) {
+		t.Fatalf("recent(0)=%v want %v (n<=0 = all, newest-first)", got, wantAll)
+	}
+	if got := ids(RecentSessions(ss, 99)); !reflect.DeepEqual(got, wantAll) {
+		t.Fatalf("recent(99)=%v want %v (n>=len = all)", got, wantAll)
+	}
+	// Does not mutate the caller's slice order.
+	if ss[0].ID != "a" {
+		t.Fatalf("RecentSessions mutated input order: %v", ids(ss))
+	}
+}
+
 // TestReconcileLoopCorpus: the real reconcile sessions have work between them, so
 // neither is in a loop — the heuristic must NOT false-fire.
 func TestReconcileLoopCorpus(t *testing.T) {

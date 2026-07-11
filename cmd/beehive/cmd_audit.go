@@ -25,6 +25,7 @@ import (
 func auditCmd() *cobra.Command {
 	var submodule string
 	var write bool
+	var toolWindow int
 	c := &cobra.Command{
 		Use:   "audit",
 		Short: "extract reproducible session metrics and select the next un-audited N-2 batch",
@@ -80,7 +81,11 @@ func auditCmd() *cobra.Command {
 			// trend is the delivered-only cost gauge at this pass.
 			aggs := audit.Aggregate(sessions, delivered)
 			silentAggs := audit.AggregateSilentLoss(sessions)
-			toolFails := audit.AggregateToolFails(sessions)
+			// Tool-call-failure mining is scoped to a RECENT window (not the full
+			// corpus): old sessions predate the fixes, so mining everything would
+			// bias the ranking toward already-solved classes. RecentSessions ages
+			// fixed classes out as newer sessions land.
+			toolFails := audit.AggregateToolFails(audit.RecentSessions(sessions, toolWindow))
 			trend := audit.ComputeTrend(aggs, pass)
 
 			printCensus(census)
@@ -109,6 +114,8 @@ func auditCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&submodule, "submodule", "", "submodule to audit (default: the only one)")
 	c.Flags().BoolVar(&write, "write", false, "append this pass to the docs/audit ledger")
+	c.Flags().IntVar(&toolWindow, "tool-window", audit.DefaultToolFailWindow,
+		"number of most-recent sessions the tool-call-failure summary mines (<=0 = full corpus)")
 	return c
 }
 
@@ -288,14 +295,14 @@ func printSilentLoss(aggs []audit.SilentLossAgg) {
 }
 
 // printToolFails surfaces the deterministic tool-call-failure mining (see
-// internal/audit/toolfail.go) over the FULL corpus of finalized sessions — not
-// just the N-2 window — so every audit pass looks through every mineable session
-// for the recurring, fixable tool-call waste classes (missing-git-ref probes,
-// unknown-subcommand hunts, path-missing cd/ls, etc.) the operator's 2026-07-11
-// manual triage first surfaced. A future pass gets the ranked classes for free
-// instead of re-grepping the corpus by hand.
+// internal/audit/toolfail.go) over a RECENT window of finalized sessions (see
+// audit.RecentSessions / DefaultToolFailWindow) — NOT the full corpus, which
+// would bias the ranking toward failure classes already fixed in old sessions.
+// The window ages fixed classes out as newer sessions land, so a pass gets the
+// currently-costly, fixable classes (missing-git-ref probes, unknown-subcommand
+// hunts, path-missing cd/ls, etc.) ranked for free instead of re-grepping by hand.
 func printToolFails(s audit.ToolFailSummary) {
-	fmt.Println("# tool-call failure summary (full corpus)")
+	fmt.Printf("# tool-call failure summary (recent %d sessions)\n", s.Window)
 	fmt.Println(strings.Join([]string{"sessions_with_tool_calls", "tool_calls", "tool_fails", "fail_fraction"}, "\t"))
 	frac := 0.0
 	if s.Calls > 0 {
