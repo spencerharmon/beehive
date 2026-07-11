@@ -29,7 +29,7 @@ var (
 	metricsHdr = []string{
 		"pass", "session_id", "epoch", "submodule", "kind", "branch", "taskid",
 		"bytes", "turns", "user_turns", "aborted", "lost_race", "completion_miss",
-		"reconcile_loop", "abort_reason", "silent_loss",
+		"reconcile_loop", "abort_reason", "silent_loss", "tool_calls", "tool_fails",
 	}
 	// appendedMetricsCols are the columns added to metrics.tsv AFTER its original
 	// 15-wide schema, in metricsHdr order. A metrics file whose header is that
@@ -37,13 +37,16 @@ var (
 	// missing trailing column is filled from metricsDefaults, so a row ledgered
 	// before the column existed keeps parsing. This is the additive contract:
 	// append only, default on read, never break an old row.
-	appendedMetricsCols = []string{"silent_loss"}
+	appendedMetricsCols = []string{"silent_loss", "tool_calls", "tool_fails"}
 	// metricsDefaults supplies the value each appended column takes when a legacy
 	// row predating it is read. silent_loss → "false": a row ledgered before the
-	// column existed carries no verdict and not-flagged is the only safe default;
-	// the next full-corpus pass recomputes the real value.
+	// column existed carries no verdict and not-flagged is the only safe default.
+	// tool_calls / tool_fails → "0": a row ledgered before tool-call mining existed
+	// has no recorded count; the next full-corpus pass recomputes the real values.
 	metricsDefaults = map[string]string{
 		"silent_loss": "false",
+		"tool_calls":  "0",
+		"tool_fails":  "0",
 	}
 	trendHdr = []string{"pass", "delivered_tasks", "turns", "bytes", "retries"}
 )
@@ -139,6 +142,7 @@ func (l *Ledger) metricRows() [][]string {
 			strconv.FormatBool(h.Aborted), strconv.FormatBool(h.LostRace),
 			strconv.FormatBool(h.CompletionMiss), strconv.FormatBool(h.ReconcileLoop),
 			tsvSafe(h.AbortReason), strconv.FormatBool(h.SilentLoss),
+			strconv.Itoa(s.ToolCalls), strconv.Itoa(s.ToolFails),
 		})
 	}
 	return rows
@@ -189,11 +193,20 @@ func loadMetrics(path string, l *Ledger) error {
 		if err != nil {
 			return err
 		}
+		toolCalls, err := atoi(r[16], path)
+		if err != nil {
+			return err
+		}
+		toolFails, err := atoi(r[17], path)
+		if err != nil {
+			return err
+		}
 		l.Metrics = append(l.Metrics, MetricRow{
 			Pass: pass,
 			Session: Session{
 				ID: r[1], Epoch: epoch, Submodule: r[3], Kind: r[4], Branch: r[5], TaskID: r[6],
 				Bytes: bytes, Turns: turns, UserTurns: userTurns,
+				ToolCalls: toolCalls, ToolFails: toolFails,
 				Heuristics: Heuristics{
 					Aborted: aborted, LostRace: lostRace,
 					CompletionMiss: completionMiss, ReconcileLoop: reconcileLoop,

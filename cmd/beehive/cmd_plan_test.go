@@ -156,3 +156,26 @@ func mustRead(t *testing.T, p string) string {
 	}
 	return string(b)
 }
+
+func TestPlanValidateCommand(t *testing.T) {
+	setupBeehive(t)
+
+	// A well-formed PLAN.md validates.
+	cmd := planCmd()
+	cmd.SetArgs([]string{"validate", "beehive"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("validate well-formed plan: %v", err)
+	}
+
+	// A malformed header (bad heartbeat) fails validation with a non-nil error.
+	bad := "<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## alpha [TODO] <!-- attempts=0 deps= heartbeat=not-a-timestamp -->\nBody.\n"
+	if err := os.WriteFile(filepath.Join("submodules", "beehive", "PLAN.md"), []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd = planCmd()
+	cmd.SetArgs([]string{"validate", "beehive"})
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	if err := cmd.Execute(); err == nil {
+		t.Fatalf("validate malformed plan: got nil error, want a parse failure")
+	}
+}

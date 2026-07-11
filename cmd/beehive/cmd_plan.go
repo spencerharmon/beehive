@@ -15,7 +15,65 @@ import (
 func planCmd() *cobra.Command {
 	c := &cobra.Command{Use: "plan", Short: "manage PLAN.md"}
 	c.AddCommand(planArchiveCmd())
+	c.AddCommand(planValidateCmd())
 	return c
+}
+
+// planValidateCmd parses a submodule's PLAN.md and reports whether it is
+// well-formed, exiting non-zero when it is not. It exists because a work/review
+// pass frequently needs to confirm "PLAN.md still parses" after editing it, and
+// until now had no sanctioned affordance for that — the recurring audit found
+// passes flailing through `beehive plan check/lint/validate` (none of which
+// existed) and falling back to ad-hoc `go test internal/plan.Parse` runs. This
+// is read-only: it never writes or commits. Beyond a bare Parse it round-trips
+// the plan (Parse → String → Parse) and checks the re-render is stable and the
+// task set is preserved, catching a plan that parses but would not survive a
+// runner rewrite.
+func planValidateCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "validate <submodule>",
+		Short: "parse a submodule's PLAN.md and report whether it is well-formed",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			subName, err := taskSubmoduleName(args[0])
+			if err != nil {
+				return err
+			}
+			planRel := filepath.Join("submodules", subName, repo.PlanFile)
+			b, err := os.ReadFile(filepath.Join(root, planRel))
+			if err != nil {
+				return err
+			}
+			p, err := plan.Parse(string(b))
+			if err != nil {
+				return fmt.Errorf("plan validate: %s does NOT parse: %w", planRel, err)
+			}
+			// Round-trip: a plan that parses but re-renders to something that no
+			// longer parses (or drops/duplicates tasks) would silently corrupt on
+			// the next runner rewrite. Catch it here.
+			p2, err := plan.Parse(p.String())
+			if err != nil {
+				return fmt.Errorf("plan validate: %s parses but does NOT round-trip: %w", planRel, err)
+			}
+			if len(p2.Tasks) != len(p.Tasks) {
+				return fmt.Errorf("plan validate: %s round-trip changed task count %d -> %d", planRel, len(p.Tasks), len(p2.Tasks))
+			}
+			seen := map[string]bool{}
+			for _, t := range p.Tasks {
+				if seen[t.ID] {
+					return fmt.Errorf("plan validate: %s has duplicate task id %q", planRel, t.ID)
+				}
+				seen[t.ID] = true
+			}
+			fmt.Printf("plan validate: %s OK — %d tasks parse and round-trip\n", planRel, len(p.Tasks))
+			return nil
+		},
+	}
+	return cmd
 }
 
 // planArchiveCmd leans a submodule's PLAN.md: it moves each DONE task's post-hoc

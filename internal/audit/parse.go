@@ -189,6 +189,7 @@ func parseTranscript(name string, data []byte) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audit: %s: %w", name, err)
 	}
+	toolCalls, toolFails, toolCats := scanToolCalls(data)
 	s := &Session{
 		ID:        stem,
 		Epoch:     epoch,
@@ -201,6 +202,9 @@ func parseTranscript(name string, data []byte) (*Session, error) {
 		Bytes:     int64(len(data)),
 		Turns:     turns,
 		UserTurns: userTurns,
+		ToolCalls:    toolCalls,
+		ToolFails:    toolFails,
+		ToolFailCats: toolCats,
 	}
 	if warn != "" {
 		s.Heuristics.Aborted = true

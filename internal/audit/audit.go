@@ -102,6 +102,17 @@ type Session struct {
 	Turns     int    // count of "## assistant" lines (PINNED turn rule)
 	UserTurns int    // count of "## user" lines (informational)
 
+	// ToolCalls / ToolFails / ToolFailCats are the deterministic tool-call
+	// failure mining (see toolfail.go): the count of this session's OWN tool
+	// calls (fence-depth-0 markers), the subset whose output matched a failure
+	// signature, and the per-category breakdown of those failures. ToolCalls and
+	// ToolFails are persisted to the ledger (append-only columns); ToolFailCats is
+	// recomputed each pass for the full-corpus summary and is nil on a
+	// ledger-loaded Session.
+	ToolCalls    int
+	ToolFails    int
+	ToolFailCats map[string]int
+
 	Heuristics Heuristics
 }
 

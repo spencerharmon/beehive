@@ -189,7 +189,12 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
 Status is `NEEDS-REVIEW`. JUDGE the existing work against your provided task card (`## Your task`) — do
 NOT reimplement it, and do NOT open `PLAN.md` or `ROI.md` to read the task. Read (all read-only) the
 implementer branch `bee-<taskid>` (fetch from the submodule origin if absent locally) and the change
-doc; the task's `Review:` note is already in your card.
+doc; the task's `Review:` note is already in your card. A **doc-only task** (its `Files:` touch only
+`docs/`, `PLAN.md`, or other beehive-layer text, no submodule code) has NO `bee-<taskid>` CODE branch —
+its change doc and any pointer bump are the only artifacts. A missing `bee-<taskid>` branch / `couldn't
+find remote ref` there is EXPECTED, not a defect: review the change doc and PLAN.md state directly and do
+NOT burn turns re-probing git (`git log/show/fetch bee-<taskid>`) for a branch that was never created —
+the runner already verified reachability before dispatching you.
 - APPROVE: merge the implementer's pointer bump into the tracked branch, `NEEDS-REVIEW → DONE`, unlock
   dependents. Commit.
 - REJECT: `NEEDS-REVIEW → NEEDS-ARBITRATION` plus a rejection doc at
@@ -212,7 +217,9 @@ Done when the task leaves `NEEDS-ARBITRATION`.
 2. **Role step.** Do your kind's section above and make the status transition it names.
 3. **Dependents.** On any `→ DONE`, unlock linked dependents (same plan or a linked submodule).
 4. **Plan/doc/infra.** Ensure the change doc exists at its exact path and `PLAN.md`, `ARTIFACTS.md`,
-   `INFRASTRUCTURE.md` are current. Human escalation: a concrete blocker requiring operator input
+   `INFRASTRUCTURE.md` are current. After editing a `PLAN.md`, confirm it still parses with
+   `beehive plan validate <sm>` (parses + round-trips the whole plan) — do NOT hunt for a
+   `plan check`/`plan lint`/`task list` subcommand (they do not exist). Human escalation: a concrete blocker requiring operator input
    (missing credentials/config, unavailable upstream API, contradictory spec, user-visible contract
    decision) → `beehive task human <sm> <task-id> --reason "<blocker + exact input needed>"`. Not for
    ordinary uncertainty or tedious work — pick a workable path and continue. Write `--reason` as

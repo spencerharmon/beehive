@@ -753,6 +753,14 @@ func TestLedgerRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// ToolFailCats is deliberately NOT persisted to the ledger (only the scalar
+	// tool_calls/tool_fails counts are); it is recomputed from a live parse each
+	// pass for the full-corpus category summary. A ledger-loaded Session therefore
+	// carries a nil ToolFailCats, so normalise it out of the in-memory side before
+	// the struct comparison.
+	for i := range led.Metrics {
+		led.Metrics[i].Session.ToolFailCats = nil
+	}
 	if !reflect.DeepEqual(re.Metrics, led.Metrics) {
 		t.Fatalf("metrics round-trip mismatch:\n got %+v\nwant %+v", re.Metrics, led.Metrics)
 	}

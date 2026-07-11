@@ -80,12 +80,14 @@ func auditCmd() *cobra.Command {
 			// trend is the delivered-only cost gauge at this pass.
 			aggs := audit.Aggregate(sessions, delivered)
 			silentAggs := audit.AggregateSilentLoss(sessions)
+			toolFails := audit.AggregateToolFails(sessions)
 			trend := audit.ComputeTrend(aggs, pass)
 
 			printCensus(census)
 			printWindow(window)
 			printAggregate(aggs)
 			printSilentLoss(silentAggs)
+			printToolFails(toolFails)
 			printTrend(trend)
 			// Loud, byte-stable corpus-integrity alarm: an empty/sparse window over
 			// a corpus of unfinalized stubs is a finalization defect, not a rest.
@@ -224,6 +226,7 @@ func printWindow(w []audit.Session) {
 	fmt.Println(strings.Join([]string{
 		"session_id", "epoch", "kind", "taskid", "model", "bytes", "turns",
 		"aborted", "lost_race", "completion_miss", "reconcile_loop", "silent_loss",
+		"tool_calls", "tool_fails",
 	}, "\t"))
 	for _, s := range w {
 		h := s.Heuristics
@@ -236,6 +239,7 @@ func printWindow(w []audit.Session) {
 			strconv.FormatBool(h.Aborted), strconv.FormatBool(h.LostRace),
 			strconv.FormatBool(h.CompletionMiss), strconv.FormatBool(h.ReconcileLoop),
 			strconv.FormatBool(h.SilentLoss),
+			strconv.Itoa(s.ToolCalls), strconv.Itoa(s.ToolFails),
 		}, "\t"))
 	}
 }
@@ -280,6 +284,39 @@ func printSilentLoss(aggs []audit.SilentLossAgg) {
 			a.TaskID, strconv.Itoa(a.Count), strconv.Itoa(a.Turns),
 			strconv.FormatInt(a.Bytes, 10), strings.Join(a.Sessions, ","),
 		}, "\t"))
+	}
+}
+
+// printToolFails surfaces the deterministic tool-call-failure mining (see
+// internal/audit/toolfail.go) over the FULL corpus of finalized sessions — not
+// just the N-2 window — so every audit pass looks through every mineable session
+// for the recurring, fixable tool-call waste classes (missing-git-ref probes,
+// unknown-subcommand hunts, path-missing cd/ls, etc.) the operator's 2026-07-11
+// manual triage first surfaced. A future pass gets the ranked classes for free
+// instead of re-grepping the corpus by hand.
+func printToolFails(s audit.ToolFailSummary) {
+	fmt.Println("# tool-call failure summary (full corpus)")
+	fmt.Println(strings.Join([]string{"sessions_with_tool_calls", "tool_calls", "tool_fails", "fail_fraction"}, "\t"))
+	frac := 0.0
+	if s.Calls > 0 {
+		frac = float64(s.Fails) / float64(s.Calls)
+	}
+	fmt.Println(strings.Join([]string{
+		strconv.Itoa(s.Sessions), strconv.Itoa(s.Calls), strconv.Itoa(s.Fails),
+		strconv.FormatFloat(frac, 'f', 3, 64),
+	}, "\t"))
+	fmt.Println("# tool-call failures by category")
+	fmt.Println(strings.Join([]string{"category", "fails"}, "\t"))
+	for _, c := range s.SortedCategories() {
+		fmt.Println(strings.Join([]string{c.TaskID, strconv.Itoa(c.Fails)}, "\t"))
+	}
+	fmt.Println("# tool-call failures per task (worst first)")
+	fmt.Println(strings.Join([]string{"taskid", "tool_calls", "tool_fails"}, "\t"))
+	for _, t := range s.PerTask {
+		if t.Fails == 0 {
+			continue
+		}
+		fmt.Println(strings.Join([]string{t.TaskID, strconv.Itoa(t.Calls), strconv.Itoa(t.Fails)}, "\t"))
 	}
 }
 

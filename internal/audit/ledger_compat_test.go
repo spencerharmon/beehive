@@ -76,12 +76,13 @@ func TestLedgerReadsLegacyMetrics(t *testing.T) {
 }
 
 // TestLedgerReadsCurrentMetricsSilentLoss: a metrics.tsv written at the CURRENT
-// 16-col schema round-trips the silent_loss column true/false faithfully.
+// 18-col schema round-trips the silent_loss column true/false faithfully (and
+// carries the appended tool_calls/tool_fails columns).
 func TestLedgerReadsCurrentMetricsSilentLoss(t *testing.T) {
 	dir := t.TempDir()
 	rows := [][]string{
-		{"1", "bee-foo-100", "100", "beehive", "work", "bee-foo", "foo", "1", "1", "1", "false", "false", "false", "false", "", "true"},
-		{"1", "bee-foo-200", "200", "beehive", "work", "bee-foo", "foo", "1", "1", "1", "false", "false", "false", "false", "", "false"},
+		{"1", "bee-foo-100", "100", "beehive", "work", "bee-foo", "foo", "1", "1", "1", "false", "false", "false", "false", "", "true", "10", "2"},
+		{"1", "bee-foo-200", "200", "beehive", "work", "bee-foo", "foo", "1", "1", "1", "false", "false", "false", "false", "", "false", "5", "0"},
 	}
 	writeMetricsFile(t, dir, metricsHdr, rows)
 	led, err := LoadLedger(dir)
