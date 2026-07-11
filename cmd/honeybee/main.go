@@ -340,6 +340,22 @@ func run() error {
 		BuildEnv: eff.BuildEnv,
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, IdleTimeout: time.Duration(eff.TurnIdleTimeoutMinutes) * time.Minute, HTTP: &http.Client{Timeout: 0}}
+	// Ephemeral agent (agent_ephemeral=true): spawn a dedicated opencode server for
+	// THIS pass and point the client at it, tearing it down on exit. This bounds the
+	// agent's memory to a single pass's lifetime — the shared long-lived server never
+	// releases per-session state and grew to a host-killing ~40 GB over days (the
+	// 2026-07-10 OOM). Spawned AFTER selection/worktree setup so a pass that finds no
+	// work never pays the startup cost. On spawn failure, fail the pass rather than
+	// silently falling back to a shared server the operator disabled on purpose.
+	if eff.AgentIsEphemeral() {
+		ea, err := swarm.SpawnEphemeralAgent(ctx, eff.AgentCmd, os.Stderr)
+		if err != nil {
+			return fmt.Errorf("spawn ephemeral opencode agent: %w", err)
+		}
+		defer ea.Close()
+		oc.Base = ea.Base
+		fmt.Fprintf(os.Stderr, "honeybee: ephemeral opencode agent at %s (torn down at pass end)\n", ea.Base)
+	}
 	// Always-on concise activity to stderr so every scheduled `systemd-run … honeybee`
 	// pass is observable live via `journalctl --user -t honeybee` (pass kind, per-turn
 	// boundaries, tool-call names, abandon/GC reasons) — not just the runner's warnings.

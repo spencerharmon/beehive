@@ -170,6 +170,34 @@ type Config struct {
 	// that is reachable at preflight but fails MID-pass still fails that individual
 	// pass (then retries), independent of this flag.
 	AbortOnRemoteFailure *bool `yaml:"abort_on_remote_failure"`
+
+	// AgentEphemeral makes each honeybee pass spawn its OWN dedicated `opencode
+	// serve` subprocess (on an OS-picked port, with an isolated, seeded-and-then-
+	// discarded data dir) and tear it down when the pass exits, instead of talking
+	// to one long-lived shared server at AgentURL.
+	//
+	//   - false / unset (the default, and the historical behavior): every pass uses
+	//     the shared server at AgentURL. That server's heap and its on-disk session
+	//     store (SQLite DB + git snapshots) grow monotonically across the thousands
+	//     of sessions a busy swarm opens over days — it never releases per-session
+	//     state — until it exhausts host memory (the 2026-07-10 global OOM: one
+	//     shared server reached ~40 GB RSS and the kernel killed it plus co-tenant
+	//     workloads).
+	//   - true: the pass launches `AgentCmd serve --hostname 127.0.0.1 --port 0`
+	//     with XDG_DATA_HOME pointed at a fresh temp dir (auth.json seeded in from
+	//     the real data dir so provider credentials are present), uses the port the
+	//     server prints as its AgentURL for this pass only, and on exit SIGINTs the
+	//     process group and removes the temp dir. The OS reclaims ALL of that pass's
+	//     agent heap and session store at teardown, so nothing accumulates across
+	//     passes and the OOM failure mode cannot recur. Concurrent passes each get
+	//     their own short-lived server (bounded by the swarm's pass concurrency),
+	//     never one unbounded shared one.
+	//
+	// It is a *bool so "unset" (nil, => the false default) is distinguishable from an
+	// explicit `agent_ephemeral: false`; read it through AgentIsEphemeral(). When
+	// true, AgentURL is ignored by the honeybee pass (the frontend/editor, which
+	// need a persistent interactive server, keep using AgentURL).
+	AgentEphemeral *bool `yaml:"agent_ephemeral"`
 }
 
 // boolPtr returns a pointer to b, for *bool config fields whose default is not the
@@ -331,6 +359,9 @@ func merge(base, over Config) Config {
 	if over.AbortOnRemoteFailure != nil {
 		out.AbortOnRemoteFailure = over.AbortOnRemoteFailure
 	}
+	if over.AgentEphemeral != nil {
+		out.AgentEphemeral = over.AgentEphemeral
+	}
 	out.Tags = mergeTags(base.Tags, over.Tags)
 	return out
 }
@@ -357,6 +388,15 @@ func (c Config) ModelFor(kind string) string {
 // set it) means the default, true.
 func (c Config) AbortsOnRemoteFailure() bool {
 	return c.AbortOnRemoteFailure == nil || *c.AbortOnRemoteFailure
+}
+
+// AgentIsEphemeral reports the effective agent_ephemeral setting: false (the
+// default) unless a config layer explicitly set it to true. When true, a honeybee
+// pass spawns and tears down its own dedicated opencode server instead of using
+// the shared server at AgentURL. A nil pointer (no layer set it) means the
+// default, false.
+func (c Config) AgentIsEphemeral() bool {
+	return c.AgentEphemeral != nil && *c.AgentEphemeral
 }
 
 // mergeEnv layers build_env per KEY (not whole-map): over's non-empty keys win,

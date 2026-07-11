@@ -34,6 +34,43 @@ func TestTurnIdleRetriesOverride(t *testing.T) {
 // TestAbortOnRemoteFailureDefault: unset => the effective setting is true (the
 // historical fatal-on-unreachable-remote behavior), and the default pointer is
 // non-nil so Load() always resolves it.
+// TestAgentEphemeralDefault: unset agent_ephemeral reads false via the accessor
+// (default is the shared long-lived server at AgentURL).
+func TestAgentEphemeralDefault(t *testing.T) {
+	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AgentEphemeral != nil {
+		t.Fatalf("agent_ephemeral default should be nil (unset), got %v", *c.AgentEphemeral)
+	}
+	if c.AgentIsEphemeral() {
+		t.Fatal("AgentIsEphemeral() should default to false")
+	}
+	if (Config{}).AgentIsEphemeral() {
+		t.Fatal("zero Config AgentIsEphemeral() should be false")
+	}
+}
+
+// TestAgentEphemeralOverride: an explicit `agent_ephemeral: true` in a config
+// layer flips the effective setting on.
+func TestAgentEphemeralOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", dir)
+	write(t, filepath.Join(dir, "config.yaml"), "agent_ephemeral: true\n")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AgentEphemeral == nil || !*c.AgentEphemeral {
+		t.Fatalf("agent_ephemeral: true not applied: %+v", c.AgentEphemeral)
+	}
+	if !c.AgentIsEphemeral() {
+		t.Fatal("AgentIsEphemeral() should be true after explicit override")
+	}
+}
+
 func TestAbortOnRemoteFailureDefault(t *testing.T) {
 	t.Setenv("BEEHIVE_CONFIG_DIR", t.TempDir())
 	c, err := Load()
