@@ -224,6 +224,43 @@ func filesFromCard(body []string) []string {
 	return out
 }
 
+// isDocOnlyCard reports whether a task card's Files: line names ONLY beehive-layer
+// text — every parsed path resolves under docs/, PLAN.md, ROI.md, or docs/tasks/.
+// Such a task never produces a bee-<taskid> submodule CODE branch, so a reviewer/
+// arbiter must not be told to fetch/inspect one. Classification is conservative:
+// a card with no parseable Files: paths, or a MIXED line carrying any code path,
+// is treated as code-bearing (false) so the existing fetch/inspect guidance stands.
+func isDocOnlyCard(body []string) bool {
+	files := filesFromCard(body)
+	if len(files) == 0 {
+		return false
+	}
+	for _, f := range files {
+		if !isBeehiveLayerPath(f) {
+			return false
+		}
+	}
+	return true
+}
+
+// isBeehiveLayerPath reports whether a repo-relative path is beehive-layer text
+// (never submodule code): PLAN.md, ROI.md, or anything under docs/ (which includes
+// docs/tasks/). The path may be submodule-qualified (submodules/<sm>/docs/...) or
+// bare (docs/...); the tail after any submodules/<sm>/ prefix is what's classified.
+func isBeehiveLayerPath(p string) bool {
+	p = path.Clean(strings.TrimSpace(p))
+	if rest, ok := strings.CutPrefix(p, "submodules/"); ok {
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			p = rest[i+1:]
+		}
+	}
+	switch p {
+	case "PLAN.md", "ROI.md":
+		return true
+	}
+	return strings.HasPrefix(p, "docs/")
+}
+
 // stripParens removes every parenthetical group from s (nesting-aware), so a
 // Files: line's inline annotations do not leak into the parsed path tokens.
 func stripParens(s string) string {
