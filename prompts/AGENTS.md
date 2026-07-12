@@ -183,6 +183,7 @@ column below marks who each is for.
 | Rebootstrap | rebuilding a target's plan from scratch | operator | `skills/rebootstrap.md` |
 | Cleanup | clearing stale worktrees/branches/claims/drift | operator | `skills/cleanup.md` |
 | Repair a corrupt PLAN.md | a plan fails to parse (e.g. `bad heartbeat ""`) after a pass was killed mid-write | operator | `skills/repair-plan.md` |
+| Reset a lost-work / looping task | a task is stuck in a `recover-lost-work` loop or was escalated to `NEEDS-HUMAN` by it, and must be reimplemented cleanly (reset `attempts`, clear the stale claim, strip lost-work notes) | operator | `skills/reset-lost-work-task.md` |
 | Deferred verification | a work task's effect only shows after an external system converges (GitOps reconcile, CI run, cache/TTL) | honeybee | `skills/deferred-verification.md` |
 | Update instructions | refreshing managed files to new binary defaults | operator | `skills/update-instructions.md` |
 
