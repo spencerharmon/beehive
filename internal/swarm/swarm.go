@@ -648,6 +648,23 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// leaves the task alone. Fails OPEN on any uncertainty, exactly like the
 	// guards below.
 	if sel.Kind == selectt.Review || sel.Kind == selectt.Arbitrate {
+		// Durable-record already-merged guard (lost-work-durable-fix): runs BEFORE
+		// recoverIfLost so an interrupted review whose merge landed on tracked main
+		// but whose bee-<taskid> branch was since reclaimed/reused is finalized to
+		// DONE from the task's OWN recorded reviewed commit — instead of recoverIfLost
+		// misreading the vanished branch as lost work and looping the task. Fails
+		// OPEN (falls through) on any uncertainty. See finalizeIfMergedByRecord.
+		finalized, ferr := r.finalizeIfMergedByRecord(ctx, sel, absRoot)
+		if ferr != nil && r.Debug != nil {
+			fmt.Fprintf(r.Debug, "[honeybee] durable-record already-merged pre-check for %s failed; continuing: %v\n", sel.Task.ID, ferr)
+		}
+		if finalized {
+			res.Completed = true
+			if r.Debug != nil {
+				fmt.Fprintf(r.Debug, "[honeybee] %s recorded reviewed commit already merged into tracked main; runner-finalized DONE (branch gone/reused) without spawning a %s pass\n", sel.Task.ID, sel.Kind)
+			}
+			return res, nil
+		}
 		recovered, rerr := r.recoverIfLost(ctx, sel, res.Branch, absRoot)
 		if rerr != nil && r.Debug != nil {
 			fmt.Fprintf(r.Debug, "[honeybee] lost-work recovery pre-check for %s failed; dispatching normally: %v\n", sel.Task.ID, rerr)
@@ -1183,6 +1200,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						cleanup()
 						return res, nil
 					}
+					if w := r.recordReviewedCommit(ctx, sel, absRoot, cl); w != "" && res.Warning == "" {
+						res.Warning = w
+					}
 					// Delete a rejected attempt's orphan bee branch (see the mirror
 					// block in the done path): an arbitration -> TODO rework must clear
 					// the superseded remote branch so the next attempt's push is not
@@ -1437,6 +1457,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				res.Completed = false
 				cleanup()
 				return res, nil
+			}
+			if w := r.recordReviewedCommit(ctx, sel, absRoot, cl); w != "" && res.Warning == "" {
+				res.Warning = w
 			}
 			// Arbitration that sided with the reviewer sends the task back to TODO for
 			// rework. The rejected attempt's pushed bee-<taskid> branch is now a
@@ -2304,6 +2327,130 @@ func (r *Runner) demoteUnpushed(ctx context.Context, sel *selectt.Selection, rea
 // the caller falls through to the reachability guard / normal dispatch rather
 // than risk a false finalize of a genuinely pending — or never attempted —
 // review.
+// recordReviewedCommit durably stamps the submodule commit a just-completed
+// Work pass handed to review (its NEEDS-REVIEW gitlink tip) onto the task, so a
+// later pass can recognize the work as already-merged-into-tracked-main even
+// after the disposable bee-<taskid> branch is reclaimed or reused
+// (finalizeIfMergedByRecord). It runs only for a Work pass whose published
+// status is NEEDS-REVIEW; every other kind/state is a no-op. Best-effort: it
+// returns a warning string, never a hard error, so a failed record never blocks
+// completion — finalize still has its branch-based check (finalizeIfAlreadyMerged)
+// as a fallback.
+func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selection, absRoot string, cl *claim.Claimer) string {
+	if sel.Kind != selectt.Work || !hasTask(sel) {
+		return ""
+	}
+	st, err := r.taskStatus(sel)
+	if err != nil || st != plan.StatusReview {
+		return ""
+	}
+	rel, err := filepath.Rel(absRoot, sel.Submodule.RepoDir())
+	if err != nil {
+		return ""
+	}
+	sha, err := r.Git.RevParse(ctx, "HEAD:"+rel)
+	if err != nil || sha == "" {
+		return ""
+	}
+	if err := cl.RecordReviewCommit(ctx, sel.Task.ID, sha); err != nil {
+		return fmt.Sprintf("could not record reviewed commit for %s: %v", sel.Task.ID, err)
+	}
+	return ""
+}
+
+// finalizeIfMergedByRecord is the durable-record counterpart to
+// finalizeIfAlreadyMerged (lost-work-durable-fix). finalizeIfAlreadyMerged can
+// only recognize an interrupted-review merge WHILE the bee-<taskid> branch still
+// resolves somewhere — but the same successful merge that lands the commit on
+// tracked main also reclaims that branch, and a later reworked attempt reuses the
+// name at a different tip. Once the branch is gone/moved, finalizeIfAlreadyMerged
+// falls through and recoverIfLost (which also only checks the branch) misreads the
+// vanished branch as lost work, looping the task forever — escalating to
+// NEEDS-HUMAN once attempts pass the limit (observed live: phantom-library
+// m14-per-user-rig). This guard closes that gap using the task's OWN durably
+// recorded reviewed commit (plan.Task.ReviewCommit, stamped by recordReviewedCommit
+// the moment the Work pass landed NEEDS-REVIEW) INSTEAD of the branch: if that
+// recorded sha is an ancestor of the submodule's tracked main, the work WAS merged
+// — complete the interrupted bookkeeping to DONE, no branch and no re-review
+// required.
+//
+// Safe for the same reason finalizeIfAlreadyMerged is: submodule main advances
+// ONLY via an approved review merge, so ancestry-of-main of THIS task's own
+// recorded commit can only follow a prior approval. The recorded sha is
+// task-specific (never the ambient shared gitlink pointer, whose triviality
+// finalizeIfAlreadyMerged's sourceBranchExists gate exists to dodge), so it cannot
+// be trivially-an-ancestor for reasons unrelated to this task. Fails OPEN on any
+// uncertainty — no record, submodule not checked out here, a remote error, or the
+// recorded sha not even resolvable (so a merge cannot be proven) — returning
+// (false, err)/(false, nil) so the caller falls through to the branch-based guards
+// and normal dispatch; a genuinely pending or truly lost task is never wrongly
+// finalized. Handles a NEEDS-REVIEW or NEEDS-ARBITRATION task.
+func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Selection, absRoot string) (bool, error) {
+	sha := sel.Task.ReviewCommit
+	if sha == "" {
+		return false, nil
+	}
+	repoDir := sel.Submodule.RepoDir()
+	rel, err := filepath.Rel(absRoot, repoDir)
+	if err != nil {
+		return false, err
+	}
+	if _, err := r.Git.RevParse(ctx, "HEAD:"+rel); err != nil {
+		return false, fmt.Errorf("resolve submodule %s pointer: %w", sel.Submodule.Name, err)
+	}
+	if !isSourceCheckout(ctx, repoDir) {
+		if _, err := r.Git.Run(ctx, "submodule", "update", "--init", "--", rel); err != nil {
+			return false, err
+		}
+	}
+	if !isSourceCheckout(ctx, repoDir) {
+		return false, fmt.Errorf("submodule %s not checked out at %s", sel.Submodule.Name, repoDir)
+	}
+	sg := git.New(repoDir)
+	rem, err := sg.Remote(ctx)
+	if err != nil {
+		return false, err
+	}
+	tracked := r.trackedBranch(ctx, rel)
+	trackedRef := tracked
+	if rem != "" {
+		// Fetch tracked main so the ancestry check sees the latest tip AND so the
+		// recorded commit's object is present locally when it lives only on main.
+		if err := sg.Fetch(ctx, rem, tracked); err != nil {
+			return false, err
+		}
+		trackedRef = rem + "/" + tracked
+	}
+	merged, err := sg.IsAncestor(ctx, sha, trackedRef)
+	if err != nil || !merged {
+		// err: the recorded sha is not even resolvable here (a merge cannot be
+		// proven) — fail open. !merged: genuinely not on tracked main yet — fall
+		// through to the branch-based guards / normal dispatch.
+		return false, err
+	}
+	// Merged: sync THIS pass's private submodule checkout to the tracked tip so the
+	// gitlink bump (FinalizeAlreadyMerged -> CommitPaths) records the real HEAD,
+	// exactly as finalizeIfAlreadyMerged does.
+	if err := sg.HardReset(ctx, trackedRef); err != nil {
+		return false, fmt.Errorf("sync submodule %s to %s: %w", sel.Submodule.Name, trackedRef, err)
+	}
+	tip, err := sg.RevParse(ctx, "HEAD")
+	if err != nil {
+		return false, err
+	}
+	note := fmt.Sprintf(
+		"recorded reviewed commit %s already merged into tracked %s (%s) by a prior interrupted review; runner-finalized DONE (no re-review, branch not required)",
+		sha, tracked, tip)
+	cl := &claim.Claimer{
+		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
+		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
+	}
+	if err := cl.FinalizeAlreadyMerged(ctx, sel.Task.ID, rel, note); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selection, branch, absRoot string) (bool, error) {
 	repoDir := sel.Submodule.RepoDir()
 	rel, err := filepath.Rel(absRoot, repoDir)
@@ -2558,6 +2705,25 @@ func (r *Runner) recoverIfLost(ctx context.Context, sel *selectt.Selection, bran
 	if err != nil {
 		return false, err
 	}
+	// Check 0 (lost-work-durable-fix): never reset a task whose durably-recorded
+	// reviewed commit is already an ancestor of tracked main. That is completed work
+	// an interrupted review left mid-bookkeeping (finalizeIfMergedByRecord finalizes
+	// it to DONE), NOT lost work — and its bee-<taskid> branch is legitimately gone,
+	// which the branch checks below would otherwise misread as a loss. Backstops
+	// finalizeIfMergedByRecord in case that guard failed open on a transient error.
+	// Only a positive, git-confirmed merge aborts the reset; any error is ignored
+	// here so the conservative branch checks below stay authoritative.
+	if sha := sel.Task.ReviewCommit; sha != "" {
+		tracked := r.trackedBranch(ctx, rel)
+		trackedRef := tracked
+		if rem != "" {
+			_ = sg.Fetch(ctx, rem, tracked)
+			trackedRef = rem + "/" + tracked
+		}
+		if merged, aerr := sg.IsAncestor(ctx, sha, trackedRef); aerr == nil && merged {
+			return false, nil // recorded reviewed commit is on tracked main: not lost.
+		}
+	}
 	// Check 1: local ref.
 	if _, err := sg.RevParse(ctx, "refs/heads/"+branch); err == nil {
 		return false, nil // present locally: recoverable, do not reset.
@@ -2672,6 +2838,26 @@ func (r *Runner) taskStatus(sel *selectt.Selection) (plan.Status, error) {
 	return t.Status, nil
 }
 
+// taskStatusByID reads a task's current status from sub's (published) PLAN.md by
+// id, for callers that hold a submodule + branch but no Selection (e.g.
+// reclaimSourceBranch's DONE-gate). A missing/unparseable plan or an absent task
+// returns "" (no status), which callers read as "no constraint".
+func (r *Runner) taskStatusByID(sub repo.Submodule, id string) (plan.Status, error) {
+	b, err := os.ReadFile(sub.PlanPath())
+	if err != nil {
+		return "", err
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		return "", err
+	}
+	t := p.Find(id)
+	if t == nil {
+		return "", nil
+	}
+	return t.Status, nil
+}
+
 // reclaimSourceBranch deletes a finished task's pushed bee-<taskid> source branch
 // from the submodule origin and drops its local ref — but ONLY once that branch's
 // tip is already contained in the submodule's tracked main. That guard is
@@ -2726,6 +2912,19 @@ func (r *Runner) reclaimSourceBranch(ctx context.Context, sub repo.Submodule, br
 	if !merged {
 		// In-flight: deleting it would lose the commit and dangle the pointer. Keep.
 		return ""
+	}
+	// Merged into tracked main, but ALSO require the hive task to have reached DONE
+	// before deleting (lost-work-durable-fix). A branch can be merged into submodule
+	// main while its hive PLAN task is still NEEDS-REVIEW — an approved review whose
+	// merge landed (durable) but whose DONE bookkeeping was interrupted. In that
+	// window the branch is the evidence finalizeIfAlreadyMerged needs to complete
+	// the bookkeeping; deleting it here would strand the task (recoverIfLost misreads
+	// the vanished branch as lost work and loops). Keep it until DONE lands; a task
+	// absent from the plan (removed) is fine to reclaim (the removed-guard owns it).
+	if id := strings.TrimPrefix(branch, "bee-"); id != branch {
+		if st, serr := r.taskStatusByID(sub, id); serr == nil && st != "" && st != plan.StatusDone {
+			return fmt.Sprintf("source branch %s is merged into %s/%s but task %s is %s (not DONE); kept as already-merged finalize evidence until DONE lands", branch, rem, tracked, id, st)
+		}
 	}
 	if err := sg.DeleteRemoteBranch(ctx, rem, branch); err != nil {
 		return fmt.Sprintf("merged source branch %s was NOT deleted on %s (%v); it will accumulate until reclaimed", branch, rem, err)

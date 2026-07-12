@@ -80,7 +80,18 @@ type Task struct {
 	// spaced re-check/retry) a task or the runner may set/refresh on itself. Zero
 	// means no gate. Serialized as `not_before=<RFC3339>` in the header comment.
 	NotBefore time.Time
-	Body      []string // body lines verbatim, without trailing blank
+	// ReviewCommit, when non-empty, is the submodule commit sha a completed Work
+	// pass handed to review — the exact commit its NEEDS-REVIEW gitlink bump
+	// points at, recorded DURABLY on the task by the runner (Claimer.
+	// RecordReviewCommit) the moment the work lands NEEDS-REVIEW. It survives the
+	// disposable bee-<taskid> branch being reclaimed or reused, so the runner can
+	// still recognize "this task's work was already merged into tracked main" (an
+	// interrupted review that landed the merge but not the DONE bookkeeping) after
+	// the branch is gone — without it, the vanished branch is misread as lost work
+	// and the task loops. Tested for ancestry-of-main, never trusted as a status.
+	// Serialized as `review=<sha>` in the header comment.
+	ReviewCommit string
+	Body         []string // body lines verbatim, without trailing blank
 }
 
 // Plan is a parsed PLAN.md.
@@ -182,6 +193,8 @@ func parseHeader(m []string) (*Task, error) {
 				return nil, fmt.Errorf("plan: bad not_before %q for %s", v, t.ID)
 			}
 			t.NotBefore = ts
+		case "review":
+			t.ReviewCommit = v
 		}
 	}
 	return t, nil
@@ -242,6 +255,9 @@ func (t *Task) header() string {
 	}
 	if !t.NotBefore.IsZero() {
 		meta += " not_before=" + t.NotBefore.UTC().Format(time.RFC3339)
+	}
+	if t.ReviewCommit != "" {
+		meta += " review=" + t.ReviewCommit
 	}
 	return fmt.Sprintf("## %s [%s] <!-- %s -->", t.ID, t.Status, meta)
 }

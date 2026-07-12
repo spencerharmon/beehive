@@ -260,6 +260,62 @@ func TestBounceUnreachableGuarded(t *testing.T) {
 // reset must reach the given Publish func synchronously so a peer sees the
 // task ready to reselect right away, never re-dispatching a doomed
 // review/arbitration pass against it again.
+func TestRecordReviewCommitPublishesImmediately(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+	g := git.New(root)
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}} {
+		g.Run(ctx, a...)
+	}
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(sm, 0o755)
+	os.WriteFile(filepath.Join(sm, "PLAN.md"), []byte("## T1 [NEEDS-REVIEW] <!-- attempts=1 deps= session=bee-A heartbeat=2026-01-01T00:00:00Z -->\ndo it\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	wt := filepath.Join(root, ".worktrees", "bee-a")
+	if err := g.WorktreeAdd(ctx, wt, "bee-a", "main"); err != nil {
+		t.Fatal(err)
+	}
+	rp, _ := repo.Open(wt)
+	subs, _ := rp.Submodules()
+	wg := git.New(wt)
+	published := false
+	c := &Claimer{
+		Repo: rp, Sub: subs[0], Git: wg, TTL: time.Hour, Session: "bee-a",
+		Publish: func(ctx context.Context) error {
+			published = true
+			return wg.PublishToMain(ctx, "")
+		},
+	}
+	sha := "f11aef766662b31b4f492bef1eb4cbbb1729e1eb"
+	if err := c.RecordReviewCommit(ctx, "T1", sha); err != nil {
+		t.Fatalf("record-review-commit: %v", err)
+	}
+	if !published {
+		t.Fatal("RecordReviewCommit must publish immediately")
+	}
+	// Read back from the ORIGINAL (main) checkout, proving the record reached main.
+	mp, err := plan.Parse(mustRead(t, filepath.Join(sm, "PLAN.md")))
+	if err != nil {
+		t.Fatalf("parse main PLAN.md: %v", err)
+	}
+	tk := mp.Find("T1")
+	if tk.ReviewCommit != sha {
+		t.Fatalf("main review commit = %q, want %q", tk.ReviewCommit, sha)
+	}
+	// Recording must NOT change status or claim — pure metadata.
+	if tk.Status != plan.StatusReview {
+		t.Fatalf("status changed to %s; record must be status-neutral", tk.Status)
+	}
+	if tk.Session != "bee-A" {
+		t.Fatalf("claim disturbed: session = %q", tk.Session)
+	}
+	if tk.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (unchanged)", tk.Attempts)
+	}
+}
+
 func TestRecoverLostWorkPublishesImmediately(t *testing.T) {
 	root := t.TempDir()
 	ctx := context.Background()

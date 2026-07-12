@@ -382,6 +382,39 @@ func (c *Claimer) RecoverLostWork(ctx context.Context, taskID, reason string, li
 	return nil
 }
 
+// RecordReviewCommit durably stamps sha as taskID's reviewed submodule commit
+// (see plan.Task.SetReviewCommit / ReviewCommit). The runner calls it right
+// after a Work pass lands the task NEEDS-REVIEW, so a later pass can still
+// recognize the work as already-merged-into-tracked-main after the disposable
+// bee-<taskid> branch is reclaimed or reused (swarm.finalizeIfMergedByRecord).
+// It commits AND publishes immediately, on its own PLAN.md-only commit, and
+// swallows a benign publish conflict exactly like RecoverLostWork/Release. A
+// no-op setter (blank sha, or the value unchanged) yields git.ErrNothing from
+// CommitPaths, which is treated as success.
+func (c *Claimer) RecordReviewCommit(ctx context.Context, taskID, sha string) error {
+	p, err := c.load()
+	if err != nil {
+		return err
+	}
+	t := p.Find(taskID)
+	if t == nil {
+		return fmt.Errorf("record-review-commit: task %q absent", taskID)
+	}
+	t.SetReviewCommit(sha)
+	if err := c.save(p); err != nil {
+		return err
+	}
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "record-review-commit"), c.planRel()); err != nil && err != git.ErrNothing {
+		return err
+	}
+	if c.Publish != nil {
+		if err := c.Publish(ctx); err != nil && !errors.Is(err, git.ErrConflict) {
+			return err
+		}
+	}
+	return nil
+}
+
 // FinalizeAlreadyMerged completes taskID's bookkeeping deterministically,
 // without spawning a review, when its recorded submodule pointer is discovered
 // already merged into the submodule's tracked main — the symmetric counterpart

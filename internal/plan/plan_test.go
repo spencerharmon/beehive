@@ -278,7 +278,14 @@ func TestFinalizeAlreadyMerged(t *testing.T) {
 // NEEDS-REVIEW, and always requires a concrete note (an empty note would leave
 // no record of why the task jumped straight to DONE without a review verdict).
 func TestFinalizeAlreadyMergedGuardedAndRequiresNote(t *testing.T) {
-	for _, st := range []Status{StatusTODO, StatusArb, StatusDone, StatusHuman} {
+	// Valid from either reviewable status (NEEDS-REVIEW or NEEDS-ARBITRATION):
+	// an interrupted review's merge can be finalized from both.
+	for _, st := range []Status{StatusReview, StatusArb} {
+		if err := (&Task{ID: "a", Status: st}).FinalizeAlreadyMerged("note", time.Now()); err != nil {
+			t.Fatalf("finalize-already-merged rejected on %s: %v", st, err)
+		}
+	}
+	for _, st := range []Status{StatusTODO, StatusDone, StatusHuman} {
 		if err := (&Task{ID: "a", Status: st}).FinalizeAlreadyMerged("note", time.Now()); err == nil {
 			t.Fatalf("finalize-already-merged allowed on %s", st)
 		}
@@ -500,6 +507,32 @@ func TestSelectableDefersCrossSubmoduleDeps(t *testing.T) {
 
 // TestNotBeforeParseRoundTrip proves an optional not_before stamp parses to a
 // time and round-trips through String() byte-for-byte.
+func TestReviewCommitParseRoundTrip(t *testing.T) {
+	sha := "f11aef766662b31b4f492bef1eb4cbbb1729e1eb"
+	src := "<!-- Beehive-ROI: abc -->\n\n## x [NEEDS-REVIEW] <!-- attempts=1 deps= review=" + sha + " -->\nbody\n"
+	p, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := p.Task("x")
+	if x.ReviewCommit != sha {
+		t.Fatalf("review commit parsed wrong: %q", x.ReviewCommit)
+	}
+	if got := p.String(); got != src {
+		t.Fatalf("round trip mismatch:\n%q\nvs\n%q", got, src)
+	}
+	// SetReviewCommit ignores a blank sha (never erases a good record) and
+	// overwrites otherwise.
+	x.SetReviewCommit("")
+	if x.ReviewCommit != sha {
+		t.Fatalf("blank SetReviewCommit erased the record: %q", x.ReviewCommit)
+	}
+	x.SetReviewCommit("deadbeef")
+	if x.ReviewCommit != "deadbeef" {
+		t.Fatalf("SetReviewCommit did not overwrite: %q", x.ReviewCommit)
+	}
+}
+
 func TestNotBeforeParseRoundTrip(t *testing.T) {
 	src := "<!-- Beehive-ROI: abc -->\n\n## x [TODO] <!-- attempts=0 deps= not_before=2026-07-01T12:00:00Z -->\nbody\n"
 	p, err := Parse(src)

@@ -1163,6 +1163,196 @@ func TestReviewDispatchFinalizesAlreadyMergedRemote(t *testing.T) {
 // (merged-guard-branch-gate's own gate: sourceBranchExists) sits at that same
 // commit, exactly what a genuine fast-forward merge leaves behind. Must
 // finalize without ever dispatching a session.
+// TestReviewDispatchFinalizesByRecordWhenBranchGone is the durable-record
+// regression (lost-work-durable-fix): an interrupted review merged bee-R1 into
+// tracked main but its DONE bookkeeping never landed, and the bee-R1 branch has
+// since been reclaimed (gone from origin) — the exact phantom-library
+// m14-per-user-rig shape. Neither finalizeIfAlreadyMerged nor bounceIfUnreachable
+// can recognize the merge without the branch, and recoverIfLost would misread the
+// vanished branch as lost work and reset/loop. The task's DURABLE review=<sha>
+// record lets finalizeIfMergedByRecord finalize it to DONE at dispatch, no branch
+// required.
+func TestReviewDispatchFinalizesByRecordWhenBranchGone(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	// The implementer commit was merged into tracked main by a prior interrupted
+	// review; a later unrelated commit also landed, so the recorded commit is an
+	// ancestor of main without being its tip. Crucially, bee-R1 is NOT pushed —
+	// it was reclaimed, so it resolves nowhere on origin.
+	sc := filepath.Join(t.TempDir(), "push")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+		t.Fatalf("scratch clone: %v", err)
+	}
+	scg := gitConfig(t, sc)
+	os.WriteFile(filepath.Join(sc, "feature.txt"), []byte("work\n"), 0o644)
+	if err := scg.Commit(ctx, "feat: work"); err != nil {
+		t.Fatalf("commit implementer work: %v", err)
+	}
+	implSHA, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse implementer commit: %v", err)
+	}
+	os.WriteFile(filepath.Join(sc, "unrelated.txt"), []byte("other\n"), 0o644)
+	if err := scg.Commit(ctx, "unrelated follow-up merge"); err != nil {
+		t.Fatalf("commit follow-up: %v", err)
+	}
+	if err := scg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push tracked main past the implementer commit: %v", err)
+	}
+	mainTip, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse pushed main tip: %v", err)
+	}
+
+	// gitlink left at the pre-merge recorded pointer; PLAN carries the DURABLE
+	// review=<implSHA> record (what recordReviewedCommit stamps at NEEDS-REVIEW).
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+implSHA+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed pre-merge gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=1 deps= review="+implSHA+" -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	// Precondition: bee-R1 must NOT exist on origin (reclaimed).
+	if originHasBranch(t, origin, "bee-R1") {
+		t.Fatal("precondition: bee-R1 must be absent on origin for the branch-gone case")
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview, Attempts: 1, ReviewCommit: implSHA}}
+
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a durably-recorded already-merged task should finalize at dispatch even with the branch gone, got %+v", res)
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("R1")
+	if tk == nil {
+		t.Fatal("task R1 vanished from PLAN.md")
+	}
+	if tk.Status != plan.Done {
+		t.Fatalf("status = %s, want DONE (finalized from the durable record)", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("finalize must release the claim")
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if !contains(joined, "recorded reviewed commit") || !contains(joined, mainTip) {
+		t.Fatalf("plan body missing durable-record finalize note naming the merged tip %s:\n%s", mainTip, joined)
+	}
+	out, err := g.Run(ctx, "ls-files", "-s", "submodules/sm/repo")
+	if err != nil {
+		t.Fatalf("ls-files gitlink: %v", err)
+	}
+	if !contains(out, mainTip) {
+		t.Fatalf("gitlink = %q, want bumped to tracked-main tip %s", out, mainTip)
+	}
+}
+
+// TestReviewDispatchDoesNotFinalizeByRecordWhenNotMerged proves the durable-record
+// guard is conservative: a review=<sha> whose commit is NOT an ancestor of tracked
+// main (genuinely pending/rejected work) must NOT be finalized — it falls through
+// to the normal guards.
+func TestReviewDispatchDoesNotFinalizeByRecordWhenNotMerged(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	// A commit that exists but was NEVER merged into tracked main (a diverging
+	// branch tip), pushed as bee-R1 so it is resolvable but not an ancestor.
+	sc := filepath.Join(t.TempDir(), "push")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+		t.Fatalf("scratch clone: %v", err)
+	}
+	scg := gitConfig(t, sc)
+	os.WriteFile(filepath.Join(sc, "feature.txt"), []byte("work\n"), 0o644)
+	if err := scg.Commit(ctx, "feat: pending work"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	pendingSHA, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if _, err := scg.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-R1"); err != nil {
+		t.Fatalf("push bee-R1: %v", err)
+	}
+
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+pendingSHA+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= review="+pendingSHA+" -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview, ReviewCommit: pendingSHA}}
+
+	// A genuinely-pending reachable commit must dispatch a NORMAL review, not be
+	// auto-finalized. The session approves it the normal way (flips DONE on turn 1).
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= review="+pendingSHA+" -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if cl.sess.prompts == 0 {
+		t.Fatal("a not-yet-merged recorded commit must dispatch a REAL review, not a zero-turn record-finalize")
+	}
+	b, _ := os.ReadFile(planPath)
+	p, _ := plan.Parse(string(b))
+	tk := p.Find("R1")
+	if tk == nil {
+		t.Fatal("task R1 vanished")
+	}
+	if joined := strings.Join(tk.Body, "\n"); contains(joined, "recorded reviewed commit") {
+		t.Fatalf("task was wrongly record-finalized instead of reviewed:\n%s", joined)
+	}
+}
+
 func TestReviewDispatchFinalizesAlreadyMergedLocalSharing(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -3366,6 +3556,34 @@ func TestReclaimSourceBranchGuard(t *testing.T) {
 		}
 		if !originHasBranch(t, origin, "bee-T1") {
 			t.Fatal("an unmerged in-flight source branch must be left intact on origin")
+		}
+	})
+
+	t.Run("merged-but-task-not-done-kept", func(t *testing.T) {
+		// A branch merged into tracked main whose hive task is still NEEDS-REVIEW
+		// (an interrupted review) must be KEPT — it is the evidence
+		// finalizeIfAlreadyMerged needs; deleting it strands the task.
+		r, sub, origin, absRoot := build(t)
+		os.WriteFile(sub.PlanPath(), []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nreview\n"), 0o644)
+		pushBee(t, r.Git, origin, "bee-T1", false) // == main: merged
+		w := r.reclaimSourceBranch(ctx, sub, "bee-T1", absRoot)
+		if w == "" {
+			t.Fatal("reclaim of a merged branch whose task is not DONE must warn, not silently delete")
+		}
+		if !originHasBranch(t, origin, "bee-T1") {
+			t.Fatal("a merged branch whose task is still NEEDS-REVIEW must be kept as finalize evidence")
+		}
+	})
+
+	t.Run("merged-and-task-done-deletes", func(t *testing.T) {
+		r, sub, origin, absRoot := build(t)
+		os.WriteFile(sub.PlanPath(), []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ndone\n"), 0o644)
+		pushBee(t, r.Git, origin, "bee-T1", false) // == main: merged
+		if w := r.reclaimSourceBranch(ctx, sub, "bee-T1", absRoot); w != "" {
+			t.Fatalf("merged+DONE branch reclaim warned: %q", w)
+		}
+		if originHasBranch(t, origin, "bee-T1") {
+			t.Fatal("a merged branch whose task is DONE must be deleted on origin")
 		}
 	})
 

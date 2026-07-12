@@ -169,10 +169,10 @@ func (t *Task) BounceUnreachable(reason string) error {
 // via approved reviews), so auto-finalizing is safe: it completes interrupted
 // bookkeeping, it never approves anything itself. note is appended as a body
 // line in the same free-form convention BounceUnreachable/Strand use. Valid
-// only from NEEDS-REVIEW. Releases the active claim.
+// from NEEDS-REVIEW or NEEDS-ARBITRATION. Releases the active claim.
 func (t *Task) FinalizeAlreadyMerged(note string, now time.Time) error {
-	if t.Status != StatusReview {
-		return fmt.Errorf("plan: finalize-already-merged on non-NEEDS-REVIEW task %s (%s)", t.ID, t.Status)
+	if t.Status != StatusReview && t.Status != StatusArb {
+		return fmt.Errorf("plan: finalize-already-merged on non-reviewable task %s (%s)", t.ID, t.Status)
 	}
 	note = oneLine(note)
 	if note == "" {
@@ -183,6 +183,21 @@ func (t *Task) FinalizeAlreadyMerged(note string, now time.Time) error {
 	t.Heartbeat = time.Time{}
 	t.appendNote("Review (runner-finalized): " + note)
 	return nil
+}
+
+// SetReviewCommit durably records sha as the submodule commit this task's
+// completed Work pass handed to review (its NEEDS-REVIEW gitlink tip). It is a
+// pure metadata setter — it never changes status or the claim — written by the
+// runner right after a Work pass lands NEEDS-REVIEW so a later pass can still
+// recognize the work as already-merged-into-main after the disposable
+// bee-<taskid> branch is reclaimed/reused. Overwrites any prior value (each
+// fresh review landing supersedes the last); a blank sha is ignored so a
+// resolution failure never erases a good record.
+func (t *Task) SetReviewCommit(sha string) {
+	if sha == "" {
+		return
+	}
+	t.ReviewCommit = sha
 }
 
 // RecoverLostWork resets a NEEDS-REVIEW or NEEDS-ARBITRATION task back to TODO
