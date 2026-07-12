@@ -60,6 +60,7 @@ type PlanItem struct {
 	Doc         string    // linked change-doc path from a body "Doc:" line, "" if none
 	DocHref     string    // link to view the change doc (from the commit stamp or the design Doc), "" if unresolved
 	HumanReason string    // explicit NEEDS-HUMAN reason from a body "Human-needed:" line (may span multiple lines)
+	Category    string    // NEEDS-HUMAN escalation category (secret|external-permission|contradiction|architecture), "" if unclassified/runner-forced
 }
 
 // BodyHTML renders the task's full body (Body) as sanitized markdown for the
@@ -92,6 +93,55 @@ func (it PlanItem) HumanReasonHTML() template.HTML {
 // class too keeps an unknown/empty status shaped (neutral) rather than unstyled.
 func (it PlanItem) StatusClass() string {
 	return "status status-" + strings.ToLower(it.Status)
+}
+
+// CategoryClass is the design-system badge class for a NEEDS-HUMAN escalation
+// category: the base `cat` shape plus a `cat-<value>` hue class, or `cat
+// cat-unclassified` when the task carries no category (a runner-forced overflow
+// escalation or a legacy pre-category task). Parallels StatusClass.
+func (it PlanItem) CategoryClass() string {
+	slug := it.Category
+	if slug == "" {
+		slug = "unclassified"
+	}
+	return "cat cat-" + slug
+}
+
+// CategoryLabel is the short human-facing badge text for the escalation category:
+// a compact label per category, or "unclassified" when none is set. Kept terse so
+// it reads as a badge; the resolve page carries the full per-category guidance.
+func (it PlanItem) CategoryLabel() string {
+	switch plan.Category(it.Category) {
+	case plan.CatSecret:
+		return "secret"
+	case plan.CatExternalPermission:
+		return "external permission"
+	case plan.CatContradiction:
+		return "contradiction"
+	case plan.CatArchitecture:
+		return "architecture decision"
+	default:
+		return "unclassified"
+	}
+}
+
+// Ask is the one-line, category-appropriate framing of what the operator must do
+// — the lead line the resolve page shows above the reason so the operator sees
+// the KIND of ask before any technical detail. "" for an unclassified escalation
+// (the page falls back to the raw reason).
+func (it PlanItem) Ask() string {
+	switch plan.Category(it.Category) {
+	case plan.CatSecret:
+		return "The swarm needs a credential only you can provide. Add the named store key, then mark resolved."
+	case plan.CatExternalPermission:
+		return "The swarm needs an action on infrastructure it does not control (out-of-cluster / host-root / vendor). Do it, then mark resolved."
+	case plan.CatContradiction:
+		return "The intent is contradictory and the swarm cannot tell which side wins. Decide, record it in ROI/PLAN, then mark resolved."
+	case plan.CatArchitecture:
+		return "A high-level, hard-to-reverse design decision is needed. Choose, record it in ROI, then mark resolved."
+	default:
+		return ""
+	}
 }
 
 // ClaimState is the unified claim phase surfaced as a label: "active" (fresh
@@ -259,6 +309,7 @@ func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
 		Active:      t.Active(now, ttl),
 		Stale:       t.Stale(now, ttl),
 		HumanReason: t.HumanReason(),
+		Category:    string(t.HumanCategory),
 	}
 	if len(t.Body) > 0 {
 		it.Body = strings.Join(t.Body, "\n")

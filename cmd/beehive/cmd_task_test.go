@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/spencerharmon/beehive/internal/plan"
+)
 
 func TestHumanReason(t *testing.T) {
 	got, err := humanReason(" Need\noperator\tinput ", "")
@@ -15,6 +19,26 @@ func TestHumanReason(t *testing.T) {
 	}
 	if _, err := humanReason("x", "y"); err == nil {
 		t.Fatal("reason and reason-file both allowed")
+	}
+}
+
+func TestHumanCategory(t *testing.T) {
+	for _, in := range []string{"secret", "external-permission", "contradiction", "architecture", " secret "} {
+		c, err := humanCategory(in)
+		if err != nil {
+			t.Fatalf("%q: %v", in, err)
+		}
+		if !c.Valid() {
+			t.Fatalf("%q -> invalid category %q", in, c)
+		}
+	}
+	for _, in := range []string{"", "  ", "maintenance", "cache-clear", "SECRET"} {
+		if _, err := humanCategory(in); err == nil {
+			t.Fatalf("category %q accepted", in)
+		}
+	}
+	if got, _ := humanCategory("contradiction"); got != plan.CatContradiction {
+		t.Fatalf("category = %q, want %q", got, plan.CatContradiction)
 	}
 }
 

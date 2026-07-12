@@ -1819,7 +1819,7 @@ func (r *Runner) statusLeft(sel *selectt.Selection, from plan.Status) (bool, err
 	if t == nil {
 		return false, nil
 	}
-	if t.Status == plan.NeedsHuman && t.HumanReason() == "" {
+	if t.Status == plan.NeedsHuman && !t.EscalationReady() {
 		return false, nil
 	}
 	return t.Status != from, nil
@@ -2021,7 +2021,7 @@ func (r *Runner) workDone(sel *selectt.Selection, branch string) (bool, error) {
 		return false, nil
 	}
 	if t.Status == plan.NeedsHuman {
-		return t.HumanReason() != "", nil
+		return t.EscalationReady(), nil
 	}
 	terminal := t.Status == plan.Done || t.Status == plan.NeedsReview ||
 		t.Status == plan.NeedsArb

@@ -346,11 +346,17 @@ func TestRecoverLostWorkGuardedAndRequiresReason(t *testing.T) {
 func TestRequestHuman(t *testing.T) {
 	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
 	tk := &Task{ID: "a", Status: StatusTODO, Session: "bee-1", Heartbeat: now, Body: []string{"do thing"}}
-	if err := tk.RequestHuman("Need operator to choose public wire format.\nChanging later is breaking.", now); err != nil {
+	if err := tk.RequestHuman(CatArchitecture, "Need operator to choose public wire format.\nChanging later is breaking.", now); err != nil {
 		t.Fatal(err)
 	}
 	if tk.Status != StatusHuman {
 		t.Fatalf("status = %s, want NEEDS-HUMAN", tk.Status)
+	}
+	if tk.HumanCategory != CatArchitecture {
+		t.Fatalf("category = %q, want %q", tk.HumanCategory, CatArchitecture)
+	}
+	if !tk.EscalationReady() {
+		t.Fatal("a categorized escalation with a reason must be EscalationReady")
 	}
 	if tk.Session != "" || !tk.Heartbeat.IsZero() {
 		t.Fatal("human request must release claim")
@@ -358,17 +364,57 @@ func TestRequestHuman(t *testing.T) {
 	if got := tk.HumanReason(); got != "Need operator to choose public wire format. Changing later is breaking." {
 		t.Fatalf("reason = %q", got)
 	}
-	if got := (&Plan{Tasks: []*Task{tk}}).String(); !strings.Contains(got, "Human-needed: Need operator") {
-		t.Fatalf("serialized plan missing human reason:\n%s", got)
+	s := (&Plan{Tasks: []*Task{tk}}).String()
+	if !strings.Contains(s, "Human-needed: Need operator") {
+		t.Fatalf("serialized plan missing human reason:\n%s", s)
+	}
+	if !strings.Contains(s, "category=architecture") {
+		t.Fatalf("serialized plan missing category:\n%s", s)
+	}
+	pp, err := Parse(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pp.Find("a").HumanCategory; got != CatArchitecture {
+		t.Fatalf("parsed category = %q, want %q", got, CatArchitecture)
 	}
 }
 
-func TestRequestHumanRejectsEmptyAndDone(t *testing.T) {
-	if err := (&Task{ID: "a", Status: StatusTODO}).RequestHuman(" \n\t ", time.Now()); err == nil {
+func TestRequestHumanRejectsEmptyDoneAndUncategorized(t *testing.T) {
+	if err := (&Task{ID: "a", Status: StatusTODO}).RequestHuman(CatSecret, " \n\t ", time.Now()); err == nil {
 		t.Fatal("empty reason allowed")
 	}
-	if err := (&Task{ID: "a", Status: StatusDone}).RequestHuman("need operator", time.Now()); err == nil {
+	if err := (&Task{ID: "a", Status: StatusDone}).RequestHuman(CatSecret, "need operator", time.Now()); err == nil {
 		t.Fatal("DONE human request allowed")
+	}
+	if err := (&Task{ID: "a", Status: StatusTODO}).RequestHuman("", "need operator", time.Now()); err == nil {
+		t.Fatal("empty category allowed")
+	}
+	if err := (&Task{ID: "a", Status: StatusTODO}).RequestHuman(Category("maintenance"), "need operator", time.Now()); err == nil {
+		t.Fatal("unknown category allowed")
+	}
+}
+
+// TestEscalationReady proves the runner-facing completion gate: a NEEDS-HUMAN
+// task is only "ready" (terminal for a honeybee pass) with BOTH a non-empty
+// reason AND a valid category. A runner-forced overflow escalation (no category)
+// is deliberately not EscalationReady — it is set directly, never gated here.
+func TestEscalationReady(t *testing.T) {
+	good := &Task{ID: "a", Status: StatusHuman, HumanCategory: CatSecret, Body: []string{"Human-needed: add zuul_gitea_token."}}
+	if !good.EscalationReady() {
+		t.Fatal("reason+category should be ready")
+	}
+	noCat := &Task{ID: "a", Status: StatusHuman, Body: []string{"Human-needed: rejected 4 times; exceeded reject_limit=3"}}
+	if noCat.EscalationReady() {
+		t.Fatal("reason without a valid category must NOT be ready")
+	}
+	noReason := &Task{ID: "a", Status: StatusHuman, HumanCategory: CatSecret}
+	if noReason.EscalationReady() {
+		t.Fatal("category without a reason must NOT be ready")
+	}
+	badCat := &Task{ID: "a", Status: StatusHuman, HumanCategory: Category("maintenance"), Body: []string{"Human-needed: x"}}
+	if badCat.EscalationReady() {
+		t.Fatal("invalid category must NOT be ready")
 	}
 }
 
@@ -434,7 +480,7 @@ func TestSetHumanReasonReplacesStructuredSpan(t *testing.T) {
 func TestResolveReopensHumanTask(t *testing.T) {
 	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
 	tk := &Task{ID: "a", Status: StatusTODO, Session: "bee-1", Heartbeat: now, Body: []string{"do thing"}}
-	if err := tk.RequestHuman("Need the Cloudflare API token.", now); err != nil {
+	if err := tk.RequestHuman(CatSecret, "Need the Cloudflare API token.", now); err != nil {
 		t.Fatal(err)
 	}
 	// A stale claim may have been re-stamped onto the escalated task; Resolve must

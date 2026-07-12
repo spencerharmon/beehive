@@ -7,7 +7,7 @@
 //	<!-- Beehive-ROI: <sha> -->
 //	# Plan
 //
-//	## <id> [<STATUS>] <!-- attempts=N deps=a,b session=<id> heartbeat=<RFC3339> not_before=<RFC3339> -->
+//	## <id> [<STATUS>] <!-- attempts=N deps=a,b session=<id> heartbeat=<RFC3339> not_before=<RFC3339> category=<cat> -->
 //	free-form body lines...
 //	Human-needed: concrete blocker/reason (only when status is NEEDS-HUMAN),
 //	  optionally continued by immediately-following non-blank lines (e.g.
@@ -64,6 +64,56 @@ var allStatuses = map[Status]bool{
 	StatusArb: true, StatusDone: true, StatusHuman: true,
 }
 
+// Category is the machine-readable class of a NEEDS-HUMAN escalation. The set is
+// EXHAUSTIVE: a honeybee-initiated escalation (RequestHuman / `beehive task
+// human`) must carry exactly one of these, and nothing that fails to fit one is a
+// legitimate NEEDS-HUMAN. It exists so the operator UI can lead with the single
+// relevant ask and show only that category's resolution affordance instead of a
+// generic blob, and so a honeybee cannot farm ordinary in-authority work (an
+// in-cluster restart, a cache clear, a reversible internal choice) out to a human
+// by mislabeling it. Serialized as `category=<value>` in the task header comment;
+// absent on a runner-forced escalation (Reject/Strand/RecoverLostWork retry
+// overflow) or a legacy pre-category task, which the UI renders as unclassified.
+type Category string
+
+const (
+	// CatSecret: a credential/secret only the operator can supply (PAT, password,
+	// private key, token, API key). The ask is a store key to populate.
+	CatSecret Category = "secret"
+	// CatExternalPermission: an action on infrastructure the beehive does NOT
+	// control — host-root on a node, a physical/hardware/vendor action, a
+	// registrar/cloud/DNS change outside the repo, any out-of-GitOps, out-of-
+	// cluster op. In-cluster kubectl against workloads this swarm deploys is NOT
+	// this — that is the swarm's own job.
+	CatExternalPermission Category = "external-permission"
+	// CatContradiction: the ROI is internally self-contradictory, the ROI and
+	// PLAN conflict, or two linked-submodule ROIs oppose, and the honeybee cannot
+	// tell which side is authoritative. The ask is which intent wins.
+	CatContradiction Category = "contradiction"
+	// CatArchitecture: a high-level design decision with a lasting, hard-to-
+	// reverse, user-visible consequence (wire format, on-disk schema, public API,
+	// a fork where picking wrong forces a later breaking change). The ask is
+	// which option, with the user-visible consequence of each.
+	CatArchitecture Category = "architecture"
+)
+
+var allCategories = map[Category]bool{
+	CatSecret: true, CatExternalPermission: true,
+	CatContradiction: true, CatArchitecture: true,
+}
+
+// Valid reports whether c is one of the four legitimate escalation categories.
+// The empty category is NOT valid: a honeybee-initiated escalation must classify
+// itself. (Runner-forced overflow escalations set NEEDS-HUMAN directly, outside
+// the category-gated completion checks, and are allowed to carry no category.)
+func (c Category) Valid() bool { return allCategories[c] }
+
+// Categories returns the four legitimate categories in canonical order (for CLI
+// help, validation messages, and UI enumeration).
+func Categories() []Category {
+	return []Category{CatSecret, CatExternalPermission, CatContradiction, CatArchitecture}
+}
+
 // Task is one PLAN.md item.
 type Task struct {
 	ID        string
@@ -91,7 +141,13 @@ type Task struct {
 	// and the task loops. Tested for ancestry-of-main, never trusted as a status.
 	// Serialized as `review=<sha>` in the header comment.
 	ReviewCommit string
-	Body         []string // body lines verbatim, without trailing blank
+	// HumanCategory, when set, is the machine-readable class of a NEEDS-HUMAN
+	// escalation (see Category). Set by RequestHuman on a honeybee-initiated
+	// escalation (always one of the four valid values) and cleared by Resolve.
+	// Empty on a runner-forced overflow escalation or a legacy task. Serialized as
+	// `category=<value>` in the header comment.
+	HumanCategory Category
+	Body          []string // body lines verbatim, without trailing blank
 }
 
 // Plan is a parsed PLAN.md.
@@ -195,6 +251,12 @@ func parseHeader(m []string) (*Task, error) {
 			t.NotBefore = ts
 		case "review":
 			t.ReviewCommit = v
+		case "category":
+			// Stored verbatim; validity is enforced at the write/completion
+			// boundary (RequestHuman, the CLI, the runner completion checks), not
+			// on parse, so a legacy/unknown value still round-trips rather than
+			// failing the whole plan to load.
+			t.HumanCategory = Category(v)
 		}
 	}
 	return t, nil
@@ -258,6 +320,9 @@ func (t *Task) header() string {
 	}
 	if t.ReviewCommit != "" {
 		meta += " review=" + t.ReviewCommit
+	}
+	if t.HumanCategory != "" {
+		meta += " category=" + string(t.HumanCategory)
 	}
 	return fmt.Sprintf("## %s [%s] <!-- %s -->", t.ID, t.Status, meta)
 }

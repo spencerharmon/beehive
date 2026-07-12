@@ -29,7 +29,7 @@ func humanFixture(t *testing.T, reply string) (*Server, string, *httptest.Server
 	// Seed a real NEEDS-HUMAN task and commit it so headSHA/planView see it.
 	planRel := "submodules/alpha/PLAN.md"
 	write(t, root+"/"+planRel, "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
-		"## needs-token [NEEDS-HUMAN] <!-- attempts=0 deps= weight=4 -->\n"+
+		"## needs-token [NEEDS-HUMAN] <!-- attempts=0 deps= weight=4 category=secret -->\n"+
 		"Wire the external API client.\n"+
 		"Human-needed: provide the API token in the secrets panel as api_token.\n")
 	if err := git.New(root).Commit(context.Background(), "seed needs-human task"); err != nil {
@@ -81,6 +81,32 @@ func TestResolveSystemPromptSeedsBlockerAndBoundaries(t *testing.T) {
 	for _, bad := range []string{"live source at", "%[5]s"} {
 		if strings.Contains(sys, bad) {
 			t.Fatalf("system prompt still contains out-of-tree directive %q", bad)
+		}
+	}
+}
+
+// TestHumanResolvePageCategoryAffordance: the resolve page leads with the
+// category badge + the one-line categorical ask and shows ONLY that category's
+// affordance. The seeded task is `secret`, so the page carries the secret badge,
+// the secret ask, and the Secrets-panel step — and NOT the contradiction/
+// architecture guidance meant for other categories.
+func TestHumanResolvePageCategoryAffordance(t *testing.T) {
+	_, _, ts := humanFixture(t, "How can I help?")
+	body := httpGet(t, ts.URL+"/human/alpha/needs-token")
+	for _, want := range []string{
+		"cat-secret", "secret",
+		"credential only you can provide",
+		"Secrets panel",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("secret resolve page missing %q:\n%s", want, body)
+		}
+	}
+	for _, bad := range []string{
+		"which intent wins", "hard-to-reverse design decision",
+	} {
+		if strings.Contains(body, bad) {
+			t.Fatalf("secret resolve page leaked another category's affordance %q", bad)
 		}
 	}
 }

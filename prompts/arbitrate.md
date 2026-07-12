@@ -16,7 +16,7 @@ Then decide and commit on main:
   submodule's tracked branch, set the PLAN.md task -> DONE, unlock dependents. Commit.
 - **SIDE WITH THE REVIEWER**: the rejection stands. Set the PLAN.md task -> TODO and record the binding
   rationale in the task body / a doc so the next implementer knows what to fix. If arbitration exposes a
-  concrete operator blocker, run `beehive task human <submodule> <task-id> --reason "<specific blocker>"`
-  instead; this records `Human-needed:` and sets NEEDS-HUMAN. Commit.
+  concrete operator blocker, run `beehive task human <submodule> <task-id> --category <secret|external-permission|contradiction|architecture> --reason "<the one-line ask>"`
+  instead; this records `Human-needed:` + the category and sets NEEDS-HUMAN. Commit.
 
 The run completes when the task leaves NEEDS-ARBITRATION. Never read or edit ROI.md.

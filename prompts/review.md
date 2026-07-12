@@ -18,7 +18,7 @@ What to read:
   fails with "does not appear to be a git repository") and do not spelunk git internals looking for it —
   if it is absent from BOTH a local ref and (when configured) the fetched origin, this is a runner defect,
   not something you can recover from by digging further: run `beehive task human <submodule> <task-id>
-  --reason "reviewable commit unreachable"` and end the turn.
+  --category external-permission --reason "reviewable commit unreachable"` and end the turn.
 - The change doc at submodules/<sm>/docs/<branch>-<taskid>.md (read-only).
 
 Then decide and commit on main:
@@ -29,6 +29,6 @@ Then decide and commit on main:
   submodules/<sm>/docs/<taskid>-review-reject.md naming the concrete gaps (failing tests, missing
   acceptance criteria, ROI mismatch). Commit. Do not delete or rewrite the implementer's branch. If review
   exposes a concrete operator blocker instead of an implementer gap, run
-  `beehive task human <submodule> <task-id> --reason "<specific blocker>"`.
+  `beehive task human <submodule> <task-id> --category <secret|external-permission|contradiction|architecture> --reason "<the one-line ask>"`.
 
 The run completes when the task leaves NEEDS-REVIEW. Never read or edit ROI.md.

@@ -23,9 +23,9 @@ worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` �
   answer you. NEVER call an interactive/elicitation tool (e.g. a `question`/`ask` tool) to request
   input, confirmation, or a decision: nothing can reply, so the call blocks your entire turn until the
   per-turn timeout kills the pass — discarding your work and stranding your task claim until TTL GC.
-  The ONLY way to reach a human is `beehive task human <sm> <task-id> --reason "..."`, which sets
-  `NEEDS-HUMAN` and ends the pass cleanly. When unsure, do not ask — pick a workable path and continue
-  (see Work task / Steps).
+  The ONLY way to reach a human is `beehive task human <sm> <task-id> --category <cat> --reason "..."`,
+  which sets `NEEDS-HUMAN` and ends the pass cleanly (see Work task / Steps §4 for the required
+  `--category` enum and the boundary gate). When unsure, do not ask — pick a workable path and continue.
 - Code writes ONLY in your worktree `submodules/<sm>/worktrees/bee-<taskid>/`; never the shared
   `submodules/<sm>/repo` checkout.
 - NEVER modify the beehive repo's git config or remotes (`git remote add/remove/set-url`,
@@ -134,7 +134,7 @@ legal edges, each owned by exactly one kind:
 - `NEEDS-ARBITRATION → DONE` — arbiter sided with the implementer.
 - `NEEDS-ARBITRATION → TODO` — arbiter sided with the reviewer; rework.
 - any working status `→ NEEDS-HUMAN` — a concrete operator blocker, set only via `beehive task human`
-  (never hand-write the status). Exact string `NEEDS-HUMAN`.
+  (never hand-write the status; it requires a `--category` + `--reason`, see Steps §4). Exact string `NEEDS-HUMAN`.
 A reconcile pass rewrites `PLAN.md` wholesale rather than moving one task; see its section.
 
 ## Reconcile task
@@ -156,7 +156,7 @@ range.
   delete, rename, or repurpose it. Your reconcile folds only THIS submodule's ROI diff into THIS plan.
 - **Cross-repo intent conflict → NEEDS-HUMAN.** If this submodule's new ROI genuinely contradicts what a
   dependent submodule needs from such a linked task, do not resolve it unilaterally: `beehive task human
-  <sm> <task-id> --reason "..."` naming both conflicting intents. Never silently break the contract or
+  <sm> <task-id> --category contradiction --reason "..."` naming both conflicting intents. Never silently break the contract or
   "convert"/guess a dangling dep into a real one.
 - Restamp `PLAN.md` to the current ROI commit: `<!-- Beehive-ROI: <sha> -->`. Commit to main; conflict
   → stop, the runner reselects.
@@ -219,12 +219,34 @@ Done when the task leaves `NEEDS-ARBITRATION`.
 4. **Plan/doc/infra.** Ensure the change doc exists at its exact path and `PLAN.md`, `ARTIFACTS.md`,
    `INFRASTRUCTURE.md` are current. After editing a `PLAN.md`, confirm it still parses with
    `beehive plan validate <sm>` (parses + round-trips the whole plan) — do NOT hunt for a
-   `plan check`/`plan lint`/`task list` subcommand (they do not exist). Human escalation: a concrete blocker requiring operator input
-   (missing credentials/config, unavailable upstream API, contradictory spec, user-visible contract
-   decision) → `beehive task human <sm> <task-id> --reason "<blocker + exact input needed>"`. Not for
-   ordinary uncertainty or tedious work — pick a workable path and continue. Write `--reason` as
-   short, structured markdown, not a run-on sentence: a one-line summary, then bullets naming the
-   concrete blocker and the exact input needed — the `/human` view renders it as formatted markdown.
+   `plan check`/`plan lint`/`task list` subcommand (they do not exist). **Human escalation is a
+   narrow channel, NOT a work queue for the operator** — it is only for what the swarm genuinely
+   cannot do for itself. Before escalating, apply the boundary gate: **if some action within your
+   authority (in-cluster kubectl, restarting/scaling a workload, clearing a cache, a reversible
+   internal choice — anything your `INFRASTRUCTURE.md` allows) accomplishes the ROI, and NOT doing
+   it accomplishes nothing the operator wanted, there is no decision to farm out — DO IT.** Ordinary
+   uncertainty, an internal impl choice, a tradeoff, and async/pollable convergence are NEVER
+   escalations (pick a workable path, note it, continue). Escalate ONLY when the blocker fits
+   exactly one of these four categories, and pass it as a required `--category`:
+   `beehive task human <sm> <task-id> --category <cat> --reason "<the one-line ask>"` where `<cat>` is
+   one of:
+   - `secret` — a credential/secret only the operator can supply. Reason = the exact store key(s) to
+     populate and what they unlock.
+   - `external-permission` — an action on infrastructure the beehive does NOT control (host-root on a
+     node, hardware/vendor, registrar/DNS, any out-of-GitOps / out-of-cluster op). **In-cluster
+     kubectl is NOT this — it is your job.** Reason = the exact out-of-band action + why GitOps/in-
+     cluster cannot do it.
+   - `contradiction` — the ROI is self-contradictory, the ROI and PLAN conflict, or two linked-
+     submodule ROIs oppose, and you cannot tell which is authoritative. Reason = the two conflicting
+     intents quoted with their locations + the decision needed. (Merely underspecified ≠
+     contradiction — pick a reading and continue.)
+   - `architecture` — a high-level, hard-to-reverse, user-visible decision (wire format, on-disk
+     schema, public API, an architecture fork). Reason = the options + each one's user-visible
+     consequence. (An internal choice with no user-visible difference ≠ architecture — pick the
+     cleaner one, note the tradeoff.)
+   The `--reason` must LEAD with the operator-facing ask and stay short — the investigation narrative
+   and evidence belong in the change doc, not the escalation. The runner will NOT let the pass end on
+   a NEEDS-HUMAN with a blank reason or a missing/invalid `--category`.
 5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills

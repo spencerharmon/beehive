@@ -414,6 +414,36 @@ small, .small { font-size: var(--text-sm); }
 .status-done { --sh: var(--hue-done); }
 .status-needs-human { --sh: var(--hue-human); }
 
+/* Escalation category badges (NEEDS-HUMAN) ------------------------------- *
+ * Same pill shape as .status; hue distinguishes the four legitimate escalation
+ * categories plus an unclassified fallback (runner-forced overflow / legacy).
+ * Keep the slug list in sync with plan.Category + PlanItem.CategoryClass.      */
+.cat,
+.cat-secret,
+.cat-external-permission,
+.cat-contradiction,
+.cat-architecture,
+.cat-unclassified {
+  --sh: var(--hue-todo);
+  display: inline-block;
+  padding: 0.14em 0.62em;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+  vertical-align: baseline;
+  background: hsl(var(--sh) var(--pill-s) var(--pill-bg-l));
+  color: hsl(var(--sh) var(--pill-fg-s) var(--pill-fg-l));
+  border: var(--border-width) solid hsl(var(--sh) var(--pill-s) var(--pill-border-l));
+}
+.cat-secret { --sh: var(--hue-human); }
+.cat-external-permission { --sh: var(--hue-arbitration); }
+.cat-contradiction { --sh: var(--hue-review); }
+.cat-architecture { --sh: var(--hue-done); }
+.cat-unclassified { --sh: var(--hue-todo); opacity: 0.7; }
+
 /* Active overlay: additive modifier for a fresh session+heartbeat claim.
  * Best applied to the status pill, a card, or a table row. Renders a teal
  * ring plus a pulsing dot; motion is disabled under reduced-motion. -------- */

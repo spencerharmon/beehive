@@ -48,10 +48,14 @@ re-defer behavior — it degrades gracefully.
 
 ### NEVER escalate merely because verification is async
 
-`NEEDS-HUMAN` is reserved for genuine human input: a missing credential, an
-out-of-GitOps operator action, an intent/scope decision. "The result is only
-observable after Flux reconciles / CI runs / the TTL expires" is NOT a human
-blocker — it is exactly the in-pass-poll or land+defer case above.
+`NEEDS-HUMAN` is reserved for genuine human input and MUST carry one of the four
+`beehive task human --category` values: `secret` (a credential only the operator
+holds), `external-permission` (an out-of-GitOps / out-of-cluster / host-root
+action the swarm cannot perform — in-cluster kubectl is NOT this), `contradiction`
+(irreconcilable ROI/PLAN intent), or `architecture` (a hard-to-reverse user-
+visible decision). "The result is only observable after Flux reconciles / CI runs
+/ the TTL expires" is NONE of these — it is exactly the in-pass-poll or land+defer
+case above.
 
 ## Worked anti-pattern
 

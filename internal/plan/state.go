@@ -244,11 +244,18 @@ func (t *Task) appendNote(line string) {
 	t.Body = append(t.Body, line)
 }
 
-// RequestHuman moves a non-DONE task to NEEDS-HUMAN with an explicit reason and
-// releases its active claim. This is the first-class escalation path when a bee
-// hits a concrete blocker requiring operator input (credentials, calibration,
-// public-contract decision, contradictory spec, missing upstream API, etc.).
-func (t *Task) RequestHuman(reason string, now time.Time) error {
+// RequestHuman moves a non-DONE task to NEEDS-HUMAN with an explicit category +
+// reason and releases its active claim. This is the first-class honeybee-
+// initiated escalation path when a bee hits a concrete blocker requiring operator
+// input. The category MUST be one of the four legitimate Category values (secret,
+// external-permission, contradiction, architecture) — an invalid/empty category
+// is rejected so a bee cannot escalate an unclassified blocker (or farm ordinary
+// in-authority work out to a human by leaving it uncategorized). The reason must
+// be non-empty and should lead with the category's operator-facing ask.
+func (t *Task) RequestHuman(category Category, reason string, now time.Time) error {
+	if !category.Valid() {
+		return fmt.Errorf("plan: human request for %s requires a category, one of %v", t.ID, Categories())
+	}
 	reason = oneLine(reason)
 	if reason == "" {
 		return fmt.Errorf("plan: human request for %s requires a reason", t.ID)
@@ -259,8 +266,21 @@ func (t *Task) RequestHuman(reason string, now time.Time) error {
 	t.Status = StatusHuman
 	t.Session = ""
 	t.Heartbeat = time.Time{}
+	t.HumanCategory = category
 	t.setHumanReason(reason)
 	return nil
+}
+
+// EscalationReady reports whether a NEEDS-HUMAN task is a well-formed honeybee-
+// initiated escalation: a non-empty reason AND a valid category. The runner's
+// work/review/arbitration completion checks use this to refuse to terminate a
+// pass on a malformed escalation (blank reason or missing/invalid category), so a
+// honeybee is forced to classify its blocker before the pass can end. Runner-
+// forced overflow escalations (Reject/Strand/RecoverLostWork) set NEEDS-HUMAN
+// directly and never flow through these checks, so their lack of a category does
+// not strand a pass.
+func (t *Task) EscalationReady() bool {
+	return t.HumanReason() != "" && t.HumanCategory.Valid()
 }
 
 // Resolve reopens a NEEDS-HUMAN task to TODO once the operator has cleared the
@@ -278,6 +298,7 @@ func (t *Task) Resolve(now time.Time) error {
 	t.Status = StatusTODO
 	t.Session = ""
 	t.Heartbeat = time.Time{}
+	t.HumanCategory = ""
 	t.clearHumanReason()
 	return nil
 }

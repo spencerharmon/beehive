@@ -21,7 +21,7 @@ You are given the diff of ROI.md from the last-reconciled commit to HEAD (ROI.md
     another submodule's PLAN.md depends on it (`<this-sm>:<taskid>`). If so it is a cross-repo contract
     this ROI reconcile does not own — do not touch it.
   - A cross-repo intent conflict (this ROI contradicts what a dependent submodule needs from a linked
-    task) -> `beehive task human <sm> <task-id> --reason "..."`, not a unilateral rewrite.
+    task) -> `beehive task human <sm> <task-id> --category contradiction --reason "..."`, not a unilateral rewrite.
 - **(Re)weight every task on the logarithmic (base-2) priority scale below** whenever the ROI diff
   changes the priority order or adds/retiers tasks. Selection is a weighted-random lottery, so weight
   must make high priority dominate while still letting lower tiers run:

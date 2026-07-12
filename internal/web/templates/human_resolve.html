@@ -5,6 +5,8 @@
 
 <div class="card">
   <h2>Blocker</h2>
+  <p><span class="{{.Item.CategoryClass}}">{{.Item.CategoryLabel}}</span></p>
+  {{if .Item.Ask}}<p><strong>{{.Item.Ask}}</strong></p>{{end}}
   <p><strong>Why the swarm needs you:</strong> {{if .Item.HumanReason}}{{.Item.HumanReason}}{{else}}<span class="muted">(no explicit reason recorded)</span>{{end}}</p>
   <p><strong>Task:</strong> {{.Item.Desc}}</p>
   {{if .Item.DepStates}}<p><strong>Dependents wait on this.</strong> Deps:
@@ -14,13 +16,39 @@
 
 <div class="card">
   <h2>How to clear this blocker</h2>
-  <p class="muted">Do whichever one the blocker needs, then reopen the task so the swarm resumes.</p>
+  {{if eq .Item.Category "secret"}}
+  <p class="muted">This escalation needs a credential only you can supply. Add it, then reopen the task.</p>
+  <ol>
+    <li>Add the store key named in the reason above in the <a href="/secrets">Secrets panel</a> (values stay encrypted; never paste them into chat).</li>
+    <li>Then <strong>Mark resolved</strong> below to flip this task NEEDS-HUMAN → TODO so the swarm re-selects it.</li>
+  </ol>
+  {{else if eq .Item.Category "external-permission"}}
+  <p class="muted">This needs an action on infrastructure the beehive does not control (host-root, hardware/vendor, registrar/DNS, or another out-of-cluster op). In-cluster kubectl is the swarm's own job — if that is all this needs, it was mis-escalated; note it and resolve.</p>
+  <ol>
+    <li>Perform the exact out-of-band action named in the reason above.</li>
+    <li>Then <strong>Mark resolved</strong> below to reopen the task.</li>
+  </ol>
+  {{else if eq .Item.Category "contradiction"}}
+  <p class="muted">The intent is contradictory and the swarm cannot tell which side is authoritative. Decide which intent wins and record it, then reopen.</p>
+  <ol>
+    <li>Use the AI agent below to draft the reconciling <code>ROI.md</code>/<code>PLAN.md</code> edit (both conflicting intents are quoted in the reason above), review the diff, and <strong>Publish</strong> it.</li>
+    <li>Then <strong>Mark resolved</strong> below to reopen the task.</li>
+  </ol>
+  {{else if eq .Item.Category "architecture"}}
+  <p class="muted">A high-level, hard-to-reverse design decision is needed (wire format, on-disk schema, public API, or an architecture fork). Choose, record the decision, then reopen.</p>
+  <ol>
+    <li>Use the AI agent below to capture the chosen option in <code>ROI.md</code> (the options and their user-visible consequences are in the reason above); review the diff and <strong>Publish</strong> it. The swarm implements it once reopened.</li>
+    <li>Then <strong>Mark resolved</strong> below to reopen the task.</li>
+  </ol>
+  {{else}}
+  <p class="muted">Unclassified escalation (runner-forced retry-overflow or legacy). Do whichever the reason needs, then reopen the task so the swarm resumes.</p>
   <ol>
     <li><strong>Credential/secret?</strong> Add it in the <a href="/secrets">Secrets panel</a> (values stay encrypted; never paste them into chat).</li>
     <li><strong>Decision, intent, or documentation?</strong> Use the AI agent below to draft the coordination-layer change, review the diff, and <strong>Publish</strong> it.</li>
     <li><strong>Needs code?</strong> Have the agent capture what the swarm should build in <code>ROI.md</code> (Publish it); the swarm implements it once reopened.</li>
     <li><strong>Then</strong> click <strong>Mark resolved</strong> below to flip this task NEEDS-HUMAN → TODO so the swarm re-selects it.</li>
   </ol>
+  {{end}}
   <form method="post" action="/human/{{.Sub}}/{{.Item.ID}}/resolve"
         onsubmit="return confirm('Reopen {{.Item.ID}} as TODO and publish to main? The swarm will re-select it.');">
     <button class="merge">Mark resolved → TODO</button>
