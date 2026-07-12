@@ -748,4 +748,3 @@ func TestChatEditPanelClearsWorkingOnIdle(t *testing.T) {
 		t.Fatalf("idle chatedit panel must show the rendered (markdown->HTML) reply:\n%s", idle)
 	}
 }
-
