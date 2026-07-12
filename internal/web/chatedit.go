@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html/template"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -64,6 +65,37 @@ type chatTurn struct {
 	Text  string
 	At    time.Time
 	Parts []swarm.Part
+}
+
+// chatLogEntry is a log turn projected for the panel template
+// (chat-editor-working-indicator-clear). An agent turn's Text is rendered
+// markdown->HTML through renderMarkdown — the SAME sanitized VIEW path the
+// doc/session panes use — so once the turn goes idle the working bubble is
+// replaced by a formatted reply, not raw markdown. A user/system turn keeps its
+// plain Text (HTML stays empty, so the template escapes it). Parts carry the
+// reasoning/tool-call breakdown unchanged.
+type chatLogEntry struct {
+	Role  string
+	Text  string
+	HTML  template.HTML
+	Parts []swarm.Part
+}
+
+// chatLogView projects a session's raw log into template entries, rendering each
+// agent message body as sanitized markdown HTML (renderMarkdown) while leaving
+// user/system turns as plain escaped text.
+func chatLogView(turns []chatTurn) []chatLogEntry {
+	out := make([]chatLogEntry, len(turns))
+	for i, t := range turns {
+		e := chatLogEntry{Role: t.Role, Parts: t.Parts}
+		if t.Role == "agent" && strings.TrimSpace(t.Text) != "" {
+			e.HTML = renderMarkdown(t.Text)
+		} else {
+			e.Text = t.Text
+		}
+		out[i] = e
+	}
+	return out
 }
 
 // sessionState is the coarse connection/turn lifecycle the panel surfaces so
@@ -696,7 +728,7 @@ func (s *Server) chatPanelData(ctx context.Context, sess *chatSession) map[strin
 	return map[string]interface{}{
 		"ID":          sess.ID,
 		"Path":        sess.Path,
-		"Log":         sess.logCopy(),
+		"Log":         chatLogView(sess.logCopy()),
 		"Rows":        editor.RenderDiffHTML(base, right, oldHTML, newHTML),
 		"HasProposal": has,
 		"Busy":        busy,
@@ -704,5 +736,16 @@ func (s *Server) chatPanelData(ctx context.Context, sess *chatSession) map[strin
 		"ConnState":   string(state),
 		"ConnLabel":   connLabel(state),
 		"LiveSteps":   live,
+		// Nonce gives the busy re-arm poll node a UNIQUE id every render
+		// (chat-editor-working-indicator-clear). The polled panes swap with
+		// idiomorph (hx-swap="morph:innerHTML"), which PATCHES the DOM in place:
+		// a stable-id hidden poll node would be PRESERVED across a tick, so its
+		// one-shot `load delay` trigger — armed only when htmx first processes a
+		// freshly-added node — would never re-fire, and polling would stop after
+		// the first tick (the working/spinner state then sticking until a manual
+		// refresh). A per-render id forces idiomorph to replace the node each
+		// tick, so htmx re-processes it, `load` re-arms, and the loop continues
+		// until the turn goes idle (when the panel renders without the node).
+		"Nonce": sess.mgr.now().UnixNano(),
 	}
 }

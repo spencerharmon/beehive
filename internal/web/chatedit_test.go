@@ -508,7 +508,7 @@ func TestChatStartChatShowsUserMessageAndWorkingBeforeReply(t *testing.T) {
 	// startChat's beginTurn runs synchronously before the goroutine dispatches,
 	// so no polling is needed to observe this.
 	data := s.chatPanelData(ctx, sess)
-	log, _ := data["Log"].([]chatTurn)
+	log, _ := data["Log"].([]chatLogEntry)
 	if len(log) != 1 || log[0].Role != "user" || log[0].Text != "hello" {
 		t.Fatalf("user message should render immediately: %+v", log)
 	}
@@ -528,8 +528,8 @@ func TestChatStartChatShowsUserMessageAndWorkingBeforeReply(t *testing.T) {
 	close(promptGate)
 	waitUntilNotBusy(t, sess)
 	final := s.chatPanelData(ctx, sess)
-	log2 := final["Log"].([]chatTurn)
-	if len(log2) != 2 || log2[1].Role != "agent" || log2[1].Text != "ok" {
+	log2 := final["Log"].([]chatLogEntry)
+	if len(log2) != 2 || log2[1].Role != "agent" || !strings.Contains(string(log2[1].HTML), "ok") {
 		t.Fatalf("agent reply should be appended once the turn settles: %+v", log2)
 	}
 	if final["ConnState"] != string(stateConnected) {
@@ -698,3 +698,54 @@ func TestChatEditPanelRendersConnStateAndSteps(t *testing.T) {
 		t.Fatalf("both completed steps should stay expandable after settling, found %d:\n%s", n, body2)
 	}
 }
+
+// TestChatEditPanelClearsWorkingOnIdle is the chat-editor-working-indicator-clear
+// acceptance: while a turn is in flight the panel shows the working/spinner
+// bubble AND re-arms the self-perpetuating poll; the instant the turn goes idle
+// (the completed-turn signal Prompt blocks on) the very next render drops the
+// working bubble AND the poll node, and swaps in the rendered (markdown->HTML)
+// reply — no manual refresh. The busy re-arm node also carries a per-render
+// unique id so idiomorph replaces (never preserves) it, which is what keeps the
+// poll firing until idle instead of freezing after one tick.
+func TestChatEditPanelClearsWorkingOnIdle(t *testing.T) {
+	promptGate := make(chan struct{})
+	client := &fakeChatClient{reply: "All **done** now.", promptGate: promptGate}
+	s, _ := chatFixtureClient(t, client)
+	ctx := context.Background()
+
+	sess, err := s.chat.open(ctx, "submodules/alpha/notes.md")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := sess.ensureConnected(ctx); err != nil {
+		t.Fatalf("ensureConnected: %v", err)
+	}
+	if err := sess.startChat(context.Background(), "make a change"); err != nil {
+		t.Fatalf("startChat: %v", err)
+	}
+
+	// While busy: the working bubble AND the re-arm poll node (with a unique id)
+	// are present so the loop keeps refreshing until the turn settles.
+	busy := renderTmpl(t, s, "chatedit_panel.html", s.chatPanelData(ctx, sess))
+	for _, want := range []string{`msg agent busy`, "Working…", `id="chatedit-poll-`, `hx-trigger="load delay:1500ms"`} {
+		if !strings.Contains(busy, want) {
+			t.Fatalf("busy chatedit panel missing %q:\n%s", want, busy)
+		}
+	}
+
+	close(promptGate)
+	waitUntilNotBusy(t, sess)
+
+	// Once idle: no working bubble, no spinner, and no re-arm poll node — the
+	// panel has settled and stops polling. The reply is rendered markdown.
+	idle := renderTmpl(t, s, "chatedit_panel.html", s.chatPanelData(ctx, sess))
+	for _, gone := range []string{`msg agent busy`, "Working…", `id="chatedit-poll-`} {
+		if strings.Contains(idle, gone) {
+			t.Fatalf("idle chatedit panel must drop %q (working state must auto-clear):\n%s", gone, idle)
+		}
+	}
+	if !strings.Contains(idle, "<strong>done</strong>") {
+		t.Fatalf("idle chatedit panel must show the rendered (markdown->HTML) reply:\n%s", idle)
+	}
+}
+
