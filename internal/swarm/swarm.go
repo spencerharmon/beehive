@@ -2818,9 +2818,10 @@ func remoteNoteFor(rem string) string {
 // CommitReachable's identical fetch-then-check idiom lives in that package,
 // not this one.
 //
-//nolint:unused // retained alongside remoteNoteFor as the sibling message-shape
 // predicate for lost-work reachability; recoverIfLost now reaches through
 // git.Repo.BranchReachableAnywhere, which owns this check internally.
+//
+//nolint:unused // retained alongside remoteNoteFor as the sibling message-shape
 func isRemoteRefMissingFetch(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "couldn't find remote ref") || strings.Contains(msg, "not found in upstream")
