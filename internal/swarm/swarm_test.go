@@ -1353,6 +1353,187 @@ func TestReviewDispatchDoesNotFinalizeByRecordWhenNotMerged(t *testing.T) {
 	}
 }
 
+// TestReviewDispatchDoesNotFinalizeByRecordWhenBranchTipDiverges is the
+// finalize-merge-verify-work-commit regression: the recorded review=<sha>
+// stamp is a PARENT of bee-R1's real work commit — itself already an ancestor
+// of tracked main for reasons unrelated to this task (e.g. it is also an
+// ancestor of an earlier, unrelated approval) — while bee-R1's OWN tip is a
+// sibling commit that was NEVER merged. This reproduces the exact nixconf
+// wireguard-yoga-profile shape: recorded review=b0895eb (a parent, already an
+// ancestor of main) while the task's actual code commit 8f6779b never landed.
+// Pre-fix, finalizeIfMergedByRecord trusted the recorded sha alone and
+// wrongly finalized DONE without ever merging the real work. Post-fix it must
+// prefer bee-R1's own resolvable tip, see it is NOT an ancestor, and fall
+// through to a normal review instead of auto-finalizing.
+func TestReviewDispatchDoesNotFinalizeByRecordWhenBranchTipDiverges(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	sc := filepath.Join(t.TempDir(), "push")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+		t.Fatalf("scratch clone: %v", err)
+	}
+	scg := gitConfig(t, sc)
+	// The recorded "review commit" is really just the PARENT of the actual
+	// work (e.g. a preceding, already-merged task's own commit) — already an
+	// ancestor of tracked main on its own merits.
+	os.WriteFile(filepath.Join(sc, "parent.txt"), []byte("parent\n"), 0o644)
+	if err := scg.Commit(ctx, "parent (already-merged, unrelated task)"); err != nil {
+		t.Fatalf("commit parent: %v", err)
+	}
+	parentSHA, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse parent: %v", err)
+	}
+	if err := scg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push parent onto tracked main: %v", err)
+	}
+	// bee-R1's REAL work commit sits on top of the parent but was never merged.
+	os.WriteFile(filepath.Join(sc, "wireguard-yoga.nix"), []byte("real work\n"), 0o644)
+	if err := scg.Commit(ctx, "feat: the actual task code"); err != nil {
+		t.Fatalf("commit real work: %v", err)
+	}
+	if _, err := scg.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-R1"); err != nil {
+		t.Fatalf("push bee-R1 (unmerged): %v", err)
+	}
+
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+parentSHA+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= review="+parentSHA+" -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview, ReviewCommit: parentSHA}}
+
+	// Must dispatch a NORMAL review (the branch's own tip is not merged),
+	// never a zero-turn record-finalize off the recorded parent sha.
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= review="+parentSHA+" -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if cl.sess.prompts == 0 {
+		t.Fatal("a recorded-sha-is-parent-but-branch-tip-diverges task must dispatch a REAL review, not auto-finalize off the stale recorded sha")
+	}
+	b, _ := os.ReadFile(planPath)
+	p, _ := plan.Parse(string(b))
+	tk := p.Find("R1")
+	if tk == nil {
+		t.Fatal("task R1 vanished")
+	}
+	if joined := strings.Join(tk.Body, "\n"); contains(joined, "recorded reviewed commit") {
+		t.Fatalf("task was wrongly record-finalized from a stale parent/proxy sha instead of testing bee-R1's own tip:\n%s", joined)
+	}
+}
+
+// TestReviewDispatchDoesNotFinalizeByRecordWhenDocFilesMissing is the
+// completion-check-assertion regression (finalize-merge-verify-work-commit
+// part d): the recorded review commit genuinely IS an ancestor of tracked
+// main (a real merge happened), but the task's OWN change doc names a file
+// that is NOT present in that merged tree — proving the merged commit is not
+// actually this task's work (a phantom-DONE shape one step further than the
+// ancestry check alone can catch). Must NOT finalize.
+func TestReviewDispatchDoesNotFinalizeByRecordWhenDocFilesMissing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	sc := filepath.Join(t.TempDir(), "push")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+		t.Fatalf("scratch clone: %v", err)
+	}
+	scg := gitConfig(t, sc)
+	// A real merge landed on tracked main — but it never carried the file the
+	// task's change doc says it should have (e.g. a phantom merge of an
+	// unrelated commit that happens to share the recorded sha).
+	os.WriteFile(filepath.Join(sc, "unrelated.txt"), []byte("other\n"), 0o644)
+	if err := scg.Commit(ctx, "unrelated commit, not the task's real work"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	implSHA, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	if err := scg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+implSHA+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed gitlink: %v", err)
+	}
+	// The task's change doc names a file that this merged commit's tree does
+	// NOT contain.
+	os.WriteFile(filepath.Join(sm, "docs", "bee-R1-R1.md"), []byte(
+		"Task R1.\nFiles: `profiles/wireguard-yoga.nix`, `flake.nix`.\nDoc.\n"), 0o644)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=1 deps= review="+implSHA+" -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md", "submodules/sm/docs/bee-R1-R1.md"); err != nil {
+		t.Fatalf("add plan+doc: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	// Precondition: bee-R1 absent on origin (branch-gone shape), so the record
+	// path — not the branch-tip path — is what is under test here.
+	if originHasBranch(t, origin, "bee-R1") {
+		t.Fatal("precondition: bee-R1 must be absent on origin")
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview, Attempts: 1, ReviewCommit: implSHA}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=1 deps= review="+implSHA+" -->\nreview\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if cl.sess.prompts == 0 {
+		t.Fatal("a merged-but-doc-files-missing task must dispatch a REAL review, not auto-finalize")
+	}
+	b, _ := os.ReadFile(planPath)
+	p, _ := plan.Parse(string(b))
+	tk := p.Find("R1")
+	if tk == nil {
+		t.Fatal("task R1 vanished")
+	}
+	if joined := strings.Join(tk.Body, "\n"); contains(joined, "recorded reviewed commit") {
+		t.Fatalf("task was wrongly record-finalized despite its doc's files being absent from the merged tree:\n%s", joined)
+	}
+}
+
 func TestReviewDispatchFinalizesAlreadyMergedLocalSharing(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

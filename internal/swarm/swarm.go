@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,10 @@ import (
 	selectt "github.com/spencerharmon/beehive/internal/select"
 	"github.com/spencerharmon/beehive/internal/version"
 )
+
+// docFilesBacktickRe matches each backtick-quoted path in a change doc's
+// Files: line (see parseDocFiles).
+var docFilesBacktickRe = regexp.MustCompile("`([^`]+)`")
 
 // Session is one opencode conversation; context persists across Prompt calls.
 // Prompt blocks until the assistant turn finishes and returns its reply text.
@@ -654,7 +659,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// DONE from the task's OWN recorded reviewed commit — instead of recoverIfLost
 		// misreading the vanished branch as lost work and looping the task. Fails
 		// OPEN (falls through) on any uncertainty. See finalizeIfMergedByRecord.
-		finalized, ferr := r.finalizeIfMergedByRecord(ctx, sel, absRoot)
+		finalized, ferr := r.finalizeIfMergedByRecord(ctx, sel, res.Branch, absRoot)
 		if ferr != nil && r.Debug != nil {
 			fmt.Fprintf(r.Debug, "[honeybee] durable-record already-merged pre-check for %s failed; continuing: %v\n", sel.Task.ID, ferr)
 		}
@@ -1200,7 +1205,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						cleanup()
 						return res, nil
 					}
-					if w := r.recordReviewedCommit(ctx, sel, absRoot, cl); w != "" && res.Warning == "" {
+					if w := r.recordReviewedCommit(ctx, sel, wg, cl); w != "" && res.Warning == "" {
 						res.Warning = w
 					}
 					// Delete a rejected attempt's orphan bee branch (see the mirror
@@ -1458,7 +1463,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				cleanup()
 				return res, nil
 			}
-			if w := r.recordReviewedCommit(ctx, sel, absRoot, cl); w != "" && res.Warning == "" {
+			if w := r.recordReviewedCommit(ctx, sel, wg, cl); w != "" && res.Warning == "" {
 				res.Warning = w
 			}
 			// Arbitration that sided with the reviewer sends the task back to TODO for
@@ -2053,6 +2058,100 @@ func pathHasPrefix(name, stem string) bool {
 	return len(name) >= len(stem) && name[:len(stem)] == stem
 }
 
+// docFilesLandedInTree is the completion-check assertion finalize-merge-
+// verify-work-commit adds: even once an ancestry check above proves SOME
+// commit is merged into ref, this confirms that commit's tree actually
+// carries the files the task's OWN change doc documents — the last line of
+// defense against auto-finalizing DONE over a commit that is an ancestor of
+// tracked main for reasons unconnected to this task's work ever landing
+// (observed live: nixconf wireguard-yoga-profile/wireguard-yoga-build-verify
+// finalized DONE from a parent commit whose tree never contained
+// profiles/wireguard-yoga.nix or the flake.nix import). Best-effort and fails
+// OPEN on any parsing/read uncertainty — a missing doc, an unparseable
+// Files: line, or zero extracted paths returns (true, nil) so a doc-format
+// gap never blocks a legitimate finalize, matching every other guard in this
+// file. Only a doc that names a file CONFIRMED absent from ref's tree (a
+// positive, git-confirmed absence) returns (false, nil).
+func (r *Runner) docFilesLandedInTree(ctx context.Context, sel *selectt.Selection, branch string, sg *git.Repo, ref string) (bool, error) {
+	if branch == "" {
+		return true, nil
+	}
+	dir := filepath.Join(sel.Submodule.Path, "docs")
+	stem := branch + "-" + sel.Task.ID
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return true, nil
+	}
+	var docPath string
+	for _, e := range ents {
+		if !e.IsDir() && pathHasPrefix(e.Name(), stem) {
+			docPath = filepath.Join(dir, e.Name())
+			break
+		}
+	}
+	if docPath == "" {
+		return true, nil
+	}
+	b, err := os.ReadFile(docPath)
+	if err != nil {
+		return true, nil
+	}
+	files := parseDocFiles(string(b))
+	if len(files) == 0 {
+		return true, nil
+	}
+	for _, f := range files {
+		if !sg.Exists(ctx, ref, f) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// parseDocFiles extracts the file list from a change doc's `Files:` line.
+// Docs vary in style — some backtick-quote each path (optionally with a
+// trailing annotation like "(new)"), others write a bare comma-separated
+// list — so this tries the backtick form first and falls back to a plain
+// comma split, stripping a trailing "." and any parenthetical annotation.
+// Returns nil (never an error) on anything it cannot confidently parse, so
+// callers fail open exactly like every other best-effort guard here.
+func parseDocFiles(doc string) []string {
+	idx := strings.Index(doc, "Files:")
+	if idx < 0 {
+		return nil
+	}
+	rest := doc[idx+len("Files:"):]
+	if end := strings.Index(rest, "\n\n"); end >= 0 {
+		rest = rest[:end]
+	}
+	rest = strings.ReplaceAll(rest, "\n", " ")
+
+	if bm := docFilesBacktickRe.FindAllStringSubmatch(rest, -1); len(bm) > 0 {
+		var out []string
+		for _, m := range bm {
+			if p := strings.TrimSpace(m[1]); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+
+	var out []string
+	for _, tok := range strings.Split(rest, ",") {
+		tok = strings.TrimSpace(tok)
+		tok = strings.TrimSuffix(tok, ".")
+		if i := strings.Index(tok, " ("); i >= 0 {
+			tok = tok[:i]
+		}
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
 // taskID is the stable id used in the change-doc stem and Context preamble.
 func taskID(sel *selectt.Selection) string {
 	switch sel.Kind {
@@ -2328,15 +2427,32 @@ func (r *Runner) demoteUnpushed(ctx context.Context, sel *selectt.Selection, rea
 // than risk a false finalize of a genuinely pending — or never attempted —
 // review.
 // recordReviewedCommit durably stamps the submodule commit a just-completed
-// Work pass handed to review (its NEEDS-REVIEW gitlink tip) onto the task, so a
-// later pass can recognize the work as already-merged-into-tracked-main even
-// after the disposable bee-<taskid> branch is reclaimed or reused
-// (finalizeIfMergedByRecord). It runs only for a Work pass whose published
-// status is NEEDS-REVIEW; every other kind/state is a no-op. Best-effort: it
-// returns a warning string, never a hard error, so a failed record never blocks
-// completion — finalize still has its branch-based check (finalizeIfAlreadyMerged)
-// as a fallback.
-func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selection, absRoot string, cl *claim.Claimer) string {
+// Work pass handed to review (the bee-<taskid> work-branch tip it actually
+// authored) onto the task, so a later pass can recognize the work as
+// already-merged-into-tracked-main even after the disposable bee-<taskid>
+// branch is reclaimed or reused (finalizeIfMergedByRecord). It runs only for
+// a Work pass whose published status is NEEDS-REVIEW; every other kind/state
+// is a no-op. Best-effort: it returns a warning string, never a hard error,
+// so a failed record never blocks completion — finalize still has its
+// branch-based check (finalizeIfAlreadyMerged) as a fallback.
+//
+// Reads wg's OWN HEAD (the work worktree this Work pass actually committed
+// in) rather than the ambient beehive-layer gitlink pointer at
+// HEAD:submodules/<sm>/repo (finalize-merge-verify-work-commit): that ambient
+// path is the SAME shared, single-slot value sourceBranchExists's doc already
+// warns never to trust — it names whichever task's Work pass most recently
+// bumped the gitlink, and after a conflicted/racing publish (or simply a
+// later task landing before this read executes) it can read back a PARENT of
+// the actual work commit — one that is trivially an ancestor of tracked main
+// for reasons having nothing to do with THIS task ever being reviewed and
+// merged. That silently stamped the wrong (already-ancestor) sha, so
+// finalizeIfMergedByRecord's ancestry check on it "succeeded" without the
+// task's own code ever having been merged — a phantom DONE (observed live:
+// nixconf wireguard-yoga-profile/wireguard-yoga-build-verify, recorded
+// review=b0895eb, a parent of the actual profile commit 8f6779b). wg's HEAD
+// is task-specific and unambiguous: it is exactly the commit this Work pass
+// authored and pushed as bee-<taskid>, never an ambient/shared value.
+func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selection, wg *git.Repo, cl *claim.Claimer) string {
 	if sel.Kind != selectt.Work || !hasTask(sel) {
 		return ""
 	}
@@ -2344,11 +2460,10 @@ func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selectio
 	if err != nil || st != plan.StatusReview {
 		return ""
 	}
-	rel, err := filepath.Rel(absRoot, sel.Submodule.RepoDir())
-	if err != nil {
+	if wg == nil {
 		return ""
 	}
-	sha, err := r.Git.RevParse(ctx, "HEAD:"+rel)
+	sha, err := wg.RevParse(ctx, "HEAD")
 	if err != nil || sha == "" {
 		return ""
 	}
@@ -2385,7 +2500,7 @@ func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selectio
 // (false, err)/(false, nil) so the caller falls through to the branch-based guards
 // and normal dispatch; a genuinely pending or truly lost task is never wrongly
 // finalized. Handles a NEEDS-REVIEW or NEEDS-ARBITRATION task.
-func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Selection, absRoot string) (bool, error) {
+func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Selection, branch, absRoot string) (bool, error) {
 	sha := sel.Task.ReviewCommit
 	if sha == "" {
 		return false, nil
@@ -2421,11 +2536,36 @@ func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Sele
 		}
 		trackedRef = rem + "/" + tracked
 	}
-	merged, err := sg.IsAncestor(ctx, sha, trackedRef)
+	// Defense-in-depth (finalize-merge-verify-work-commit): the recorded sha is
+	// only trustworthy going forward now that recordReviewedCommit stamps
+	// wg's own HEAD (the work-branch tip) instead of the ambient beehive-layer
+	// gitlink pointer — but a task reviewed BEFORE that fix landed may still
+	// carry a stale recorded sha that is a PARENT/proxy of the real work
+	// commit rather than the commit itself (observed live: nixconf
+	// wireguard-yoga-profile, recorded review=b0895eb, a parent of the actual
+	// profile commit 8f6779b — trivially an ancestor of main for reasons
+	// having nothing to do with this task ever being merged). So whenever
+	// bee-<taskid> itself STILL resolves somewhere, its own tip is
+	// authoritative over the recorded stamp; only once the branch is
+	// confirmed gone/reused (the shape this guard exists for) does the
+	// recorded sha stand alone.
+	checkSha := sha
+	if branch != "" {
+		if bTip, exists, berr := r.sourceBranchExists(ctx, sg, rem, branch); berr == nil && exists && bTip != "" {
+			if rem != "" {
+				if err := sg.Fetch(ctx, rem, branch); err != nil {
+					return false, err
+				}
+			}
+			checkSha = bTip
+		}
+	}
+	merged, err := sg.IsAncestor(ctx, checkSha, trackedRef)
 	if err != nil || !merged {
-		// err: the recorded sha is not even resolvable here (a merge cannot be
+		// err: the sha under test is not even resolvable here (a merge cannot be
 		// proven) — fail open. !merged: genuinely not on tracked main yet — fall
-		// through to the branch-based guards / normal dispatch.
+		// through to the branch-based guards / normal dispatch (which re-drives
+		// the merge rather than trusting a stale recorded stamp).
 		return false, err
 	}
 	// Merged: sync THIS pass's private submodule checkout to the tracked tip so the
@@ -2434,13 +2574,22 @@ func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Sele
 	if err := sg.HardReset(ctx, trackedRef); err != nil {
 		return false, fmt.Errorf("sync submodule %s to %s: %w", sel.Submodule.Name, trackedRef, err)
 	}
+	// Completion-check assertion (finalize-merge-verify-work-commit part d): a
+	// DONE closed by this guard must actually carry the files its change doc
+	// documents — the last line of defense against finalizing over a commit
+	// that is an ancestor of main for reasons unrelated to this task ever
+	// landing its own work. Fails OPEN on any doc-parsing uncertainty; only a
+	// doc that names a file CONFIRMED absent from the merged tree blocks.
+	if ok, verr := r.docFilesLandedInTree(ctx, sel, branch, sg, trackedRef); verr != nil || !ok {
+		return false, verr
+	}
 	tip, err := sg.RevParse(ctx, "HEAD")
 	if err != nil {
 		return false, err
 	}
 	note := fmt.Sprintf(
 		"recorded reviewed commit %s already merged into tracked %s (%s) by a prior interrupted review; runner-finalized DONE (no re-review, branch not required)",
-		sha, tracked, tip)
+		checkSha, tracked, tip)
 	cl := &claim.Claimer{
 		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
 		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
@@ -2509,6 +2658,11 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 	// checkout's actual state.
 	if err := sg.HardReset(ctx, trackedRef); err != nil {
 		return false, fmt.Errorf("sync submodule %s to %s: %w", sel.Submodule.Name, trackedRef, err)
+	}
+	// Completion-check assertion (finalize-merge-verify-work-commit part d):
+	// see the identical guard in finalizeIfMergedByRecord.
+	if ok, verr := r.docFilesLandedInTree(ctx, sel, branch, sg, trackedRef); verr != nil || !ok {
+		return false, verr
 	}
 	tip, err := sg.RevParse(ctx, "HEAD")
 	if err != nil {
