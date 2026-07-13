@@ -326,6 +326,42 @@ func (r *Repo) CommitReachable(ctx context.Context, remote, branch, sha string) 
 	return r.CommitExists(ctx, sha), nil
 }
 
+// BranchReachableAnywhere reports whether branch resolves to a ref this repo
+// can see: a local ref (refs/heads/<branch>), or — when remote is non-empty — a
+// ref on remote after an explicit prune-fetch. false means the branch exists
+// NOWHERE this host can look: the "lost work: bee-<taskid> was never pushed"
+// shape the dispatch-time lost-work guard (swarm.recoverIfLost,
+// lost-work-recover-any-status) resets a task on.
+//
+// It is the branch-existence sibling of CommitReachable, which checks a SPECIFIC
+// sha: a work pass OOM-killed / capped BEFORE it could commit and push
+// bee-<taskid> records no commit sha at all, so there is no sha to test — only
+// the absence of the branch everywhere. Same conservative contract as
+// CommitReachable: remote == "" (local sharing, one shared object DB) skips the
+// remote probe entirely; a remote fetch failure that is NOT a definitive
+// "no such ref" (network/auth) is returned as a real error, never folded into
+// "absent", so a transient blip can never falsely reset a good task. Only
+// "checked fine, branch present nowhere" reports (false, nil).
+func (r *Repo) BranchReachableAnywhere(ctx context.Context, remote, branch string) (bool, error) {
+	if _, err := r.RevParse(ctx, "refs/heads/"+branch); err == nil {
+		return true, nil // present locally: recoverable.
+	}
+	if remote == "" {
+		return false, nil // local sharing: no remote to consult; absent everywhere.
+	}
+	if err := r.Fetch(ctx, remote, branch); err != nil {
+		if isRemoteRefMissing(err) || isCouldNotFindRemoteRef(err) {
+			return false, nil // definitive: remote simply has no such branch.
+		}
+		return false, err // network/auth uncertainty: fail open.
+	}
+	tip, err := r.LsRemoteBranch(ctx, remote, branch)
+	if err != nil {
+		return false, err
+	}
+	return tip != "", nil
+}
+
 // isCouldNotFindRemoteRef reports whether a fetch failed because the remote
 // simply has no such ref — git's "couldn't find remote ref <name>" — a
 // definitive, confirmed absence distinct from a network/auth failure talking

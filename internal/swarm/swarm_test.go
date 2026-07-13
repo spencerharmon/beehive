@@ -870,9 +870,160 @@ func TestArbitrationDispatchRecoversTrulyLostWork(t *testing.T) {
 	}
 }
 
+// TestWorkDispatchRecoversTrulyLostWork generalizes the lost-work guard to a
+// plain Work (TODO) task (lost-work-recover-any-status): a prior work pass was
+// OOM-killed / capped BEFORE it could push bee-<taskid> and bump the pointer,
+// leaving the task in TODO with a STALE claim and nothing reachable anywhere (no
+// local branch, none on origin after a prune-fetch, gitlink never advanced, no
+// change doc). Run() must reset it to TODO (claim cleared, attempts bumped),
+// report Completed, and NEVER open a session (refusingClient). It also proves the
+// two ROI "Correctness blockers": no NEEDS-HUMAN even at a HIGH attempts count,
+// and after K resets a distinct health/observability signal is emitted while the
+// task keeps being reimplemented.
+func TestWorkDispatchRecoversTrulyLostWork(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	// TODO task carrying a STALE claim (session set, old heartbeat) and a high
+	// attempts count. bee-lost-w is never created anywhere and no doc is written —
+	// the "work pass died before publish" shape.
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## lost-w [TODO] <!-- attempts=5 deps= session=bee-old heartbeat=2020-01-01T00:00:00Z -->\nwork\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/repo", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	// sel.Task mirrors the PRE-claim selection state: the stale session is the
+	// signal the Work-kind guard gates on.
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0],
+		Task: plan.Task{ID: "lost-w", Status: plan.StatusTODO, Attempts: 5, Session: "bee-old"}}
+
+	var health strings.Builder
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Concise: &health}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a resolved dispatch-time recovery should report Completed, got %+v", res)
+	}
+	p, err := plan.Parse(readFile(t, planPath))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("lost-w")
+	if tk == nil {
+		t.Fatal("task lost-w vanished from PLAN.md")
+	}
+	if tk.Status != plan.StatusTODO {
+		t.Fatalf("status = %s, want TODO (a lost commit must NEVER escalate to NEEDS-HUMAN)", tk.Status)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("recovery must release the stale claim")
+	}
+	if tk.Attempts != 6 {
+		t.Fatalf("attempts = %d, want 6", tk.Attempts)
+	}
+	if !contains(strings.Join(tk.Body, "\n"), "unrecoverable") {
+		t.Fatalf("plan body missing recovery reason:\n%s", strings.Join(tk.Body, "\n"))
+	}
+	// K=RejectLimit default 3; attempts (6) >= K, so the repeated-loss health
+	// signal must be surfaced to the observability channel (not the task status).
+	if !contains(health.String(), "HEALTH lost-work-loop") || !contains(health.String(), "lost-w") {
+		t.Fatalf("expected a lost-work-loop HEALTH signal after K resets, got:\n%s", health.String())
+	}
+}
+
+// TestWorkDispatchSkipsRecoveryWithoutStaleClaim proves the Work-kind gate that
+// prevents a reset livelock: a FRESH TODO (no prior session — never claimed, or
+// just reset by this very guard) must NOT be treated as lost work even when its
+// branch is absent everywhere; it falls straight through to a genuine work
+// dispatch (a session IS opened) instead of being re-reset forever with zero real
+// attempts.
+func TestWorkDispatchSkipsRecoveryWithoutStaleClaim(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## fresh [TODO] <!-- attempts=0 deps= -->\nwork\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/repo", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	// No Session on the pre-claim task => the guard must be skipped.
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0],
+		Task: plan.Task{ID: "fresh", Status: plan.StatusTODO}}
+
+	oc := &openRecordingClient{}
+	r := &Runner{Repo: rp, Git: g, Client: oc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	// The dispatch proceeds past the guard and opens a session; our stub errors
+	// out of Open so we don't have to script a whole work pass — the point is only
+	// that Open WAS reached, proving the guard did not short-circuit.
+	_, _ = r.Run(ctx, sel, "sys", "first")
+	if !oc.opened {
+		t.Fatal("a fresh TODO (no stale claim) must NOT be reset; the guard must fall through to a real work dispatch")
+	}
+	p, err := plan.Parse(readFile(t, planPath))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	if tk := p.Find("fresh"); tk == nil || tk.Attempts != 0 {
+		t.Fatalf("a skipped guard must not touch attempts; got %+v", tk)
+	}
+}
+
+// openRecordingClient records that a session Open was attempted, then errors —
+// letting a test assert the dispatch reached the session stage without scripting
+// a full work pass.
+type openRecordingClient struct{ opened bool }
+
+func (c *openRecordingClient) Open(ctx context.Context, cwd, system string) (Session, error) {
+	c.opened = true
+	return nil, errors.New("openRecordingClient: intentional stop after Open")
+}
+
+// readFile reads a whole file or fails the test.
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
 // TestReviewDispatchDoesNotRecoverWithDocPresent proves recoverIfLost's
 // conservative guard: even with no local branch and no remote branch, a
-// PRESENT change doc is a single positive signal that must abort the recovery
 // (no false-positive data loss) and fall through to the normal reachability
 // guard (bounceIfUnreachable), which — the commit still being unreachable —
 // bounces to NEEDS-ARBITRATION exactly as before this guard existed.

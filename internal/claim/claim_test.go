@@ -345,7 +345,7 @@ func TestRecoverLostWorkPublishesImmediately(t *testing.T) {
 		},
 	}
 	reason := "implementer commit for bee-T1 unrecoverable: no local branch, no branch on the submodule remote, and no change doc"
-	if err := c.RecoverLostWork(ctx, "T1", reason, 3); err != nil {
+	if err := c.RecoverLostWork(ctx, "T1", reason); err != nil {
 		t.Fatalf("recover-lost-work: %v", err)
 	}
 	if !published {
@@ -372,11 +372,18 @@ func TestRecoverLostWorkPublishesImmediately(t *testing.T) {
 	}
 }
 
-// TestRecoverLostWorkGuarded: only legal from NEEDS-REVIEW/NEEDS-ARBITRATION.
+// TestRecoverLostWorkGuarded: rejected only on the terminal DONE/NEEDS-HUMAN
+// states; a plain TODO (a work pass that lost its commit before publishing) is
+// now a legal recovery target (lost-work-recover-any-status).
 func TestRecoverLostWorkGuarded(t *testing.T) {
 	c, ctx := setup(t)
-	if err := c.RecoverLostWork(ctx, "T1", "reason", 3); err == nil {
-		t.Fatal("recover-lost-work on TODO must error")
+	writePlan(t, c, ctx, "## T1 [DONE] <!-- attempts=0 deps= -->\ndo it\n")
+	if err := c.RecoverLostWork(ctx, "T1", "reason"); err == nil {
+		t.Fatal("recover-lost-work on DONE must error")
+	}
+	writePlan(t, c, ctx, "## T1 [TODO] <!-- attempts=0 deps= -->\ndo it\n")
+	if err := c.RecoverLostWork(ctx, "T1", "reason"); err != nil {
+		t.Fatalf("recover-lost-work on TODO must now be legal: %v", err)
 	}
 }
 

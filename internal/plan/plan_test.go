@@ -295,50 +295,52 @@ func TestFinalizeAlreadyMergedGuardedAndRequiresNote(t *testing.T) {
 	}
 }
 
-// TestRecoverLostWorkAttempts mirrors TestRejectAttempts/TestStrandAttempts:
-// repeated recoveries recycle NEEDS-REVIEW or NEEDS-ARBITRATION back to TODO
-// (claim released, attempts bumped) up to limit, then overflow to NEEDS-HUMAN
-// carrying the caller's concrete reason verbatim.
+// TestRecoverLostWorkAttempts: repeated recoveries recycle a task in ANY
+// non-terminal state (NEEDS-REVIEW, NEEDS-ARBITRATION, or a plain TODO whose work
+// pass died before publishing) back to TODO (claim released, attempts bumped) —
+// and NEVER escalate to NEEDS-HUMAN no matter how high attempts climbs
+// (lost-work-recover-any-status: a lost commit is always reimplemented, the
+// repeated-loss pattern is a health signal the caller surfaces, not a status
+// change).
 func TestRecoverLostWorkAttempts(t *testing.T) {
 	now := time.Now()
-	for _, start := range []Status{StatusReview, StatusArb} {
+	for _, start := range []Status{StatusReview, StatusArb, StatusTODO} {
 		tk := &Task{ID: "a", Status: start, Attempts: 0}
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 6; i++ { // well past any old limit — must never escalate.
 			tk.Status = start
 			tk.Session, tk.Heartbeat = "bee-1", now
-			if err := tk.RecoverLostWork("implementer commit unrecoverable: no branch, no doc", 3, now); err != nil {
+			if err := tk.RecoverLostWork("implementer commit unrecoverable: no branch, no doc", now); err != nil {
 				t.Fatal(err)
 			}
 			if tk.Status != StatusTODO {
-				t.Fatalf("from %s attempt %d status %s", start, i, tk.Status)
+				t.Fatalf("from %s attempt %d status %s, want TODO (never NEEDS-HUMAN)", start, i, tk.Status)
 			}
 			if tk.Session != "" || !tk.Heartbeat.IsZero() {
 				t.Fatalf("from %s attempt %d: recover-lost-work must release the claim", start, i)
 			}
 		}
-		tk.Status = start
-		if err := tk.RecoverLostWork("implementer commit unrecoverable: no branch, no doc", 3, now); err != nil {
-			t.Fatal(err) // 4th > 3
-		}
-		if tk.Status != StatusHuman {
-			t.Fatalf("from %s: want NEEDS-HUMAN, got %s", start, tk.Status)
-		}
-		if got := tk.HumanReason(); got != "implementer commit unrecoverable: no branch, no doc" {
-			t.Fatalf("human reason = %q, want the caller's concrete reason verbatim", got)
+		if tk.Attempts != 6 {
+			t.Fatalf("from %s: attempts = %d, want 6", start, tk.Attempts)
 		}
 	}
 }
 
-// TestRecoverLostWorkGuardedAndRequiresReason: only legal from NEEDS-REVIEW or
-// NEEDS-ARBITRATION (never TODO/DONE), and always requires a concrete reason.
+// TestRecoverLostWorkGuardedAndRequiresReason: legal from any non-terminal status
+// (TODO/NEEDS-REVIEW/NEEDS-ARBITRATION), rejected on the terminal DONE/NEEDS-HUMAN
+// states, and always requires a concrete reason.
 func TestRecoverLostWorkGuardedAndRequiresReason(t *testing.T) {
 	now := time.Now()
-	for _, st := range []Status{StatusTODO, StatusDone, StatusHuman} {
-		if err := (&Task{ID: "a", Status: st}).RecoverLostWork("reason", 3, now); err == nil {
-			t.Fatalf("recover-lost-work allowed on %s", st)
+	for _, st := range []Status{StatusDone, StatusHuman} {
+		if err := (&Task{ID: "a", Status: st}).RecoverLostWork("reason", now); err == nil {
+			t.Fatalf("recover-lost-work allowed on terminal %s", st)
 		}
 	}
-	if err := (&Task{ID: "a", Status: StatusReview}).RecoverLostWork("  \t \n ", 3, now); err == nil {
+	for _, st := range []Status{StatusTODO, StatusReview, StatusArb} {
+		if err := (&Task{ID: "a", Status: st}).RecoverLostWork("reason", now); err != nil {
+			t.Fatalf("recover-lost-work rejected on non-terminal %s: %v", st, err)
+		}
+	}
+	if err := (&Task{ID: "a", Status: StatusReview}).RecoverLostWork("  \t \n ", now); err == nil {
 		t.Fatal("recover-lost-work allowed with an empty/blank reason")
 	}
 }

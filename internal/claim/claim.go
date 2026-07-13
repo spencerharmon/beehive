@@ -347,16 +347,17 @@ func (c *Claimer) BounceUnreachable(ctx context.Context, taskID, reason string) 
 	return nil
 }
 
-// RecoverLostWork resets taskID (NEEDS-REVIEW or NEEDS-ARBITRATION) back to
-// TODO — or, past limit, escalates to NEEDS-HUMAN — when its implementer
-// commit is confirmed truly unrecoverable (see swarm.recoverIfLost, the
-// selection-time guard that calls this, and plan.Task.RecoverLostWork for the
-// exact preconditions). Unlike Reject/Strand this commits AND publishes
-// immediately: it runs standalone, before any turn loop or session exists (a
-// dispatch-time short-circuit, mirroring BounceUnreachable/Release). A publish
-// conflict is benign (a peer already resolved this exact task) and is
+// RecoverLostWork resets taskID (in any non-terminal state) back to TODO when
+// its implementer commit is confirmed truly unrecoverable (see
+// swarm.recoverIfLost, the selection-time guard that calls this, and
+// plan.Task.RecoverLostWork for the exact preconditions). It NEVER escalates to
+// NEEDS-HUMAN — a repeatedly-lost commit is a health signal the caller surfaces
+// to observability, not an operator gate. Unlike Reject/Strand this commits AND
+// publishes immediately: it runs standalone, before any turn loop or session
+// exists (a dispatch-time short-circuit, mirroring BounceUnreachable/Release). A
+// publish conflict is benign (a peer already resolved this exact task) and is
 // swallowed, matching BounceUnreachable/FinalizeAlreadyMerged/Release.
-func (c *Claimer) RecoverLostWork(ctx context.Context, taskID, reason string, limit int) error {
+func (c *Claimer) RecoverLostWork(ctx context.Context, taskID, reason string) error {
 	p, err := c.load()
 	if err != nil {
 		return err
@@ -365,7 +366,7 @@ func (c *Claimer) RecoverLostWork(ctx context.Context, taskID, reason string, li
 	if t == nil {
 		return fmt.Errorf("recover-lost-work: task %q absent", taskID)
 	}
-	if err := t.RecoverLostWork(reason, limit, c.now()); err != nil {
+	if err := t.RecoverLostWork(reason, c.now()); err != nil {
 		return err
 	}
 	if err := c.save(p); err != nil {

@@ -1055,6 +1055,73 @@ func TestCommitReachable(t *testing.T) {
 	})
 }
 
+// TestBranchReachableAnywhere covers the branch-existence sibling of
+// CommitReachable used by the lost-work guard (lost-work-recover-any-status):
+// present locally, present remote-only (after fetch), absent everywhere with and
+// without a remote, and the conservative fail-open on a genuine fetch error.
+func TestBranchReachableAnywhere(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "f", "v1\n", "v1")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("seed main: %v", err)
+	}
+
+	t.Run("present-locally", func(t *testing.T) {
+		if _, err := a.Run(ctx, "checkout", "-q", "-b", "bee-local"); err != nil {
+			t.Fatalf("checkout: %v", err)
+		}
+		commitFile(t, a, "g", "local\n", "local work")
+		// Even with a remote configured, a local ref short-circuits before any fetch.
+		ok, err := a.BranchReachableAnywhere(ctx, "origin", "bee-local")
+		if err != nil || !ok {
+			t.Fatalf("BranchReachableAnywhere(local ref) = %v,%v want true,nil", ok, err)
+		}
+	})
+
+	t.Run("remote-only-after-fetch", func(t *testing.T) {
+		b := cloneOf(t, origin, "b")
+		if _, err := a.Run(ctx, "push", "origin", "bee-local:refs/heads/bee-remote-only"); err != nil {
+			t.Fatalf("push bee-remote-only: %v", err)
+		}
+		ok, err := b.BranchReachableAnywhere(ctx, "origin", "bee-remote-only")
+		if err != nil || !ok {
+			t.Fatalf("BranchReachableAnywhere(remote-only) = %v,%v want true,nil", ok, err)
+		}
+	})
+
+	t.Run("absent-everywhere-with-remote", func(t *testing.T) {
+		b := cloneOf(t, origin, "c")
+		ok, err := b.BranchReachableAnywhere(ctx, "origin", "bee-never-existed")
+		if err != nil {
+			t.Fatalf("BranchReachableAnywhere(absent) returned an error, want (false,nil): %v", err)
+		}
+		if ok {
+			t.Fatal("BranchReachableAnywhere(absent everywhere) = true, want false")
+		}
+	})
+
+	t.Run("absent-everywhere-no-remote", func(t *testing.T) {
+		b := cloneOf(t, origin, "d")
+		// remote == "" (local sharing): no remote probe, absent locally => false.
+		ok, err := b.BranchReachableAnywhere(ctx, "", "bee-never-existed")
+		if err != nil || ok {
+			t.Fatalf("BranchReachableAnywhere(absent, no remote) = %v,%v want false,nil", ok, err)
+		}
+	})
+
+	t.Run("fetch-error-fails-open", func(t *testing.T) {
+		b := cloneOf(t, origin, "e")
+		// A remote that does not exist is a network/auth-class failure (NOT a
+		// definitive "no such ref"), so it must surface as an error — never be
+		// silently folded into "absent" and wrongly reset a good task.
+		if _, err := b.BranchReachableAnywhere(ctx, "definitely-no-such-remote", "bee-x"); err == nil {
+			t.Fatal("BranchReachableAnywhere must return an error on a genuine fetch failure (fail open)")
+		}
+	})
+}
+
 func TestGitlinkAt(t *testing.T) {
 	r := initRepo(t)
 	ctx := context.Background()

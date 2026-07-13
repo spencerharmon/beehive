@@ -200,21 +200,29 @@ func (t *Task) SetReviewCommit(sha string) {
 	t.ReviewCommit = sha
 }
 
-// RecoverLostWork resets a NEEDS-REVIEW or NEEDS-ARBITRATION task back to TODO
-// (or, past limit, escalates to NEEDS-HUMAN like Reject/Strand) when its
+// RecoverLostWork resets a task in ANY non-terminal state back to TODO when its
 // implementer commit is confirmed truly unrecoverable — reachable NOWHERE
-// (branch absent both locally and on the submodule remote after a
-// prune-fetch), not reflected in the tracked submodule pointer, and with no
-// change doc on disk. A work pass can flip a task NEEDS-REVIEW/NEEDS-ARBITRATION
-// after authoring in its worktree but before the runner publishes; if that
-// publish never lands (crash, killed at cap, failed push), the task strands at
-// a phantom commit forever without this. Mirrors Reject/Strand's
-// attempts/limit escalation so a task that keeps losing its work does not
-// auto-recycle indefinitely. Valid from NEEDS-REVIEW or NEEDS-ARBITRATION.
-// Releases the active claim.
-func (t *Task) RecoverLostWork(reason string, limit int, now time.Time) error {
-	if t.Status != StatusReview && t.Status != StatusArb {
-		return fmt.Errorf("plan: recover-lost-work on non-reviewable task %s (%s)", t.ID, t.Status)
+// (branch absent both locally and on the submodule remote after a prune-fetch),
+// not reflected in the tracked submodule pointer, and with no change doc on
+// disk. The identical unrecoverable-commit signal arises for two shapes: a work
+// pass that flipped the task NEEDS-REVIEW/NEEDS-ARBITRATION after authoring in
+// its worktree but before the runner published, AND a plain work pass OOM-killed
+// / capped BEFORE it could push bee-<taskid> and bump the pointer — the latter
+// leaving the task in TODO (or any non-terminal state) with a stale claim and no
+// reviewable status (lost-work-recover-any-status). Both simply reimplement from
+// intent, so recovery is ALWAYS a TODO reset — it NEVER escalates to
+// NEEDS-HUMAN. Escalating a merely-lost commit strands a hard dep behind a
+// no-decision operator gate (observed: phantom-library m14-per-user-rig
+// accumulated attempts=4 of correct detection yet still escalated); NEEDS-HUMAN
+// is reserved for genuine human input (credential, out-of-GitOps action,
+// intent/scope decision), never a pass that reliably dies before publish — that
+// is a health signal the caller surfaces to observability, not a status change.
+// Bumps attempts (so the caller can detect a repeated-loss loop) and releases
+// the active claim. Valid from any non-terminal status (not DONE, not
+// NEEDS-HUMAN).
+func (t *Task) RecoverLostWork(reason string, now time.Time) error {
+	if t.Status == StatusDone || t.Status == StatusHuman {
+		return fmt.Errorf("plan: recover-lost-work on terminal task %s (%s)", t.ID, t.Status)
 	}
 	reason = oneLine(reason)
 	if reason == "" {
@@ -223,13 +231,8 @@ func (t *Task) RecoverLostWork(reason string, limit int, now time.Time) error {
 	t.Attempts++
 	t.Session = ""
 	t.Heartbeat = time.Time{}
-	if t.Attempts > limit {
-		t.Status = StatusHuman
-		t.setHumanReason(reason)
-	} else {
-		t.Status = StatusTODO
-		t.appendNote("Recovered (runner, lost work): " + reason)
-	}
+	t.Status = StatusTODO
+	t.appendNote("Recovered (runner, lost work): " + reason)
 	return nil
 }
 

@@ -665,6 +665,32 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 			return res, nil
 		}
+	}
+
+	// Lost-work auto-recovery guard, generalized to ANY non-terminal task
+	// (lost-work-recover-any-status). The identical unrecoverable-commit signal —
+	// bee-<taskid> reachable NOWHERE (no local ref, none on the submodule remote
+	// after a prune-fetch), the gitlink never advanced onto it, and no change doc —
+	// arises for TWO shapes: a work pass that already flipped the task
+	// NEEDS-REVIEW/NEEDS-ARBITRATION before the runner published (Review/Arbitrate
+	// here), AND a plain work pass OOM-killed / capped BEFORE it could push
+	// bee-<taskid> and bump the pointer, leaving the task in TODO with a stale claim
+	// and no reviewable status. Both simply reimplement from intent, so both reset
+	// to TODO — NEVER NEEDS-HUMAN (see recoverIfLost / plan.Task.RecoverLostWork).
+	//
+	// Gating differs by kind so the TODO case cannot livelock. For Review/Arbitrate
+	// the guard always runs: a reset flips the task to TODO, changing its KIND, so
+	// it structurally cannot re-enter this guard and loop. For a Work (TODO) task it
+	// runs ONLY when a prior pass left a STALE claim (sel.Task.Session != "", the
+	// pre-claim selection state — the sole proof a pass actually ran and abandoned
+	// it): a brand-new TODO (never claimed) and a task we JUST reset (claim cleared)
+	// both carry no prior session, so they fall straight through to a genuine work
+	// dispatch instead of being re-reset forever with zero real attempts. cl.Claim
+	// only succeeds over a STALE (never a live) claim, so a non-empty pre-claim
+	// session here is always a reclaimed-stale one.
+	lostWorkGuard := sel.Kind == selectt.Review || sel.Kind == selectt.Arbitrate ||
+		(sel.Kind == selectt.Work && sel.Task.Session != "")
+	if lostWorkGuard {
 		recovered, rerr := r.recoverIfLost(ctx, sel, res.Branch, absRoot)
 		if rerr != nil && r.Debug != nil {
 			fmt.Fprintf(r.Debug, "[honeybee] lost-work recovery pre-check for %s failed; dispatching normally: %v\n", sel.Task.ID, rerr)
@@ -2724,22 +2750,19 @@ func (r *Runner) recoverIfLost(ctx context.Context, sel *selectt.Selection, bran
 			return false, nil // recorded reviewed commit is on tracked main: not lost.
 		}
 	}
-	// Check 1: local ref.
-	if _, err := sg.RevParse(ctx, "refs/heads/"+branch); err == nil {
-		return false, nil // present locally: recoverable, do not reset.
+	// Checks 1+2: the implementer branch resolves NOWHERE this host can see —
+	// no local ref AND (when a remote exists) none on the submodule remote after
+	// an explicit prune-fetch. Reuses internal/git's reachability plumbing next to
+	// CommitReachable (git.Repo.BranchReachableAnywhere), which fails OPEN on a
+	// network/auth uncertainty so a merely-slow fetch or a locally-present-but-
+	// unpushed branch is never misread as loss — only a positive, git-confirmed
+	// absence everywhere falls through to the reset.
+	reachable, rerr := sg.BranchReachableAnywhere(ctx, rem, branch)
+	if rerr != nil {
+		return false, rerr // uncertain (network/auth): fail open.
 	}
-	// Check 2: remote ref, after an explicit prune-fetch.
-	if rem != "" {
-		if ferr := sg.Fetch(ctx, rem, branch); ferr != nil && !isRemoteRefMissingFetch(ferr) {
-			return false, ferr // uncertain (network/auth): fail open.
-		}
-		tip, lerr := sg.LsRemoteBranch(ctx, rem, branch)
-		if lerr != nil {
-			return false, lerr
-		}
-		if tip != "" {
-			return false, nil // present on the remote: recoverable, do not reset.
-		}
+	if reachable {
+		return false, nil // present somewhere: recoverable, do not reset.
 	}
 	// Check 3 (see doc comment above): implied by 1+2 both confirming absence.
 	// Check 4: no change doc on disk.
@@ -2756,12 +2779,24 @@ func (r *Runner) recoverIfLost(ctx context.Context, sel *selectt.Selection, bran
 		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
 		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
 	}
-	limit := r.RejectLimit
-	if limit <= 0 {
-		limit = 3
-	}
-	if err := cl.RecoverLostWork(ctx, sel.Task.ID, reason, limit); err != nil {
+	if err := cl.RecoverLostWork(ctx, sel.Task.ID, reason); err != nil {
 		return false, err
+	}
+	// Bounded-retry health/observability signal (never a status change): a lost
+	// commit ALWAYS resets to TODO and keeps being reimplemented, but after K
+	// consecutive zero-progress resets on the SAME task the pattern (a pass
+	// reliably dying before it can publish — likely OOM on the memory-constrained
+	// host, or the turn cap) is surfaced where journalctl/audit can mine it, so it
+	// is not silently masked by the auto-recovery. RecoverLostWork just
+	// incremented attempts on disk; the pre-claim selection carried the prior
+	// count, so the new total is sel.Task.Attempts+1.
+	k := r.RejectLimit
+	if k <= 0 {
+		k = 3
+	}
+	if attempts := sel.Task.Attempts + 1; attempts >= k {
+		r.logConcise("[honeybee] HEALTH lost-work-loop submodule=%s task=%s attempts=%d: pass repeatedly dies before publishing bee-%s (likely OOM on the memory-constrained host or turn-cap); investigate build/test cleanup + turn-cap levers — still reimplementing, NOT escalating\n",
+			sel.Submodule.Name, sel.Task.ID, attempts, sel.Task.ID)
 	}
 	return true, nil
 }
@@ -2782,6 +2817,10 @@ func remoteNoteFor(rem string) string {
 // package git), re-implemented here against the same git message shapes since
 // CommitReachable's identical fetch-then-check idiom lives in that package,
 // not this one.
+//
+//nolint:unused // retained alongside remoteNoteFor as the sibling message-shape
+// predicate for lost-work reachability; recoverIfLost now reaches through
+// git.Repo.BranchReachableAnywhere, which owns this check internally.
 func isRemoteRefMissingFetch(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "couldn't find remote ref") || strings.Contains(msg, "not found in upstream")
