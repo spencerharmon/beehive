@@ -787,30 +787,60 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	var preamble string
 	switch sel.Kind {
 	case selectt.Review:
+		// A doc-only task (its Files: line names only beehive-layer paths) has NO
+		// bee-<taskid> code branch to fetch/inspect — telling the reviewer to fetch
+		// one only earns a "couldn't find remote ref" failure before it falls back to
+		// the doc. State the fact instead. A code-bearing (or mixed) card keeps the
+		// historical fetch/inspect sentence byte-identical.
+		var branchLine string
+		if isDocOnlyCard(sel.Task.Body) {
+			branchLine = fmt.Sprintf(
+				"This is a DOC-ONLY task: no bee-%[2]s code branch exists (nothing to fetch/inspect) — "+
+					"judge the change doc and PLAN.md state directly. Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md.\n",
+				smName, sel.Task.ID)
+		} else {
+			branchLine = fmt.Sprintf(
+				"Implementer's work is on branch bee-%[2]s in submodules/%[1]s/repo — inspect read-only via git "+
+					"(fetch from origin if the branch is absent locally). Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md.\n",
+				smName, sel.Task.ID)
+		}
 		preamble = fmt.Sprintf(
 			"# Context (REVIEW — judge existing work, do NOT reimplement)\n"+
 				"cwd is the beehive repo root. Submodule: %[1]s. Task under review: %[2]s.\n"+
 				"Beehive layer: write submodules/%[1]s/PLAN.md (status only) and submodules/%[1]s/docs/. Your task card "+
 				"(with its `Review:` note) is provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
-				"Implementer's work is on branch bee-%[2]s in submodules/%[1]s/repo — inspect read-only via git "+
-				"(fetch from origin if the branch is absent locally). Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md.\n"+
+				"%[3]s"+
 				"APPROVE -> merge the submodule pointer bump + PLAN.md task DONE + unlock dependents. "+
 				"REJECT -> PLAN.md task NEEDS-ARBITRATION + rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
 				"The run completes when the task leaves NEEDS-REVIEW. Act autonomously.\n\n",
-			smName, sel.Task.ID)
+			smName, sel.Task.ID, branchLine)
 	case selectt.Arbitrate:
+		// Same doc-only classification as Review: a doc-only dispute has no
+		// bee-<taskid> code branch, so state that instead of pointing at one.
+		var branchLine string
+		if isDocOnlyCard(sel.Task.Body) {
+			branchLine = fmt.Sprintf(
+				"This is a DOC-ONLY task: no bee-%[2]s code branch exists (nothing to fetch/inspect) — "+
+					"judge the change doc and PLAN.md state directly. Change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
+					"reviewer rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n",
+				smName, sel.Task.ID)
+		} else {
+			branchLine = fmt.Sprintf(
+				"Implementer branch bee-%[2]s in submodules/%[1]s/repo; change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
+					"reviewer rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n",
+				smName, sel.Task.ID)
+		}
 		preamble = fmt.Sprintf(
 			"# Context (ARBITRATION — settle the dispute, do NOT reimplement)\n"+
 				"cwd is the beehive repo root. Submodule: %[1]s. Task in arbitration: %[2]s.\n"+
 				"Beehive layer: write submodules/%[1]s/PLAN.md (status only) and submodules/%[1]s/docs/. Your task card is "+
 				"provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
-				"Implementer branch bee-%[2]s in submodules/%[1]s/repo; change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
-				"reviewer rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
+				"%[3]s"+
 				"SIDE WITH IMPLEMENTER -> merge pointer bump + PLAN.md DONE + unlock dependents. "+
 				"SIDE WITH REVIEWER -> PLAN.md TODO with the binding rationale; if a concrete operator blocker is exposed, "+
 				"run beehive task human %[1]s %[2]s --reason \"<specific blocker>\".\n"+
 				"The run completes when the task leaves NEEDS-ARBITRATION. Act autonomously.\n\n",
-			smName, sel.Task.ID)
+			smName, sel.Task.ID, branchLine)
 	case selectt.Work:
 		// The completion rule (flip to NEEDS-REVIEW, commit+push with the Beehive
 		// stamp, bump the pointer) is a static "what to do at the end" dump. In lean

@@ -631,6 +631,119 @@ func TestReviewCompletesOnStatusChange(t *testing.T) {
 	}
 }
 
+// reviewPreambleFor runs a Review dispatch for a task whose card Body carries the
+// given Files: line and returns the injected first-turn preamble. It shares the
+// minimal NEEDS-REVIEW plan/repo fixture the review tests use.
+func reviewPreambleFor(t *testing.T, kind selectt.Kind, filesLine string) string {
+	t.Helper()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	planPath := filepath.Join(sm, "PLAN.md")
+	status := "NEEDS-REVIEW"
+	if kind == selectt.Arbitrate {
+		status = "NEEDS-ARBITRATION"
+	}
+	os.WriteFile(planPath, []byte("## R1 ["+status+"] <!-- attempts=0 deps= -->\nbody\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	st := plan.StatusReview
+	if kind == selectt.Arbitrate {
+		st = plan.StatusArb
+	}
+	sel := &selectt.Selection{
+		Kind:      kind,
+		Submodule: subs[0],
+		Task:      plan.Task{ID: "R1", Status: st, Body: []string{filesLine}},
+	}
+	var firstPrompt string
+	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
+		// Move out of the review/arbitration status so the pass completes in one turn.
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= -->\nbody\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	return firstPrompt
+}
+
+// TestReviewPreambleDocOnlyBranchHint: a Review dispatch for a doc-only task (its
+// Files: line names only beehive-layer paths) renders the DOC-ONLY sentence
+// instead of the fetch/inspect instruction, so the reviewer never chases a
+// nonexistent bee-<taskid> code branch.
+func TestReviewPreambleDocOnlyBranchHint(t *testing.T) {
+	p := reviewPreambleFor(t, selectt.Review, "Files: docs/tasks/foo.md, submodules/sm/PLAN.md")
+	if !contains(p, "DOC-ONLY task") {
+		t.Fatalf("doc-only review preamble missing DOC-ONLY hint; got:\n%s", p)
+	}
+	if contains(p, "inspect read-only via git") || contains(p, "fetch from origin") {
+		t.Fatalf("doc-only review preamble must NOT tell the reviewer to fetch/inspect a branch; got:\n%s", p)
+	}
+}
+
+// TestReviewPreambleCodeBearingUnchanged: a Review dispatch for a code-bearing
+// task (Files: names a submodule code path) keeps the historical fetch/inspect
+// sentence, and a MIXED line (code + docs) is conservatively treated as code.
+func TestReviewPreambleCodeBearingUnchanged(t *testing.T) {
+	for _, filesLine := range []string{
+		"Files: internal/swarm/swarm.go, internal/swarm/swarm_test.go",
+		"Files: internal/swarm/swarm.go, docs/tasks/foo.md", // mixed → code
+	} {
+		p := reviewPreambleFor(t, selectt.Review, filesLine)
+		if !contains(p, "inspect read-only via git") || !contains(p, "fetch from origin") {
+			t.Fatalf("code-bearing review preamble (%q) must keep the fetch/inspect sentence; got:\n%s", filesLine, p)
+		}
+		if contains(p, "DOC-ONLY task") {
+			t.Fatalf("code-bearing review preamble (%q) must NOT render the doc-only hint; got:\n%s", filesLine, p)
+		}
+	}
+}
+
+// TestArbitratePreambleDocOnlyBranchHint mirrors the review test for the
+// Arbitrate preamble builder.
+func TestArbitratePreambleDocOnlyBranchHint(t *testing.T) {
+	p := reviewPreambleFor(t, selectt.Arbitrate, "Files: docs/tasks/foo.md")
+	if !contains(p, "DOC-ONLY task") {
+		t.Fatalf("doc-only arbitrate preamble missing DOC-ONLY hint; got:\n%s", p)
+	}
+	if contains(p, "Implementer branch bee-") {
+		t.Fatalf("doc-only arbitrate preamble must NOT point at a code branch; got:\n%s", p)
+	}
+	code := reviewPreambleFor(t, selectt.Arbitrate, "Files: internal/swarm/swarm.go")
+	if !contains(code, "Implementer branch bee-") {
+		t.Fatalf("code-bearing arbitrate preamble must keep the implementer branch ref; got:\n%s", code)
+	}
+	if contains(code, "DOC-ONLY task") {
+		t.Fatalf("code-bearing arbitrate preamble must NOT render the doc-only hint; got:\n%s", code)
+	}
+}
+
+// TestIsDocOnlyCard exercises the classifier directly, including the conservative
+// no-Files-line case (treated as code-bearing).
+func TestIsDocOnlyCard(t *testing.T) {
+	cases := []struct {
+		body []string
+		want bool
+	}{
+		{[]string{"Files: docs/tasks/x.md, submodules/sm/PLAN.md"}, true},
+		{[]string{"Files: docs/foo.md, ROI.md"}, true},
+		{[]string{"Files: internal/swarm/swarm.go"}, false},
+		{[]string{"Files: internal/swarm/swarm.go, docs/tasks/x.md"}, false}, // mixed
+		{[]string{"no files line here"}, false},                             // conservative
+		{nil, false},
+	}
+	for _, c := range cases {
+		if got := isDocOnlyCard(c.body); got != c.want {
+			t.Errorf("isDocOnlyCard(%q) = %v, want %v", c.body, got, c.want)
+		}
+	}
+}
+
 // refusingClient fails the test if Open is EVER called — used to prove a
 // dispatch-time short-circuit (the F-LIVE review-dispatch reachability guard)
 // never spends a single agent turn.
