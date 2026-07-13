@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1200,7 +1201,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						cleanup()
 						return res, nil
 					}
-					if w := r.recordReviewedCommit(ctx, sel, absRoot, cl); w != "" && res.Warning == "" {
+					if w := r.recordReviewedCommit(ctx, sel, wg, cl); w != "" && res.Warning == "" {
 						res.Warning = w
 					}
 					// Delete a rejected attempt's orphan bee branch (see the mirror
@@ -1458,7 +1459,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				cleanup()
 				return res, nil
 			}
-			if w := r.recordReviewedCommit(ctx, sel, absRoot, cl); w != "" && res.Warning == "" {
+			if w := r.recordReviewedCommit(ctx, sel, wg, cl); w != "" && res.Warning == "" {
 				res.Warning = w
 			}
 			// Arbitration that sided with the reviewer sends the task back to TODO for
@@ -2053,6 +2054,85 @@ func pathHasPrefix(name, stem string) bool {
 	return len(name) >= len(stem) && name[:len(stem)] == stem
 }
 
+// codeRefRe matches a backtick-quoted, path-like token in a change doc, e.g.
+// `internal/swarm/swarm.go`, `profiles/wireguard-yoga.nix`, `flake.nix`.
+var codeRefRe = regexp.MustCompile("`([A-Za-z0-9_][A-Za-z0-9_./+-]*\\.[A-Za-z0-9]+)`")
+
+// codeExts is the set of extensions treated as submodule-repo CODE for the
+// finalize completion-check assertion. Beehive-layer text (docs/, PLAN.md,
+// ROI.md) is excluded separately in isRepoCodePath.
+var codeExts = map[string]bool{
+	".go": true, ".nix": true, ".py": true, ".js": true, ".ts": true,
+	".tsx": true, ".jsx": true, ".rs": true, ".c": true, ".h": true,
+	".cc": true, ".cpp": true, ".hpp": true, ".java": true, ".kt": true,
+	".rb": true, ".sh": true, ".bash": true, ".yaml": true, ".yml": true,
+	".toml": true, ".json": true, ".proto": true, ".tf": true, ".sql": true,
+	".mod": true, ".sum": true,
+}
+
+// isRepoCodePath reports whether p looks like a submodule-repo-relative code
+// file path — the kind a change doc references for the work it landed — as
+// opposed to a beehive-layer artifact (docs/, sessions/, PLAN.md, ROI.md, or a
+// superproject-qualified submodules/<sm>/... path). Only such paths are asserted
+// present in the merged tree.
+func isRepoCodePath(p string) bool {
+	if strings.HasPrefix(p, "docs/") || strings.HasPrefix(p, "sessions/") ||
+		strings.HasPrefix(p, "submodules/") || strings.HasPrefix(p, "PLAN") ||
+		strings.HasPrefix(p, "ROI") {
+		return false
+	}
+	return codeExts[strings.ToLower(filepath.Ext(p))]
+}
+
+// referencedCodeFiles extracts the distinct submodule-repo-relative code file
+// paths a change doc references (backtick-quoted path tokens with a code
+// extension, excluding beehive-layer artifacts). Order-preserving, de-duplicated.
+func referencedCodeFiles(doc string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range codeRefRe.FindAllStringSubmatch(doc, -1) {
+		p := m[1]
+		if !isRepoCodePath(p) || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// changeDocFilesLanded is the finalize-time completion-check assertion
+// (finalize-work-commit-reachability item d): before a finalize path closes a
+// task DONE without a review session, confirm the task's change doc's referenced
+// submodule-repo code files actually exist in the tracked main tree (trackedRef).
+// This catches the phantom-DONE-without-merge shape where an "already merged"
+// test passed on a proxy/parent commit but the task's OWN code never landed — a
+// DONE that landed no code and left the plan reading green.
+//
+// Fails OPEN (returns true) when there is no change doc to read or the doc
+// references no recognizable code path (a legitimately doc-only task, or an
+// unparseable doc), so it never blocks a good finalize. Returns false ONLY on a
+// POSITIVE signal: the doc names one or more code files and NONE of them is
+// present at trackedRef — the caller then falls through to drive the real merge
+// / normal dispatch instead of finalizing.
+func (r *Runner) changeDocFilesLanded(ctx context.Context, sel *selectt.Selection, sg *git.Repo, trackedRef string) bool {
+	docPath := filepath.Join(sel.Submodule.Path, "docs", fmt.Sprintf("bee-%s-%s.md", sel.Task.ID, sel.Task.ID))
+	b, err := os.ReadFile(docPath)
+	if err != nil {
+		return true
+	}
+	refs := referencedCodeFiles(string(b))
+	if len(refs) == 0 {
+		return true
+	}
+	for _, p := range refs {
+		if sg.Exists(ctx, trackedRef, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // taskID is the stable id used in the change-doc stem and Context preamble.
 func taskID(sel *selectt.Selection) string {
 	switch sel.Kind {
@@ -2328,15 +2408,27 @@ func (r *Runner) demoteUnpushed(ctx context.Context, sel *selectt.Selection, rea
 // than risk a false finalize of a genuinely pending — or never attempted —
 // review.
 // recordReviewedCommit durably stamps the submodule commit a just-completed
-// Work pass handed to review (its NEEDS-REVIEW gitlink tip) onto the task, so a
-// later pass can recognize the work as already-merged-into-tracked-main even
-// after the disposable bee-<taskid> branch is reclaimed or reused
-// (finalizeIfMergedByRecord). It runs only for a Work pass whose published
-// status is NEEDS-REVIEW; every other kind/state is a no-op. Best-effort: it
-// returns a warning string, never a hard error, so a failed record never blocks
-// completion — finalize still has its branch-based check (finalizeIfAlreadyMerged)
-// as a fallback.
-func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selection, absRoot string, cl *claim.Claimer) string {
+// Work pass handed to review onto the task, so a later pass can recognize the
+// work as already-merged-into-tracked-main even after the disposable
+// bee-<taskid> branch is reclaimed or reused (finalizeIfMergedByRecord). It runs
+// only for a Work pass whose published status is NEEDS-REVIEW; every other
+// kind/state is a no-op. Best-effort: it returns a warning string, never a hard
+// error, so a failed record never blocks completion — finalize still has its
+// branch-based check (finalizeIfAlreadyMerged) as a fallback.
+//
+// It stamps the WORK-BRANCH TIP — the bee-<taskid> commit THIS pass authored and
+// pushed (its own code worktree HEAD, wg), the commit that actually carries the
+// task's code diff and change doc — NOT the ambient submodule gitlink pointer
+// (`HEAD:submodules/<sm>/repo`). The ambient pointer can name a PROXY/PARENT
+// commit unrelated to this task's work (e.g. a dependency's already-merged
+// commit that was the worktree base), which is trivially an ancestor of tracked
+// main; recording it let finalizeIfMergedByRecord read "already merged" off a sha
+// that is not this task's work at all and close the task DONE while its code was
+// silently dropped (the phantom-DONE-without-merge defect, observed live in
+// nixconf's wireguard-yoga-profile: recorded the parent secret commit, not the
+// profile's own code commit). Keying on wg's HEAD makes the recorded stamp the
+// WORK commit, so the "already merged" test can never pass on a proxy.
+func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selection, wg *git.Repo, cl *claim.Claimer) string {
 	if sel.Kind != selectt.Work || !hasTask(sel) {
 		return ""
 	}
@@ -2344,13 +2436,9 @@ func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selectio
 	if err != nil || st != plan.StatusReview {
 		return ""
 	}
-	rel, err := filepath.Rel(absRoot, sel.Submodule.RepoDir())
-	if err != nil {
-		return ""
-	}
-	sha, err := r.Git.RevParse(ctx, "HEAD:"+rel)
+	sha, err := wg.RevParse(ctx, "HEAD")
 	if err != nil || sha == "" {
-		return ""
+		return fmt.Sprintf("could not resolve work-branch tip for %s: %v", sel.Task.ID, err)
 	}
 	if err := cl.RecordReviewCommit(ctx, sel.Task.ID, sha); err != nil {
 		return fmt.Sprintf("could not record reviewed commit for %s: %v", sel.Task.ID, err)
@@ -2428,6 +2516,16 @@ func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Sele
 		// through to the branch-based guards / normal dispatch.
 		return false, err
 	}
+	// Completion-check assertion (finalize-work-commit-reachability): the recorded
+	// WORK commit is an ancestor of tracked main, but before closing DONE confirm
+	// the task's change doc's referenced code files actually exist in that tree.
+	// This catches a phantom "already merged" that passed on a proxy commit whose
+	// own code never landed — a DONE that landed no code. Fails OPEN (does not
+	// block) on an absent/unparseable doc; only a POSITIVE "doc names code files,
+	// none present at trackedRef" falls through to drive the real merge.
+	if !r.changeDocFilesLanded(ctx, sel, sg, trackedRef) {
+		return false, nil
+	}
 	// Merged: sync THIS pass's private submodule checkout to the tracked tip so the
 	// gitlink bump (FinalizeAlreadyMerged -> CommitPaths) records the real HEAD,
 	// exactly as finalizeIfAlreadyMerged does.
@@ -2496,6 +2594,14 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 	merged, err := sg.IsAncestor(ctx, branchTip, trackedRef)
 	if err != nil || !merged {
 		return false, err
+	}
+	// Completion-check assertion (finalize-work-commit-reachability): the
+	// bee-<taskid> branch tip is an ancestor of tracked main, but before closing
+	// DONE confirm the change doc's referenced code files exist in that tree, so a
+	// DONE that landed no code is caught and the real merge is driven instead.
+	// Fails OPEN on an absent/unparseable doc.
+	if !r.changeDocFilesLanded(ctx, sel, sg, trackedRef) {
+		return false, nil
 	}
 	// The recorded pointer is already folded into tracked main: sync THIS pass's
 	// own (private, per-pass) submodule checkout to that tip — exactly

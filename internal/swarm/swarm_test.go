@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/audit"
+	"github.com/spencerharmon/beehive/internal/claim"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -4342,5 +4343,135 @@ func TestPredicateHardStopNoSpuriousCancel(t *testing.T) {
 	}
 	if !contains(res.Warning, "per-turn ceiling") {
 		t.Fatalf("want the ordinary TurnTimeout warning, got %q", res.Warning)
+	}
+}
+
+// TestReferencedCodeFiles pins the finalize completion-check assertion's parser:
+// it extracts backtick-quoted submodule-repo code paths and ignores beehive-layer
+// artifacts and prose.
+func TestReferencedCodeFiles(t *testing.T) {
+	doc := "Fixes it in `internal/swarm/swarm.go` and `profiles/wireguard-yoga.nix`, " +
+		"imports `flake.nix`. Not code: `docs/tasks/x.md`, `submodules/sm/repo`, " +
+		"`PLAN.md`, `ROI.md`, plain word, and `just-text` with no ext."
+	got := referencedCodeFiles(doc)
+	want := []string{"internal/swarm/swarm.go", "profiles/wireguard-yoga.nix", "flake.nix"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("referencedCodeFiles = %v, want %v", got, want)
+	}
+	// A doc-only change (no code paths) yields none, so the assertion fails OPEN.
+	if got := referencedCodeFiles("Only touched `docs/foo.md` and `PLAN.md`."); len(got) != 0 {
+		t.Fatalf("doc-only change should reference no code files, got %v", got)
+	}
+}
+
+// TestChangeDocFilesLanded proves the assertion catches a DONE that landed no
+// code: when the change doc names code files that are ABSENT from the merged tree
+// it returns false; present -> true; and an absent/doc-only doc fails OPEN (true).
+func TestChangeDocFilesLanded(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	docsDir := filepath.Join(sm, "docs")
+	os.MkdirAll(docsDir, 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	sg := gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "unrelated.txt"), []byte("x\n"), 0o644)
+	sg.Commit(ctx, "base without the profile")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "T1"}}
+	r := &Runner{Repo: rp, Git: g, TTL: time.Hour}
+
+	doc := "# bee-T1\nAdds `profiles/wireguard-yoga.nix` and imports it in `flake.nix`.\n"
+	docPath := filepath.Join(docsDir, "bee-T1-T1.md")
+	os.WriteFile(docPath, []byte(doc), 0o644)
+
+	// The referenced code files are NOT in the tree -> phantom DONE -> false.
+	if r.changeDocFilesLanded(ctx, sel, sg, "main") {
+		t.Fatal("expected changeDocFilesLanded=false when the doc's code files are absent from the merged tree")
+	}
+
+	// Land the files, commit, and it must now pass.
+	os.MkdirAll(filepath.Join(repoDir, "profiles"), 0o755)
+	os.WriteFile(filepath.Join(repoDir, "profiles", "wireguard-yoga.nix"), []byte("{}\n"), 0o644)
+	os.WriteFile(filepath.Join(repoDir, "flake.nix"), []byte("{}\n"), 0o644)
+	sg.Commit(ctx, "land the profile")
+	if !r.changeDocFilesLanded(ctx, sel, sg, "main") {
+		t.Fatal("expected changeDocFilesLanded=true once the referenced files exist in the tree")
+	}
+
+	// A doc-only doc (no code refs) fails OPEN even against the base tree.
+	os.WriteFile(docPath, []byte("# bee-T1\nOnly touched `docs/x.md` and `PLAN.md`.\n"), 0o644)
+	if !r.changeDocFilesLanded(ctx, sel, sg, "main") {
+		t.Fatal("a doc-only change must fail OPEN (true)")
+	}
+
+	// A missing doc fails OPEN too.
+	os.Remove(docPath)
+	if !r.changeDocFilesLanded(ctx, sel, sg, "main") {
+		t.Fatal("a missing change doc must fail OPEN (true)")
+	}
+}
+
+// TestRecordReviewedCommitStampsWorkBranchTip is the accept criterion for item
+// (b): the recorded review stamp must be the bee-<taskid> WORK-branch tip (the
+// commit carrying the code diff), NEVER the ambient submodule gitlink pointer,
+// which can name a proxy/parent commit already an ancestor of main. Seeds the
+// ambient gitlink at a BASE (proxy) commit while the work worktree HEAD is a
+// distinct child commit, and asserts recordReviewedCommit stamps the child.
+func TestRecordReviewedCommitStampsWorkBranchTip(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	sg := gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("base\n"), 0o644)
+	sg.Commit(ctx, "base (proxy/parent)")
+	baseSHA, _ := sg.RevParse(ctx, "HEAD")
+	os.WriteFile(filepath.Join(repoDir, "work.txt"), []byte("work\n"), 0o644)
+	sg.Commit(ctx, "the actual work commit")
+	workSHA, _ := sg.RevParse(ctx, "HEAD")
+	if baseSHA == workSHA {
+		t.Fatal("base and work commits must differ")
+	}
+
+	// Ambient gitlink pinned at the BASE (proxy), the exact phantom-DONE shape.
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+baseSHA+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed ambient gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= session=bee-A heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Run(ctx, "add", "submodules/sm/PLAN.md")
+	g.Run(ctx, "commit", "-m", "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.NeedsReview}}
+	r := &Runner{Repo: rp, Git: g, TTL: time.Hour}
+	cl := &claim.Claimer{Repo: rp, Sub: subs[0], Git: g, TTL: time.Hour, Session: "bee-A"}
+
+	// wg is the work code worktree — its HEAD is the work-branch tip.
+	if w := r.recordReviewedCommit(ctx, sel, sg, cl); w != "" {
+		t.Fatalf("recordReviewedCommit warned: %s", w)
+	}
+	b, _ := os.ReadFile(planPath)
+	p, _ := plan.Parse(string(b))
+	tk := p.Find("T1")
+	if tk == nil {
+		t.Fatal("task T1 vanished")
+	}
+	if tk.ReviewCommit != workSHA {
+		t.Fatalf("recorded review=%s, want the WORK-branch tip %s (proxy base was %s)", tk.ReviewCommit, workSHA, baseSHA)
+	}
+	if tk.ReviewCommit == baseSHA {
+		t.Fatal("recorded the ambient proxy/base gitlink instead of the work commit")
 	}
 }
