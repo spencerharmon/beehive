@@ -4344,3 +4344,69 @@ func TestPredicateHardStopNoSpuriousCancel(t *testing.T) {
 		t.Fatalf("want the ordinary TurnTimeout warning, got %q", res.Warning)
 	}
 }
+
+// TestDocReferencedFiles proves the change-doc Files: parse keeps only concrete
+// submodule-source paths: globs and beehive-layer entries (PLAN.md, docs/…) are
+// dropped so assertDocFilesLanded checks exactly the paths whose landing proves a
+// merge carried the real change.
+func TestDocReferencedFiles(t *testing.T) {
+	dir := t.TempDir()
+	docPath := filepath.Join(dir, "doc.md")
+	body := "Landed a thing.\n" +
+		"Files: internal/swarm/swarm.go, internal/swarm/swarm_test.go (tests), " +
+		"internal/audit/*_test.go, PLAN.md, docs/foo.md.\n"
+	if err := os.WriteFile(docPath, []byte(body), 0o644); err != nil {
+		t.Fatalf("write doc: %v", err)
+	}
+	got, err := docReferencedFiles(docPath)
+	if err != nil {
+		t.Fatalf("docReferencedFiles: %v", err)
+	}
+	want := []string{"internal/swarm/swarm.go", "internal/swarm/swarm_test.go"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("docReferencedFiles = %v, want %v", got, want)
+	}
+
+	// Absent doc must return an error so the caller can fail open.
+	if _, err := docReferencedFiles(filepath.Join(dir, "nope.md")); err == nil {
+		t.Fatal("docReferencedFiles on a missing doc must return an error (fail-open signal)")
+	}
+}
+
+// TestAssertDocFilesLanded proves the completion assertion blocks an auto-finalize
+// when a change-doc Files: entry is absent from the merged tracked tree, passes
+// when every listed file is present, and fails OPEN when the doc is missing.
+func TestAssertDocFilesLanded(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := gitInit(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, "landed.go"), []byte("package p\n"), 0o644); err != nil {
+		t.Fatalf("write landed: %v", err)
+	}
+	if _, err := g.Run(ctx, "add", "landed.go"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-q", "-m", "seed"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	r := &Runner{}
+
+	// All listed files present -> nil.
+	present := filepath.Join(dir, "present.md")
+	os.WriteFile(present, []byte("Files: landed.go.\n"), 0o644)
+	if err := r.assertDocFilesLanded(ctx, g, "HEAD", present); err != nil {
+		t.Fatalf("assertDocFilesLanded with a present file must pass, got %v", err)
+	}
+
+	// A listed file absent from the tree -> error (blocks finalize).
+	missing := filepath.Join(dir, "missing.md")
+	os.WriteFile(missing, []byte("Files: landed.go, gone.go.\n"), 0o644)
+	if err := r.assertDocFilesLanded(ctx, g, "HEAD", missing); err == nil {
+		t.Fatal("assertDocFilesLanded must fail when a doc-listed file is absent from the merged tree")
+	}
+
+	// No doc on disk -> fail open (nil), other guards decide.
+	if err := r.assertDocFilesLanded(ctx, g, "HEAD", filepath.Join(dir, "nope.md")); err != nil {
+		t.Fatalf("assertDocFilesLanded must fail open on a missing doc, got %v", err)
+	}
+}

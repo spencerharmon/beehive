@@ -2428,6 +2428,15 @@ func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Sele
 		// through to the branch-based guards / normal dispatch.
 		return false, err
 	}
+	// Ancestry proves the recorded commit is on tracked main, but a mis-recorded
+	// sha or a merge that dropped the change's files could still leave the actual
+	// source unlanded. Refuse to auto-finalize DONE unless the change doc's Files:
+	// entries are present in the merged tree — never rubber-stamp a "merge" whose
+	// effect is absent.
+	docPath := filepath.Join(sel.Submodule.Path, "docs", fmt.Sprintf("bee-%s-%s.md", sel.Task.ID, sel.Task.ID))
+	if err := r.assertDocFilesLanded(ctx, sg, trackedRef, docPath); err != nil {
+		return false, err
+	}
 	// Merged: sync THIS pass's private submodule checkout to the tracked tip so the
 	// gitlink bump (FinalizeAlreadyMerged -> CommitPaths) records the real HEAD,
 	// exactly as finalizeIfAlreadyMerged does.
@@ -2497,6 +2506,13 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 	if err != nil || !merged {
 		return false, err
 	}
+	// Ancestry proves the branch tip is on tracked main, but the same completion
+	// assertion applies: refuse to auto-finalize DONE unless the change doc's
+	// Files: entries actually landed in the merged tree.
+	docPath := filepath.Join(sel.Submodule.Path, "docs", fmt.Sprintf("bee-%s-%s.md", sel.Task.ID, sel.Task.ID))
+	if err := r.assertDocFilesLanded(ctx, sg, trackedRef, docPath); err != nil {
+		return false, err
+	}
 	// The recorded pointer is already folded into tracked main: sync THIS pass's
 	// own (private, per-pass) submodule checkout to that tip — exactly
 	// syncWorktreeBase's pattern — so the beehive-layer gitlink bump below
@@ -2527,7 +2543,55 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 	return true, nil
 }
 
-// sourceBranchExists reports whether branch (bee-<taskid>) is a REAL,
+// docReferencedFiles reads the change doc at docPath and returns the concrete,
+// non-glob submodule-source paths named on its `Files:` line (reusing
+// filesFromCard's conservative parse). Beehive-layer entries (PLAN.md, docs/…)
+// and wildcard/glob patterns are dropped: only real tracked source paths remain,
+// so a caller checks exactly the files whose landing proves the merge carried the
+// actual change. Returns the read error when the doc is absent/unreadable so the
+// caller can fail open.
+func docReferencedFiles(docPath string) ([]string, error) {
+	data, err := os.ReadFile(docPath)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, f := range filesFromCard(strings.Split(string(data), "\n")) {
+		if strings.ContainsAny(f, "*?[") {
+			continue // a glob names no single concrete path to assert
+		}
+		if f == "PLAN.md" || strings.HasPrefix(f, "docs/") {
+			continue // beehive-layer, not submodule source
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+// assertDocFilesLanded verifies every concrete source path named on the change
+// doc's Files: line is PRESENT in the merged tracked tree (trackedRef) of the
+// submodule, so an auto-finalize to DONE cannot silently pass a "merge" whose
+// files never actually landed. Returns an error naming the first missing path.
+// Fails OPEN — an absent/unreadable doc, or a doc with no parseable concrete
+// source path (glob-only or doc-only Files:), yields nil — so a legitimately
+// merged task still finalizes.
+func (r *Runner) assertDocFilesLanded(ctx context.Context, sg *git.Repo, trackedRef, docPath string) error {
+	files, err := docReferencedFiles(docPath)
+	if err != nil {
+		return nil // no readable change doc — fail open, other guards decide
+	}
+	for _, f := range files {
+		if !sg.Exists(ctx, trackedRef, f) {
+			return fmt.Errorf(
+				"change doc %s lists %s but it is absent from the merged tracked tree %s: "+
+					"refusing to auto-finalize DONE for a merge that never landed the change",
+				docPath, f, trackedRef)
+		}
+	}
+	return nil
+}
+
+
 // resolvable ref for this task's OWN attempt — the gate finalizeIfAlreadyMerged
 // applies before ever trusting IsAncestor — and, when it is, ALSO returns
 // branch's own resolved tip sha so the caller can test ancestry against THAT
