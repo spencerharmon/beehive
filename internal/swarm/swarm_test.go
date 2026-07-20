@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/audit"
+	"github.com/spencerharmon/beehive/internal/claim"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -1151,6 +1152,118 @@ func TestReviewDispatchFinalizesAlreadyMergedRemote(t *testing.T) {
 	}
 	if !contains(out, mainTip) {
 		t.Fatalf("gitlink = %q, want bumped to the tracked-main tip %s (not left at the implementer commit %s)", out, mainTip, implSHA)
+	}
+}
+
+// TestRecordReviewedCommitRecordsBranchTipNotAmbientPointer is the regression
+// for record-review-commit-ambient-pointer: a completed Work pass on a BUSY
+// submodule must record its OWN bee-<taskid> tip as ReviewCommit, never the
+// ambient beehive-layer gitlink `HEAD:submodules/<sm>/repo`. Pre-fix,
+// recordReviewedCommit stamped HEAD:rel, which on a busy submodule is a SIBLING
+// task's already-merged pointer (an ancestor of tracked main) — so
+// finalizeIfMergedByRecord later trivially "proved" that unrelated sha merged
+// and flipped the task DONE while its real work never merged (observed live:
+// flux phantom-library-bluegreen-deploy recorded the gitea-OOM sibling commit;
+// gostream state-pvc recorded the zuul-ci merge). Here the ambient gitlink is
+// deliberately a sibling commit (mainTip), while bee-R1 sits at the real,
+// unmerged work (workSHA); the recorded review= MUST be workSHA.
+func TestRecordReviewedCommitRecordsBranchTipNotAmbientPointer(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	// A scratch clone drives origin. First: the REAL work for R1 on bee-R1
+	// (branched off the base, deliberately NEVER merged into main), pushed to
+	// origin exactly as a completed Work pass leaves it.
+	sc := filepath.Join(t.TempDir(), "push")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+		t.Fatalf("scratch clone: %v", err)
+	}
+	scg := gitConfig(t, sc)
+	os.WriteFile(filepath.Join(sc, "r1-work.txt"), []byte("the real R1 work\n"), 0o644)
+	if err := scg.Commit(ctx, "R1: real implementer work"); err != nil {
+		t.Fatalf("commit R1 work: %v", err)
+	}
+	workSHA, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse R1 work: %v", err)
+	}
+	if _, err := scg.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-R1"); err != nil {
+		t.Fatalf("push bee-R1: %v", err)
+	}
+
+	// Now a SIBLING task's work lands on tracked main (the busy-submodule shape):
+	// main advances to mainTip, an already-merged commit unrelated to R1. Reset
+	// the scratch back to the seeded base first so this is NOT built on bee-R1.
+	if _, err := scg.Run(ctx, "reset", "--hard", "origin/main"); err != nil {
+		t.Fatalf("reset scratch to main: %v", err)
+	}
+	os.WriteFile(filepath.Join(sc, "sibling.txt"), []byte("unrelated sibling task\n"), 0o644)
+	if err := scg.Commit(ctx, "sibling: unrelated merged work"); err != nil {
+		t.Fatalf("commit sibling: %v", err)
+	}
+	if err := scg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push sibling to main: %v", err)
+	}
+	mainTip, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse main tip: %v", err)
+	}
+	if workSHA == mainTip {
+		t.Fatal("test bug: work and sibling commits must differ")
+	}
+
+	// The ambient beehive-layer gitlink names the SIBLING's already-merged
+	// pointer (mainTip) — precisely what HEAD:submodules/sm/repo resolves to when
+	// a sibling pass most recently bumped the single shared gitlink.
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+mainTip+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed ambient sibling gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\nwork\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+	r := &Runner{Repo: rp, Git: g, TTL: time.Hour}
+	cl := &claim.Claimer{Repo: rp, Sub: subs[0], Git: g, TTL: time.Hour, Session: "bee-R1"}
+
+	if w := r.recordReviewedCommit(ctx, sel, "bee-R1", root, cl); w != "" {
+		t.Fatalf("recordReviewedCommit returned warning: %s", w)
+	}
+
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("R1")
+	if tk == nil {
+		t.Fatal("task R1 vanished from PLAN.md")
+	}
+	if tk.ReviewCommit != workSHA {
+		t.Fatalf("ReviewCommit = %q, want the bee-R1 tip %q (NOT the ambient sibling pointer %q)", tk.ReviewCommit, workSHA, mainTip)
+	}
+	if tk.ReviewCommit == mainTip {
+		t.Fatal("ReviewCommit recorded the ambient sibling gitlink pointer — the exact record-review-commit-ambient-pointer bug")
 	}
 }
 

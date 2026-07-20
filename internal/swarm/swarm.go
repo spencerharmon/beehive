@@ -1200,7 +1200,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						cleanup()
 						return res, nil
 					}
-					if w := r.recordReviewedCommit(ctx, sel, absRoot, cl); w != "" && res.Warning == "" {
+					if w := r.recordReviewedCommit(ctx, sel, res.Branch, absRoot, cl); w != "" && res.Warning == "" {
 						res.Warning = w
 					}
 					// Delete a rejected attempt's orphan bee branch (see the mirror
@@ -1458,7 +1458,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				cleanup()
 				return res, nil
 			}
-			if w := r.recordReviewedCommit(ctx, sel, absRoot, cl); w != "" && res.Warning == "" {
+			if w := r.recordReviewedCommit(ctx, sel, res.Branch, absRoot, cl); w != "" && res.Warning == "" {
 				res.Warning = w
 			}
 			// Arbitration that sided with the reviewer sends the task back to TODO for
@@ -2328,15 +2328,35 @@ func (r *Runner) demoteUnpushed(ctx context.Context, sel *selectt.Selection, rea
 // than risk a false finalize of a genuinely pending — or never attempted —
 // review.
 // recordReviewedCommit durably stamps the submodule commit a just-completed
-// Work pass handed to review (its NEEDS-REVIEW gitlink tip) onto the task, so a
-// later pass can recognize the work as already-merged-into-tracked-main even
-// after the disposable bee-<taskid> branch is reclaimed or reused
-// (finalizeIfMergedByRecord). It runs only for a Work pass whose published
-// status is NEEDS-REVIEW; every other kind/state is a no-op. Best-effort: it
-// returns a warning string, never a hard error, so a failed record never blocks
-// completion — finalize still has its branch-based check (finalizeIfAlreadyMerged)
-// as a fallback.
-func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selection, absRoot string, cl *claim.Claimer) string {
+// Work pass handed to review onto the task, so a later pass can recognize the
+// work as already-merged-into-tracked-main even after the disposable
+// bee-<taskid> branch is reclaimed or reused (finalizeIfMergedByRecord). It
+// runs only for a Work pass whose published status is NEEDS-REVIEW; every other
+// kind/state is a no-op. Best-effort: it returns a warning string, never a hard
+// error, so a failed record never blocks completion — finalize still has its
+// branch-based check (finalizeIfAlreadyMerged) as a fallback.
+//
+// It records the task's OWN bee-<taskid> branch tip (resolved via the SAME
+// sourceBranchExists idiom finalizeIfAlreadyMerged uses), NOT the ambient
+// beehive-layer gitlink `HEAD:submodules/<sm>/repo`. This distinction is the
+// whole point of the record and was the subject of a silent-corruption bug
+// (record-review-commit-ambient-pointer): the single shared gitlink path only
+// ever names whichever task's Work pass most recently bumped IT, so on a busy
+// submodule (many concurrent passes racing one gitlink) `HEAD:rel` frequently
+// resolves to a SIBLING task's already-merged commit — an ancestor of tracked
+// main for reasons having nothing to do with THIS task ever being merged.
+// finalizeIfMergedByRecord then trivially "proves" that sibling sha merged and
+// flips the task DONE while its real work (the bee-<taskid> tip) is never
+// merged. Recording the branch's own tip keeps ReviewCommit genuinely
+// task-specific, exactly the invariant finalizeIfMergedByRecord's safety
+// argument depends on. This runs only after landSourceBranch has pushed the
+// branch (a demoted/unpushed pass returns before reaching here), so the branch
+// resolves: origin/bee-<taskid> via ls-remote in remote mode, or the local
+// refs/heads/bee-<taskid> (a worktree branch, visible in the shared ref store)
+// in local-sharing mode. If it does NOT resolve, fail open — record nothing and
+// let the branch-based finalizeIfAlreadyMerged / normal review dispatch handle
+// it, never a wrong sha.
+func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selection, branch, absRoot string, cl *claim.Claimer) string {
 	if sel.Kind != selectt.Work || !hasTask(sel) {
 		return ""
 	}
@@ -2344,13 +2364,24 @@ func (r *Runner) recordReviewedCommit(ctx context.Context, sel *selectt.Selectio
 	if err != nil || st != plan.StatusReview {
 		return ""
 	}
-	rel, err := filepath.Rel(absRoot, sel.Submodule.RepoDir())
-	if err != nil {
-		return ""
+	repoDir := sel.Submodule.RepoDir()
+	if !isSourceCheckout(ctx, repoDir) {
+		return fmt.Sprintf("could not record reviewed commit for %s: submodule %s not checked out at %s", sel.Task.ID, sel.Submodule.Name, repoDir)
 	}
-	sha, err := r.Git.RevParse(ctx, "HEAD:"+rel)
-	if err != nil || sha == "" {
-		return ""
+	sg := git.New(repoDir)
+	rem, err := sg.Remote(ctx)
+	if err != nil {
+		return fmt.Sprintf("could not record reviewed commit for %s: %v", sel.Task.ID, err)
+	}
+	// The task's OWN bee-<taskid> tip — never the ambient shared gitlink pointer.
+	sha, exists, err := r.sourceBranchExists(ctx, sg, rem, branch)
+	if err != nil {
+		return fmt.Sprintf("could not record reviewed commit for %s: resolving %s: %v", sel.Task.ID, branch, err)
+	}
+	if !exists || sha == "" {
+		// Fail open: no branch to name means no task-specific sha to record.
+		// finalizeIfAlreadyMerged (branch-based) / normal review dispatch cover it.
+		return fmt.Sprintf("could not record reviewed commit for %s: source branch %s did not resolve", sel.Task.ID, branch)
 	}
 	if err := cl.RecordReviewCommit(ctx, sel.Task.ID, sha); err != nil {
 		return fmt.Sprintf("could not record reviewed commit for %s: %v", sel.Task.ID, err)
