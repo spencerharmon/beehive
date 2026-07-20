@@ -105,7 +105,7 @@ func scanToolCalls(data []byte) (calls, fails int, cats map[string]int) {
 	sc.Buffer(make([]byte, 0, 64*1024), 4<<20)
 
 	inFence := false
-	pending := false   // a depth-0 tool marker awaiting its output fence
+	pending := false    // a depth-0 tool marker awaiting its output fence
 	collecting := false // currently accumulating the pending marker's output fence
 	var out strings.Builder
 
