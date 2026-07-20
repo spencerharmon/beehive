@@ -165,10 +165,25 @@ range.
 ## Work task
 Status is `TODO` — it is yours to IMPLEMENT. If the task is invalid versus your provided task card, set
 it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, to completion:
-- Make and TEST the change in your worktree.
+- Make the change in your worktree and PROVE it. A behavioral change (bug fix, feature, config, script)
+  REQUIRES an automated regression test that FAILS without your change and PASSES with it: write it, run
+  it, and paste the exact command + its passing result into the change doc. "DONE" is NEVER a guess or a
+  plausible-looking diff — it is a claim a reviewer can re-run from the evidence you recorded. If no
+  honest automated test is possible for this change, say so explicitly in the doc and record the manual
+  verification you actually ran instead; never silently skip verification.
+- VERIFY THE REAL EFFECT, not merely that code builds. A task whose deliverable is a running effect — a
+  deploy, a GitOps manifest, a service, a data migration — is NOT done when the manifest is committed; it
+  is done when the effect is CONFIRMED live (the Kustomization reconciled, the rollout is Ready, the
+  endpoint answers) and that confirmation is pasted into the change doc. When the effect only lands after
+  an external system converges, follow `skills/deferred-verification.md`: keep the task `NEEDS-REVIEW`
+  with the exact pending check named in the doc, or re-check until it converges — NEVER flip a
+  deploy/service/migration task `DONE` on the ASSUMPTION it will reconcile. A service claimed done that
+  was never actually deployed is precisely the failure this rule exists to prevent.
 - Write the change doc at EXACTLY `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` (the beehive layer,
   NOT inside the code worktree). The runner's completion check requires it there; a doc elsewhere reads
-  as "not done".
+  as "not done". The doc MUST carry the evidence from the two rules above — the regression test's command
+  and passing output, and (for an effect task) the live-effect confirmation. A change doc with no
+  evidence is not a record of done; it is a guess, and the reviewer will reject it.
 - Regardless of whether this task changes code: `git commit` your beehive-layer worktree's `PLAN.md`
   status flip and `docs/` changes YOURSELF, in THIS worktree — a doc-only task commits here exactly like
   a code task does. This is NOT the forbidden "author in the live/shared checkout": this worktree (your
@@ -195,8 +210,11 @@ its change doc and any pointer bump are the only artifacts. A missing `bee-<task
 find remote ref` there is EXPECTED, not a defect: review the change doc and PLAN.md state directly and do
 NOT burn turns re-probing git (`git log/show/fetch bee-<taskid>`) for a branch that was never created —
 the runner already verified reachability before dispatching you.
-- APPROVE: merge the implementer's pointer bump into the tracked branch, `NEEDS-REVIEW → DONE`, unlock
-  dependents. Commit.
+- APPROVE only when the change doc CARRIES the evidence: an automated regression test (command +
+  passing result) for any behavioral change, and a live-effect confirmation for a deploy/service/
+  migration task. No evidence in the doc ⇒ you cannot verify "done" ⇒ REJECT (do not approve on a
+  plausible-looking diff). When satisfied, merge the implementer's pointer bump into the tracked branch,
+  `NEEDS-REVIEW → DONE`, unlock dependents. Commit.
 - REJECT: `NEEDS-REVIEW → NEEDS-ARBITRATION` plus a rejection doc at
   `submodules/<sm>/docs/<taskid>-review-reject.md` naming the concrete gaps. Commit. Never delete or
   rewrite the implementer branch.
