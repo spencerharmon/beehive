@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -614,10 +615,15 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		hyg = Hygiene{Err: err.Error()}
 	}
 	rootFiles := s.rootFileLinks()
+	skillsDrift := s.skillsDrift()
+	// The "instruction update has work" signal must reflect the SAME set update
+	// touches (instruct.Files(), which includes skills/*), not just the three root
+	// docs rootFilesDrift sees — otherwise a skill-only drift is invisible here.
+	instructionDrift := rootFilesDrift(rootFiles) || len(skillsDrift) > 0
 	// No "Title": the dashboard is the root page, and layout.html's own
 	// {{if .Title}} falls back to the bare site name — the one page that
 	// demonstrates the fallback rather than composing one via pageTitle.
-	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": rootFiles, "RootFilesDrift": rootFilesDrift(rootFiles), "Nav": "dashboard"})
+	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": rootFiles, "RootFilesDrift": rootFilesDrift(rootFiles), "SkillsDrift": skillsDrift, "InstructionDrift": instructionDrift, "Nav": "dashboard"})
 }
 
 // subViews builds the dashboard card data for every submodule: State
@@ -814,6 +820,41 @@ func rootFilesDrift(links []rootFileLink) bool {
 		}
 	}
 	return false
+}
+
+// skillsDrift returns the managed skills/*.md files under the hive root that have
+// drifted from (Modified) or are missing versus the binary's embedded default,
+// as slash-form names (e.g. "skills/modify-roi.md"), sorted.
+//
+// This closes the beehived detection gap behind "beehived doesn't detect stale
+// instruction files": the dashboard's per-file index and rootFilesDrift key off
+// repo.RootInstructionFiles, which declares ONLY the three root docs (AGENTS.md,
+// HONEYBEE.md, BOOTSTRAP.md) plus the unmanaged LOCALS.md — never the skills. But
+// `beehive instruction update` refreshes the FULL instruct.Files() set INCLUDING
+// skills/*, so a run where only a skill file drifted (e.g. after a binary rebuild
+// advanced skills/modify-roi.md's embedded default but no `instruction update`
+// re-laid the on-disk copy) left the dashboard saying "managed files match the
+// shipped default" with the update action muted — the operator saw no signal even
+// though update had real work to do. Scanning the same instruct set the CLI and the
+// honeybee stderr preflight use (no second comparison path) makes the dashboard
+// agree with them. A scan error yields nil (best-effort overview, mirroring
+// rootFileLinks' Present tolerance), never a dashboard-wide failure.
+func (s *Server) skillsDrift() []string {
+	st, err := instruct.Scan(s.repo.Root)
+	if err != nil {
+		return nil
+	}
+	var drifted []string
+	for name, status := range st {
+		if !strings.HasPrefix(name, "skills/") {
+			continue
+		}
+		if status == instruct.Modified || status == instruct.Missing {
+			drifted = append(drifted, name)
+		}
+	}
+	sort.Strings(drifted) // deterministic: Scan returns a map
+	return drifted
 }
 
 func (s *Server) explorer(w http.ResponseWriter, r *http.Request) {

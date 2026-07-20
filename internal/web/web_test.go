@@ -2661,6 +2661,75 @@ func TestRootFileLinksDriftStatus(t *testing.T) {
 	}
 }
 
+// TestDashboardDetectsStaleSkillFiles is the regression for the beehived
+// detection gap behind "beehived doesn't detect stale instruction files": the
+// dashboard's file index and rootFilesDrift key off repo.RootInstructionFiles,
+// which declares ONLY the three root docs — never the managed skills/*.md — yet
+// `beehive instruction update` refreshes the full instruct.Files() set INCLUDING
+// skills. So a run where only a skill file drifted (e.g. a binary rebuild advanced
+// skills/modify-roi.md's embedded default with no follow-up `instruction update`)
+// left the dashboard muting the update action and saying "managed files match the
+// shipped default" — no signal at all. skillsDrift() + the hive-wide InstructionDrift
+// signal close that: with the three root docs still clean, a drifted skill must
+// flip both the skillsDrift list and the dashboard's update emphasis.
+func TestDashboardDetectsStaleSkillFiles(t *testing.T) {
+	s, root := setup(t)
+
+	// Fresh fixture: Init lays skills from the same embedded defaults — none drift.
+	if d := s.skillsDrift(); len(d) != 0 {
+		t.Fatalf("skillsDrift = %v on a fresh fixture, want none", d)
+	}
+
+	// Pick a real managed skill and hand-edit it on disk (root docs stay clean).
+	var skill string
+	for _, f := range instruct.Files() {
+		if strings.HasPrefix(f.Name, "skills/") {
+			skill = f.Name
+			break
+		}
+	}
+	if skill == "" {
+		t.Fatal("no managed skills/* in instruct.Files() — fixture assumption broken")
+	}
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(skill)), []byte("# hand-edited skill\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The root docs are untouched, so rootFilesDrift alone stays false — exactly the
+	// blind spot. skillsDrift must catch the stale skill.
+	if rootFilesDrift(s.rootFileLinks()) {
+		t.Fatal("rootFilesDrift = true, but only a skill was edited — test premise broken")
+	}
+	d := s.skillsDrift()
+	if len(d) != 1 || d[0] != skill {
+		t.Fatalf("skillsDrift = %v, want exactly [%s]", d, skill)
+	}
+
+	// The rendered dashboard must now emphasize the update action (not muted) and
+	// name the drifted skill — the operator-visible signal that was missing.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	s.dashboard(rr, req)
+	body := rr.Body.String()
+	if !strings.Contains(body, "managed files have drifted from the shipped default") {
+		t.Errorf("dashboard did not report drift though a skill is stale:\n%s", body)
+	}
+	if strings.Contains(body, "managed files match the shipped default") {
+		t.Error("dashboard still claims managed files match the shipped default while a skill is stale")
+	}
+	if !strings.Contains(body, skill) {
+		t.Errorf("dashboard did not name the drifted skill %q:\n%s", skill, body)
+	}
+
+	// A missing skill is also a reason to run update.
+	if err := os.Remove(filepath.Join(root, filepath.FromSlash(skill))); err != nil {
+		t.Fatal(err)
+	}
+	if d := s.skillsDrift(); len(d) != 1 || d[0] != skill {
+		t.Fatalf("skillsDrift after removal = %v, want [%s] (missing)", d, skill)
+	}
+}
+
 // TestDashboardDriftBadgeAndUpdateAction locks the dashboard surface for
 // instruction-update-drift: a per-managed-file drift badge and the POST
 // /instruction/update action. A clean fixture shows clean badges plus the

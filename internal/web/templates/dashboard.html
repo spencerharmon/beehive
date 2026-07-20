@@ -15,8 +15,9 @@
   {{end}}
   </ul>
   <form method="post" action="/instruction/update" class="instruction-update">
-    <button {{if not .RootFilesDrift}}class="muted"{{end}} title="refresh the managed files (AGENTS/HONEYBEE/BOOTSTRAP) to the binary's defaults; a modified file is backed up to &lt;name&gt;.&lt;epoch&gt;.bak first. LOCALS.md is never touched.">run instruction update</button>
-    {{if .RootFilesDrift}}<span class="muted small">managed files have drifted from the shipped default</span>{{else}}<span class="muted small">managed files match the shipped default</span>{{end}}
+    <button {{if not .InstructionDrift}}class="muted"{{end}} title="refresh the managed files (AGENTS/HONEYBEE/BOOTSTRAP and skills/*) to the binary's defaults; a modified file is backed up to &lt;name&gt;.&lt;epoch&gt;.bak first. LOCALS.md is never touched.">run instruction update</button>
+    {{if .InstructionDrift}}<span class="muted small">managed files have drifted from the shipped default</span>{{else}}<span class="muted small">managed files match the shipped default</span>{{end}}
+    {{if .SkillsDrift}}<span class="muted small skills-drift" title="managed skills/*.md that differ from or are missing versus the binary's embedded default">{{len .SkillsDrift}} skill(s) drifted: {{range $i, $s := .SkillsDrift}}{{if $i}}, {{end}}{{$s}}{{end}}</span>{{end}}
   </form>
 </nav>
 <div class="cards">
