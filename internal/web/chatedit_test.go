@@ -370,6 +370,39 @@ func TestChatPanelWiring(t *testing.T) {
 	}
 }
 
+// TestChatPanelPreservesFormatting proves the chat pane honors authored
+// formatting (chat-editor-chat-formatting-preserve): a multi-line message that
+// includes a fenced code block renders through the shared markdown→HTML path, so
+// its line breaks and code structure survive as real HTML block structure
+// instead of collapsing into a single run of text. Both the BodyHTML render path
+// and the template wiring are exercised.
+func TestChatPanelPreservesFormatting(t *testing.T) {
+	s, _ := chatFixture(t, "")
+	msg := "first line\nsecond line\n\n```go\nfunc x() {}\n```"
+	log := []chatTurn{{Role: "agent", Text: msg}}
+
+	// BodyHTML must produce structured HTML, not a single collapsed text run.
+	html := string(log[0].BodyHTML())
+	for _, want := range []string{"<p>", "<pre>", "<code", "func x() {}"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("BodyHTML missing %q; multi-line/code structure collapsed:\n%s", want, html)
+		}
+	}
+	// It must NOT be the raw text jammed onto one line (the pre-fix behavior).
+	if strings.Contains(html, "first line\nsecond line") && !strings.Contains(html, "<") {
+		t.Fatalf("BodyHTML emitted raw unstructured text:\n%s", html)
+	}
+
+	panel := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{
+		"ID": "c1", "Path": "submodules/alpha/notes.md", "Log": log,
+	})
+	for _, want := range []string{`<div class="body">`, "<pre>", "func x() {}"} {
+		if !strings.Contains(panel, want) {
+			t.Fatalf("chatedit_panel.html did not preserve formatting; missing %q:\n%s", want, panel)
+		}
+	}
+}
+
 // ---- chat-editor-snappy-polish ----
 //
 // Never strand the user on a bare spinner: connecting/connected/working/error

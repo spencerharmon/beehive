@@ -783,6 +783,14 @@ section { margin: var(--space-5) 0; }
   margin-right: var(--space-2);
 }
 .msg.busy .spinner { color: var(--text-muted); font-style: italic; }
+/* chat-editor-chat-formatting-preserve: message bodies render through the shared
+   markdown→HTML path, so honor their authored structure — tight paragraph
+   spacing, and wrap (never clip) multi-line / fenced-code content. */
+.msg .body > :first-child { margin-top: 0; }
+.msg .body > :last-child { margin-bottom: 0; }
+.msg .body p { margin: var(--space-1) 0; }
+.msg .body pre { white-space: pre-wrap; overflow-x: auto; }
+.msg .body code { word-break: break-word; }
 
 .statusbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); margin-bottom: var(--space-2); }
 .state { padding: 0.12em 0.6em; border-radius: var(--radius-pill); font-weight: 700; font-size: var(--text-xs); }

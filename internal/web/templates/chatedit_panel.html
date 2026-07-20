@@ -1,7 +1,7 @@
 <div class="editor-grid">
   <div class="chat" id="chatedit-chat" data-scroll-preserve data-scroll-pin>
     {{if .ConnState}}<div class="conn-state {{.ConnState}}" role="status" aria-live="polite">{{.ConnLabel}}</div>{{end}}
-    {{range .Log}}<div class="msg {{.Role}}"><span class="who">{{.Role}}</span>{{range .Parts}}{{template "agent-step" .}}{{end}}{{if .Text}} {{.Text}}{{end}}</div>
+    {{range .Log}}<div class="msg {{.Role}}"><span class="who">{{.Role}}</span>{{range .Parts}}{{template "agent-step" .}}{{end}}{{if .Text}}<div class="body">{{.BodyHTML}}</div>{{end}}</div>
     {{else}}<p class="muted">Say what you'd like to change in {{.Path}}.</p>{{end}}
     {{if .Busy}}<div class="msg agent busy"><span class="who">agent</span>{{range .LiveSteps}}{{template "agent-step" .}}{{else}}<span class="spinner">Working…</span>{{end}}</div>{{end}}
     {{if .Error}}<div class="msg err">⚠️ {{.Error}}</div>{{end}}

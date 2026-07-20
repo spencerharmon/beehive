@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html/template"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -64,6 +65,21 @@ type chatTurn struct {
 	Text  string
 	At    time.Time
 	Parts []swarm.Part
+}
+
+// BodyHTML renders the turn's message text through the shared markdown→HTML path
+// (renderMarkdown, the same sanitized renderer the doc/ROI/transcript view panes
+// use) so the chat pane honors the authored formatting instead of collapsing it:
+// newlines, whitespace, and markdown/code structure survive as real HTML block
+// structure rather than being squashed into a single run of text by HTML
+// whitespace folding. Empty text renders nothing. Sanitization is inherited
+// wholesale from renderMarkdown (no WithUnsafe), so a message can never inject
+// live markup.
+func (t chatTurn) BodyHTML() template.HTML {
+	if t.Text == "" {
+		return ""
+	}
+	return renderMarkdown(t.Text)
 }
 
 // sessionState is the coarse connection/turn lifecycle the panel surfaces so
