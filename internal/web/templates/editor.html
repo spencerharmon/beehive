@@ -16,8 +16,10 @@
   {{template "skeleton-transcript"}}
 </div>
 <form hx-post="/editor/{{.ID}}/chat" hx-target="#editor" hx-swap="innerHTML"
-      hx-on::after-request="this.reset()">
-  <input name="message" placeholder="Ask the editor to change something…" aria-label="message to the editor" autocomplete="off" autofocus style="width:70%">
+      hx-on::after-request="this.reset(); this.querySelector('textarea.composer-autogrow').style.height='auto'">
+  <textarea name="message" class="composer-autogrow" rows="1" placeholder="Ask the editor to change something…" aria-label="message to the editor" autocomplete="off" autofocus style="width:70%;resize:none;overflow:hidden;white-space:pre-wrap;overflow-wrap:break-word;word-wrap:break-word"
+    oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"
+    onkeydown="if(event.key==='Enter' &amp;&amp; !event.shiftKey &amp;&amp; !event.isComposing){event.preventDefault();(this.form.requestSubmit?this.form.requestSubmit():this.form.submit());}"></textarea>
   <button>send</button>
 </form>
 <form method="post" action="/editor/{{.ID}}/close" onsubmit="return confirm('Close this editor session and discard its worktree? Merged changes stay; unmerged proposals are lost.');">
