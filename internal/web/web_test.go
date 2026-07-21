@@ -3303,6 +3303,46 @@ func TestEditorPageBreadcrumb(t *testing.T) {
 	}
 }
 
+// TestEditorComposerAutogrowsAndWraps proves chat-editor-input-autogrow-wrap:
+// the bottom user-input box on the /editor/{id} page is a wrapping,
+// auto-growing <textarea> (not a single-line, horizontally-scrolling <input>),
+// still posts to the same /editor/{id}/chat endpoint, and preserves
+// Enter-submits/Shift+Enter-newlines behavior.
+func TestEditorComposerAutogrowsAndWraps(t *testing.T) {
+	s, root := setup(t)
+	commitAndNormalizeMain(t, root)
+
+	id := openEditorSession(t, s, repo.InfraFile)
+	body := get(t, s, "/editor/"+id).Body.String()
+
+	if strings.Contains(body, `<input name="message"`) {
+		t.Fatalf("editor composer still a single-line <input>, want a wrapping/autogrow <textarea>:\n%s", body)
+	}
+	if !strings.Contains(body, `<textarea name="message"`) {
+		t.Fatalf("editor composer missing a <textarea name=\"message\">:\n%s", body)
+	}
+	// Vertical autogrow: oninput drives height from scrollHeight.
+	if !strings.Contains(body, "scrollHeight") {
+		t.Fatalf("editor composer textarea missing autogrow (scrollHeight) wiring:\n%s", body)
+	}
+	// Line wrapping: wraps long lines instead of horizontally scrolling one line.
+	if !strings.Contains(body, "overflow-wrap:break-word") && !strings.Contains(body, "word-wrap:break-word") {
+		t.Fatalf("editor composer textarea missing line-wrap styling:\n%s", body)
+	}
+	if !strings.Contains(body, "white-space:pre-wrap") {
+		t.Fatalf("editor composer textarea missing pre-wrap styling:\n%s", body)
+	}
+	// Preserved submit behavior: Enter (without Shift) still submits the form,
+	// not a bare newline.
+	if !strings.Contains(body, `event.key==='Enter'`) || !strings.Contains(body, `!event.shiftKey`) {
+		t.Fatalf("editor composer textarea missing Enter-submits/Shift+Enter-newline wiring:\n%s", body)
+	}
+	// Same endpoint, unchanged.
+	if !strings.Contains(body, `hx-post="/editor/`+id+`/chat"`) {
+		t.Fatalf("editor composer form no longer posts to /editor/{id}/chat:\n%s", body)
+	}
+}
+
 // TestDocExplorerListsWholeTree proves submodule-doc-explorer's core contract:
 // every file under docs/ — a top-level change doc, an audit report under
 // docs/audit/, and a task design doc under docs/tasks/ — is listed with a
