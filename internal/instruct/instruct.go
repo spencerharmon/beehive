@@ -136,6 +136,15 @@ type Confirm func(name string) bool
 // the refreshed file are committed. Returns the per-file results.
 func Update(ctx context.Context, root string, clobber bool, confirm Confirm) ([]Result, error) {
 	g := git.New(root)
+	// Convergence protocol (docs/main-convergence-protocol.md): instruction update
+	// authors a commit DIRECTLY on the primary main, so it must merge the hive
+	// remote into local main BEFORE authoring (and publish after), or it
+	// manufactures the fork ff-only pullMain cannot heal. Mirrors syncSubmodule's
+	// sync-before/publish-after call-site pattern exactly.
+	remote, _ := g.Remote(ctx)
+	if err := g.SyncMainFromRemote(ctx, remote); err != nil {
+		return nil, err
+	}
 	var results []Result
 	var commitPaths []string
 	for _, f := range Files() {
@@ -175,6 +184,9 @@ func Update(ctx context.Context, root string, clobber bool, confirm Confirm) ([]
 	if len(commitPaths) > 0 {
 		if err := g.CommitPaths(ctx, "beehive instruction update", commitPaths...); err != nil && err != git.ErrNothing {
 			return results, fmt.Errorf("commit instruction update: %w", err)
+		}
+		if err := g.PublishPrimaryMain(ctx, remote); err != nil {
+			return results, fmt.Errorf("publish instruction update: %w", err)
 		}
 	}
 	return results, nil

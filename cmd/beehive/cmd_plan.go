@@ -94,6 +94,16 @@ func planArchiveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Convergence protocol (docs/main-convergence-protocol.md): plan archive
+			// authors a commit DIRECTLY on the primary main, so it must merge the hive
+			// remote into local main BEFORE authoring (and publish after), or it
+			// manufactures the fork ff-only pullMain cannot heal. Mirrors
+			// syncSubmodule's sync-before/publish-after call-site pattern exactly.
+			rootGit := git.New(root)
+			remote, _ := rootGit.Remote(cmd.Context())
+			if err := rootGit.SyncMainFromRemote(cmd.Context(), remote); err != nil {
+				return err
+			}
 			subName, err := taskSubmoduleName(args[0])
 			if err != nil {
 				return err
@@ -138,6 +148,9 @@ func planArchiveCmd() *cobra.Command {
 			msg := fmt.Sprintf("plan: archive DONE narrative for %s (%s)\n\nBeehive: plan-lean-task-card %s",
 				subName, strings.Join(ids, ", "), archiveDirRel)
 			if err := git.New(root).CommitPaths(cmd.Context(), msg, paths...); err != nil && err != git.ErrNothing {
+				return err
+			}
+			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
 				return err
 			}
 			fmt.Printf("plan archive: leaned %d DONE task(s) in %s: %s\n", len(archived), subName, strings.Join(ids, ", "))
