@@ -123,8 +123,8 @@ type Session struct {
 	mu       sync.Mutex
 	oc       swarm.Session // opencode session (lazy: created on first chat)
 	log      []Turn
-	busy     bool // UI-facing "working…" status; clears the instant the reply is ready (chat-editor-status-poll-fix), NOT when publish work finishes
-	turnOn   bool // serializes turns end-to-end (reply + commit/transcript/push/merge); NEVER surfaced to the UI
+	busy     bool      // UI-facing "working…" status; clears the instant the reply is ready (chat-editor-status-poll-fix), NOT when publish work finishes
+	turnOn   bool      // serializes turns end-to-end (reply + commit/transcript/push/merge); NEVER surfaced to the UI
 	err      string    // last turn error, surfaced in the panel
 	activity time.Time // last open/chat/merge, drives startup staleness
 }
