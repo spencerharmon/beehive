@@ -31,6 +31,47 @@ type agentClient interface {
 // "ask the agent to merge" and clicking Merge converge to the same git state.
 const mergeMarker = "<<<MERGE>>>"
 
+// ===========================================================================
+// INVARIANT (editor-session-wipe): a live or pending chat-diff editor session's
+// durable state — its worktree, its branch (local AND on a trusted remote), and
+// its persisted store record — MUST NEVER be destroyed by any automatic beehive
+// process while the session is still in use. Losing it mid-chat surfaces to the
+// operator as a 404 ("no such session") on the very next turn and throws away
+// their in-flight edit, conversation, and the tokens spent producing them.
+//
+// Two concrete rules enforce it, both in this file:
+//
+//  1. NAMESPACE OWNERSHIP. This Manager owns EXACTLY the branches it creates:
+//     those under editBranchPrefix. It is NOT the only subsystem that cuts
+//     `edit-*` worktrees in the shared beehive-root .worktrees/ dir — the web
+//     layer's resolve agent (internal/web/resolveagent.go, `edit-resolve-*`)
+//     and the bootstrap chat editor (internal/web/chatedit.go, `edit-*`) do
+//     too, and they hold their proposals in memory with NO persistence store.
+//     If this Manager's reclaim/adoption enumerated the bare `edit-*` prefix it
+//     would (a) adopt a live foreign worktree into its own store as a bogus
+//     editor session and (b) delete that foreign worktree/branch the moment it
+//     looked "clean" (a Q&A-only turn, or a proposal still held in memory) —
+//     silently wiping another subsystem's in-flight edit. So every enumeration
+//     here (isEditBranch, the local worktree scan, the trusted-remote branch
+//     glob) is scoped to editBranchPrefix and NEVER touches a foreign edit-*
+//     branch.
+//
+//  2. NEVER RECLAIM A LIVE SESSION. A branch currently registered in m.byID is
+//     a live, in-memory session (an operator has it open); it is NEVER
+//     reclaimed, whatever its record age or working-tree cleanliness. Startup
+//     Reload runs on an empty byID so this is a no-op there, but the gc dance
+//     (Reclaimable + Reload on a LIVE daemon) would otherwise delete an
+//     operator's open-but-idle session once its record aged past the TTL.
+// ===========================================================================
+
+// editBranchPrefix is the branch/worktree name prefix for every session THIS
+// Manager creates and the ONLY prefix it ever enumerates, adopts, or reclaims.
+// It is deliberately distinct from the bare `edit-` prefix the web layer's
+// resolve agent (`edit-resolve-*`) and bootstrap chat editor (`edit-*`) use, so
+// this Manager's startup/gc reclaim can never adopt or destroy those other
+// subsystems' in-flight worktrees (see the INVARIANT above).
+const editBranchPrefix = "hive-edit-"
+
 // transcriptSidecarPath is the tracked file (repo-relative to the edit
 // worktree) that carries a session's running chat log while a remote-durable
 // edit is in flight (chat-diff-session-durability): committed on the edit
@@ -250,7 +291,7 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 	if m.primary.Exists(ctx, "main", file) && !m.primary.Exists(ctx, base, file) {
 		return nil, fmt.Errorf("editor: %s exists on main but not at edit base %q; refusing to open a destructive edit (the base may be a wrong or foreign main)", file, base)
 	}
-	branch := "edit-" + slugFile(file) + "-" + fmt.Sprint(time.Now().Unix())
+	branch := editBranchPrefix + slugFile(file) + "-" + fmt.Sprint(time.Now().Unix())
 	wtPath := filepath.Join(m.absRoot, ".worktrees", branch)
 	if err := m.primary.WorktreeAdd(ctx, wtPath, branch, base); err != nil {
 		return nil, fmt.Errorf("worktree add: %w", err)
@@ -357,12 +398,14 @@ func (m *Manager) persist() error {
 	return m.store.save(recs)
 }
 
-// isEditBranch reports whether a worktree branch is an AI-editor branch (created
-// by Open as edit-<slug>-<unix>). The startup prune acts ONLY on these; honeybee
-// bee-* branches, the runner's beehive-* pass worktrees, and the primary main
-// checkout are never enumerated for removal.
+// isEditBranch reports whether a worktree branch is one THIS Manager created
+// (Open names them editBranchPrefix+<slug>+<unix>). The startup/gc prune acts
+// ONLY on these; honeybee bee-* branches, the runner's beehive-* pass
+// worktrees, the primary main checkout, AND — critically — other subsystems'
+// bare `edit-*`/`edit-resolve-*` worktrees (resolve agent, bootstrap chat
+// editor) are never enumerated for removal (see the INVARIANT above).
 func isEditBranch(branch string) bool {
-	return strings.HasPrefix(branch, "edit-")
+	return strings.HasPrefix(branch, editBranchPrefix)
 }
 
 // Reload recovers persisted editor sessions and prunes stale edit worktrees at
@@ -448,7 +491,7 @@ func (m *Manager) Reload(ctx context.Context) error {
 		// Recover sessions with NO local trace whatsoever — a different host, or
 		// a fully-lost local repo — from every edit-* branch the trusted remote
 		// still carries that this local loop never saw.
-		branches, err := m.primary.ListRemoteBranches(ctx, trusted, "edit-*")
+		branches, err := m.primary.ListRemoteBranches(ctx, trusted, editBranchPrefix+"*")
 		if err != nil {
 			return err
 		}
@@ -473,12 +516,23 @@ func (m *Manager) Reload(ctx context.Context) error {
 }
 
 // evaluateWorktree applies Reload's KEEP-or-RECLAIM decision to one edit
-// worktree (freshly recovered or already present): KEEP + register when it
-// carries a fresh persisted record or a pending unpublished change, else
-// RECLAIM it — and, when trusted names a verified repo-own remote, delete its
-// pushed copy there too, so a reclaimed session is never resurrected by a
-// later Reload's remote scan (chat-diff-session-durability).
+// worktree (freshly recovered or already present): KEEP + register when it is
+// already a LIVE in-memory session, carries a fresh persisted record, or a
+// pending unpublished change, else RECLAIM it — and, when trusted names a
+// verified repo-own remote, delete its pushed copy there too, so a reclaimed
+// session is never resurrected by a later Reload's remote scan
+// (chat-diff-session-durability).
 func (m *Manager) evaluateWorktree(ctx context.Context, w git.Worktree, byBranch map[string]sessionRecord, now time.Time, trusted string) error {
+	// INVARIANT: never reclaim a branch that is a LIVE registered session — an
+	// operator has it open. Cleanliness/record-age are irrelevant for a live
+	// session; deleting it out from under the operator is the editor-session-wipe
+	// bug this guard exists to prevent (the gc dance runs this on a live daemon).
+	m.mu.Lock()
+	_, live := m.byID[w.Branch]
+	m.mu.Unlock()
+	if live {
+		return nil
+	}
 	rec, hasRec := byBranch[w.Branch]
 	pending, err := m.worktreePending(ctx, w)
 	if err != nil {
@@ -577,9 +631,20 @@ func (m *Manager) Reclaimable(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	now := m.now()
+	m.mu.Lock()
+	live := make(map[string]bool, len(m.byID))
+	for id := range m.byID {
+		live[id] = true
+	}
+	m.mu.Unlock()
 	var out []string
 	for _, w := range wts {
 		if !isEditBranch(w.Branch) {
+			continue
+		}
+		// A live registered session is never reclaimable, mirroring evaluateWorktree's
+		// same guard so the dry-run matches the apply exactly (INVARIANT above).
+		if live[w.Branch] {
 			continue
 		}
 		rec, hasRec := byBranch[w.Branch]

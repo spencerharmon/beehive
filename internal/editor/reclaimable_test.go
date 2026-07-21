@@ -33,13 +33,13 @@ func TestReclaimableListsStaleCleanOnly(t *testing.T) {
 	}
 
 	// stale + clean -> reclaimable.
-	staleBranch := "edit-stale-100"
+	staleBranch := "hive-edit-stale-100"
 	staleWt := addWt(staleBranch)
 	// fresh record + clean -> kept.
-	activeBranch := "edit-active-200"
+	activeBranch := "hive-edit-active-200"
 	activeWt := addWt(activeBranch)
 	// record-less worktree with a committed unmerged change -> pending, kept.
-	pendingBranch := "edit-pending-300"
+	pendingBranch := "hive-edit-pending-300"
 	pendingWt := addWt(pendingBranch)
 	pf := filepath.Join(pendingWt, "submodules", "sm", repo.InfraFile)
 	if err := os.WriteFile(pf, []byte("pending infra\n"), 0o644); err != nil {
