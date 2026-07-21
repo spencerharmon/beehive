@@ -24,3 +24,10 @@ A new submodule is dormant (never selected) until a human authors its `ROI.md`.
 The first honeybee then bootstraps `PLAN.md`. ROI.md is human-owned; honeybees
 may never edit it (enforced by pre-receive hook). Frontend runs `beehived`
 (default `:8955`).
+
+`submodule sync`/`submodule remote`, `plan`, `task`, and `instruction update`
+author commits directly on the primary `main` (no worktree). In a
+remote-sharing hive that write MUST be sync-before-author/publish-after or it
+can fork `main` and silently drop commits — see
+[docs/main-convergence-protocol.md](main-convergence-protocol.md) for the write
+recipe and which of these verbs already carry it.
