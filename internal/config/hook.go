@@ -99,6 +99,22 @@ exit 0
 // push. It rejects any pushed ref update whose commits touch a ROI.md path when
 // the pushing identity is a honeybee; the frontend / human is allowed.
 //
+// It ALSO refuses any non-fast-forward (force) update to main — the server-side
+// enforcement point for "main only ever advances". Every beehive main-write path
+// is a plain, non-force push that merges the advanced remote main in before
+// pushing (git.PublishToMain / PublishPrimaryMain / UpdateLocalMain,
+// web.publishMain), so a rewind of main to an ANCESTOR (the
+// hive-remote-force-rewind-fix observation: a repair commit rewound to an earlier
+// ancestor) is a force-push no readable code path produces. No code-side call
+// site force-pushes; the receiving repo silently ACCEPTING a non-fast-forward is
+// the server-side config gap this guard closes, refusing the rewind at the point
+// of receipt. Unlike the ROI rule this applies to EVERY identity (an external /
+// manual `git push --force`, not just a honeybee), and a main ref DELETION is
+// refused too (a delete-then-recreate would otherwise bypass the ff-check to the
+// same rewind effect). Non-main refs (submodule-pointer bumps ride main; the
+// bee-<taskid> branches live on submodule origins, a different repo) are
+// untouched, so the runner's own PushBranchReconciled orphan handling is unaffected.
+//
 // Honeybee identity OVER THE WIRE. The task caveat is explicit that the hook must
 // NOT rely on client-only env (a push env does not traverse a remote push) and
 // names a "push option" as an acceptable mechanism, so identity is recognized
@@ -136,10 +152,14 @@ exit 0
 // ref deletions (new all-zeros) are nothing to inspect and pass.
 const preReceiveHook = `#!/bin/sh
 # beehive pre-receive guard (installed by CLI). See internal/config/hook.go.
-# Server-side mirror of the pre-commit ROI rule: ROI.md is human-owned, so a
-# honeybee identity may never push a change that touches a ROI.md path. The
-# frontend / human is allowed. Honeybee identity is recognized from EITHER signal,
-# so the guard does NOT rely on client-only env (per the task caveat):
+# Two rules: (1) main only ever advances -- refuse any non-fast-forward (force)
+# update or deletion of main, from ANY identity (closes the server-config gap that
+# let an external force-push rewind main to an ancestor); (2) server-side mirror
+# of the pre-commit ROI rule: ROI.md is human-owned, so a honeybee identity may
+# never push a change that touches a ROI.md path. The frontend / human is allowed
+# to edit ROI.md but is still bound by rule (1). Honeybee identity is recognized
+# from EITHER signal, so the guard does NOT rely on client-only env (per the task
+# caveat):
 #   (1) push option beehive-honeybee=1 (git push -o beehive-honeybee=1), delivered
 #       as GIT_PUSH_OPTION_COUNT / GIT_PUSH_OPTION_<i> -- transport-independent
 #       (needs receive.advertisePushOptions=true on the receiver);
@@ -155,12 +175,31 @@ while [ "$i" -lt "$n" ]; do
   [ "$opt" = "beehive-honeybee=1" ] && honeybee=1
   i=$((i + 1))
 done
-# Frontend / human identity is never restricted.
-[ "$honeybee" = "1" ] || exit 0
 # All-zeros OID = ref create/delete sentinel; length-agnostic (sha1 or sha256).
 is_zero() { case "$1" in "" | *[!0]*) return 1 ;; *) return 0 ;; esac; }
 rc=0
 while read -r old new ref; do
+  # Force-rewind guard for main (EVERY identity, not just honeybee): main only
+  # ever advances by fast-forward (all main-write paths merge the advanced remote
+  # main in before a plain, non-force push), so a non-fast-forward update -- new
+  # is NOT a descendant of old -- can only be a force rewind. A main ref deletion
+  # is refused too (delete-then-recreate would bypass the ff-check to the same
+  # effect). merge-base --is-ancestor old new is true exactly when the update is a
+  # genuine fast-forward.
+  if [ "$ref" = "refs/heads/main" ]; then
+    if is_zero "$new"; then
+      echo "beehive: refusing to delete main (ref $ref)" >&2
+      rc=1
+      continue
+    fi
+    if ! is_zero "$old" && ! git merge-base --is-ancestor "$old" "$new" 2>/dev/null; then
+      echo "beehive: refusing non-fast-forward (force) update to main: $old -> $new (ref $ref)" >&2
+      rc=1
+      continue
+    fi
+  fi
+  # Frontend / human identity is never restricted by the ROI rule below.
+  [ "$honeybee" = "1" ] || continue
   is_zero "$new" && continue          # ref deletion: nothing to inspect
   if is_zero "$old"; then
     set -- "$new" --not --all         # new ref: only its not-yet-present commits

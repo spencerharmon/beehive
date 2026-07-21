@@ -180,6 +180,8 @@ func TestInstallHooks(t *testing.T) {
 	for _, want := range []string{
 		"BEEHIVE_HONEYBEE", "beehive-honeybee=1", "GIT_PUSH_OPTION_COUNT",
 		"while read -r old new ref", `(^|/)ROI\.md$`, "may not push changes to ROI.md",
+		"refs/heads/main", "merge-base --is-ancestor", "non-fast-forward (force) update to main",
+		"refusing to delete main",
 	} {
 		if !strings.Contains(preReceiveHook, want) {
 			t.Fatalf("pre-receive hook missing %q:\n%s", want, preReceiveHook)
@@ -510,5 +512,121 @@ func TestPreReceiveRejectsHoneybeeROIPush(t *testing.T) {
 	}
 	if head, _ := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD"); strings.TrimSpace(head) != pinned {
 		t.Fatalf("dest HEAD advanced despite a rejected push-option ROI push: %s != %s", strings.TrimSpace(head), pinned)
+	}
+}
+
+// TestPreReceiveRejectsMainForceRewind drives the installed pre-receive hook
+// through a REAL force-push that rewinds main to an earlier ancestor — the exact
+// hive-remote-force-rewind-fix shape (a later commit force-rewound back to an
+// ancestor). No beehive code path force-pushes, so the receiving repo silently
+// ACCEPTING a non-fast-forward is the server-config gap; the guard closes it. It
+// proves, end to end, that:
+//   - a genuine fast-forward advance of main is ACCEPTED;
+//   - a `git push --force` rewinding main to an ancestor is REJECTED (for EVERY
+//     identity: env unset here, i.e. an external/human push, not just a honeybee)
+//     and dest main is left UNMOVED;
+//   - deleting main is REJECTED.
+//
+// A no-op / ROI-only hook would let the force-rewind through, so this test bites.
+func TestPreReceiveRejectsMainForceRewind(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	runGit := func(dir string, env []string, args ...string) (string, error) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		if out, err := runGit(dir, preReceiveEnv(false), args...); err != nil {
+			t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+		}
+	}
+
+	// Convergence target: a bare-like repo on main with the pre-receive hook.
+	// (denyCurrentBranch=ignore so a checked-out main can still receive a
+	// non-ff push at the transport layer — the hook, not denyCurrentBranch, must
+	// be what refuses the rewind.)
+	dest := t.TempDir()
+	for _, a := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "t@t"},
+		{"config", "user.name", "t"},
+		{"config", "receive.denyCurrentBranch", "ignore"},
+	} {
+		mustGit(dest, a...)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "code.txt"), []byte("v0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(dest, "add", "code.txt")
+	mustGit(dest, "commit", "-qm", "c0")
+	if err := os.WriteFile(filepath.Join(dest, "code.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(dest, "add", "code.txt")
+	mustGit(dest, "commit", "-qm", "c1")
+	if err := InstallPreReceiveHook(dest); err != nil {
+		t.Fatal(err)
+	}
+	ancestor, err := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD~1")
+	if err != nil {
+		t.Fatalf("rev-parse ancestor: %v\n%s", err, ancestor)
+	}
+	ancestor = strings.TrimSpace(ancestor)
+	tip, err := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse tip: %v\n%s", err, tip)
+	}
+	tip = strings.TrimSpace(tip)
+
+	// A working clone to push from.
+	neutral := t.TempDir()
+	work := filepath.Join(t.TempDir(), "work")
+	if out, err := runGit(neutral, preReceiveEnv(false), "clone", "-q", dest, work); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+	mustGit(work, "config", "user.email", "t@t")
+	mustGit(work, "config", "user.name", "t")
+
+	// (A) Genuine fast-forward advance -> ACCEPTED.
+	if err := os.WriteFile(filepath.Join(work, "code.txt"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(work, "commit", "-qam", "c2")
+	if out, err := runGit(work, preReceiveEnv(false), "push", "origin", "main"); err != nil {
+		t.Fatalf("fast-forward advance of main must be ACCEPTED, got: %v\n%s", err, out)
+	}
+	advanced, err := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse advanced: %v\n%s", err, advanced)
+	}
+	advanced = strings.TrimSpace(advanced)
+	if advanced == tip {
+		t.Fatal("fast-forward push did not advance dest main")
+	}
+
+	// (B) Force-rewind main back to the ancestor -> REJECTED, dest main UNMOVED.
+	// This is the hive-remote-force-rewind-fix shape.
+	if out, err := runGit(work, preReceiveEnv(false), "push", "--force", "origin", ancestor+":refs/heads/main"); err == nil {
+		t.Fatalf("force-rewind of main to an ancestor must be REJECTED, but it succeeded:\n%s", out)
+	} else if !strings.Contains(out, "non-fast-forward (force) update to main") {
+		t.Fatalf("force-rewind rejection missing the guard message:\n%s", out)
+	}
+	if head, _ := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD"); strings.TrimSpace(head) != advanced {
+		t.Fatalf("dest main moved despite a rejected force-rewind: %s != %s", strings.TrimSpace(head), advanced)
+	}
+
+	// (C) Deleting main -> REJECTED.
+	if out, err := runGit(work, preReceiveEnv(false), "push", "origin", ":refs/heads/main"); err == nil {
+		t.Fatalf("deleting main must be REJECTED, but it succeeded:\n%s", out)
+	} else if !strings.Contains(out, "refusing to delete main") {
+		t.Fatalf("delete rejection missing the guard message:\n%s", out)
+	}
+	if head, _ := runGit(dest, preReceiveEnv(false), "rev-parse", "HEAD"); strings.TrimSpace(head) != advanced {
+		t.Fatalf("dest main changed despite a rejected delete: %s != %s", strings.TrimSpace(head), advanced)
 	}
 }
