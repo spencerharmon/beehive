@@ -12,8 +12,10 @@ What to read:
   submodules/<sm>/docs/<taskid>-review-reject.md (read-only).
 
 Then decide and commit on main:
-- **SIDE WITH THE IMPLEMENTER**: the work is acceptable. Merge the submodule pointer bump into the
-  submodule's tracked branch, set the PLAN.md task -> DONE, unlock dependents. Commit.
+- **SIDE WITH THE IMPLEMENTER**: the work is acceptable. Merge `bee-<taskid>` into the
+  submodule's tracked branch on its origin, set the PLAN.md task -> DONE, unlock dependents. Commit.
+  Do NOT touch the submodule pointer (gitlink) — the runner pins it to the tracked-branch tip; that is
+  the only value it may ever hold (see `docs/submodule-pointer-invariant.md`).
 - **SIDE WITH THE REVIEWER**: the rejection stands. Set the PLAN.md task -> TODO and record the binding
   rationale in the task body / a doc so the next implementer knows what to fix. If arbitration exposes a
   concrete operator blocker, run `beehive task human <submodule> <task-id> --category <secret|external-permission|contradiction|architecture> --reason "<the one-line ask>"`

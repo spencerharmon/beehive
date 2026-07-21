@@ -112,12 +112,20 @@ exact complement. Each pass, the runner automatically:
   stamp matches `ROI.md` HEAD; bootstrap: `PLAN.md` exists. The agent need not
   self-declare done — meeting the predicate ends the pass.
 - **Publishes and cleans up** — merges the commits the agent made in its worktree (the
-  `bee-<taskid>` code branch, the submodule-pointer bump, `PLAN.md`/`docs/`) to `main`,
+  `bee-<taskid>` code branch, `PLAN.md`/`docs/`) to `main`,
   drives conflict resolution (handing the agent only the conflicted files to rewrite),
   reclaims the merged source branch, streams the session transcript to `sessions/`, and
   removes the worktree. The agent authors and commits the change — including pushing its
-  `bee-<taskid>` branch to the submodule origin and bumping the pointer, per its role
+  `bee-<taskid>` branch to the submodule origin, per its role
   step; the runner merges that to `main`, it does not write it for the agent.
+- **Owns the submodule pointer** — the runner (never the agent) pins each submodule's
+  gitlink to the tip of its configured tracked branch (`.gitmodules`
+  `submodule.<path>.branch`), at work-pass start and at every task-bearing completion.
+  **INVARIANT: a gitlink MUST ALWAYS equal the tracked-branch tip — never a `bee-<taskid>`
+  tip, never any other commit.** A pointer that names anything else eventually fails
+  `git submodule update`, dirties the primary tree unhealably, and aborts every preflight —
+  halting the swarm. Agents must NEVER write the gitlink or `submodules/<sm>/repo`. See
+  `docs/submodule-pointer-invariant.md`.
 - **Dedups reconcile** (skips one already applied by a peer) and **bounds each turn**
   with a timeout, sending "continue" until the completion check passes or a cap hits.
 

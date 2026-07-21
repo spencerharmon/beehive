@@ -46,11 +46,14 @@ participant in that same protocol.
    (A running honeybee's next sync would also advance the pointer; doing it
    explicitly keeps the projection current immediately.)
 
-> This `submodule sync` only fast-forwards to an ALREADY-TRACKED tip (step 3 landed the commit on
-> the tracked branch first) — it does not apply to a Work-task honeybee's pointer bump, which
-> points the gitlink at its own not-yet-merged `bee-<taskid>` commit instead. That case uses
-> `git update-index --cacheinfo 160000,<sha>,submodules/<sm>/repo` directly; see `HONEYBEE.md`'s
-> Work task section.
+> This `submodule sync` fast-forwards the gitlink to the ALREADY-TRACKED branch tip (step 3 landed the
+> commit on the tracked branch first) — which is the ONLY value a submodule pointer may ever hold
+> (see `submodules/<sm>/repo`'s tracked branch in `.gitmodules`; and
+> `submodules/beehive/docs/submodule-pointer-invariant.md`). A pointer must NEVER be set to a
+> `bee-<taskid>` tip or any other commit: a Work-task honeybee does NOT bump the pointer at all — the
+> runner owns the gitlink and pins it to the tracked-branch tip. Never run
+> `git update-index --cacheinfo 160000,<sha>,submodules/<sm>/repo` to point the gitlink anywhere but
+> the tracked-branch tip.
 
 ## Edit a BEEHIVE-LAYER file (superproject)
 
