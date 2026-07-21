@@ -7735,3 +7735,44 @@ func TestScrollPreserveScopedForMorph(t *testing.T) {
 		t.Fatalf("scroll-preserve still stashes per-pane scrollTop — morph makes that redundant and it fights the in-place patch:\n%s", page)
 	}
 }
+
+// TestEditorFullWidthPanelLayout is the chat-editor-fullwidth-panel-layout
+// contract: the AI chat-diff editor renders in a full-width, panel-style shell
+// (no narrow centered column) with a dense two-panel grid, while every other
+// page keeps the centered .container column. There is no browser here, so this
+// asserts the markup/CSS contract off the parsed templates + embedded stylesheet.
+func TestEditorFullWidthPanelLayout(t *testing.T) {
+	s, _ := setup(t)
+
+	// (1) The editor shell opts into the full-width modifier via the header .Wide
+	//     flag, so the two panels span the whole window left-to-right.
+	eShell := renderTmpl(t, s, "editor.html", map[string]interface{}{
+		"ID": "e1", "File": "ROI.md", "Wide": true,
+	})
+	if !strings.Contains(eShell, `class="container container-wide"`) {
+		t.Fatalf("editor page must render the full-width shell (.container-wide):\n%s", eShell)
+	}
+
+	// (2) A page that does NOT set Wide keeps the centered column — the modifier
+	//     is strictly opt-in and never leaks onto other pages.
+	dash := get(t, s, "/").Body.String()
+	if strings.Contains(dash, "container-wide") {
+		t.Fatalf("non-editor page must keep the centered .container column, got container-wide:\n%s", dash)
+	}
+
+	// (3) The CSS: the wide modifier drops the max-width cap, and the editor grid
+	//     fills the width as a dense two-panel layout (still stacking at the one
+	//     narrow-viewport breakpoint).
+	css := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		".container-wide { max-width: none; }",
+		"width: 100%;",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("style.css missing full-width layout rule %q:\n%s", want, css)
+		}
+	}
+	if !strings.Contains(css, "@media (max-width: 48rem)") {
+		t.Fatalf("style.css must keep the editor-grid narrow-viewport stack breakpoint:\n%s", css)
+	}
+}

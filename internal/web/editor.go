@@ -52,6 +52,9 @@ func (s *Server) editorPage(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "editor.html", map[string]interface{}{
 		"ID": sess.ID, "File": sess.File, "Title": pageTitle("edit", sess.File),
 		"Crumbs": editorCrumbs(sess.File),
+		// chat-editor-fullwidth-panel-layout: render the editor in the full-width
+		// panel shell (drops the centered 66rem column) for the dense two-panel feel.
+		"Wide": true,
 	})
 }
 
