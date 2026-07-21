@@ -208,5 +208,16 @@ add a local skill so agents can discover it.
 - NEVER hand-edit a `PLAN.md` — reconcile/bootstrap own it.
 - Do not stop, kill, or restart running passes/processes without explicit operator
   approval; see `LOCALS.md` for the local safety rule and how work is scheduled.
+- NEVER push a commit to a hive's `remote/main` and let the local primary `main`
+  lag it. Local `main` only ever fast-forwards; a commit that lives only on the
+  remote while local `main` advances independently **forks** history, and
+  beehived's ff-only `pullMain` silently drops one line (permanent, no error).
+  Publish through a beehive path that advances local `main` after the remote push
+  (worktree + `PublishToMain` then `UpdateLocalMain`, or the editor / `POST
+  /roi/{name}`); for a commit authored directly on the primary `main`, call
+  `SyncMainFromRemote` before authoring and `PublishPrimaryMain` after. Never
+  split authorship across the two anchors (e.g. an external `git push` interleaved
+  with `beehive submodule sync`). Full protocol: `docs/main-convergence-protocol.md`
+  in the beehive submodule.
 - No shortcuts: compute real values; no placeholders, swallowed errors, or fake
   "done".

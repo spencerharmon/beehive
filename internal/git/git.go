@@ -690,6 +690,68 @@ func (r *Repo) PublishToMain(ctx context.Context, remote string) error {
 	return fmt.Errorf("git: publish to main exhausted retries")
 }
 
+// SyncMainFromRemote brings the current checkout's main up to date with
+// remote/main by fetch + MERGE (never ff-only). This is the deliberate
+// counterpart to Pull (--ff-only), which "records and proceeds" on a fork
+// (pullMain) and so can leave a divergence to rot: a merge HEALS a pre-existing
+// fork by authoring a merge commit, so any commit made AFTERWARD is a linear
+// descendant of the remote and can never fork history. It is a no-op when remote
+// is empty (a local-only hive: the primary main is already the sole authority).
+// Any merge conflict is surfaced (never swallowed) after aborting the merge.
+//
+// Every write that authors a commit DIRECTLY on the primary main (the `beehive`
+// CLI verbs: submodule sync, submodule remote, plan, task, instruction update)
+// MUST call this BEFORE authoring, or it manufactures the exact fork that
+// ff-only pullMain cannot heal. See docs/main-convergence-protocol.md.
+func (r *Repo) SyncMainFromRemote(ctx context.Context, remote string) error {
+	if remote == "" {
+		return nil
+	}
+	if err := r.Fetch(ctx, remote, "main"); err != nil {
+		return err
+	}
+	if _, err := r.Run(ctx, "merge", "--no-edit", "FETCH_HEAD"); err != nil {
+		cerr := r.conflictErr(ctx)
+		_, _ = r.Run(ctx, "merge", "--abort")
+		return cerr
+	}
+	return nil
+}
+
+// PublishPrimaryMain pushes a commit authored DIRECTLY on the primary main (not
+// in a linked worktree) out to remote/main, re-merging remote drift on a
+// non-fast-forward and retrying, so the bump is never stranded on local main.
+// It is a no-op when remote is empty (local-only hive: local main is already the
+// published state). Callers MUST have run SyncMainFromRemote before authoring,
+// so the common case is a clean fast-forward; the fetch+merge retry only covers a
+// genuine race with a concurrent publisher between the sync and this push.
+// Symmetric with PublishToMain, but for the direct-on-primary write path the CLI
+// verbs use. See docs/main-convergence-protocol.md.
+func (r *Repo) PublishPrimaryMain(ctx context.Context, remote string) error {
+	if remote == "" {
+		return nil
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		_, err := r.Run(ctx, "push", remote, "HEAD:refs/heads/main")
+		if err == nil {
+			return nil
+		}
+		if isNonFastForward(err) {
+			if ferr := r.Fetch(ctx, remote, "main"); ferr != nil {
+				return ferr
+			}
+			if _, merr := r.Run(ctx, "merge", "--no-edit", "FETCH_HEAD"); merr != nil {
+				cerr := r.conflictErr(ctx)
+				_, _ = r.Run(ctx, "merge", "--abort")
+				return cerr
+			}
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("git: publish primary main exhausted retries")
+}
+
 // isDirtyTreeRejection reports whether a push to a local checked-out branch was
 // refused because updateInstead found the target working tree dirty (versus a
 // non-fast-forward race or a permission/protection rejection).

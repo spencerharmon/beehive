@@ -256,7 +256,21 @@ func run() error {
 		return err
 	}
 	gitRepo := git.New(wtPath)
-	publish := func(ctx context.Context) error { return gitRepo.PublishToMain(ctx, remote) }
+	publish := func(ctx context.Context) error {
+		if err := gitRepo.PublishToMain(ctx, remote); err != nil {
+			return err
+		}
+		if remote != "" {
+			// Advance local main so it never lags the remote it just published to —
+			// the seam a stale-base primary-checkout commit could fork on (see
+			// docs/main-convergence-protocol.md). Soft: a dirty primary tree must not
+			// fail a publish the remote already accepted; pullMain re-syncs it.
+			if uerr := gitRepo.UpdateLocalMain(ctx); uerr != nil {
+				fmt.Fprintf(os.Stderr, "honeybee: WARNING published to remote main; local main not advanced (%v)\n", uerr)
+			}
+		}
+		return nil
+	}
 	sessGit := git.New(sessPath)
 	sessPublish := func(ctx context.Context) error { return sessGit.PublishToMain(ctx, remote) }
 	// When the hive has a remote, push the isolated session branch to it on every

@@ -1106,3 +1106,129 @@ func TestGitlinkAt(t *testing.T) {
 		t.Fatalf("GitlinkAt(absent) = %q, want \"\"", got)
 	}
 }
+
+// TestSyncMainFromRemoteHealsFork locks the core anti-silent-loss behavior: when
+// local main and remote/main have DIVERGED (a commit exists only on the remote
+// while a stale-base commit was authored on local main), Pull's --ff-only refuses
+// to cross the fork (proven by TestPullFFOnlyDivergence), but SyncMainFromRemote
+// MERGES it — authoring a merge that contains BOTH lines — so nothing is lost.
+// This is the exact fork `beehive submodule sync` used to manufacture by
+// committing on a stale local main; syncing first now makes it impossible.
+func TestSyncMainFromRemoteHealsFork(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "base", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push base: %v", err)
+	}
+
+	// b clones at base, then authors a stale-base commit on its local main...
+	b := cloneOf(t, origin, "b")
+	bTip := commitFile(t, b, "local", "b-only\n", "b-only")
+	// ...while the remote advances down a different line (a commit only on origin).
+	remoteTip := commitFile(t, a, "remote", "remote-only\n", "remote-only")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push remote-only: %v", err)
+	}
+
+	// Precondition: ff-only Pull CANNOT reconcile this fork (records, never merges).
+	if err := b.Pull(ctx, "origin", "main"); err == nil {
+		t.Fatal("precondition: --ff-only Pull must fail on the fork")
+	}
+	if got, _ := b.RevParse(ctx, "HEAD"); got != bTip {
+		t.Fatalf("ff-only Pull moved HEAD across a fork: %s != %s", got, bTip)
+	}
+
+	// SyncMainFromRemote MERGES the fork: no conflict, both lines present.
+	if err := b.SyncMainFromRemote(ctx, "origin"); err != nil {
+		t.Fatalf("SyncMainFromRemote heal: %v", err)
+	}
+	if c, _ := b.HasConflict(ctx); c {
+		t.Fatal("SyncMainFromRemote left a conflicted/merging state")
+	}
+	// The merge commit descends from BOTH the local stale-base tip and the remote.
+	if !b.sharesHistory(ctx, bTip) || !b.sharesHistory(ctx, remoteTip) {
+		t.Fatalf("merge does not contain both parents (local=%s remote=%s)", bTip, remoteTip)
+	}
+	if got := readFile(t, b, "remote"); got != "remote-only\n" {
+		t.Fatalf("remote-only content missing after heal: %q", got)
+	}
+	if got := readFile(t, b, "local"); got != "b-only\n" {
+		t.Fatalf("local content lost after heal: %q", got)
+	}
+}
+
+// sharesHistory reports whether ref is an ancestor of HEAD (test helper).
+func (r *Repo) sharesHistory(ctx context.Context, ref string) bool {
+	_, err := r.Run(ctx, "merge-base", "--is-ancestor", ref, "HEAD")
+	return err == nil
+}
+
+// TestSyncMainFromRemoteNoRemoteIsNoop locks that the local-only hive path
+// (remote == "") is a pure no-op: the primary main is already authoritative, so
+// no fetch/merge is attempted and HEAD is untouched.
+func TestSyncMainFromRemoteNoRemoteIsNoop(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	tip := commitFile(t, r, "f", "v1\n", "v1")
+	if err := r.SyncMainFromRemote(ctx, ""); err != nil {
+		t.Fatalf("no-remote sync must be a no-op, got: %v", err)
+	}
+	if got, _ := r.RevParse(ctx, "HEAD"); got != tip {
+		t.Fatalf("no-remote sync moved HEAD: %s != %s", got, tip)
+	}
+}
+
+// TestPublishPrimaryMainPushesAndMergesRace locks the direct-on-primary publish
+// path: after authoring a commit on local main, PublishPrimaryMain lands it on
+// remote/main, and when the remote advanced under it (a concurrent publisher
+// between sync and push) it fetch+merges and retries rather than losing either
+// side or force-pushing.
+func TestPublishPrimaryMainPushesAndMergesRace(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "base", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push base: %v", err)
+	}
+	b := cloneOf(t, origin, "b")
+
+	// a authors a bump on its (fresh) local main.
+	aTip := commitFile(t, a, "bump", "a-bump\n", "a-bump")
+	// A concurrent publisher advances the remote between a's sync and a's push.
+	bTip := commitFile(t, b, "peer", "b-peer\n", "b-peer")
+	if err := b.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("b push peer: %v", err)
+	}
+
+	// PublishPrimaryMain must land a's bump AND preserve the peer commit (merge).
+	if err := a.PublishPrimaryMain(ctx, "origin"); err != nil {
+		t.Fatalf("PublishPrimaryMain: %v", err)
+	}
+	if !a.sharesHistory(ctx, aTip) || !a.sharesHistory(ctx, bTip) {
+		t.Fatalf("published main missing a side (a=%s b=%s)", aTip, bTip)
+	}
+	// origin/main now equals a's merged HEAD (nothing force-dropped).
+	aHead, _ := a.RevParse(ctx, "HEAD")
+	c := cloneOf(t, origin, "c")
+	cHead, _ := c.RevParse(ctx, "HEAD")
+	if aHead != cHead {
+		t.Fatalf("origin/main != published HEAD: origin=%s want=%s", cHead, aHead)
+	}
+}
+
+// TestPublishPrimaryMainNoRemoteIsNoop: local-only hive, PublishPrimaryMain does
+// nothing (the commit on local main is already the published state).
+func TestPublishPrimaryMainNoRemoteIsNoop(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	tip := commitFile(t, r, "f", "v1\n", "v1")
+	if err := r.PublishPrimaryMain(ctx, ""); err != nil {
+		t.Fatalf("no-remote publish must be a no-op, got: %v", err)
+	}
+	if got, _ := r.RevParse(ctx, "HEAD"); got != tip {
+		t.Fatalf("no-remote publish moved HEAD: %s != %s", got, tip)
+	}
+}

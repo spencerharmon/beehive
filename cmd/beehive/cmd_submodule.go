@@ -162,6 +162,14 @@ func syncSubmodule(ctx context.Context, root, sm string) error {
 		return fmt.Errorf("no repo at %s", rel)
 	}
 	rootGit := git.New(root)
+	// Convergence protocol (docs/main-convergence-protocol.md): this verb authors a
+	// gitlink-bump commit DIRECTLY on the primary main, so it must first merge the
+	// hive remote into local main. Committing on a stale base manufactures a fork
+	// that ff-only pullMain cannot heal — the exact silent-loss bug this guards.
+	remote, _ := rootGit.Remote(ctx)
+	if err := rootGit.SyncMainFromRemote(ctx, remote); err != nil {
+		return err
+	}
 	branch, err := rootGit.Run(ctx, "config", "-f", ".gitmodules", "submodule."+rel+".branch")
 	if err != nil || branch == "" {
 		branch = "main"
@@ -177,6 +185,11 @@ func syncSubmodule(ctx context.Context, root, sm string) error {
 		return err
 	}
 	if err := rootGit.CommitPaths(ctx, "submodule sync: "+sm+" -> "+branch+" tip\n\nBeehive: submodule-sync "+sm, rel); err != nil && err != git.ErrNothing {
+		return err
+	}
+	// Publish the bump to the hive remote so it is not stranded on local main
+	// (the other half of the invariant: write on a fresh base, then push remote).
+	if err := rootGit.PublishPrimaryMain(ctx, remote); err != nil {
 		return err
 	}
 	head, _ := g.Run(ctx, "rev-parse", "--short", "HEAD")
