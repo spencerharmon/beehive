@@ -52,11 +52,24 @@ func submoduleRemoteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Convergence protocol (docs/main-convergence-protocol.md): this verb
+			// authors a .gitmodules commit DIRECTLY on the primary main, so it must
+			// merge the hive remote into local main BEFORE authoring, or it
+			// manufactures the fork ff-only pullMain cannot heal. Mirrors
+			// syncSubmodule's sync-before/publish-after call-site pattern exactly.
+			rootGit := git.New(root)
+			remote, _ := rootGit.Remote(cmd.Context())
+			if err := rootGit.SyncMainFromRemote(cmd.Context(), remote); err != nil {
+				return err
+			}
 			rel, err := submod.SetRemoteURL(cmd.Context(), root, args[0], args[1])
 			if err != nil {
 				return err
 			}
-			if err := git.New(root).CommitPaths(cmd.Context(), "submodule remote: "+args[0]+" -> "+args[1], ".gitmodules"); err != nil && err != git.ErrNothing {
+			if err := rootGit.CommitPaths(cmd.Context(), "submodule remote: "+args[0]+" -> "+args[1], ".gitmodules"); err != nil && err != git.ErrNothing {
+				return err
+			}
+			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
 				return err
 			}
 			fmt.Printf("%s remote set to %s\n", rel, args[1])
