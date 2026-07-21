@@ -326,6 +326,42 @@ func (r *Repo) CommitReachable(ctx context.Context, remote, branch, sha string) 
 	return r.CommitExists(ctx, sha), nil
 }
 
+// RemoteContainsCommit reports whether sha is DURABLY PUSHED to remote's branch:
+// it is reachable from the tip the remote itself advertises for branch, not
+// merely present in this repo's local object database. This is strictly stronger
+// than CommitReachable (which accepts a commit that exists only locally): a
+// submodule-pointer bump must target a commit that has actually reached the
+// submodule's origin, otherwise the superproject gitlink dangles on every OTHER
+// host (the chronic self-hosting defect — a gitlink bumped to a worktree commit
+// that never left the local checkout, e.g. dangling 62243addcc / 672eabd857).
+//
+// It fetches remote/branch (so the local remote-tracking ref reflects what origin
+// truly has), then asks `git merge-base --is-ancestor sha remote/branch`. A commit
+// that exists locally but was never pushed is NOT an ancestor of the remote tip,
+// so this returns false — exactly the case a pointer bump must refuse.
+//
+// remote == "" (local-sharing: a shared checkout with no configured origin) has
+// no origin to confirm against; in that mode every honeybee shares one object
+// database, so "present locally" IS "shared". It falls back to CommitExists,
+// mirroring CommitReachable's local-sharing branch.
+//
+// A fetch failure that is a definitive "remote has no such branch" reports
+// (false, nil) — the sha cannot be on a branch the remote does not carry. Any
+// other fetch failure (network/auth) is returned as a real error, never folded
+// into "unreachable", so a transient blip does not falsely refuse a good bump.
+func (r *Repo) RemoteContainsCommit(ctx context.Context, remote, branch, sha string) (bool, error) {
+	if remote == "" {
+		return r.CommitExists(ctx, sha), nil
+	}
+	if err := r.Fetch(ctx, remote, branch); err != nil {
+		if isRemoteRefMissing(err) || isCouldNotFindRemoteRef(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return r.IsAncestor(ctx, sha, remote+"/"+branch)
+}
+
 // isCouldNotFindRemoteRef reports whether a fetch failed because the remote
 // simply has no such ref — git's "couldn't find remote ref <name>" — a
 // definitive, confirmed absence distinct from a network/auth failure talking
@@ -495,6 +531,17 @@ func (r *Repo) GitlinkAt(ctx context.Context, ref, path string) (string, error) 
 		return "", nil
 	}
 	return fields[2], nil
+}
+
+// BumpGitlink rewrites the gitlink (mode-160000) INDEX entry for the submodule
+// at path to point at sha, via `git update-index --cacheinfo`. It touches only
+// this repo's index — not the shared submodule checkout at path — so it is safe
+// to run from any beehive-layer worktree (each has its own private index). The
+// caller stages/commits the bumped gitlink afterward. sha must be a full 40-char
+// object id (update-index records the id verbatim without resolving it).
+func (r *Repo) BumpGitlink(ctx context.Context, path, sha string) error {
+	_, err := r.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+sha+","+path)
+	return err
 }
 
 // DeleteRemoteBranch deletes branch on remote (`git push remote --delete
