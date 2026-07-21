@@ -108,10 +108,21 @@ func TestStatusClearsWhenReplyReadyWhilePublishing(t *testing.T) {
 
 	// Release the stalled push and let the background turn fully drain BEFORE
 	// returning, so the worktree/remote are quiescent when the temp dirs are
-	// torn down (a still-running push otherwise races TempDir cleanup).
+	// torn down (a still-running push otherwise races TempDir cleanup). Busy()
+	// itself now clears the instant the reply is ready (the fix under test), so
+	// draining on it would return immediately while the commit/transcript/push
+	// publish work is still running in the background; wait on the session's
+	// internal turn-in-flight flag instead (same package: direct field access
+	// under its own lock) so teardown only proceeds once that work is done.
 	os.Remove(sentinel)
 	drain := time.Now().Add(15 * time.Second)
-	for sess.Busy() && time.Now().Before(drain) {
+	for {
+		sess.mu.Lock()
+		on := sess.turnOn
+		sess.mu.Unlock()
+		if !on || time.Now().After(drain) {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 

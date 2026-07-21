@@ -123,7 +123,8 @@ type Session struct {
 	mu       sync.Mutex
 	oc       swarm.Session // opencode session (lazy: created on first chat)
 	log      []Turn
-	busy     bool
+	busy     bool // UI-facing "working…" status; clears the instant the reply is ready (chat-editor-status-poll-fix), NOT when publish work finishes
+	turnOn   bool // serializes turns end-to-end (reply + commit/transcript/push/merge); NEVER surfaced to the UI
 	err      string    // last turn error, surfaced in the panel
 	activity time.Time // last open/chat/merge, drives startup staleness
 }
@@ -749,10 +750,11 @@ func readTranscriptSidecar(wtPath string) ([]Turn, bool) {
 // the diff as the agent edits the file on disk. One turn at a time per session.
 func (s *Session) StartChat(bg context.Context, msg string) error {
 	s.mu.Lock()
-	if s.busy {
+	if s.turnOn {
 		s.mu.Unlock()
 		return fmt.Errorf("a turn is already in progress")
 	}
+	s.turnOn = true
 	s.busy = true
 	s.err = ""
 	s.log = append(s.log, Turn{Role: "user", Text: msg, At: time.Now()})
@@ -766,10 +768,11 @@ func (s *Session) StartChat(bg context.Context, msg string) error {
 // want a blocking call). It still records the turn and may merge.
 func (s *Session) Chat(ctx context.Context, msg string) (string, error) {
 	s.mu.Lock()
-	if s.busy {
+	if s.turnOn {
 		s.mu.Unlock()
 		return "", fmt.Errorf("a turn is already in progress")
 	}
+	s.turnOn = true
 	s.busy = true
 	s.err = ""
 	s.log = append(s.log, Turn{Role: "user", Text: msg, At: time.Now()})
@@ -783,12 +786,20 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 	if err != nil {
 		s.err = err.Error()
 		s.busy = false
+		s.turnOn = false
 		s.mu.Unlock()
 		return "", err
 	}
 	doMerge := strings.Contains(reply, mergeMarker)
 	display := strings.TrimSpace(strings.ReplaceAll(reply, mergeMarker, ""))
 	s.log = append(s.log, Turn{Role: "agent", Text: display, At: time.Now()})
+	// chat-editor-status-poll-fix: the assistant's reply is now ready and
+	// recorded — clear the UI-facing status HERE, not after the trailing
+	// commit/transcript/push/merge publish work below. Those steps still run
+	// (serialized by turnOn, not busy) so a concurrent turn cannot race the
+	// worktree, but the human-visible "working…" indicator must not linger
+	// once the reply the human is waiting for is already in the log.
+	s.busy = false
 	s.mu.Unlock()
 
 	// Commit whatever the agent wrote so the branch carries the proposal (and a
@@ -821,7 +832,7 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 		}
 	}
 	s.mu.Lock()
-	s.busy = false
+	s.turnOn = false
 	s.activity = s.mgr.now()
 	s.mu.Unlock()
 	if perr := s.mgr.persist(); perr != nil {
