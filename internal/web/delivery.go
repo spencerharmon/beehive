@@ -151,8 +151,15 @@ func (s *Server) buildDeliveries(ctx context.Context, head string, sm repo.Submo
 		want[id] = true
 	}
 	planRel := planRelPath(sm)
-	flips, _ := cachedView(head, s.cache, "delivery-flips:"+sm.Name, func() (map[string]string, error) {
-		return hiveDoneFlips(ctx, s.git, planRel, want), nil
+	// delivery-flips is a multi-second pickaxe walk of the hive's whole PLAN.md
+	// history and only powers a SECONDARY "why is this DONE" flip link — never
+	// block the page on it. Serve it stale-while-revalidate: the first render
+	// after a commit shows blank FlipSHA/FlipHref and a background goroutine
+	// recomputes for the new HEAD, so a later render (a poll or refresh) fills
+	// them in. delivery-docs stays synchronous — it is a cheap (~8ms) per-repo
+	// read, not a history walk.
+	flips, _ := cachedViewAsync(head, s.cache, "delivery-flips:"+sm.Name, func(bg context.Context) map[string]string {
+		return hiveDoneFlips(bg, s.git, planRel, want)
 	})
 	docs, _ := cachedView(head, s.cache, "delivery-docs:"+sm.Name, func() (map[string]string, error) {
 		return changeDocsByTask(ctx, sm.RepoDir()), nil

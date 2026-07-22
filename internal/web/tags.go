@@ -43,11 +43,15 @@ var builtinFacets = []string{"submodule", "kind", "branch", "model"}
 func (s *Server) sessionTags(sess sessionRef) map[string]string {
 	tags := map[string]string{}
 
-	// Built-ins: reuse audit.ParseFile (header parse + file-name cross-check +
-	// model-header parse). A parse failure is not fatal — leave the built-ins
-	// unset and fall through to whatever config tags still match (none, if the
-	// session has no derivable facet).
-	if a, err := audit.ParseFile(sess.path); err == nil {
+	// Built-ins: reuse audit.ParseFileHeader — the SAME header parse + file-name
+	// cross-check + model-header parse ParseFile does, but reading ONLY the header
+	// line, never the (often hundreds-of-KB) turn/tool-call body sessionTags never
+	// looks at. This is the hot /stats path over thousands of transcripts, so
+	// avoiding a full-file read+scan per session is what keeps the page fast. A
+	// parse failure is not fatal — leave the built-ins unset and fall through to
+	// whatever config tags still match (none, if the session has no derivable
+	// facet).
+	if a, err := audit.ParseFileHeader(sess.path); err == nil {
 		setTag(tags, "submodule", a.Submodule)
 		setTag(tags, "kind", a.Kind)
 		setTag(tags, "branch", a.Branch)

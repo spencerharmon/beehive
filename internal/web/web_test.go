@@ -3614,11 +3614,7 @@ func TestComputeStatsDeliveryLinks(t *testing.T) {
 	os.MkdirAll(filepath.Join(root, "submodules", "beta"), 0o755)
 	writeHivePlan(t, root, "beta", "dt2", "DONE")
 
-	subs, _, err := s.computeStats(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	find := func(name string) subStat {
+	find := func(subs []subStat, name string) subStat {
 		for _, st := range subs {
 			if st.Name == name {
 				return st
@@ -3637,7 +3633,29 @@ func TestComputeStatsDeliveryLinks(t *testing.T) {
 		return DeliveryLink{}
 	}
 
-	dt1 := findDelivery(find("alpha"), "dt1")
+	// The hive-flip half (FlipSHA/FlipHref) is served stale-while-revalidate
+	// (delivery-flips via cachedViewAsync): the FIRST computeStats after a
+	// commit triggers a background history walk and returns "" until it lands,
+	// so poll computeStats until the flip warms (a running beehived's later
+	// poll sees it filled in). The doc half is synchronous.
+	var dt1 DeliveryLink
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		subs, _, err := s.computeStats(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dt1 = findDelivery(find(subs, "alpha"), "dt1")
+		if dt1.FlipHref != "" || time.Now().After(deadline) {
+			// negative control checked against the same snapshot
+			dt2 := findDelivery(find(subs, "beta"), "dt2")
+			if dt2.FlipHref != "" || dt2.DocHref != "" {
+				t.Fatalf("dt2 (negative control) should have no locatable links, got %+v", dt2)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if dt1.FlipHref != "/submodule/alpha/commit/"+flipSHA {
 		t.Fatalf("dt1 FlipHref = %q, want hive commit %q", dt1.FlipHref, flipSHA)
 	}
@@ -3645,13 +3663,9 @@ func TestComputeStatsDeliveryLinks(t *testing.T) {
 		t.Fatalf("dt1 DocHref = %q", dt1.DocHref)
 	}
 
-	dt2 := findDelivery(find("beta"), "dt2")
-	if dt2.FlipHref != "" || dt2.DocHref != "" {
-		t.Fatalf("dt2 (negative control) should have no locatable links, got %+v", dt2)
-	}
-
 	// End-to-end: /stats renders both links for dt1 and never a dead href for
 	// dt2 (no error, no /submodule/beta/commit/... or doc href in the body).
+	// The async flip is warm by now (polled above), so it renders on this hit.
 	w := get(t, s, "/stats")
 	if w.Code != 200 {
 		t.Fatalf("stats %d: %s", w.Code, w.Body)
@@ -3686,12 +3700,24 @@ func TestBranchesDeliveryLink(t *testing.T) {
 	commitRepoAt(t, filepath.Join(root, "submodules", "alpha", "repo"),
 		"impl dt1\n\nBeehive: dt1 bee-dt1.md")
 
-	w := get(t, s, "/submodule/alpha/branches")
-	if w.Code != 200 {
-		t.Fatalf("branches %d: %s", w.Code, w.Body)
-	}
-	if body := w.Body.String(); !strings.Contains(body, `href="/submodule/alpha/commit/`+flipSHA+`"`) {
-		t.Fatalf("branches missing hive flip link for dt1:\n%s", body)
+	// The hive-flip link is served stale-while-revalidate (delivery-flips via
+	// cachedViewAsync): the first render triggers the background history walk
+	// and omits the link until it lands, so poll the branches view until it
+	// warms (a running beehived's later poll shows it) before asserting.
+	want := `href="/submodule/alpha/commit/` + flipSHA + `"`
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		w := get(t, s, "/submodule/alpha/branches")
+		if w.Code != 200 {
+			t.Fatalf("branches %d: %s", w.Code, w.Body)
+		}
+		if strings.Contains(w.Body.String(), want) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("branches missing hive flip link for dt1:\n%s", w.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -3941,14 +3967,23 @@ func TestStatsDeliveryFlipSHALinksToCommitView(t *testing.T) {
 	commitAll(t, root, "dt1-done")
 	flipSHA := hygGit(t, root, "rev-parse", "--short=12", "HEAD")
 
-	w := get(t, s, "/stats")
-	if w.Code != 200 {
-		t.Fatalf("stats %d: %s", w.Code, w.Body)
-	}
-	// The sha is BOTH the link target and its visible <code> anchor text.
+	// The sha is BOTH the link target and its visible <code> anchor text. The
+	// flip link is served stale-while-revalidate (cachedViewAsync), so poll
+	// /stats until the background history walk has warmed it.
 	want := `<a href="/submodule/alpha/commit/` + flipSHA + `"><code>` + flipSHA + `</code></a>`
-	if body := w.Body.String(); !strings.Contains(body, want) {
-		t.Fatalf("stats deliveries sha not a commitView deep link (%s):\n%s", want, body)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		w := get(t, s, "/stats")
+		if w.Code != 200 {
+			t.Fatalf("stats %d: %s", w.Code, w.Body)
+		}
+		if strings.Contains(w.Body.String(), want) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stats deliveries sha not a commitView deep link (%s):\n%s", want, w.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -7404,6 +7439,21 @@ func TestSessionListLinksTaskDocCommit(t *testing.T) {
 	writeTranscript(t, root, stem, "work", model)
 
 	// (1) Session list: shortened name, kind+model tags, task/doc/commit links.
+	// The commit (hive flip) link is served stale-while-revalidate
+	// (cachedViewAsync), so warm it first: poll the list until the background
+	// history walk has populated the flip before asserting on the snapshot.
+	commitLink := `<a href="/submodule/alpha/commit/` + flipSHA + `" aria-label="commit for t1">commit</a>`
+	warmDeadline := time.Now().Add(2 * time.Second)
+	for {
+		wl := get(t, s, "/submodule/alpha/sessions/body")
+		if wl.Code == 200 && strings.Contains(wl.Body.String(), commitLink) {
+			break
+		}
+		if time.Now().After(warmDeadline) {
+			t.Fatalf("sessions list flip link never warmed (%s):\n%s", commitLink, wl.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	list := get(t, s, "/submodule/alpha/sessions/body")
 	if list.Code != 200 {
 		t.Fatalf("sessions/body status %d: %s", list.Code, list.Body)

@@ -561,29 +561,25 @@ func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.T
 // resolution (sessionLinksFor).
 func (s *Server) sessionInfosPage(ctx context.Context, sm repo.Submodule, now time.Time, ttl time.Duration, page, size int) sessionPage {
 	dir := sm.SessionsDir()
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return sessionPage{Page: 1, Pages: 1, Size: size}
-	}
 	if size < 1 {
 		size = 1
 	}
-	// Cheap pre-pass: collect .md entries with their file mtime (no file read),
-	// so the window can be chosen before paying any per-session I/O.
+	// Cheap pre-pass: enumerate the .md entries with their file mtime (no body
+	// read), in PARALLEL — this whole-dir stat scan is the hot primitive that
+	// dominates the sessions list's load on a thousands-of-transcripts hive, and
+	// the stats are independent, so fanning them across a worker pool hides the
+	// per-file latency. The window is chosen before paying any per-session I/O.
+	scanned := scanSessionDir(dir)
+	if len(scanned) == 0 {
+		return sessionPage{Page: 1, Pages: 1, Size: size}
+	}
 	type entRef struct {
 		id  string
 		mod time.Time
 	}
-	var refs []entRef
-	for _, e := range ents {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		refs = append(refs, entRef{id: strings.TrimSuffix(e.Name(), ".md"), mod: fi.ModTime()})
+	refs := make([]entRef, 0, len(scanned))
+	for _, e := range scanned {
+		refs = append(refs, entRef{id: e.ID, mod: e.Mod})
 	}
 	// Newest-first by file mtime so page 1 holds the freshest sessions.
 	sort.Slice(refs, func(i, j int) bool { return refs[i].mod.After(refs[j].mod) })

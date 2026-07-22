@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/repo"
 )
 
 // subStat is one submodule's honeybee-performance figures, all derived on read
@@ -80,6 +81,113 @@ func (st *subStat) derive() {
 	}
 }
 
+// smAggregate is the TIME-INDEPENDENT, git-derived slice of one submodule's
+// /stats figures: everything that turns purely on committed history (DONE task
+// count, per-model session tallies, stranded branches) and NOT on the wall
+// clock. It is memoized per HEAD generation in viewCache (statsAggregate), so a
+// warm /stats never re-reads the submodule's thousands of session-transcript
+// HEADERS or re-walks its branch refs — that per-file I/O, not any single
+// parse, is what made /stats cost seconds on the live hive. The one figure that
+// is time-dependent — ActiveNow, a claim's active/stale flip across the TTL
+// with no new commit — is DELIBERATELY excluded here and recomputed fresh each
+// request in computeStats (the cache doc forbids caching that projection).
+type smAggregate struct {
+	DeliveredTasks int
+	Honeybees      int
+	Stranded       int
+	Models         []modelStat
+	Bees           map[string]int // per-model session tally, for the total row
+	Delivered      map[string]int // per-model delivered tally, for the total row
+	DoneIDs        []string       // DONE task ids, for buildDeliveries (order preserved)
+}
+
+// statsAggregate computes (or returns memoized) the time-independent figures for
+// one submodule at HEAD generation head. Everything it touches is a pure
+// projection of committed history, so it is safe to cache per HEAD; ActiveNow is
+// computed by the caller, never here. An empty head bypasses the cache (loads
+// fresh) exactly like every other cachedView caller.
+func (s *Server) statsAggregate(ctx context.Context, head string, sm repo.Submodule) smAggregate {
+	agg, _ := cachedView(head, s.cache, "stats-aggregate:"+sm.Name, func() (smAggregate, error) {
+		return s.computeSmAggregate(ctx, sm), nil
+	})
+	return agg
+}
+
+// computeSmAggregate does the actual (uncached) work behind statsAggregate: the
+// session-header scan + per-model attribution + stranded-branch walk for one
+// submodule. Split out from computeStats so the expensive, time-independent part
+// can be memoized while ActiveNow stays fresh.
+func (s *Server) computeSmAggregate(ctx context.Context, sm repo.Submodule) smAggregate {
+	agg := smAggregate{Bees: map[string]int{}, Delivered: map[string]int{}}
+	doneIDs := doneTaskIDs(sm)
+	agg.DoneIDs = doneIDs
+	done := make(map[string]bool, len(doneIDs))
+	for _, id := range doneIDs {
+		done[id] = true
+	}
+	agg.DeliveredTasks = len(doneIDs)
+	// Per-model tallies for this submodule, plus the model of each task's
+	// most-recent session (epoch then pid) so a DONE task's delivery is
+	// attributed to the model that last drove it.
+	bees := agg.Bees
+	type latest struct {
+		epoch, pid int
+		model      string
+	}
+	taskLatest := map[string]latest{}
+	if ents := scanSessionDir(sm.SessionsDir()); len(ents) > 0 {
+		// Derive each session's model tag in PARALLEL: sessionTags reads the
+		// transcript HEADER per file, and over thousands of transcripts that
+		// accumulated per-file I/O — not any single parse — is what made
+		// /stats slow, so fan it across a worker pool. Each result is
+		// index-aligned with ents; the fold below stays serial (map writes).
+		names := make([]string, len(ents))
+		for i, e := range ents {
+			names[i] = e.ID
+		}
+		models := parallelMap(names, func(id string) string {
+			stem := id
+			if sessionNameRE.FindStringSubmatch(stem) == nil {
+				return ""
+			}
+			// Model comes from the session's BUILT-IN `model` TAG
+			// (sessionTags — the extensible, git-derived tag model),
+			// single-sourcing the model parse with the rest of the tag set.
+			// sessionTags OMITS an absent model; the by-model view credits
+			// that unstamped history to opus (defaultModel), below.
+			return s.sessionTags(sessionRef{submodule: sm.Name, path: filepath.Join(sm.SessionsDir(), stem+".md")})["model"]
+		})
+		for i, e := range ents {
+			stem := e.ID
+			m := sessionNameRE.FindStringSubmatch(stem)
+			if m == nil {
+				continue
+			}
+			agg.Honeybees++
+			model := models[i]
+			if model == "" {
+				model = defaultModel
+			}
+			bees[model]++
+			task := m[1]
+			epoch, _ := strconv.Atoi(m[2])
+			pid, _ := strconv.Atoi(m[3])
+			if cur, ok := taskLatest[task]; !ok || epoch > cur.epoch || (epoch == cur.epoch && pid > cur.pid) {
+				taskLatest[task] = latest{epoch, pid, model}
+			}
+		}
+	}
+	// Attribute each delivered task to its latest session's model.
+	for task := range done {
+		if l, ok := taskLatest[task]; ok {
+			agg.Delivered[l.model]++
+		}
+	}
+	agg.Models = buildModelStats(bees, agg.Delivered)
+	agg.Stranded = strandedCount(ctx, git.New(sm.RepoDir()), done)
+	return agg
+}
+
 // computeStats returns per-submodule figures plus a total row.
 func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subStat, err error) {
 	sms, err := s.repo.Submodules()
@@ -97,78 +205,42 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 	// now/ttl for ActiveNow's claim-freshness projection (activeHoneybees),
 	// resolved once and shared across every submodule exactly like head above.
 	now, ttl := time.Now(), s.ttl()
+	// Resolve the live-stream-branch snapshot ONCE and share it across every
+	// submodule's ActiveNow computation (a single git for-each-ref for the whole
+	// /stats page instead of one per submodule).
+	live := s.liveBranchSet(ctx)
 	for _, sm := range sms {
-		st := subStat{Name: sm.Name}
+		// The heavy, TIME-INDEPENDENT figures (session-header scan, per-model
+		// attribution, stranded walk) come memoized per HEAD from statsAggregate
+		// — a warm /stats never re-reads the thousands of transcripts.
+		agg := s.statsAggregate(ctx, head, sm)
+		st := subStat{
+			Name:           sm.Name,
+			DeliveredTasks: agg.DeliveredTasks,
+			Honeybees:      agg.Honeybees,
+			Stranded:       agg.Stranded,
+			Models:         agg.Models,
+		}
 		// ActiveNow: the canonical active-honeybee set (active-honeybee-count-
 		// unify) — the SAME set the dashboard counter and sessions page/list
-		// read, never a re-derived rule. A PLAN.md parse error leaves it 0
-		// rather than failing the whole page (mirrors subViews' own resilience).
+		// read, never a re-derived rule. TIME-DEPENDENT (a claim goes stale as
+		// the wall clock crosses the TTL with no new commit), so it is computed
+		// FRESH every request here, never memoized. A PLAN.md parse error leaves
+		// it 0 rather than failing the whole page (mirrors subViews' resilience).
 		if p, perr := s.planView(head, sm.PlanPath(), now, ttl); perr == nil {
-			st.ActiveNow = len(s.activeHoneybees(ctx, sm, p))
+			st.ActiveNow = len(s.activeHoneybeesLive(ctx, sm, p, live))
 		}
-		doneIDs := doneTaskIDs(sm)
-		done := make(map[string]bool, len(doneIDs))
-		for _, id := range doneIDs {
-			done[id] = true
-		}
-		st.DeliveredTasks = len(doneIDs)
 		// delivery-traceability: link each DONE task to the hive commit that
 		// flipped it (half a) and its submodule code/doc (half b) — see
-		// delivery.go. Best-effort/read-only; never fails the page.
-		st.Deliveries = s.buildDeliveries(ctx, head, sm, doneIDs)
-		// Per-model tallies for this submodule, plus the model of each task's
-		// most-recent session (epoch then pid) so a DONE task's delivery is
-		// attributed to the model that last drove it.
-		bees := map[string]int{}
-		type latest struct {
-			epoch, pid int
-			model      string
-		}
-		taskLatest := map[string]latest{}
-		if ents, rerr := os.ReadDir(sm.SessionsDir()); rerr == nil {
-			for _, e := range ents {
-				if !strings.HasSuffix(e.Name(), ".md") {
-					continue
-				}
-				stem := strings.TrimSuffix(e.Name(), ".md")
-				m := sessionNameRE.FindStringSubmatch(stem)
-				if m == nil {
-					continue
-				}
-				st.Honeybees++
-				// Model for the by-model breakdown comes from the session's
-				// BUILT-IN `model` TAG (sessionTags — the extensible, git-derived
-				// tag model), single-sourcing the model parse with the rest of the
-				// tag set. sessionTags OMITS an absent model; the by-model view's
-				// own policy credits that unstamped history to opus (defaultModel).
-				model := s.sessionTags(sessionRef{submodule: sm.Name, path: filepath.Join(sm.SessionsDir(), e.Name())})["model"]
-				if model == "" {
-					model = defaultModel
-				}
-				bees[model]++
-				task := m[1]
-				epoch, _ := strconv.Atoi(m[2])
-				pid, _ := strconv.Atoi(m[3])
-				if cur, ok := taskLatest[task]; !ok || epoch > cur.epoch || (epoch == cur.epoch && pid > cur.pid) {
-					taskLatest[task] = latest{epoch, pid, model}
-				}
-			}
-		}
-		// Attribute each delivered task to its latest session's model.
-		delivered := map[string]int{}
-		for task := range done {
-			if l, ok := taskLatest[task]; ok {
-				delivered[l.model]++
-			}
-		}
-		st.Models = buildModelStats(bees, delivered)
-		for mdl, n := range bees {
+		// delivery.go. Best-effort/read-only; never fails the page. Its flip
+		// half is served stale-while-revalidate so it never blocks the page.
+		st.Deliveries = s.buildDeliveries(ctx, head, sm, agg.DoneIDs)
+		for mdl, n := range agg.Bees {
 			totBees[mdl] += n
 		}
-		for mdl, n := range delivered {
+		for mdl, n := range agg.Delivered {
 			totDelivered[mdl] += n
 		}
-		st.Stranded = strandedCount(ctx, git.New(sm.RepoDir()), done)
 		st.derive()
 		subs = append(subs, st)
 		total.DeliveredTasks += st.DeliveredTasks

@@ -1,9 +1,11 @@
 package web
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"sync"
+	"time"
 )
 
 // viewCache is the frontend's parse-once cache. Every request otherwise
@@ -48,7 +50,34 @@ type viewCache struct {
 	ents    map[string]any // key -> parsed value for the current generation
 	miss    int            // loader invocations (cache misses); read via Misses()
 	lookups int            // cache-participating reads (hit or miss); read via Lookups()/Hits()
+	async   map[string]*asyncEnt // key -> last value + gen for the stale-while-revalidate path
+	ttlc    map[string]*ttlEnt   // key -> last value + expiry for the short-TTL memo (cachedTTL)
 }
+
+// asyncEnt is one stale-while-revalidate cache slot (cachedViewAsync): the LAST
+// successfully-computed value, the HEAD generation it was computed at, and
+// whether a background recompute for a newer generation is already running. It
+// deliberately survives a generation change (unlike ents, which cachedView drops
+// wholesale) so a request at a new HEAD is served the previous generation's value
+// IMMEDIATELY while a single background goroutine recomputes — the value is
+// coarse/expensive traceability, not correctness-critical, so serving it a
+// commit or two stale for a moment is far better than blocking the whole page on
+// a multi-second history walk.
+type asyncEnt struct {
+	val      any    // last computed value ("" of T until the first refresh completes)
+	gen      string // HEAD the val was computed at
+	inflight bool   // a background refresh is already running (single-flight)
+}
+
+
+// ttlEnt is one cachedTTL slot: the last computed value, its expiry, and a
+// single-flight guard so only one background goroutine ever refreshes it.
+type ttlEnt struct {
+	val      any
+	exp      time.Time
+	inflight bool
+}
+
 
 // newViewCache builds an empty cache. Generations are supplied per call by the
 // caller (the beehive repo HEAD short SHA), not held here.
@@ -124,6 +153,111 @@ func cachedView[T any](head string, c *viewCache, key string, load func() (T, er
 	}
 	c.ents[key] = v
 	return v, nil
+}
+
+// cachedViewAsync is the stale-while-revalidate variant of cachedView for a
+// value that is EXPENSIVE and only SECONDARY (traceability, not correctness):
+// it NEVER blocks the request on the loader. On the first ever call for a key
+// (no stored value yet) it returns the zero value of T and the second return
+// false ("not yet warm"), kicking off a single background recompute; every
+// later call returns the LAST successfully-computed value immediately (true),
+// and — if HEAD has advanced past the value's generation and no refresh is
+// already running — launches one background goroutine to recompute for the new
+// generation. The slot deliberately survives generation changes (unlike ents,
+// which cachedView wipes wholesale), so a commit or two of staleness is traded
+// for never paying the loader's cost on the request path.
+//
+// The background load runs on a DETACHED context (context.Background), NOT the
+// request context: the request that triggered the refresh returns immediately,
+// so its ctx is cancelled the moment it finishes — a refresh bound to it would
+// be killed before it could store anything, and every request would re-trigger
+// a doomed refresh. head=="" (no commit to key on) bypasses entirely and
+// returns the zero value, false — the same no-HEAD bypass cachedView uses.
+func cachedViewAsync[T any](head string, c *viewCache, key string, load func(context.Context) T) (T, bool) {
+	var zero T
+	if head == "" {
+		return zero, false
+	}
+	c.mu.Lock()
+	if c.async == nil {
+		c.async = map[string]*asyncEnt{}
+	}
+	e := c.async[key]
+	if e == nil {
+		e = &asyncEnt{}
+		c.async[key] = e
+	}
+	haveVal := e.gen != ""
+	stale := e.gen != head
+	if stale && !e.inflight {
+		e.inflight = true
+		go func() {
+			v := load(context.Background())
+			c.mu.Lock()
+			e.val = v
+			e.gen = head
+			e.inflight = false
+			c.mu.Unlock()
+		}()
+	}
+	var val T
+	if haveVal {
+		val = e.val.(T)
+	}
+	c.mu.Unlock()
+	return val, haveVal
+}
+
+// cachedTTL memoizes an EXPENSIVE, git-subprocess-backed value that is NOT
+// HEAD-keyable — a whole-hive `git for-each-ref` liveness snapshot, a hygiene
+// sweep — for a short wall-clock window, so a frequently-polled dashboard pays
+// the subprocess cost at most once per ttl instead of on every render. Unlike
+// cachedView (keyed on HEAD, dropped on any commit), these values turn on git
+// state that changes with NO commit (a branch appears, a worktree is pruned),
+// so HEAD is the wrong key; a brief TTL is exactly right because the value is a
+// coarse operator-facing gauge, not a correctness input, and a second or two of
+// staleness is invisible next to the claim TTL (minutes).
+//
+// The FIRST call for a key (no value yet) computes synchronously under the lock
+// (single-flight, like cachedView) so the first render is real, not empty.
+// Every later call returns the last value IMMEDIATELY and — once it is past its
+// expiry and no refresh is already running — launches ONE background goroutine
+// to recompute on a DETACHED context (context.Background, not the request ctx,
+// which is cancelled the moment the triggering request returns). So after the
+// first render no request ever blocks on the subprocess again.
+func cachedTTL[T any](c *viewCache, key string, ttl time.Duration, load func(context.Context) T) T {
+	c.mu.Lock()
+	if c.ttlc == nil {
+		c.ttlc = map[string]*ttlEnt{}
+	}
+	e := c.ttlc[key]
+	if e != nil && e.val != nil {
+		val := e.val.(T)
+		if time.Now().After(e.exp) && !e.inflight {
+			e.inflight = true
+			go func() {
+				v := load(context.Background())
+				c.mu.Lock()
+				e.val = v
+				e.exp = time.Now().Add(ttl)
+				e.inflight = false
+				c.mu.Unlock()
+			}()
+		}
+		c.mu.Unlock()
+		return val
+	}
+	// No value yet: compute synchronously (holding the lock single-flights
+	// concurrent cold misses on this key, exactly like cachedView's loader).
+	if e == nil {
+		e = &ttlEnt{}
+		c.ttlc[key] = e
+	}
+	v := load(context.Background())
+	e.val = v
+	e.exp = time.Now().Add(ttl)
+	c.mu.Unlock()
+	return v
 }
 
 // fragmentETag returns a strong ETag validator (RFC 7232 §2.3) for a rendered

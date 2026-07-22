@@ -609,11 +609,18 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	// single hive-wide deploy state.
 	// Read-only hygiene summary alongside the submodule cards. A scan error is
 	// surfaced inside the widget (not swallowed) rather than failing the whole
-	// dashboard, which is the operator's primary page.
-	hyg, err := scanHygiene(r.Context(), s.repo.Root, s.git)
-	if err != nil {
-		hyg = Hygiene{Err: err.Error()}
-	}
+	// dashboard, which is the operator's primary page. The sweep spawns many git
+	// subprocesses (worktree/ref/pack queries) and is not HEAD-keyable (a
+	// worktree or remote changes with no commit), so it is memoized behind a
+	// short TTL (cachedTTL): a polled dashboard pays the sweep at most once per
+	// window, and its coarse cruft gauge is fine a few seconds stale.
+	hyg := cachedTTL(s.cache, "hygiene", 5*time.Second, func(bg context.Context) Hygiene {
+		h, err := scanHygiene(bg, s.repo.Root, s.git)
+		if err != nil {
+			return Hygiene{Err: err.Error()}
+		}
+		return h
+	})
 	rootFiles := s.rootFileLinks()
 	skillsDrift := s.skillsDrift()
 	// The "instruction update has work" signal must reflect the SAME set update
@@ -653,6 +660,10 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 	// keyed by this one generation, so the dashboard pays a single rev-parse and
 	// all cards reflect the same commit.
 	head := s.headSHA(ctx)
+	// Resolve the live-stream-branch snapshot ONCE for the whole dashboard and
+	// share it across every submodule's activeHoneybees call — a single git
+	// for-each-ref for the page instead of one per submodule.
+	live := s.liveBranchSet(ctx)
 	var views []subView
 	for _, sm := range subs {
 		v := subView{Name: sm.Name, State: "active"}
@@ -687,7 +698,7 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 					v.Human++
 				}
 			}
-			v.Bees = len(s.activeHoneybees(ctx, sm, p))
+			v.Bees = len(s.activeHoneybeesLive(ctx, sm, p, live))
 			v.Working = v.Bees > 0
 		}
 		// Env badge: the submodule's own blue/green deploy state via the typed

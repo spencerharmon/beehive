@@ -157,6 +157,67 @@ func ClassifyStubs(c *Census, resolve BranchResolver) {
 	}
 }
 
+// SessionHeader is the lightweight, HEADER-ONLY projection of a transcript: just
+// the built-in facets carried on the "submodule: … · kind: … · branch: … ·
+// model: …" line. It exists for the hot read paths (e.g. /stats' per-session
+// tagging over thousands of transcripts) that need ONLY those facets and never
+// the turn/tool-call body — deriving them without reading and regex-scanning the
+// whole (often hundreds-of-KB) file. It reports the exact same four facets, from
+// the exact same header parse + file-name cross-check, that ParseFile fills, so
+// the two can never disagree on what a session's built-in tags are.
+type SessionHeader struct {
+	Submodule, Kind, Branch string
+	Model                   string // "" when the header carries no model field
+}
+
+// ParseFileHeader reads a transcript's HEADER ONLY and returns its built-in
+// facets, WITHOUT reading or scanning the file body. It streams the file line by
+// line and stops at the authoritative "submodule: …" header line (always near
+// the top), so it touches only the first few lines of a file that may be hundreds
+// of KB — the whole point, versus ParseFile's os.ReadFile + full-body scan.
+//
+// It applies the SAME parse and file-name cross-check ParseFile does (the header
+// line via parseHeaderLine, then splitName against the branch), so a session it
+// accepts, and the four facets it reports, are byte-identical to what ParseFile
+// would derive. A stub / legacy / malformed / mis-headed transcript yields the
+// same error ParseFile would (no header line, or a name/branch mismatch), which
+// hot callers treat exactly as before: omit the built-ins for that session.
+func ParseFileHeader(path string) (SessionHeader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return SessionHeader{}, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	var line string
+	found := false
+	for sc.Scan() {
+		l := strings.TrimRight(sc.Text(), "\r")
+		if strings.HasPrefix(l, "submodule:") {
+			line, found = l, true
+			break
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return SessionHeader{}, err
+	}
+	if !found {
+		return SessionHeader{}, fmt.Errorf("audit: %s: no submodule/kind/branch header line", filepath.Base(path))
+	}
+	h, err := parseHeaderLine(line)
+	if err != nil {
+		return SessionHeader{}, err
+	}
+	// File-name cross-check, mirroring parseTranscript: a name that does not
+	// start with the header branch (or whose epoch segment is malformed) is a
+	// mis-headed transcript, rejected exactly as ParseFile rejects it.
+	if _, _, err := splitName(filepath.Base(path), h.Branch); err != nil {
+		return SessionHeader{}, err
+	}
+	return SessionHeader{Submodule: h.Submodule, Kind: h.Kind, Branch: h.Branch, Model: h.Model}, nil
+}
+
 // ParseFile reads and parses a single transcript file. Bytes is the file size.
 func ParseFile(path string) (*Session, error) {
 	data, err := os.ReadFile(path)
