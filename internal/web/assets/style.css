@@ -825,6 +825,22 @@ pre.diff {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* Multi-file diff boxes (multi-file-diff-boxes): a multi-file change (resolve
+ * agent, dance dry-run) renders one independently collapsible <details.diffbox>
+ * per file instead of a single merged blob, so a file's diff can be expanded or
+ * collapsed without affecting any other file's box. Native <details> gives the
+ * per-file independence with no JS. */
+.diff-boxes { display: flex; flex-direction: column; gap: var(--space-2); }
+.diffbox { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.diffbox > summary.diffbox-path {
+  cursor: pointer;
+  padding: var(--space-1) var(--space-2);
+  font-weight: 600;
+  user-select: none;
+}
+.diffbox[open] > summary.diffbox-path { border-bottom: 1px solid var(--border); }
+.diffbox > pre.diff { margin: 0; border: 0; }
 pre.diff .ln { display: block; padding: 0 0.3em; }
 pre.diff .ln.add { background: var(--diff-add-bg); }
 pre.diff .ln.del { background: var(--diff-del-bg); text-decoration: line-through; }

@@ -601,14 +601,6 @@ func isTrue(v string) bool {
 	}
 }
 
-// danceDiffView is one file's rendered diff for the panel: the target path plus
-// the diff rows, so a multi-file plan (e.g. per-submodule normalization) previews
-// each file's change under its own path.
-type danceDiffView struct {
-	Path string
-	Rows []editor.DiffRow
-}
-
 // dancePanel is the view model for one dance's card/panel: identity + flags plus,
 // once a dry-run or apply has run, the plan, the rendered per-file diffs, the
 // result, and any note/error to surface.
@@ -620,7 +612,7 @@ type dancePanel struct {
 	ReportOnly  bool
 
 	Plan   *dancePlan
-	Diffs  []danceDiffView
+	Diffs  []editor.FileDiffBox
 	Result *danceResult
 	Note   string
 	Err    string
@@ -643,14 +635,18 @@ func newDancePanel(sk *dance) dancePanel {
 	}
 }
 
-// withPlan attaches a plan (and its rendered per-file diffs) to the panel.
+// withPlan attaches a plan (and its rendered per-file diffs) to the panel. Each
+// changed file becomes its own editor.FileDiffBox (via RenderMultiFileDiff), so
+// a multi-file plan previews as one independently collapsible box per file.
 func (p dancePanel) withPlan(plan dancePlan) dancePanel {
 	p.Plan = &plan
+	changes := make([]editor.FileChange, 0, len(plan.Diffs))
 	for _, d := range plan.Diffs {
 		if d.changed() {
-			p.Diffs = append(p.Diffs, danceDiffView{Path: d.Path, Rows: editor.RenderDiff(d.Before, d.After)})
+			changes = append(changes, editor.FileChange{Path: d.Path, Old: d.Before, New: d.After})
 		}
 	}
+	p.Diffs = editor.RenderMultiFileDiff(changes)
 	return p
 }
 
