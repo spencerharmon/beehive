@@ -11,48 +11,32 @@ the operator directs it.
 
 ## NEVER commit an ROI edit on the live `main` tree
 
-The live `main` working tree and every `submodules/<name>/repo/` checkout are
-**derived state, not editing surfaces**. Honeybee passes and `beehived` share that
-filesystem and converge by merging worktree branches into `main` and pushing them to
-the hive's publish ref. A raw `git commit` on the primary `main` checkout becomes a
-**stray diverging head that only exists locally**: the swarm keeps pushing to the
-hive remote (e.g. `gitea/main`), your commit never goes up, and the next
-`git pull --ff-only` cannot fast-forward divergent histories → the pull stalls and
-every component's publish backs up behind it. This wedges the whole repo.
-
-So an operator-directed ROI edit is **not** a plain "edit the file and commit." It
-MUST land through one of the two publish paths in the Procedure below — the
-worktree/editor flow is **mandatory, not a suggestion**. Editing the file in place
-on the live checkout is doubly wrong: a running pass's dirty-tree heal silently
-resets it before you even commit.
+The live `main` working tree is **derived state, not an editing surface** — a raw
+`git commit` there becomes a stray diverging head the swarm never pushes, which
+wedges every future `git pull --ff-only`. Use one of the paths below; both converge
+to `main` through the sanctioned publish sequence, never the live checkout.
 
 ## Procedure
 
-Pick ONE of these two paths. Both land the edit as a proper participant in the
-merge/publish protocol.
+Pick ONE path.
 
 **Path A — the `beehived` ROI/generic editor UI (preferred).** Open the target's
 `ROI.md` in the beehived editor and save. It commits and publishes through the
-sanctioned flow for you; you never touch the live checkout.
+sanctioned flow for you; you never touch the live checkout or the CLI.
 
-**Path B — the beehive-layer worktree flow.** `ROI.md` is a beehive-layer file, so
-use the superproject worktree, not a submodule worktree:
+**Path B — `beehive edit` (CLI, no LLM needed).** One deterministic call runs the
+whole worktree -> write -> commit -> publish -> cleanup sequence and shares the
+exact convergence path Path A uses:
 
-1. `beehive worktree add <branch>` — creates `.worktrees/<branch>/` off the freshest
-   `main`.
-2. Edit `.worktrees/<branch>/submodules/<name>/ROI.md` (NOT the live
-   `submodules/<name>/ROI.md`). Keep entries terse and intent-level (the *what/why*,
-   not the implementation). Commit inside the worktree.
-3. Publish to the hive's `main` **publish ref**. Check `git remote -v` first — the
-   remote may be named `gitea`, `origin`, or anything else; use whatever it is:
-   - if the hive has a remote (call it `<hive-remote>`):
-     `git -C .worktrees/<branch> push <hive-remote> HEAD:main`;
-   - only if the hive is genuinely local-only (no remote, `updateInstead`):
-     `git -C .worktrees/<branch> push . HEAD:main`.
-   Verify with `git -C .worktrees/<branch> status` / a `git fetch` that the divergence
-   against the hive publish ref is `0 0` — a non-zero ahead count means your commit is
-   a stray local head; fix it before proceeding.
-4. `beehive worktree rm <branch>`.
+```
+beehive edit submodules/<name>/ROI.md --content-file <new-content> \
+    [--message "<commit message>"]
+```
+
+Read from stdin instead of `--content-file` by piping content in. A whole-file
+deletion of `ROI.md` (a human-owned file) is refused unless you pass
+`--confirm-delete`. On success the edit is already on `main` — no further worktree,
+push, or cleanup step is needed or should be attempted.
 
 In **both** paths: do **not** touch `PLAN.md`. The next **reconcile** pass detects
 that `ROI.md`'s head is newer than the `<!-- Beehive-ROI: <sha> -->` stamp in
@@ -67,10 +51,10 @@ intended tasks appear with the expected priorities.
 
 - **Never `git commit` an ROI edit on the primary `main` working tree directly** —
   and never edit the live `submodules/<name>/ROI.md` in place. Use Path A or Path B
-  above. A stray commit on local `main` wedges the repo (see the section above).
-- When publishing via Path B, push to the hive's actual publish ref (the real remote
-  from `git remote -v` — e.g. `gitea/main` — when one exists), not a local-only `.`
-  unless the hive truly has no remote. Confirm divergence is `0 0` afterward.
+  above.
+- `beehive edit` already resolves the correct publish target (a trusted remote's
+  `main` when one exists, the local `main` otherwise) and cleans up its own worktree
+  — do not add a manual push, worktree, or cleanup step around it.
 - Never edit an `ROI.md` **as a honeybee** (an autonomous pass — the hook blocks it).
   Operator-directed edits are allowed: a hive agent acting on operator instruction,
   or the beehived editor.

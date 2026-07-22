@@ -10,20 +10,17 @@
 The live checkout is **derived state, not an editing surface**:
 
 - The beehive repo's working tree on `main` is a **pure projection of committed
-  history**. The publisher (honeybees, the `beehived` editor) treats any
-  uncommitted drift in it as corruption: on the next publish it **resets the tree to
-  HEAD and force-re-checks-out submodules** (the dirty-tree heal). Edits you make
-  directly in the live tree are silently discarded — and worse, a wedged dirty tree
-  can block every component's publish.
-- `submodules/<name>/repo/` is the **shared submodule checkout**. Honeybees are told
-  explicitly never to write it; its commit only ever *follows* the tracked branch
-  (`beehive submodule sync` clobbers it to the upstream tip verbatim). Anything you
-  author there is lost on the next sync.
+  history**. On the next publish the runner/`beehived` resets it to HEAD and
+  force-re-checks-out submodules (the dirty-tree heal) — an in-place edit is
+  silently discarded, and a wedged dirty tree can block every component's publish.
+- `submodules/<name>/repo/` is the **shared submodule checkout**; `beehive submodule
+  sync` clobbers it to the tracked tip verbatim. Anything authored there is lost on
+  the next sync.
 
-So every component instead works a **private worktree branched off the freshest
-`main`/tip, commits there, and converges by merging/pushing back to `main`**. No
-shared index, no write lock, conflict-free. Your manual edit is just one more
-participant in that same protocol.
+So every component works a **private worktree branched off the freshest `main`/tip,
+commits there, and converges by merging/pushing back to `main`**. No shared index,
+no write lock, conflict-free. Your edit is just one more participant in that same
+protocol.
 
 ## Edit a submodule's CODE
 
@@ -32,60 +29,54 @@ participant in that same protocol.
    beehive submodule worktree add <submodule> <branch>
    # -> submodules/<submodule>/worktrees/<branch>/
    ```
-2. Edit and **commit inside that worktree** (`submodules/<submodule>/worktrees/<branch>/`).
-   Never touch `submodules/<submodule>/repo/`.
+2. Edit and **commit inside that worktree**. Never touch `submodules/<submodule>/repo/`.
 3. Land the commit on the submodule's tracked branch — the beehive pointer follows
-   it. From the worktree: `git push origin HEAD:<tracked-branch>` (or open a PR and
-   let it merge). For the self-hosting beehive submodule the tracked branch is
-   `origin/main`, the single source of truth the deploy reads.
+   it: `git push origin HEAD:<tracked-branch>` from the worktree (or a PR that
+   merges). The self-hosting beehive submodule tracks `origin/main`.
 4. Advance the recorded pointer and tidy up:
    ```
    beehive submodule sync <submodule>          # bump the gitlink to the new tip
    beehive submodule worktree rm <submodule> <branch>
    ```
-   (A running honeybee's next sync would also advance the pointer; doing it
-   explicitly keeps the projection current immediately.)
 
-> This `submodule sync` fast-forwards the gitlink to the ALREADY-TRACKED branch tip (step 3 landed the
-> commit on the tracked branch first) — which is the ONLY value a submodule pointer may ever hold
-> (see `submodules/<sm>/repo`'s tracked branch in `.gitmodules`; and
-> `submodules/beehive/docs/submodule-pointer-invariant.md`). A pointer must NEVER be set to a
-> `bee-<taskid>` tip or any other commit: a Work-task honeybee does NOT bump the pointer at all — the
-> runner owns the gitlink and pins it to the tracked-branch tip. Never run
-> `git update-index --cacheinfo 160000,<sha>,submodules/<sm>/repo` to point the gitlink anywhere but
-> the tracked-branch tip.
+> `submodule sync` fast-forwards the gitlink to the ALREADY-TRACKED branch tip (step
+> 3 landed the commit there first) — the ONLY value a pointer may ever hold (see
+> `submodules/beehive/docs/submodule-pointer-invariant.md`). Never point it at a
+> `bee-<taskid>` tip or run `git update-index --cacheinfo` on it: a Work-task
+> honeybee does not touch the pointer at all — the runner owns and pins it.
 
 ## Edit a BEEHIVE-LAYER file (superproject)
 
-Beehive-layer files live in the superproject, not in `repo/`: `INFRASTRUCTURE.md`,
-`SUBMODULE-LINKS.yaml`, the root instruction files, and a submodule's
-`INFRASTRUCTURE.md` / `ARTIFACTS.md` / `docs/`.
+Beehive-layer files live in the superproject, not in `repo/`: `ROI.md`,
+`INFRASTRUCTURE.md`, `SUBMODULE-LINKS.yaml`, and a submodule's `INFRASTRUCTURE.md` /
+`ARTIFACTS.md` / `RULES.md` / `AGENTS.md`. Use `beehive edit` — one deterministic
+call replacing the manual worktree -> write -> commit -> push -> cleanup sequence:
 
-- **`ROI.md`, `INFRASTRUCTURE.md`, and `SUBMODULE-LINKS.yaml`: prefer the `beehived`
-  editor UI.** It opens an edit worktree off `main`, lets you (or its agent) change
-  the one file, and merges to `main` for you — the exact same worktree process,
-  done end-to-end. `ROI.md` is human-owned and is *only* editable this way (agents
-  are hook-blocked from committing it; see the `modify-roi` skill).
-- **By hand**, for any superproject file the editor does not cover:
-  ```
-  beehive worktree add <branch>                 # -> .worktrees/<branch>/ off main
-  # edit the file under .worktrees/<branch>/ and commit it there
-  git -C .worktrees/<branch> push . HEAD:main   # publish: updateInstead advances the
-                                                # live tree (local-only hive). With a
-                                                # remote, push to origin/main instead.
-  beehive worktree rm <branch>
-  ```
-  This `push … HEAD:main` is exactly what the components' publisher does; it
-  fast-forwards/merges and the hive's `updateInstead` updates the live working tree.
+```
+beehive edit <repo-relative-file> --content-file <new-content> [--message "<msg>"]
+```
+
+Content can also be piped via stdin. A whole-file deletion of a human-owned file
+(`ROI.md`) is refused unless `--confirm-delete` is given; do not add manual
+worktree/push/cleanup steps around this command. `ROI.md` hook-blocks a honeybee
+commit regardless of path (see `modify-roi`); prefer the `beehived` editor UI for it
+when a human is driving interactively.
+
+The root instruction files (`AGENTS.md`, `HONEYBEE.md`, `BOOTSTRAP.md`,
+`skills/*.md`) are NOT edited this way — they are GENERATED from the `beehive`
+submodule's `prompts/` templates; edit the source there (Submodule CODE, above) and
+let `beehive instruction update` re-render the root copy.
 
 ## Rules
 
 - **Never author in the live checkout** — not the primary tree on `main`, not
-  `submodules/<name>/repo/`. Use a worktree; converge by publishing to `main`.
+  `submodules/<name>/repo/`. Use a worktree (submodule code) or `beehive edit`
+  (beehive-layer files).
 - Never `git reset`/`checkout`/`stash` the live primary tree to "make room" for an
   edit — you race in-flight publishes.
 - Never hand-edit `PLAN.md` (reconcile owns it) and never edit any `ROI.md` as an
   agent.
 - Do not remove a worktree, branch, or checkout that a running pass is using, and
   never kill a running pass, without operator approval (see `LOCALS.md`).
-- Always remove your worktree + branch when done so they do not look like live work.
+- Always remove your worktree + branch when done (`beehive edit` already does this
+  for you).
