@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 
 	"github.com/spencerharmon/beehive/internal/plan"
@@ -79,16 +80,31 @@ func realRunVerify(ctx context.Context, dir, name string, args ...string) (verif
 }
 
 // verifyGate runs the handoff protocol gate for a Work task the agent has just
-// driven to NEEDS-REVIEW: the code worktree must carry NO uncommitted work. It is
-// language-agnostic by construction — a git status is meaningful for every
-// submodule regardless of toolchain, and the runner deliberately runs NO
-// correctness check (that belongs to the honeybees; see
-// docs/runner-protocol-vs-correctness.md). It returns "" when the tree is clean or
-// the gate is INAPPLICABLE (any other kind or status, or no code worktree); a
-// non-empty commit-forward prompt to hand the agent when the tree is dirty; or a
-// non-nil error when the check could not be run (fail-closed: the caller blocks
-// completion).
-func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs string) (string, error) {
+// driven to NEEDS-REVIEW. It enforces TWO protocol invariants, both language-
+// agnostic and neither a correctness judgment (see
+// docs/runner-protocol-vs-correctness.md):
+//
+//  1. the CODE worktree (wtAbs) carries NO uncommitted work — else finish() would
+//     merge an empty bee-<taskid> branch and the task lands with none of its code;
+//  2. the change DOC is COMMITTED in the HIVE worktree (hiveAbs) — else the task
+//     lands NEEDS-REVIEW on main with NO change doc.
+//
+// Invariant 2 exists because of an asymmetry: the runner's own claim/heartbeat/
+// release commits carry the agent's PLAN.md status flip to main (planRel is
+// runner-committed), but NOTHING commits the change doc for the agent. An agent
+// that writes the doc to disk but never commits it satisfies the on-disk
+// docPresent completion check, yet publish (which pushes only committed HEAD)
+// carries the PLAN flip and NOT the untracked doc — the task lands NEEDS-REVIEW
+// with no doc, the reviewer rejects a doc-less handoff, and the task thrashes
+// review->arbitration->TODO (observed 2026-07-22, flux
+// zuul-github-readonly-image-source). Requiring the doc committed at THIS handoff
+// keeps the flip and its doc atomic on main.
+//
+// It returns "" when both invariants hold or the gate is INAPPLICABLE (any other
+// kind or status, or no code worktree); a non-empty commit-forward prompt to hand
+// the agent when either invariant fails; or a non-nil error when a check could not
+// be run (fail-closed: the caller blocks completion).
+func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, hiveAbs, branch string) (string, error) {
 	if sel.Kind != selectt.Work || wtAbs == "" {
 		return "", nil
 	}
@@ -125,6 +141,33 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs s
 	if strings.TrimSpace(o.out) != "" {
 		return dirtyTreeFailPrompt(o.out), nil
 	}
+	// Committed-doc gate — the change doc must already be COMMITTED in the hive
+	// worktree HEAD (the ref publish merges to main), not merely present on disk.
+	// Unlike PLAN.md (carried to main by the runner's own claim/heartbeat/release
+	// commits), the doc is never runner-committed: an uncommitted doc publishes as a
+	// NEEDS-REVIEW with no change doc. Prefix-match the docs tree exactly as
+	// docPresent does, but against committed HEAD rather than the working tree.
+	docDir := path.Join("submodules", sel.Submodule.Name, "docs")
+	lt, err := r.runVerify(ctx, hiveAbs, "git", "ls-tree", "-r", "--name-only", "HEAD", "--", docDir)
+	if err != nil {
+		return "", fmt.Errorf("verify gate: listing committed docs in %s: %w", hiveAbs, err)
+	}
+	stem := branch + "-" + sel.Task.ID
+	docPath := path.Join(docDir, stem+".md")
+	if lt.exitErr {
+		// No HEAD yet (nothing committed at all) => the doc cannot be committed.
+		return docUncommittedFailPrompt(docPath), nil
+	}
+	committed := false
+	for _, line := range strings.Split(strings.TrimSpace(lt.out), "\n") {
+		if pathHasPrefix(path.Base(strings.TrimSpace(line)), stem) {
+			committed = true
+			break
+		}
+	}
+	if !committed {
+		return docUncommittedFailPrompt(docPath), nil
+	}
 	return "", nil
 }
 
@@ -153,4 +196,21 @@ func dirtyTreeFailPrompt(out string) string {
 			"delete it. Then the gate re-runs automatically (leave the task status as-is). "+
 			"`git status --porcelain`:\n\n%s",
 		out)
+}
+
+// docUncommittedFailPrompt renders the commit-forward prompt for a NEEDS-REVIEW
+// handoff whose change doc is not committed in the hive worktree. The doc is the
+// one completion artifact the runner never commits for the agent (PLAN.md rides
+// to main on the claim/heartbeat/release commits; the doc does not), so an
+// uncommitted doc would publish a doc-less NEEDS-REVIEW the reviewer must reject.
+func docUncommittedFailPrompt(docPath string) string {
+	return fmt.Sprintf(
+		"Handoff gate FAILED: your change doc is NOT committed, so the task is NOT accepted "+
+			"as done — the runner publishes only committed history, and unlike PLAN.md (which the "+
+			"runner commits for you) NOTHING commits your change doc, so an uncommitted doc would "+
+			"land this task NEEDS-REVIEW on main with NO change doc and the reviewer would reject it. "+
+			"Write the change doc at EXACTLY %[1]s, then `git add %[1]s` and COMMIT it (with your "+
+			"PLAN.md status flip) to the hive worktree THIS session. Then the gate re-runs "+
+			"automatically (leave the task status as-is).",
+		docPath)
 }

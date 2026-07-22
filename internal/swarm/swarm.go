@@ -1398,7 +1398,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// NEEDS-REVIEW flip, and a clean tree all return "" and leave completion
 		// unchanged; an infra failure to run the check is fail-closed (blocks it).
 		if done {
-			hint, gerr := r.verifyGate(ctx, sel, wtAbs)
+			hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch)
 			if gerr != nil {
 				if ferr := finish(""); ferr != nil {
 					return res, errors.Join(gerr, ferr)

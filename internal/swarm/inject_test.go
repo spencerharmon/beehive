@@ -164,6 +164,7 @@ func TestLeanInjectTrimsSystemAndFiresInlineHint(t *testing.T) {
 	cl := &mockClient{gotSystem: &gotSystem, sess: &mockSession{all: &sent, onTurn: func(turn int) {
 		if turn == 2 {
 			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			commitReviewDoc(g)
 			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
 		}
 	}}}
@@ -218,6 +219,7 @@ func TestDefaultInjectByteStable(t *testing.T) {
 	cl := &mockClient{gotSystem: &gotSystem, sess: &mockSession{all: &sent, onTurn: func(turn int) {
 		if turn == 2 {
 			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			commitReviewDoc(g)
 			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
 		}
 	}}}

@@ -68,6 +68,15 @@ func gitInit(t *testing.T, dir string) *git.Repo {
 	return g
 }
 
+// commitReviewDoc commits the on-disk change doc into the hive worktree g so a
+// NEEDS-REVIEW handoff satisfies the committed-doc handoff gate (verifyGate): a
+// real agent commits its own change doc; the runner never commits the doc for it.
+// Standard submodule "sm" / task "T1" the swarm tests use. Ignores ErrNothing so
+// it is safe to call on every turn.
+func commitReviewDoc(g *git.Repo) {
+	_ = g.CommitPaths(context.Background(), "change doc", "submodules/sm/docs/bee-T1-T1.md")
+}
+
 func TestRunCompletes(t *testing.T) {
 	root := t.TempDir()
 	g := gitInit(t, root)
@@ -4075,6 +4084,7 @@ func TestWorkCompletionKeepsUnmergedSourceBranch(t *testing.T) {
 		_ = git.New(wtDir).Commit(ctx, "feat: in-flight work")
 		// ...then complete the Work handoff: change doc + NEEDS-REVIEW.
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		commitReviewDoc(g)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
@@ -4149,6 +4159,7 @@ func TestWorkCompletionDemotesWhenSourceBranchCannotLand(t *testing.T) {
 		os.WriteFile(filepath.Join(wtDir, "feature.txt"), []byte("work\n"), 0o644)
 		_ = git.New(wtDir).Commit(ctx, "feat: work")
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		commitReviewDoc(g)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RejectLimit: 3}
@@ -4249,7 +4260,12 @@ func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
-	gr := &gateRec{} // default: clean tree
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if len(args) > 0 && args[0] == "ls-tree" { // change doc is committed in HEAD
+			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
+		}
+		return verifyOutcome{}, nil // git status: clean
+	}}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
@@ -4260,11 +4276,15 @@ func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	if !res.Completed || res.GCMarked {
-		t.Fatalf("a clean tree must complete the handoff: %+v", res)
+		t.Fatalf("a clean tree with a committed doc must complete the handoff: %+v", res)
 	}
-	want := []gateCall{{dir: wtDir, name: "git", args: []string{"status", "--porcelain"}}}
+	wantRoot, _ := filepath.Abs(rp.Root)
+	want := []gateCall{
+		{dir: wtDir, name: "git", args: []string{"status", "--porcelain"}},
+		{dir: wantRoot, name: "git", args: []string{"ls-tree", "-r", "--name-only", "HEAD", "--", "submodules/sm/docs"}},
+	}
 	if !reflect.DeepEqual(gr.calls, want) {
-		t.Fatalf("the gate must run ONLY `git status --porcelain` and no toolchain check:\n got %+v\nwant %+v", gr.calls, want)
+		t.Fatalf("the gate must run ONLY `git status --porcelain` (code worktree) then `git ls-tree HEAD` (committed doc) — no toolchain check:\n got %+v\nwant %+v", gr.calls, want)
 	}
 }
 
@@ -4311,6 +4331,9 @@ func TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes(t *testing.T) {
 
 	gitStatus := 0
 	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if len(args) > 0 && args[0] == "ls-tree" { // change doc is committed in HEAD
+			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
+		}
 		if name == "git" {
 			gitStatus++
 			if gitStatus == 1 { // dirty on the first handoff, clean after the agent commits
@@ -4362,6 +4385,48 @@ func TestVerifyGateDirtyTreeNeverCompletes(t *testing.T) {
 	}
 	if res.Completed {
 		t.Fatalf("a persistently dirty tree must never complete the handoff: %+v", res)
+	}
+}
+
+// TestVerifyGateUncommittedDocNeverCompletes: the code worktree is clean, the
+// agent wrote the change doc to disk and flipped NEEDS-REVIEW, but the doc is NOT
+// committed in the hive worktree HEAD (ls-tree finds nothing) — so the handoff
+// must NOT complete. This is the regression guard for the doc-less NEEDS-REVIEW
+// that publishes the PLAN flip (runner-committed) while the untracked doc never
+// reaches main (observed 2026-07-22, flux zuul-github-readonly-image-source).
+func TestVerifyGateUncommittedDocNeverCompletes(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if len(args) > 0 && args[0] == "ls-tree" {
+			return verifyOutcome{out: ""}, nil // docs tree carries NO committed change doc
+		}
+		return verifyOutcome{}, nil // git status: clean code worktree
+	}}
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644) // on disk, NOT committed
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("a NEEDS-REVIEW handoff with an UNCOMMITTED change doc must never complete: %+v", res)
+	}
+	// The gate must have actually consulted the committed docs tree.
+	sawLsTree := false
+	for _, c := range gr.calls {
+		if len(c.args) > 0 && c.args[0] == "ls-tree" {
+			sawLsTree = true
+		}
+	}
+	if !sawLsTree {
+		t.Fatalf("the gate never checked whether the change doc was committed; calls=%+v", gr.calls)
 	}
 }
 
@@ -4488,6 +4553,7 @@ func TestPredicateHardStopCancelsTurnMidStream(t *testing.T) {
 	sess := &predicateHardStopSession{
 		deliver: func() {
 			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			commitReviewDoc(g)
 			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
 		},
 		secondCallRan: secondCallRan,

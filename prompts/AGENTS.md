@@ -113,8 +113,10 @@ exact complement. Each pass, the runner automatically:
 - **Checks completion deterministically** each turn, per kind — work: terminal status
   (`DONE` / `NEEDS-REVIEW` / `NEEDS-ARBITRATION`, or `NEEDS-HUMAN` with a reason) AND
   the change doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` AND (on a
-  `TODO`→`NEEDS-REVIEW` handoff) a clean code worktree (`git status --porcelain` empty,
-  so your change is actually committed); review: task left
+  `TODO`→`NEEDS-REVIEW` handoff) both a clean code worktree (`git status --porcelain`
+  empty, so your change is actually committed) AND that change doc COMMITTED in the hive
+  worktree HEAD (`git ls-tree`, so the doc actually publishes to main — the runner
+  commits your PLAN.md flip but never your doc); review: task left
   `NEEDS-REVIEW`; arbitrate: task left `NEEDS-ARBITRATION`; reconcile: `PLAN.md`'s ROI
   stamp matches `ROI.md` HEAD; bootstrap: `PLAN.md` exists. These are all PROTOCOL
   checks — mechanical, language-agnostic facts. The runner NEVER runs your tests, builds

@@ -232,14 +232,19 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   the pointer: it pins the gitlink to the tracked-branch tip (`origin/<branch>`) at completion, which is
   the ONLY value it may ever hold. Never run `git update-index --cacheinfo ... submodules/<sm>/repo`,
   never stage or commit the gitlink. See `docs/submodule-pointer-invariant.md`.
-- **The NEEDS-REVIEW handoff runs a deterministic uncommitted-work gate.** Before the runner accepts
-  your flip as done it checks `git status --porcelain` in your code worktree: if ANY change is still
-  uncommitted (modified OR untracked), the handoff is REFUSED and handed straight back for you to commit
-  this same session — because the runner only ever merges commits that already exist on `bee-<taskid>`,
-  so an edit written but never committed would be silently dropped and the task would land with none of
-  its code. "I wrote the files" is not "I committed the files": a task is not done until the diff is a
-  real commit on your pushed branch. (This is exactly the bug that shipped an empty flux base-job task
-  and stranded its gostream dependent.)
+- **The NEEDS-REVIEW handoff runs a deterministic two-part protocol gate.** Before the runner accepts
+  your flip as done it checks (1) `git status --porcelain` in your code worktree and (2) that your change
+  doc is COMMITTED in your beehive-layer (hive) worktree HEAD. If ANY change in the code worktree is still
+  uncommitted (modified OR untracked), OR your change doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md`
+  is written but not committed, the handoff is REFUSED and handed straight back for you to commit this same
+  session — because the runner only ever merges commits that already exist (the code on `bee-<taskid>`, the
+  doc + PLAN flip on your hive branch), so an edit written but never committed would be silently dropped.
+  Note the asymmetry: the runner commits your PLAN.md status flip for you (via its claim/heartbeat/release
+  commits) but NEVER commits your change doc — an uncommitted doc lands NEEDS-REVIEW on main with no doc and
+  the reviewer rejects it. "I wrote the files" is not "I committed the files": a task is not done until
+  both the code diff is a real commit on your pushed branch AND the change doc is a real commit on your hive
+  branch. (This is exactly the bug that shipped an empty flux base-job task and stranded its gostream
+  dependent, and later the doc-less flux zuul-github task that thrashed review→arbitration→TODO.)
 - Flip the `PLAN.md` task `TODO → NEEDS-REVIEW` on main and commit.
 
 ## Review task
