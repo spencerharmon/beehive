@@ -967,13 +967,25 @@ func (s *Session) stripTranscriptSidecar(ctx context.Context) error {
 }
 
 // prompt opens the opencode session on first use (seeding system + first
-// message) and reuses it for later turns.
+// message) and reuses it for later turns. On the FIRST turn of a Session that
+// was recovered from disk after a beehived restart (its live opencode handle is
+// gone but its transcript survived), the recorded conversation is replayed into
+// the new server session so the agent resumes with full context — see
+// resumeFirstMessage.
 func (s *Session) prompt(ctx context.Context, msg string) (string, error) {
 	s.mu.Lock()
 	oc := s.oc
 	s.mu.Unlock()
 	if oc == nil {
-		sess, reply, err := s.client.NewSession(ctx, s.wtPath, s.sys, msg)
+		// A new opencode server session has NO memory of the conversation. If this
+		// Session carries prior transcript turns (it was resumed after a restart,
+		// which dropped the in-memory opencode pointer while the chat log survived
+		// in the store / branch sidecar), replay them so the agent continues the
+		// SAME conversation instead of treating the next message as turn one. A
+		// brand-new session has no prior history, so first == msg and this path is
+		// byte-identical to before.
+		first := s.resumeFirstMessage(msg)
+		sess, reply, err := s.client.NewSession(ctx, s.wtPath, s.sys, first)
 		if err != nil {
 			return "", err
 		}
@@ -983,6 +995,53 @@ func (s *Session) prompt(ctx context.Context, msg string) (string, error) {
 		return reply, nil
 	}
 	return oc.Prompt(ctx, msg)
+}
+
+// resumeFirstMessage builds the first message for a NEW opencode session. When
+// this Session carries recorded transcript turns from BEFORE the current one —
+// i.e. it was recovered from disk after a beehived restart, so its live opencode
+// handle was lost while its chat log survived — it prepends a replay of that
+// prior conversation so the resumed agent has full context. The edited file
+// already on disk reflects those earlier edits, so the replay explicitly tells
+// the agent NOT to redo them. For a brand-new session (no prior turns) it
+// returns msg unchanged, so a first-ever turn is byte-identical to before this
+// existed.
+//
+// The transcript is replayed as CONTEXT in a single message, never by
+// re-driving each prior turn through the model — re-running the agent's earlier
+// turns would re-execute its file edits (duplicating them) and burn tokens.
+func (s *Session) resumeFirstMessage(msg string) string {
+	s.mu.Lock()
+	// The current user turn is already appended (StartChat/Chat) as the LAST log
+	// entry; everything before it is the prior conversation to replay.
+	var prior []Turn
+	if n := len(s.log); n > 1 {
+		prior = append(prior, s.log[:n-1]...)
+	}
+	s.mu.Unlock()
+	if len(prior) == 0 {
+		return msg
+	}
+	var b strings.Builder
+	b.WriteString("You are RESUMING an in-progress editing session that was interrupted " +
+		"(a restart dropped the live session, but the conversation and your earlier " +
+		"edits were saved). The file on disk already reflects every edit you made " +
+		"earlier in this conversation — treat it as the current state and do NOT redo " +
+		"those edits. For context, here is the conversation so far:\n\n")
+	for _, t := range prior {
+		text := strings.TrimSpace(t.Text)
+		if text == "" {
+			continue
+		}
+		who := "User"
+		if t.Role == "agent" {
+			who = "You"
+		}
+		fmt.Fprintf(&b, "%s: %s\n\n", who, text)
+	}
+	b.WriteString("Now continue the session. The user's next message is:\n\n")
+	b.WriteString(msg)
+	return b.String()
 }
 
 func (s *Session) setErr(msg string) {

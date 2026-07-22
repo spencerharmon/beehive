@@ -66,3 +66,21 @@ via a crash is swept by the manual `cleanup-stale` dance
 dirs with no live git worktree), never by an automatic process that could race a
 live session. Trading a rare, cheap leaked worktree for never deleting live work
 is the correct exchange.
+
+## Resuming a session's conversation after a restart
+
+Recovering the worktree, branch, and store record keeps the *edit* durable, but
+the live opencode session (the server-side conversation handle, `Session.oc`) is
+NOT persisted — a beehived restart always loses it. Without more, the next turn
+on a recovered session would open a fresh opencode session seeded with only the
+new message, so the agent would have amnesia about everything discussed and
+every edit it already made.
+
+So on the FIRST turn after a resume, `Session.prompt` replays the recovered
+transcript into the new opencode session (`resumeFirstMessage`): the prior
+user/agent turns are rendered as context in a single seed message, followed by
+the new user message. The replay is CONTEXT only — it never re-drives each prior
+turn through the model (that would re-execute the agent's earlier file edits and
+burn tokens), and it explicitly tells the agent the file on disk already
+reflects those edits so it must not redo them. A brand-new session has no prior
+turns, so the seed message is the raw user message, byte-identical to before.

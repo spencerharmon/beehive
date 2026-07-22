@@ -20,9 +20,16 @@ import (
 type fakeClient struct {
 	editFn func(dir string)
 	reply  string
+	// firstSeen records the `first` message the most recent NewSession was seeded
+	// with, and newCalls counts NewSession calls — the transcript-replay tests
+	// assert the recovered conversation is replayed into the new opencode session.
+	firstSeen string
+	newCalls  int
 }
 
 func (f *fakeClient) NewSession(ctx context.Context, dir, system, first string) (swarm.Session, string, error) {
+	f.firstSeen = first
+	f.newCalls++
 	if f.editFn != nil {
 		f.editFn(dir)
 	}
@@ -902,5 +909,86 @@ func TestPublishWorktreeSharedByEditorAndCLI(t *testing.T) {
 	rest := text[publishFileIdx:]
 	if !strings.Contains(rest, "PublishWorktree(ctx") {
 		t.Fatal("PublishFile no longer calls the shared PublishWorktree helper")
+	}
+}
+
+// TestResumedSessionReplaysTranscriptIntoNewOpencodeSession is the transcript-
+// replay acceptance: after a beehived restart drops the live opencode handle
+// (but the store keeps the session + its chat log), the NEXT turn must open a
+// NEW opencode session whose FIRST message replays the prior conversation and
+// carries the new user message last, so the agent resumes the SAME conversation
+// instead of treating the next message as turn one.
+func TestResumedSessionReplaysTranscriptIntoNewOpencodeSession(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	file := "submodules/sm/ROI.md"
+
+	fc := &fakeClient{reply: "I appended a goal."}
+	fc.editFn = func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(file))
+		b, _ := os.ReadFile(p)
+		_ = os.WriteFile(p, append(b, []byte("first goal\n")...), 0o644)
+	}
+	m := newTestManager(t, root, fc)
+	sess, err := m.Open(ctx, file)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := sess.Chat(ctx, "add a goal about uptime"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+
+	// Simulate a beehived restart: a brand-new Manager over the SAME root recovers
+	// the session from disk (its committed edit makes it pending -> kept), but the
+	// live opencode handle is gone (oc == nil on the rebuilt Session).
+	fc2 := &fakeClient{reply: "done."}
+	m2 := newTestManager(t, root, fc2)
+	if err := m2.Reload(ctx); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	got, ok := m2.Get(sess.ID)
+	if !ok {
+		t.Fatalf("session %s not recovered after restart", sess.ID)
+	}
+	if len(got.Log()) == 0 {
+		t.Fatalf("recovered session lost its transcript")
+	}
+
+	if _, err := got.Chat(ctx, "also mention latency"); err != nil {
+		t.Fatalf("resume chat: %v", err)
+	}
+	if fc2.newCalls != 1 {
+		t.Fatalf("resume should open exactly one new opencode session, got %d", fc2.newCalls)
+	}
+	first := fc2.firstSeen
+	for _, want := range []string{"RESUMING", "add a goal about uptime", "I appended a goal.", "also mention latency"} {
+		if !strings.Contains(first, want) {
+			t.Fatalf("resumed first message missing %q; got:\n%s", want, first)
+		}
+	}
+	// The new user message is the tail: the agent continues FROM it.
+	if !strings.HasSuffix(strings.TrimSpace(first), "also mention latency") {
+		t.Fatalf("new user message should be the tail of the replay; got:\n%s", first)
+	}
+}
+
+// TestFreshSessionFirstMessageIsUnchanged proves the replay is inert for a
+// brand-new session: a first-ever turn seeds the opencode session with the raw
+// user message, byte-identical to before transcript replay existed (no preamble).
+func TestFreshSessionFirstMessageIsUnchanged(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	file := "submodules/sm/ROI.md"
+	fc := &fakeClient{reply: "ok."}
+	m := newTestManager(t, root, fc)
+	sess, err := m.Open(ctx, file)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := sess.Chat(ctx, "make the intro punchier"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if fc.firstSeen != "make the intro punchier" {
+		t.Fatalf("a first-ever turn must seed the raw message unchanged, got %q", fc.firstSeen)
 	}
 }
