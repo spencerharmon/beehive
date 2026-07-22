@@ -71,7 +71,7 @@ func TestWorkBriefInjected(t *testing.T) {
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	cl.sess.capture = &firstPrompt
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, LeanBrief: true}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, LeanBrief: true}
 	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestWorkBriefInertByDefault(t *testing.T) {
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	cl.sess.capture = &firstPrompt
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour} // LeanBrief off
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour} // LeanBrief off
 	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
 		t.Fatalf("run: %v", err)
 	}

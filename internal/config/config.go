@@ -69,43 +69,20 @@ type Config struct {
 	MaxTurns     int               `yaml:"max_turns"`     // per-honeybee turn cap
 	MergeRetries int               `yaml:"merge_retries"` // publish conflict-resolution attempts before deferring (default 8)
 	RejectLimit  int               `yaml:"reject_limit"`  // rejections before NEEDS-HUMAN
-	// StallTurns bounds idle churn: if a Work pass produces an identical code-
-	// worktree fingerprint for this many consecutive turns without reaching
-	// completion, the runner abandons it for GC instead of burning the whole
-	// turn/wall budget on a provably stuck session. 0 = off (the default), so a
-	// host that has not opted in behaves exactly as before.
-	StallTurns int `yaml:"stall_turns"`
-	// TurnTimeoutMinutes is the ABSOLUTE per-turn ceiling (one opencode call): a
-	// hard wall-clock backstop so a turn can never run past it regardless of
-	// progress, short of the systemd RuntimeMaxSec. Day-to-day stall detection is
-	// the finer-grained TurnIdleTimeoutMinutes progress watchdog; this ceiling only
-	// bounds a pathological turn that keeps trickling progress forever. 0 = no
-	// absolute cap (the whole-run WallCap/TTL still applies between turns).
-	TurnTimeoutMinutes int `yaml:"turn_timeout_minutes"`
-
-	// TurnIdleTimeoutMinutes is the per-turn PROGRESS watchdog: a turn that produces
-	// no new transcript activity (no new tool call, streamed tool output, or text)
-	// for this long is abandoned for GC as a genuine stall. Unlike
-	// TurnTimeoutMinutes — an absolute wall-clock ceiling that kills a turn even
-	// while it is still making steady progress — this distinguishes a wedged agent
-	// from a long but productive one, so a big task's multi-step turn runs to
-	// completion while a dead HTTP socket is cut promptly. 0 = disabled (only the
-	// absolute ceiling applies). It is wired into the opencode client
-	// (Opencode.IdleTimeout); the runner mirrors it only for the GC warning wording.
+	// TurnIdleTimeoutMinutes is the liveness watchdog — the ONE timeout that ends a
+	// turn. A turn that produces NO new transcript activity (no new tool call,
+	// streamed tool output, thinking, text, or any tool field) for this long is hung,
+	// not working, and is aborted; the runner then re-drives the same session on the
+	// next turn (bounded by MaxTurns). A turn that keeps signaling is never killed,
+	// however long it runs — so a big multi-step turn always runs to completion while
+	// a dead HTTP socket is cut promptly. Wired into the opencode client
+	// (Opencode.IdleTimeout). 0 = disabled.
+	//
+	// This plus MaxTurns (the runaway backstop) and TTLMinutes (claim coordination,
+	// kept fresh by the mid-turn heartbeat so a live agent's claim never goes stale)
+	// are the ENTIRE timeout model. The retired turn_timeout_minutes, stall_turns,
+	// wallcap, and turn_idle_retries keys are ignored if still present in a config.
 	TurnIdleTimeoutMinutes int `yaml:"turn_idle_timeout_minutes"`
-
-	// TurnIdleRetries is how many times a single pass RECOVERS in-place from an idle
-	// stall before giving up. The idle watchdog catches a genuinely wedged upstream
-	// turn (github-copilot occasionally holds the streaming request open with zero
-	// output and no error, and opencode has no provider read-timeout), but these
-	// hangs are PROBABILISTIC: aborting the wedged turn server-side and re-driving
-	// the SAME session (its investigation/context is preserved) usually clears it,
-	// so a big task no longer loses a whole pass — and every retry from scratch — to
-	// one transient hang. Each retry costs up to TurnIdleTimeoutMinutes of wall time,
-	// so the total is bounded by both this count and the run WallCap/TTL. Only after
-	// this many cumulative idle stalls in a pass does it abandon the task for GC. 0 =
-	// the historical behavior (first idle stall abandons immediately).
-	TurnIdleRetries int `yaml:"turn_idle_retries"`
 
 	// BuildEnv is the host-specific Go build/test environment the runner OWNS so no
 	// honeybee re-derives it (audit session-audit-001 F1: e.g. a broken host cgo
@@ -216,9 +193,7 @@ func Defaults(dir string) Config {
 		MergeRetries:           8,
 		RejectLimit:            3,
 		AbortOnRemoteFailure:   boolPtr(true),
-		TurnTimeoutMinutes:     180,
 		TurnIdleTimeoutMinutes: 15,
-		TurnIdleRetries:        2,
 		SessionPullSeconds:     2,
 	}
 }
@@ -340,17 +315,8 @@ func merge(base, over Config) Config {
 	if over.RejectLimit != 0 {
 		out.RejectLimit = over.RejectLimit
 	}
-	if over.StallTurns != 0 {
-		out.StallTurns = over.StallTurns
-	}
-	if over.TurnTimeoutMinutes != 0 {
-		out.TurnTimeoutMinutes = over.TurnTimeoutMinutes
-	}
 	if over.TurnIdleTimeoutMinutes != 0 {
 		out.TurnIdleTimeoutMinutes = over.TurnIdleTimeoutMinutes
-	}
-	if over.TurnIdleRetries != 0 {
-		out.TurnIdleRetries = over.TurnIdleRetries
 	}
 	out.BuildEnv = mergeEnv(base.BuildEnv, over.BuildEnv)
 	if over.SessionPullSeconds != 0 {

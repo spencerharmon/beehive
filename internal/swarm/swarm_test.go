@@ -110,7 +110,7 @@ func TestRunCompletes(t *testing.T) {
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
 	mc := &mockClient{}
-	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, TTL: time.Hour}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
@@ -141,7 +141,7 @@ func TestRunGCCap(t *testing.T) {
 	rp, _ := repo.Open(root)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
-	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 3, TTL: time.Hour}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -189,7 +189,7 @@ func TestRunGCCapReclaimsWorktree(t *testing.T) {
 	}}}
 	fixed := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
 	r := &Runner{
-		Repo: rp, Git: g, Client: cl, MaxTurns: 2, WallCap: time.Hour, TTL: time.Hour,
+		Repo: rp, Git: g, Client: cl, MaxTurns: 2, TTL: time.Hour,
 		Session: "bee-z", Now: func() time.Time { return fixed },
 	}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
@@ -256,7 +256,7 @@ func TestTaskRemovedGuard(t *testing.T) {
 	rp, _ := repo.Open(root)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
-	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, BaseMain: base}
+	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 5, TTL: time.Hour, BaseMain: base}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -340,7 +340,7 @@ func TestRunPublishesSessionToMain(t *testing.T) {
 		_ = wg.CommitPaths(ctx, "plan: bootstrap", "submodules/sm/PLAN.md")
 	}
 	r := &Runner{
-		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, TTL: time.Hour,
 		Model:          "test/model-x",
 		Publish:        func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
 		SessionGit:     sessGit,
@@ -410,7 +410,7 @@ func TestRunTranscriptPublishFailureDoesNotBlockWork(t *testing.T) {
 	}
 	publishCalls := 0
 	r := &Runner{
-		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, TTL: time.Hour,
 		Publish:    func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
 		SessionGit: sessGit, SessionRoot: sessPath, SessionBranch: "bee-fail-session",
 		SessionPublish: func(ctx context.Context) error {
@@ -488,7 +488,7 @@ func TestSessionAndPlanOnSeparateBranches(t *testing.T) {
 		_ = wg.CommitPaths(ctx, "plan: bootstrap", "submodules/sm/PLAN.md")
 	}
 	r := &Runner{
-		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, TTL: time.Hour,
 		Publish:        func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
 		SessionGit:     sessGit,
 		SessionRoot:    sessPath,
@@ -562,7 +562,7 @@ func TestHeartbeatTerminalNotFatal(t *testing.T) {
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run must not error on a terminal-but-incomplete task, got: %v", err)
@@ -603,7 +603,7 @@ func TestWorkPreambleHasDocPath(t *testing.T) {
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	cl.sess.capture = &firstPrompt
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -639,7 +639,7 @@ func TestReviewCompletesOnStatusChange(t *testing.T) {
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
 		commitDocFor(g, "R1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -726,7 +726,7 @@ func TestReviewDispatchBouncesUnreachableCommit(t *testing.T) {
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "orphan-x", Status: plan.NeedsReview}}
 
-	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -801,7 +801,7 @@ func TestReviewDispatchRecoversTrulyLostWork(t *testing.T) {
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "lost-1", Status: plan.NeedsReview}}
 
-	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -867,7 +867,7 @@ func TestArbitrationDispatchRecoversTrulyLostWork(t *testing.T) {
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Arbitrate, Submodule: subs[0], Task: plan.Task{ID: "lost-2", Status: plan.NeedsArb}}
 
-	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -940,7 +940,7 @@ func TestReviewDispatchDoesNotRecoverWithDocPresent(t *testing.T) {
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "doc-only", Status: plan.NeedsReview}}
 
-	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1037,7 +1037,7 @@ func TestReviewDispatchReachableLocalSharingUnchanged(t *testing.T) {
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
 		commitDocFor(g, "R1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1141,7 +1141,7 @@ func TestReviewDispatchFinalizesAlreadyMergedRemote(t *testing.T) {
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
 
-	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1376,7 +1376,7 @@ func TestReviewDispatchFinalizesByRecordWhenBranchGone(t *testing.T) {
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview, Attempts: 1, ReviewCommit: implSHA}}
 
-	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1473,7 +1473,7 @@ func TestReviewDispatchDoesNotFinalizeByRecordWhenNotMerged(t *testing.T) {
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= review="+pendingSHA+" commits=none -->\nreview\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -1544,7 +1544,7 @@ func TestReviewDispatchFinalizesAlreadyMergedLocalSharing(t *testing.T) {
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
 
-	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1645,7 +1645,7 @@ func TestReviewDispatchDoesNotFinalizeWithoutSourceBranchRemote(t *testing.T) {
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
 		commitDocFor(g, "R1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1728,7 +1728,7 @@ func TestReviewDispatchDoesNotFinalizeWithoutSourceBranchLocalSharing(t *testing
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
 		commitDocFor(g, "R1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1851,7 +1851,7 @@ func TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestryRemote(t *testing.
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
 		commitDocFor(g, "R1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1955,7 +1955,7 @@ func TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestryLocalSharing(t *te
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
 		commitDocFor(g, "R1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2052,7 +2052,7 @@ func TestCompletionWaitsForTurnIdle(t *testing.T) {
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}
-	r := &Runner{Repo: rp, Git: g, Client: &gateClient{sess: sess}, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: &gateClient{sess: sess}, MaxTurns: 3, TTL: time.Hour}
 
 	type out struct {
 		res Result
@@ -2080,24 +2080,6 @@ func TestCompletionWaitsForTurnIdle(t *testing.T) {
 	if !o.res.Completed || o.res.GCMarked {
 		t.Fatalf("want completed after the turn settled, got %+v", o.res)
 	}
-}
-
-// blockingSession's Prompt never returns until its context is canceled, modeling
-// a stalled opencode call.
-type blockingClient struct{}
-
-func (blockingClient) Open(ctx context.Context, cwd, system string) (Session, error) {
-	return blockingSession{}, nil
-}
-
-type blockingSession struct{}
-
-func (blockingSession) Prompt(ctx context.Context, text string) (string, error) {
-	<-ctx.Done()
-	return "", ctx.Err()
-}
-func (blockingSession) Messages(ctx context.Context) ([]Message, error) {
-	return []Message{{ID: "m", Role: "assistant", Parts: []Part{{Type: "text", Text: "working"}}}}, nil
 }
 
 // idleClient's Prompt returns ErrTurnIdle, modeling the progress watchdog firing
@@ -2134,8 +2116,7 @@ func TestIdleTurnAbandonsForGC(t *testing.T) {
 
 	r := &Runner{
 		Repo: rp, Git: g, Client: idleClient{}, MaxTurns: 5,
-		WallCap: time.Hour, TTL: time.Hour,
-		TurnTimeout: time.Hour, TurnIdleTimeout: 15 * time.Minute,
+		TTL: time.Hour, TurnIdleTimeout: 15 * time.Minute,
 	}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
@@ -2144,8 +2125,8 @@ func TestIdleTurnAbandonsForGC(t *testing.T) {
 	if !res.GCMarked {
 		t.Fatalf("want GCMarked on an idle-abandoned turn, got %+v", res)
 	}
-	if !contains(res.Warning, "idle timeout") {
-		t.Fatalf("warning should name the idle timeout, got %q", res.Warning)
+	if !contains(res.Warning, "MaxTurns") {
+		t.Fatalf("warning should name the MaxTurns exhaustion, got %q", res.Warning)
 	}
 }
 
@@ -2173,12 +2154,13 @@ func (s *retryIdleSession) Messages(ctx context.Context) ([]Message, error) { re
 func (s *retryIdleSession) Close() error                                    { return nil }
 func (s *retryIdleSession) Abort(ctx context.Context) error                 { s.aborts++; return nil }
 
-// TestIdleRetryBoundThenAbandons proves that with a retry budget the runner
-// recovers in-place from an idle stall — aborting the wedged turn and re-driving
-// the SAME session — and only abandons for GC once the budget is exhausted. With
-// TurnIdleRetries=2 an always-idle session is prompted 3 times (1 + 2 retries),
-// aborted twice, and finally abandoned with the idle-timeout warning.
-func TestIdleRetryBoundThenAbandons(t *testing.T) {
+// TestIdleTurnAbortsAndRedrives proves a hung turn (ErrTurnIdle) is aborted
+// server-side and the SAME session re-driven on the next turn, bounded by
+// MaxTurns — never a per-turn time ceiling. An always-idle session is therefore
+// prompted MaxTurns times, aborted each time, and finally GC-marked at MaxTurns
+// exhaustion (its investigation preserved, the pass not thrown away on the first
+// transient hang).
+func TestIdleTurnAbortsAndRedrives(t *testing.T) {
 	root := t.TempDir()
 	g := gitInit(t, root)
 	repo.Init(root)
@@ -2194,24 +2176,20 @@ func TestIdleRetryBoundThenAbandons(t *testing.T) {
 	sess := &retryIdleSession{}
 	r := &Runner{
 		Repo: rp, Git: g, Client: fixedClient{sess: sess}, MaxTurns: 5,
-		WallCap: time.Hour, TTL: time.Hour,
-		TurnTimeout: time.Hour, TurnIdleTimeout: 15 * time.Minute, TurnIdleRetries: 2,
+		TTL: time.Hour, TurnIdleTimeout: 15 * time.Minute,
 	}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
-		t.Fatalf("idle-retry abandon must not be fatal, got: %v", err)
+		t.Fatalf("an idle-abandon must not be fatal, got: %v", err)
 	}
-	if sess.prompts != 3 {
-		t.Fatalf("want 3 prompts (1 + 2 retries), got %d", sess.prompts)
+	if sess.prompts != 5 {
+		t.Fatalf("want MaxTurns=5 prompts (each idle turn re-driven), got %d", sess.prompts)
 	}
-	if sess.aborts != 2 {
-		t.Fatalf("want 2 server-side aborts (one per retry), got %d", sess.aborts)
+	if sess.aborts != 5 {
+		t.Fatalf("want a server-side abort on every idle turn, got %d", sess.aborts)
 	}
 	if !res.GCMarked {
-		t.Fatalf("want GCMarked once the retry budget is exhausted, got %+v", res)
-	}
-	if !contains(res.Warning, "idle timeout") {
-		t.Fatalf("warning should name the idle timeout, got %q", res.Warning)
+		t.Fatalf("want GCMarked at MaxTurns exhaustion, got %+v", res)
 	}
 }
 
@@ -2237,7 +2215,7 @@ func (s *recoverIdleSession) Close() error                                    { 
 func (s *recoverIdleSession) Abort(ctx context.Context) error                 { s.aborts++; return nil }
 
 // TestIdleRetryRecoversInPlace proves a single transient idle stall no longer
-// throws the pass away: after one abort+retry the re-driven session completes the
+// throws the pass away: after one abort the re-driven session completes the
 // task, so the pass reports Completed (not GCMarked) and aborted exactly once.
 func TestIdleRetryRecoversInPlace(t *testing.T) {
 	root := t.TempDir()
@@ -2255,8 +2233,7 @@ func TestIdleRetryRecoversInPlace(t *testing.T) {
 	sess := &recoverIdleSession{planPath: filepath.Join(sm, "PLAN.md")}
 	r := &Runner{
 		Repo: rp, Git: g, Client: fixedClient{sess: sess}, MaxTurns: 5,
-		WallCap: time.Hour, TTL: time.Hour,
-		TurnTimeout: time.Hour, TurnIdleTimeout: 15 * time.Minute, TurnIdleRetries: 2,
+		TTL: time.Hour, TurnIdleTimeout: 15 * time.Minute,
 	}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
@@ -2270,40 +2247,6 @@ func TestIdleRetryRecoversInPlace(t *testing.T) {
 	}
 	if !res.Completed {
 		t.Fatalf("want Completed after in-place recovery, got %+v", res)
-	}
-}
-func (blockingSession) Close() error { return nil }
-
-// TestTurnTimeoutAbandonsForGC proves a stalled agent turn is canceled at
-// TurnTimeout and the pass abandons the task for GC with a clear warning —
-// instead of wedging on the dead call until the process backstop. This is the
-// regression for the multi-hour zombie honeybees.
-func TestTurnTimeoutAbandonsForGC(t *testing.T) {
-	root := t.TempDir()
-	g := gitInit(t, root)
-	repo.Init(root)
-	sm := filepath.Join(root, "submodules", "sm")
-	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
-	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("# ROI\n"), 0o644)
-	ctx := context.Background()
-	g.Commit(ctx, "seed")
-	rp, _ := repo.Open(root)
-	subs, _ := rp.Submodules()
-	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
-
-	r := &Runner{
-		Repo: rp, Git: g, Client: blockingClient{}, MaxTurns: 5,
-		WallCap: time.Hour, TTL: time.Hour, TurnTimeout: 50 * time.Millisecond,
-	}
-	res, err := r.Run(ctx, sel, "sys", "first")
-	if err != nil {
-		t.Fatalf("a turn timeout must not be a fatal error, got: %v", err)
-	}
-	if !res.GCMarked {
-		t.Fatalf("want GCMarked on a stalled turn, got %+v", res)
-	}
-	if !contains(res.Warning, "per-turn ceiling") {
-		t.Fatalf("warning should name the per-turn ceiling, got %q", res.Warning)
 	}
 }
 
@@ -2330,8 +2273,7 @@ func TestRunnerConciseActivityAlwaysOn(t *testing.T) {
 	var concise strings.Builder
 	r := &Runner{
 		Repo: rp, Git: g, Client: idleClient{}, MaxTurns: 5,
-		WallCap: time.Hour, TTL: time.Hour,
-		TurnTimeout: time.Hour, TurnIdleTimeout: 15 * time.Minute,
+		TTL: time.Hour, TurnIdleTimeout: 15 * time.Minute,
 		Concise: &concise, // Debug intentionally nil: a scheduled pass has no --debug
 	}
 	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
@@ -2344,7 +2286,7 @@ func TestRunnerConciseActivityAlwaysOn(t *testing.T) {
 	if !contains(got, "turn 1/5") {
 		t.Fatalf("concise stream missing an always-on turn boundary; got:\n%s", got)
 	}
-	if !contains(got, "idle timeout") {
+	if !contains(got, "MaxTurns") {
 		t.Fatalf("concise stream missing the always-on abandon/GC reason; got:\n%s", got)
 	}
 }
@@ -2438,7 +2380,7 @@ func TestRunPublishFailureBlocksCompletion(t *testing.T) {
 	// per-turn claim heartbeat (which shares this closure, pre-Prompt while still
 	// IN-PROGRESS) still succeeds; only the completion publish fails.
 	r := &Runner{
-		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour,
 		Publish: func(ctx context.Context) error {
 			if b, _ := os.ReadFile(planPath); strings.Contains(string(b), "[DONE]") {
 				return errors.New("publish boom")
@@ -2497,7 +2439,7 @@ func TestRunPublishFailureRecordsDurableTranscriptWarning(t *testing.T) {
 		commitDocFor(g, "T1")
 	}}}
 	r := &Runner{
-		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour,
 		Publish: func(ctx context.Context) error {
 			if b, _ := os.ReadFile(planPath); strings.Contains(string(b), "[DONE]") {
 				return errors.New("publish boom")
@@ -2571,7 +2513,7 @@ func TestRunClaimResolvedPublishFailureRecordsDurableTranscriptWarning(t *testin
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
 	r := &Runner{
-		Repo: rp, Git: g, Client: &mockClient{sess: &mockSession{}}, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Repo: rp, Git: g, Client: &mockClient{sess: &mockSession{}}, MaxTurns: 5, TTL: time.Hour,
 		Publish: func(ctx context.Context) error { return errors.New("publish boom") },
 	}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
@@ -2627,7 +2569,7 @@ func TestRunNoOpPublishRecordsDurableTranscriptWarning(t *testing.T) {
 		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
 	}
 	r := &Runner{
-		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, TTL: time.Hour,
 		Publish: func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
 	}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -2681,7 +2623,7 @@ func TestRunSuccessfulPublishLeavesNoTranscriptWarning(t *testing.T) {
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2783,7 +2725,7 @@ func TestRunDetectsLostClaimRaceBeforePublish(t *testing.T) {
 		}
 	}
 	r := &Runner{
-		Repo: wrp, Git: wg, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 5, TTL: time.Hour,
 		Session: "bee-A",
 		Publish: func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
 	}
@@ -2967,7 +2909,7 @@ func TestWorkSyncsWorktreeBaseToTrackedTip(t *testing.T) {
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -3060,7 +3002,7 @@ func TestWorkPinsPointerToTrackedTipDespiteAgentBeeBump(t *testing.T) {
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -3121,7 +3063,7 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -3206,7 +3148,7 @@ func TestWorkCommitPathNeverStagesWorktreeGitlink(t *testing.T) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Session: "bee-A"}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, Session: "bee-A"}
 	if _, err := r.Run(ctx, sel, "sys", "first"); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -3492,7 +3434,7 @@ func TestRunBootstrapGatesOnUnpublishedPlan(t *testing.T) {
 		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
 	}
 	r := &Runner{
-		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour,
+		Repo: wrp, Git: wg, Client: cl, MaxTurns: 3, TTL: time.Hour,
 		Publish:        func(ctx context.Context) error { return wg.PublishToMain(ctx, "") },
 		SessionGit:     sessGit,
 		SessionRoot:    sessPath,
@@ -3611,7 +3553,7 @@ func TestRunReconcileAlreadyAppliedSkipsSession(t *testing.T) {
 	var gotSys string
 	mc := &mockClient{gotSystem: &gotSys} // sess nil; Open would set gotSys + sess
 	// No Remote => refreshMain is a no-op; the guard judges the local (stamped) tree.
-	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -3658,7 +3600,7 @@ func TestRunReconcileDriftedRunsSession(t *testing.T) {
 		// The agent folds the ROI delta: stamp PLAN to the live head so reconciled() clears.
 		os.WriteFile(planPath, []byte("<!-- Beehive-ROI: "+head+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4112,7 +4054,7 @@ func TestWorkCompletionKeepsUnmergedSourceBranch(t *testing.T) {
 		commitReviewDoc(g)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4187,7 +4129,7 @@ func TestWorkCompletionDemotesWhenSourceBranchCannotLand(t *testing.T) {
 		commitReviewDoc(g)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RejectLimit: 3}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, RejectLimit: 3}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4316,7 +4258,7 @@ func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, RunVerify: gr.run}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4359,7 +4301,7 @@ func TestVerifyGateGatesWorkDoneFlip(t *testing.T) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, RunVerify: gr.run}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4404,7 +4346,7 @@ func TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes(t *testing.T) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, RunVerify: gr.run}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4436,7 +4378,7 @@ func TestVerifyGateDirtyTreeNeverCompletes(t *testing.T) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, TTL: time.Hour, RunVerify: gr.run}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4471,7 +4413,7 @@ func TestVerifyGateUncommittedDocNeverCompletes(t *testing.T) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644) // on disk, NOT committed
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, TTL: time.Hour, RunVerify: gr.run}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4507,7 +4449,7 @@ func TestWorkPassYieldsOnFiledBlockingDep(t *testing.T) {
 			"## T1 [TODO] <!-- attempts=0 deps=T2 -->\n"+
 				"## T2 [TODO] <!-- attempts=0 deps= -->\nnewly filed prerequisite\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4530,7 +4472,7 @@ func TestWorkPassTODOWithoutBlockDoesNotComplete(t *testing.T) {
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= -->\nunchanged\n"), 0o644)
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 2, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 2, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -4621,7 +4563,7 @@ func TestPredicateHardStopCancelsTurnMidStream(t *testing.T) {
 	}
 	r := &Runner{
 		Repo: rp, Git: g, Client: fixedClient{sess: sess}, MaxTurns: 5,
-		WallCap: time.Hour, TTL: time.Hour, PredicatePoll: 5 * time.Millisecond,
+		TTL: time.Hour, PredicatePoll: 5 * time.Millisecond,
 	}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
 	if err != nil {
@@ -4640,8 +4582,9 @@ func TestPredicateHardStopCancelsTurnMidStream(t *testing.T) {
 
 // TestPredicateHardStopNoSpuriousCancel is the negative control: a turn that
 // NEVER reaches the completion predicate (the task never leaves its working
-// status) must run to its normal per-turn ceiling unchanged — the watchdog must
-// never fire on a task that genuinely has not delivered.
+// status) must NOT be cancelled by the predicate watchdog — the pass runs its
+// full MaxTurns budget and GC-marks at exhaustion, exactly as if the watchdog
+// did not exist.
 func TestPredicateHardStopNoSpuriousCancel(t *testing.T) {
 	root := t.TempDir()
 	g := gitInit(t, root)
@@ -4653,22 +4596,22 @@ func TestPredicateHardStopNoSpuriousCancel(t *testing.T) {
 	g.Commit(ctx, "seed")
 	rp, _ := repo.Open(root)
 	subs, _ := rp.Submodules()
+	// Bootstrap never writes PLAN.md here, so the completion predicate is never met.
 	sel := &selectt.Selection{Kind: selectt.Bootstrap, Submodule: subs[0]}
 
 	r := &Runner{
-		Repo: rp, Git: g, Client: fixedClient{sess: blockingSession{}}, MaxTurns: 5,
-		WallCap: time.Hour, TTL: time.Hour,
-		TurnTimeout: 50 * time.Millisecond, PredicatePoll: 5 * time.Millisecond,
+		Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 5,
+		TTL: time.Hour, PredicatePoll: 5 * time.Millisecond,
 	}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if !res.GCMarked {
-		t.Fatalf("want the normal TurnTimeout abandon, unaffected by the predicate watchdog: %+v", res)
+		t.Fatalf("want GCMarked at MaxTurns exhaustion, unaffected by the predicate watchdog: %+v", res)
 	}
-	if !contains(res.Warning, "per-turn ceiling") {
-		t.Fatalf("want the ordinary TurnTimeout warning, got %q", res.Warning)
+	if res.Turns != 6 {
+		t.Fatalf("want the full MaxTurns=5 budget (turns=6 after the post-increment); the watchdog must not cut it short, got %d", res.Turns)
 	}
 }
 

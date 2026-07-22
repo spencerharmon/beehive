@@ -25,7 +25,7 @@ func humanFixture(t *testing.T, reply string) (*Server, string, *httptest.Server
 	client := &fakeChatClient{reply: reply}
 	s, root := chatFixtureClient(t, client)
 	// Rewire the resolution agent manager onto the same fake-backed client.
-	s.humans = newResolveManager(root, client, 0)
+	s.humans = newResolveManager(root, client)
 	// Seed a real NEEDS-HUMAN task and commit it so headSHA/planView see it.
 	planRel := "submodules/alpha/PLAN.md"
 	write(t, root+"/"+planRel, "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+

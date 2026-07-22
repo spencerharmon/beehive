@@ -2,10 +2,8 @@ package swarm
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -76,7 +74,7 @@ func TestRunRoutesModelPerKind(t *testing.T) {
 	// --- Work -> strong ---
 	rp, g, sm, planPath, sel := workFixture(t)
 	work := &modelClient{sess: &mockSession{onTurn: completeWork(sm, planPath)}}
-	rw := &Runner{Repo: rp, Git: g, Client: work, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, ModelFor: modelFor}
+	rw := &Runner{Repo: rp, Git: g, Client: work, MaxTurns: 5, TTL: time.Hour, ModelFor: modelFor}
 	if _, err := rw.Run(context.Background(), sel, "sys", "first"); err != nil {
 		t.Fatalf("work run: %v", err)
 	}
@@ -98,7 +96,7 @@ func TestRunRoutesModelPerKind(t *testing.T) {
 	boot := &modelClient{sess: &mockSession{onTurn: func(int) {
 		os.WriteFile(subsb[0].PlanPath(), []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
 	}}}
-	rb := &Runner{Repo: rpb, Git: gb, Client: boot, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, ModelFor: modelFor}
+	rb := &Runner{Repo: rpb, Git: gb, Client: boot, MaxTurns: 5, TTL: time.Hour, ModelFor: modelFor}
 	if _, err := rb.Run(context.Background(), selb, "sys", "first"); err != nil {
 		t.Fatalf("bootstrap run: %v", err)
 	}
@@ -114,7 +112,7 @@ func TestRunModelRoutingInertByDefault(t *testing.T) {
 	// No ModelFor at all.
 	rp, g, sm, planPath, sel := workFixture(t)
 	cl := &modelClient{sess: &mockSession{onTurn: completeWork(sm, planPath)}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
 		t.Fatalf("run (nil ModelFor): %v", err)
 	}
@@ -125,97 +123,12 @@ func TestRunModelRoutingInertByDefault(t *testing.T) {
 	// ModelFor present but empty for this kind (no routing configured for it).
 	rp2, g2, sm2, planPath2, sel2 := workFixture(t)
 	cl2 := &modelClient{sess: &mockSession{onTurn: completeWork(sm2, planPath2)}}
-	r2 := &Runner{Repo: rp2, Git: g2, Client: cl2, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+	r2 := &Runner{Repo: rp2, Git: g2, Client: cl2, MaxTurns: 5, TTL: time.Hour,
 		ModelFor: func(string) string { return "" }}
 	if _, err := r2.Run(context.Background(), sel2, "sys", "first"); err != nil {
 		t.Fatalf("run (empty ModelFor): %v", err)
 	}
 	if len(cl2.set) != 0 {
 		t.Fatalf("SetModel called %v when ModelFor returned \"\"; must be inert", cl2.set)
-	}
-}
-
-// TestStallDetectorObserve unit-tests the counting: disabled (limit<=0) never
-// trips; a constant fingerprint trips exactly when `limit` consecutive repeats
-// accumulate; a changed fingerprint resets the streak.
-func TestStallDetectorObserve(t *testing.T) {
-	// Inert when disabled.
-	off := &stallDetector{limit: 0}
-	for i := 0; i < 5; i++ {
-		if off.observe("x") {
-			t.Fatalf("limit=0 tripped at i=%d; must be inert", i)
-		}
-	}
-	// limit=2: reference (repeats 0), then two repeats -> trip on the 3rd identical.
-	d := &stallDetector{limit: 2}
-	if d.observe("a") {
-		t.Fatal("tripped on the reference observation")
-	}
-	if d.observe("a") {
-		t.Fatal("tripped after only one repeat (want 2)")
-	}
-	if !d.observe("a") {
-		t.Fatal("did not trip after two repeats")
-	}
-	// A changed fingerprint resets the streak.
-	d2 := &stallDetector{limit: 2}
-	d2.observe("a")
-	d2.observe("a") // repeats=1
-	if d2.observe("b") {
-		t.Fatal("tripped on a changed fingerprint; the streak must reset")
-	}
-	if d2.observe("b") { // repeats=1 again
-		t.Fatal("tripped one repeat after reset")
-	}
-	if !d2.observe("b") { // repeats=2
-		t.Fatal("did not trip two repeats after reset")
-	}
-}
-
-// TestRunStallCapsIdleChurn proves the real (git-fingerprint) path: an idle Work
-// agent that never changes a file leaves the code worktree fingerprint identical
-// every turn, so with StallTurns=3 the runner abandons the pass for GC at turn 4
-// — bounded and surfaced — far short of the MaxTurns=10 budget, never a silent
-// full-budget burn.
-func TestRunStallCapsIdleChurn(t *testing.T) {
-	rp, g, _, _, sel := workFixture(t)
-	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 10, WallCap: time.Hour, TTL: time.Hour, StallTurns: 3}
-	res, err := r.Run(context.Background(), sel, "sys", "first")
-	if err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if res.Completed || !res.GCMarked {
-		t.Fatalf("want idle-churn GC cap, got %+v", res)
-	}
-	if res.Turns != 4 {
-		t.Fatalf("stall cap fired at turn %d, want 4 (StallTurns=3 => 3 unchanged turns after the first)", res.Turns)
-	}
-	if !strings.Contains(res.Warning, "forward progress") {
-		t.Fatalf("idle-churn abandonment not surfaced: %q", res.Warning)
-	}
-}
-
-// TestRunStallDoesNotKillProgressingAgent proves no false kill: when each turn
-// makes forward progress (a fingerprint that changes every turn) even the most
-// aggressive StallTurns=1 never trips, so the run proceeds to the ordinary
-// MaxTurns cap (turns=MaxTurns+1) instead of an early idle-churn abandonment. The
-// progress signal is injected so the property is exercised hermetically.
-func TestRunStallDoesNotKillProgressingAgent(t *testing.T) {
-	rp, g, _, _, sel := workFixture(t)
-	var n int
-	r := &Runner{Repo: rp, Git: g, Client: &mockClient{}, MaxTurns: 4, WallCap: time.Hour, TTL: time.Hour,
-		StallTurns: 1, Progress: func(context.Context) string { n++; return fmt.Sprintf("sig-%d", n) }}
-	res, err := r.Run(context.Background(), sel, "sys", "first")
-	if err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if res.Completed {
-		t.Fatalf("idle agent should not complete: %+v", res)
-	}
-	if res.Turns != 5 {
-		t.Fatalf("changing progress must not stall-kill; reached turn %d, want 5 (MaxTurns cap)", res.Turns)
-	}
-	if strings.Contains(res.Warning, "forward progress") {
-		t.Fatalf("idle-churn kill fired despite forward progress: %q", res.Warning)
 	}
 }

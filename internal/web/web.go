@@ -164,7 +164,7 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 	// forever. It drives its OWN client so tuning it never perturbs the chat-diff
 	// editor's behavior.
 	resolveOC := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}, IdleTimeout: turnIdleTimeout(cfg)}
-	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: chat, humans: newResolveManager(r.Root, resolveOC, turnCeiling(cfg))}, nil
+	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: chat, humans: newResolveManager(r.Root, resolveOC)}, nil
 }
 
 // turnIdleTimeout is the resolution agent's per-turn PROGRESS watchdog (a turn
@@ -175,15 +175,6 @@ func turnIdleTimeout(cfg config.Config) time.Duration {
 		return time.Duration(cfg.TurnIdleTimeoutMinutes) * time.Minute
 	}
 	return 5 * time.Minute
-}
-
-// turnCeiling is the resolution agent's absolute per-turn wall-clock ceiling,
-// from config with a sane default when unset.
-func turnCeiling(cfg config.Config) time.Duration {
-	if cfg.TurnTimeoutMinutes > 0 {
-		return time.Duration(cfg.TurnTimeoutMinutes) * time.Minute
-	}
-	return 20 * time.Minute
 }
 
 // repoCookie carries the selected repo handle for a multi-repo daemon. Selection

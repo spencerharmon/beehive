@@ -146,8 +146,11 @@ exact complement. Each pass, the runner automatically:
   `git submodule update`, dirties the primary tree unhealably, and aborts every preflight —
   halting the swarm. Agents must NEVER write the gitlink or `submodules/<sm>/repo`. See
   `docs/submodule-pointer-invariant.md`.
-- **Dedups reconcile** (skips one already applied by a peer) and **bounds each turn**
-  with a timeout, sending "continue" until the completion check passes or a cap hits.
+- **Dedups reconcile** (skips one already applied by a peer) and **bounds the pass**:
+  a turn is ended only when it goes idle (no agent signal for the idle-timeout — a
+  hung turn, not a working one; it is then aborted and re-driven), and the whole
+  pass is bounded by MaxTurns. It sends "continue" until the completion check passes
+  or MaxTurns is hit.
 
 So: do your kind's role step (`HONEYBEE.md`), edit only your worktree + the beehive
 layer, flip STATUS, write the doc — and let the runner do the rest.

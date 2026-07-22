@@ -75,7 +75,6 @@ type Runner struct {
 	// same "rejections before NEEDS-HUMAN" knob Claimer.Reject uses for a review/
 	// arbitration livelock. 0 -> default 3.
 	RejectLimit int
-	WallCap     time.Duration
 	TTL         time.Duration
 	Now         func() time.Time
 	// Concise is the ALWAYS-ON activity sink (os.Stderr on a real pass): a terse
@@ -124,28 +123,15 @@ type Runner struct {
 	// turn so drift never persists past the turn that caused it. Nil in tests.
 	RestoreConfig func(context.Context)
 
-	// TurnTimeout bounds a single agent turn (one opencode Prompt). A stalled
-	// session is canceled at this cap and the task is abandoned for GC, instead of
-	// the honeybee wedging on a dead HTTP call until the systemd RuntimeMaxSec
-	// backstop. 0 = no per-turn cap (tests).
-	TurnTimeout time.Duration
-
-	// TurnIdleTimeout is the per-turn PROGRESS-watchdog window used only to word the
-	// abandon warning; the watchdog itself runs in the opencode client
-	// (Opencode.IdleTimeout), set from the SAME config key (TurnIdleTimeoutMinutes).
-	// A turn that produces no new transcript activity for this long returns
-	// ErrTurnIdle, which the turn loop treats as a stalled-agent GC — distinct from
-	// the absolute TurnTimeout ceiling. 0 = watchdog disabled.
+	// TurnIdleTimeout is the liveness watchdog window: the ONE timeout that ends a
+	// turn. The watchdog runs in the opencode client (Opencode.IdleTimeout, set from
+	// the same config key TurnIdleTimeoutMinutes) and resets on ANY agent signal
+	// (text, reasoning, a tool call, its input/output/status/title/error). A turn
+	// that produces NO new transcript activity for this long is hung, not working:
+	// the client returns ErrTurnIdle, the runner aborts that turn server-side and
+	// re-drives the SAME session on the next turn (bounded by MaxTurns). A turn that
+	// keeps signaling is never killed, however long it runs. 0 = watchdog disabled.
 	TurnIdleTimeout time.Duration
-
-	// TurnIdleRetries bounds how many times a single pass recovers in-place from an
-	// idle stall before abandoning the task for GC. On an idle stall with retries
-	// left (and wall budget remaining) the runner aborts the wedged turn server-side
-	// (Session Abort capability, best-effort) and re-drives the SAME session with a
-	// resume prompt, preserving the investigation instead of throwing the whole pass
-	// away to a transient upstream hang. 0 = the historical behavior: the first idle
-	// stall abandons immediately.
-	TurnIdleRetries int
 
 	// PredicatePoll sets the mid-turn completion-predicate watchdog cadence: while
 	// a turn is in flight (sess.Prompt blocked) the runner polls the SAME
@@ -160,7 +146,7 @@ type Runner struct {
 	// delivered. 0 -> default 500ms. It is fail-open: absent a positive complete()
 	// read the watchdog makes no decision and never touches the turn ctx, so a
 	// turn that has not yet reached its predicate always runs to its normal
-	// settle/TurnTimeout unchanged.
+	// settle unchanged.
 	PredicatePoll time.Duration
 
 	// LeanInject trims the per-pass injected system prompt to only what this pass's
@@ -209,19 +195,6 @@ type Runner struct {
 	// when ModelFor does not route the pass to a per-kind override. Empty only in
 	// tests that construct a Runner without a model; the read side then defaults it.
 	Model string
-
-	// StallTurns bounds idle churn: if a Work pass produces an identical code-
-	// worktree fingerprint (HEAD + porcelain status) for this many CONSECUTIVE
-	// turns after the first — an agent talking without changing a file — the runner
-	// abandons the pass for GC instead of burning the rest of the turn/wall budget.
-	// 0 = off (the default), so a host that has not opted in is unaffected.
-	StallTurns int
-
-	// Progress overrides the per-turn progress fingerprint the stall detector
-	// observes (tests inject a deterministic sequence). Nil = the real signal: the
-	// agent's code worktree HEAD + porcelain status. Only consulted when
-	// StallTurns > 0.
-	Progress func(context.Context) string
 
 	// BuildEnv is the resolved host build/test environment (e.g. CGO_ENABLED=0 +
 	// root-fs GOTMPDIR/TMPDIR/GOCACHE) the runner OWNS so no honeybee re-derives it
@@ -462,13 +435,10 @@ func (r *Runner) resolveConflict(ctx context.Context, sess Session) error {
 		_ = r.Git.AbortMerge(ctx)
 		return err
 	}
-	turnCtx := ctx
-	if r.TurnTimeout > 0 {
-		var cancel context.CancelFunc
-		turnCtx, cancel = context.WithTimeout(ctx, r.TurnTimeout)
-		defer cancel()
-	}
-	if _, perr := sess.Prompt(turnCtx, conflictResolutionPrompt(conflicts)); perr != nil {
+	// The client's idle watchdog (Opencode.IdleTimeout) bounds this turn: a hung
+	// conflict-resolution turn produces no signal and returns ErrTurnIdle. A working
+	// one keeps signaling and runs to completion.
+	if _, perr := sess.Prompt(ctx, conflictResolutionPrompt(conflicts)); perr != nil {
 		_ = r.Git.AbortMerge(ctx)
 		return fmt.Errorf("agent conflict-resolution turn failed: %w", perr)
 	}
@@ -1026,7 +996,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
 		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
 	}
-	deadline := r.now().Add(r.WallCap)
 	prompt := first
 	// gateHint carries a handoff verify-gate failure from the turn that detected it
 	// to the NEXT prompt: when the gate reds a would-be NEEDS-REVIEW handoff we keep
@@ -1039,21 +1008,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	var tc *turnCompactor
 	if r.LeanContext && sel.Kind == selectt.Work {
 		tc = newTurnCompactor()
-	}
-	// No-forward-progress guard. stall trips when the code worktree fingerprint is
-	// unchanged for StallTurns consecutive turns (see stallDetector); progressGit
-	// is the agent's own worktree (wtAbs) whose HEAD+status is that fingerprint —
-	// NOT the shared submodule checkout (r-side wg), which never moves as the agent
-	// commits on its branch. Both are inert when StallTurns==0 (limit<=0 never
-	// trips) so the default single-model host is unaffected.
-	stall := &stallDetector{limit: r.StallTurns}
-	// idleRetriesUsed bounds in-place recovery from idle stalls across this pass (see
-	// Runner.TurnIdleRetries). Cumulative, not per-turn, so the total wall time a
-	// pass can burn re-waiting the idle window is bounded by retries × TurnIdleTimeout.
-	idleRetriesUsed := 0
-	var progressGit *git.Repo
-	if sel.Kind == selectt.Work && wtAbs != "" {
-		progressGit = git.New(wtAbs)
 	}
 	// finishTranscript stops the recorder, optionally records an abort warning to
 	// the transcript (so it shows in the UI), and commits the final transcript to
@@ -1311,18 +1265,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 		// Drive the turn. Turn 1 sends the seeded `first` prompt; the recorder is
 		// already polling, so even the long bootstrap turn streams to the UI/debug.
-		// Bound the turn: a stalled opencode call is canceled at TurnTimeout and the
-		// task abandoned for GC, never a multi-hour zombie blocked on a dead socket.
-		var turnCtx context.Context
-		var cancelTurn context.CancelFunc
-		if r.TurnTimeout > 0 {
-			turnCtx, cancelTurn = context.WithTimeout(ctx, r.TurnTimeout)
-		} else {
-			// Always a real cancellable child (never the bare, uncancelable ctx): the
-			// mid-turn completion-predicate watchdog below needs a ctx it can cancel
-			// to hard-stop JUST this turn without also canceling the whole run.
-			turnCtx, cancelTurn = context.WithCancel(ctx)
-		}
+		// The turn ctx is a plain cancellable child of ctx: there is NO per-turn time
+		// ceiling. A turn runs as long as it keeps producing agent signals; the only
+		// thing that ends it early is the client-side idle watchdog (no signal for
+		// TurnIdleTimeout -> ErrTurnIdle) or the mid-turn completion-predicate hard
+		// stop below.
+		turnCtx, cancelTurn := context.WithCancel(ctx)
 		// Mid-turn completion-predicate hard stop (see Runner.PredicatePoll /
 		// predicateWatch): while this turn streams, poll for the agent having
 		// already driven the task to its terminal predicate and, the instant it is
@@ -1334,17 +1282,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			predHit = r.predicateWatch(turnCtx, cancelTurn, sel, res.Branch)
 		}
 		// Mid-turn heartbeat keepalive (duplicate-dispatch-selection-guard,
-		// session-audit-015): the heartbeat just above (and this loop's own
-		// top-of-turn heartbeat, before sess.Prompt started) only refreshes ONCE
-		// per turn, so a turn that legitimately runs long — TurnTimeout defaults
-		// to 3x the default TTL — crosses the TTL staleness line mid-turn and a
-		// peer's Candidates reads this claim as dead. Re-stamp it on a
-		// background ticker for the duration of just this turn so it never
-		// lapses; stopKeepalive blocks until the goroutine has fully exited
-		// before we touch PLAN.md/the claim again below.
+		// session-audit-015): the top-of-turn heartbeat refreshes the claim ONCE per
+		// turn, so a turn that legitimately runs long crosses the TTL staleness line
+		// mid-turn and a peer's Candidates reads this claim as dead. Re-stamp it on a
+		// background ticker for the duration of just this turn so it never lapses;
+		// stopKeepalive blocks until the goroutine has fully exited before we touch
+		// PLAN.md/the claim again below.
 		stopKeepalive := r.heartbeatKeepalive(turnCtx, cl, sel)
 		_, perr := sess.Prompt(turnCtx, prompt)
-		timedOut := r.TurnTimeout > 0 && turnCtx.Err() == context.DeadlineExceeded
 		idleStalled := errors.Is(perr, ErrTurnIdle)
 		// Cancel turnCtx BEFORE waiting on stopKeepalive: the keepalive goroutine
 		// only exits on turnCtx.Done() (or its own tick), so canceling first is
@@ -1362,26 +1307,24 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		hardStopped := predHit != nil && predHit.Load() && errors.Is(perr, context.Canceled)
 		if hardStopped {
 			perr = nil
-			timedOut = false
 			idleStalled = false
 			r.logConcise("[honeybee] turn %d: completion predicate observed mid-turn; hard-stopping the turn\n", res.Turns)
 		}
-		// In-place idle recovery: a wedged upstream turn (github-copilot holding the
-		// stream open with zero output, no error, and no opencode read-timeout) is
-		// probabilistic. With retry budget and wall time left, abort the dead turn
-		// server-side and re-drive the SAME session (its investigation is preserved)
-		// instead of abandoning the whole pass — which would restart from scratch and
-		// re-roll the same hang. res.Turns < MaxTurns guarantees a real turn slot
-		// remains after the loop's post-increment.
-		if idleStalled && idleRetriesUsed < r.TurnIdleRetries && res.Turns < r.MaxTurns && r.now().Before(deadline) {
-			idleRetriesUsed++
+		// A hung turn (github-copilot holding the stream open with zero output, no
+		// error, no read-timeout) surfaces as ErrTurnIdle. Abort it server-side
+		// (best-effort) and re-drive the SAME session on the next turn — its
+		// investigation is preserved and the whole pass is not thrown away for a
+		// transient upstream hang. This consumes a turn slot, so a permanently wedged
+		// agent is bounded by MaxTurns (its exhaustion GC-marks the pass); a working
+		// turn never reaches here because it keeps signaling.
+		if idleStalled {
 			if ab, ok := sess.(aborter); ok {
 				abCtx, abCancel := context.WithTimeout(ctx, 15*time.Second)
 				_ = ab.Abort(abCtx)
 				abCancel()
 			}
-			fmt.Fprintf(os.Stderr, "honeybee: turn %d idle-stalled after %s; aborted the wedged turn, retrying in-place (%d/%d)\n",
-				res.Turns, r.TurnIdleTimeout, idleRetriesUsed, r.TurnIdleRetries)
+			fmt.Fprintf(os.Stderr, "honeybee: turn %d idle-stalled after %s (no agent signal); aborted the wedged turn, re-driving next turn\n",
+				res.Turns, r.TurnIdleTimeout)
 			if tc != nil {
 				prompt = r.leanContextPrompt(ctx, sess, tc, sel, res.Branch)
 			} else {
@@ -1390,20 +1333,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			continue
 		}
 		if perr != nil {
-			if timedOut || idleStalled {
-				res.GCMarked = true
-				if idleStalled {
-					res.Warning = fmt.Sprintf("turn %d made no progress within the %s idle timeout (stalled agent); abandoning for GC", res.Turns, r.TurnIdleTimeout)
-				} else {
-					res.Warning = fmt.Sprintf("turn %d exceeded the %s per-turn ceiling; abandoning for GC", res.Turns, r.TurnTimeout)
-				}
-				if ferr := finish(res.Warning); ferr != nil {
-					cleanup()
-					return res, ferr
-				}
-				cleanup()
-				return res, nil
-			}
 			if ferr := finish(""); ferr != nil {
 				return res, errors.Join(fmt.Errorf("turn %d prompt: %w", res.Turns, perr), ferr)
 			}
@@ -1555,29 +1484,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			reclaimBranch()
 			return res, nil
 		}
-		// No-forward-progress guard: this turn did NOT complete the task, so
-		// fingerprint the agent's code worktree. An identical fingerprint for
-		// StallTurns turns running means the agent is churning — talking without
-		// changing a file — so abandon it for GC now rather than burn the remaining
-		// turn/wall budget on a provably stuck session. Fail-open: when no signal is
-		// available (a git error, or a non-Work pass with no worktree and no injected
-		// probe) progressSignal returns ok=false and the guard never fires, so a
-		// transient fault can never cause a false kill.
-		if sig, ok := r.progressSignal(ctx, progressGit); ok && stall.observe(sig) {
-			res.GCMarked = true
-			res.Warning = fmt.Sprintf(
-				"task %s made no forward progress across %d consecutive turns (idle churn); abandoning for GC",
-				taskID(sel), r.StallTurns)
-			if ferr := finish(res.Warning); ferr != nil {
-				cleanup()
-				return res, ferr
-			}
-			cleanup()
-			return res, nil
-		}
-		if r.now().After(deadline) {
-			break
-		}
 		if gateHint != "" {
 			// The gate red'd this turn's would-be handoff: the NEXT turn's prompt IS the
 			// failure so the agent fixes forward. One-shot — clear it so a later clean
@@ -1590,7 +1496,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			prompt = r.nextPrompt(sel, res.Branch)
 		}
 	}
-	// Turn/wall cap hit: the agent never reached completion. Mirror the DONE path
+	// MaxTurns reached: the agent never reached completion. Mirror the DONE path
 	// and reclaim the orphaned code worktree (cleanup -> wg.WorktreeRemove) so
 	// stale trees don't accumulate and a future `git worktree add` for this
 	// branch/dir doesn't collide. DELIBERATELY leave the task's status and its
@@ -1600,68 +1506,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// here (that clears the claim and would hide the abandonment) and must NOT flip
 	// status. cleanup() only removes the worktree dir; it never writes PLAN.md.
 	res.GCMarked = true
-	if ferr := finish(""); ferr != nil {
+	if res.Warning == "" {
+		res.Warning = fmt.Sprintf("reached the MaxTurns=%d budget without completing the task; abandoning for GC", r.MaxTurns)
+	}
+	if ferr := finish(res.Warning); ferr != nil {
 		cleanup()
 		return res, ferr
 	}
 	cleanup()
 	reclaimBranch()
 	return res, nil
-}
-
-// stallDetector trips when a pass produces no forward progress — an identical
-// progress fingerprint — for `limit` CONSECUTIVE turns after the first. The first
-// observation of any fingerprint sets the reference (repeats=0); each subsequent
-// identical one increments the streak; a changed fingerprint resets it. An
-// idle-from-start agent therefore trips on the turn that completes `limit`
-// unchanged observations. limit<=0 disables it (never trips), which is the inert
-// default that leaves a host without stall bounding unchanged.
-type stallDetector struct {
-	limit   int
-	last    string
-	repeats int
-	seen    bool
-}
-
-// observe folds one turn's fingerprint in and reports whether the pass has now
-// stalled (limit consecutive unchanged fingerprints since the reference).
-func (s *stallDetector) observe(sig string) bool {
-	if s.limit <= 0 {
-		return false
-	}
-	if s.seen && sig == s.last {
-		s.repeats++
-	} else {
-		s.last = sig
-		s.repeats = 0
-		s.seen = true
-	}
-	return s.repeats >= s.limit
-}
-
-// progressSignal returns the fingerprint the stall detector observes this turn,
-// and whether one is available. Progress (when set) is the authoritative source
-// (tests inject a deterministic sequence); otherwise the real signal is the
-// agent's code worktree HEAD + porcelain status, so any commit or uncommitted
-// edit the agent makes changes it. ok=false (no worktree, or a transient git
-// error) means "no signal" — the caller skips the guard this turn, so a fault
-// can never manufacture a false idle-churn kill.
-func (r *Runner) progressSignal(ctx context.Context, wt *git.Repo) (string, bool) {
-	if r.Progress != nil {
-		return r.Progress(ctx), true
-	}
-	if wt == nil {
-		return "", false
-	}
-	head, err := wt.RevParse(ctx, "HEAD")
-	if err != nil {
-		return "", false
-	}
-	status, err := wt.Status(ctx)
-	if err != nil {
-		return "", false
-	}
-	return head + "\x00" + status, true
 }
 
 // nextPrompt is the "keep going" prompt sent on every turn after the first.
@@ -1778,18 +1632,18 @@ func (r *Runner) taskRemoved(ctx context.Context, sel *selectt.Selection) (bool,
 // predicateWatch starts the mid-turn completion-predicate hard-stop watchdog
 // (see Runner.PredicatePoll) and returns a flag the caller reads AFTER the turn
 // returns to tell "we hard-stopped it here" apart from a normal settle, a
-// TurnTimeout, or an idle-stall. It polls the EXACT SAME check r.complete uses
+// or an idle-stall. It polls the EXACT SAME check r.complete uses
 // at the top of the next turn — so the predicate observed here is never looser
 // than the one that already gates completion — on turnCtx (never the caller's
 // unbounded ctx), so it exits the instant the turn ends for any reason and never
 // outlives it. On a positive read it cancels turnCtx (aborting the in-flight
-// opencode POST, which unblocks sess.Prompt promptly the same way TurnTimeout
-// already does) and stops; it deliberately never re-checks after that, since one
+// opencode POST, which unblocks sess.Prompt promptly the same way the idle
+// watchdog already does) and stops; it deliberately never re-checks after that, since one
 // positive, deterministic read is a complete signal, not a fingerprint to
 // debounce. Fails OPEN: a complete() error or a not-yet-met predicate is treated
 // identically to "keep waiting" — the watchdog never cancels on uncertainty, so
-// a turn that never reaches its predicate runs to its normal settle/TurnTimeout
-// exactly as before this existed.
+// a turn that never reaches its predicate runs to its normal settle exactly as
+// before this existed.
 func (r *Runner) predicateWatch(turnCtx context.Context, cancel context.CancelFunc, sel *selectt.Selection, branch string) *atomic.Bool {
 	interval := r.PredicatePoll
 	if interval <= 0 {
@@ -1822,7 +1676,7 @@ func (r *Runner) predicateWatch(turnCtx context.Context, cancel context.CancelFu
 // liveness gap the per-turn heartbeat leaves open (duplicate-dispatch-
 // selection-guard, session-audit-015): the loop's own heartbeat only refreshes
 // ONCE, at the top of a turn, before sess.Prompt runs — so a turn that
-// legitimately runs long (TurnTimeout defaults to 3x the default TTL) crosses
+// legitimately runs long crosses
 // the TTL staleness line mid-turn, is read as dead by a peer's Candidates, and
 // gets duplicate-dispatched despite being fully alive. Reuses the exact same
 // claim.Heartbeat path a normal turn boundary uses, so a keepalive tick is

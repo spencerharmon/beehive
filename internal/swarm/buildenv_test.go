@@ -59,7 +59,7 @@ func TestBuildEnvExportedAndStated(t *testing.T) {
 	var exported map[string]string
 	exportCalls := 0
 	r := &Runner{
-		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour,
 		BuildEnv:  hostBuildEnv,
 		ExportEnv: func(m map[string]string) { exportCalls++; exported = m },
 	}
@@ -126,7 +126,7 @@ func TestBuildEnvExportInertWhenUnconfigured(t *testing.T) {
 
 	exportCalled := false
 	r := &Runner{
-		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
+		Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour,
 		// BuildEnv unset (nil). ExportEnv wired to prove it is NOT invoked.
 		ExportEnv: func(map[string]string) { exportCalled = true },
 	}

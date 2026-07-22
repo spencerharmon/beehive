@@ -40,29 +40,26 @@ var (
 // backing them. Sessions are keyed by task (one general agent per blocked task,
 // reused across page reloads) and live in-memory only.
 type resolveManager struct {
-	root        string
-	git         *git.Repo // root repo (cuts the per-task worktrees)
-	client      swarm.Client
-	now         func() time.Time
-	turnCeiling time.Duration // absolute per-turn wall-clock ceiling (0 = none)
+	root   string
+	git    *git.Repo // root repo (cuts the per-task worktrees)
+	client swarm.Client
+	now    func() time.Time
 
 	mu     sync.Mutex
 	byTask map[string]*resolveSession // taskKey(sub,id) -> session
 }
 
 // newResolveManager builds a resolveManager over the beehive repo at root driving
-// the given opencode client. turnCeiling bounds a single agent turn so a wedged
-// tool call (e.g. an opencode permission elicitation that never resolves) can
-// never leave a session "working…" forever; the client's own IdleTimeout progress
-// watchdog is the finer-grained cut, this is the absolute backstop.
-func newResolveManager(root string, client swarm.Client, turnCeiling time.Duration) *resolveManager {
+// the given opencode client. A hung turn (e.g. an opencode permission elicitation
+// that never resolves) is cut by the client's own IdleTimeout watchdog — the one
+// liveness bound; there is no separate absolute per-turn ceiling.
+func newResolveManager(root string, client swarm.Client) *resolveManager {
 	return &resolveManager{
-		root:        root,
-		git:         git.New(root),
-		client:      client,
-		now:         time.Now,
-		turnCeiling: turnCeiling,
-		byTask:      map[string]*resolveSession{},
+		root:   root,
+		git:    git.New(root),
+		client: client,
+		now:    time.Now,
+		byTask: map[string]*resolveSession{},
 	}
 }
 
@@ -176,10 +173,10 @@ func (s *resolveSession) startChat(bg context.Context, msg string) error {
 	s.errMsg = ""
 	s.log = append(s.log, chatTurn{Role: "user", Text: msg, At: s.mgr.now()})
 	first := s.first
+	// The resolve agent's opencode client carries the idle watchdog (IdleTimeout);
+	// a hung turn returns ErrTurnIdle. A cancellable ctx is all we need here — there
+	// is no absolute per-turn ceiling (the idle watchdog is the one liveness bound).
 	ctx, cancel := context.WithCancel(bg)
-	if s.mgr.turnCeiling > 0 {
-		ctx, cancel = context.WithTimeout(bg, s.mgr.turnCeiling)
-	}
 	s.cancel = cancel
 	s.mu.Unlock()
 

@@ -291,7 +291,7 @@ func TestLeanContextWrapsFollowUpTurn(t *testing.T) {
 			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		}
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, LeanContext: true}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, LeanContext: true}
 	res, err := r.Run(context.Background(), sel, prompts.Honeybee, "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -327,7 +327,7 @@ func TestLeanContextOffIsInert(t *testing.T) {
 			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		}
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour} // LeanContext: false
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour} // LeanContext: false
 	res, err := r.Run(context.Background(), sel, prompts.Honeybee, "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
