@@ -57,7 +57,9 @@ worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` �
   selector silently never runs the task. So NEVER invent a placeholder / "sentinel" /
   "deliberately-not-yet-existing gate" dep, no matter how well commented. Work owned by another
   submodule is a REAL TASK IN THAT SUBMODULE, depended on as `<other-sm>:<taskid>` via a registered link
-  (see Reconcile task). Cannot name that task honestly yet → `beehive task human`, never a dangling dep.
+  (see Reconcile task). Cannot name that task honestly yet? A WORK pass FILES it — `beehive task add`
+  then `beehive task block` (see Work task / "Discovered a missing prerequisite"); never a dangling dep,
+  never a `beehive task human` for a prerequisite the swarm can build itself.
 - Every plan item you add ships a terse, LLM-targeted doc under `submodules/<sm>/docs/`.
 - Keep `PLAN.md`, `ARTIFACTS.md`, `INFRASTRUCTURE.md` current.
 - NEVER read a host-local configuration file (e.g. `/etc/<app>/config.yaml`,
@@ -167,6 +169,22 @@ range.
 ## Work task
 Status is `TODO` — it is yours to IMPLEMENT. If the task is invalid versus your provided task card, set
 it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, to completion:
+- **Discovered a missing prerequisite → FILE it, don't fake it and don't escalate.** If, while
+  implementing, you find your task genuinely depends on work that does not yet exist — a base job, a
+  script, an upstream manifest, a task owned by a linked submodule — do NOT invent a dangling/sentinel
+  dep, do NOT flip a terminal status on top of the gap, and do NOT `beehive task human` for it (a
+  prerequisite the swarm can build is NOT an operator blocker). Instead, in ONE pass:
+  1. `beehive task add <target-sm> <new-taskid> --body-file <card> --doc-file <doc>` — file the real
+     task (in THIS submodule for a local gap, or in the OWNING linked submodule for a cross-repo gap),
+     with its design doc. `--deps` and `--weight` as needed.
+  2. `beehive task block <this-sm> <this-taskid> --on <dep>` — add that prerequisite as a dependency of
+     your OWN task (`<dep>` is a bare id for a local task, or `<target-sm>:<new-taskid>` for a
+     cross-submodule one; the command registers the authorizing submodule link if missing and REJECTS a
+     dep that would form a wait cycle) and releases your claim.
+  That leaves your task `TODO`-and-blocked: the selector holds it until the prerequisite is DONE, and
+  your pass COMPLETES as a clean yield (no doc needed for the yield — the FILED task carries its own).
+  Only escalate `contradiction` when two intents genuinely OPPOSE and you cannot tell which is
+  authoritative — never merely because a prerequisite is absent.
 - Make the change in your worktree and PROVE it. A behavioral change (bug fix, feature, config, script)
   REQUIRES an automated regression test that FAILS without your change and PASSES with it: write it, run
   it, and paste the exact command + its passing result into the change doc. "DONE" is NEVER a guess or a
@@ -199,6 +217,14 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   the pointer: it pins the gitlink to the tracked-branch tip (`origin/<branch>`) at completion, which is
   the ONLY value it may ever hold. Never run `git update-index --cacheinfo ... submodules/<sm>/repo`,
   never stage or commit the gitlink. See `docs/submodule-pointer-invariant.md`.
+- **The NEEDS-REVIEW handoff runs a deterministic uncommitted-work gate.** Before the runner accepts
+  your flip as done it checks `git status --porcelain` in your code worktree: if ANY change is still
+  uncommitted (modified OR untracked), the handoff is REFUSED and handed straight back for you to commit
+  this same session — because the runner only ever merges commits that already exist on `bee-<taskid>`,
+  so an edit written but never committed would be silently dropped and the task would land with none of
+  its code. "I wrote the files" is not "I committed the files": a task is not done until the diff is a
+  real commit on your pushed branch. (This is exactly the bug that shipped an empty flux base-job task
+  and stranded its gostream dependent.)
 - Flip the `PLAN.md` task `TODO → NEEDS-REVIEW` on main and commit.
 
 ## Review task
@@ -278,8 +304,9 @@ procedure. `ROI.md` edits are never yours (`skills/modify-roi.md` is operator-on
 
 ## Tooling
 The `beehive` CLI runs the deterministic git ops (submodule sync, worktree add/rm, `beehive task
-human`). Your work worktree is pre-created, so you rarely need worktree plumbing. Not on PATH → plain
-`git`. `beehive help` for details.
+human`, and — for a discovered prerequisite — `beehive task add` / `beehive task block`, which author on
+primary main through the convergence protocol). Your work worktree is pre-created, so you rarely need
+worktree plumbing. Not on PATH → plain `git`. `beehive help` for details.
 
 ## Turn loop
 Each turn the runner checks completion deterministically. Met → you exit. Not met → you receive

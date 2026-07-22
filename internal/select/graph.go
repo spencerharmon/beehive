@@ -133,3 +133,27 @@ func (g *Graph) crossDepSatisfied(sm, d string) bool {
 	}
 	return g.Status[d] == plan.StatusDone
 }
+
+// CrossDepSatisfied is the exported form of crossDepSatisfied: it reports whether
+// a cross-submodule dependency d of a task in submodule sm is authorized (sm is
+// linked to the target submodule) AND the target task is DONE. A bare local dep
+// (no "<submodule>:" prefix) always returns true here — local readiness is the
+// plan layer's (plan.Blocked / plan.Selectable) responsibility. Used by the
+// runner to recognize a work pass that deliberately yielded by filing a blocking
+// cross-submodule dependency on itself.
+func (g *Graph) CrossDepSatisfied(sm, d string) bool { return g.crossDepSatisfied(sm, d) }
+
+// LinkedTo reports whether submodule a is authorized to depend on submodule b
+// (SUBMODULE-LINKS.yaml records the link). Exposed so `beehive task block` can
+// reject a cross-submodule dep the link graph does not authorize before it is
+// ever written into a PLAN.md.
+func (g *Graph) LinkedTo(a, b string) bool { return g.Linked[a][b] }
+
+// TaskStatus returns the recorded status of a qualified node id
+// ("<submodule>:<taskid>"), and whether that task exists in the loaded graph.
+// Exposed so `beehive task block` can confirm the dependency task it is about to
+// point at actually exists (never link to a dangling id).
+func (g *Graph) TaskStatus(node string) (plan.Status, bool) {
+	s, ok := g.Status[node]
+	return s, ok
+}

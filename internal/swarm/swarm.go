@@ -2123,6 +2123,28 @@ func (r *Runner) workChecklist(sel *selectt.Selection, branch string) ([]complet
 			docItem,
 		}, nil
 	}
+	// Deliberate-yield completion (cross-dep-autonomy): a work pass that DISCOVERS a
+	// missing prerequisite files it as a real task (in this or a linked submodule)
+	// and links its own task to it via `beehive task block`, which leaves this task
+	// TODO but now BLOCKED by that fresh dependency. The selector only ever
+	// dispatches a work task whose deps are all satisfied, so a work pass observing
+	// its OWN task as TODO-and-blocked can only mean it just added the blocking dep
+	// this session — a legitimate, complete yield (the runner releases the claim;
+	// the selector holds the task until the new dep is DONE). Without this the pass
+	// would spin to the idle-timeout with nothing left to do, misflagged as a
+	// no-progress abort. No doc is required for a yield (the FILED task ships its own
+	// doc; this task's implementation doc comes when it is later re-picked).
+	if t.Status == plan.StatusTODO {
+		yielded, err := r.taskYieldedBlocked(sel, p, t)
+		if err != nil {
+			return nil, err
+		}
+		if yielded {
+			return []completionItem{
+				{"work pass yielded: task left TODO and blocked on a newly-filed dependency", true},
+			}, nil
+		}
+	}
 	if t.Status == plan.NeedsHuman {
 		return []completionItem{
 			{"NEEDS-HUMAN escalation ready (--category + --reason set)", t.EscalationReady()},
@@ -2134,6 +2156,40 @@ func (r *Runner) workChecklist(sel *selectt.Selection, branch string) ([]complet
 		{"terminal STATUS set (NEEDS-REVIEW | DONE | NEEDS-ARBITRATION)", terminal},
 		docItem,
 	}, nil
+}
+
+// taskYieldedBlocked reports whether a work task, left TODO by its pass, is now
+// held out of selection by an unmet dependency — the signal of a deliberate
+// cross-dep yield (see workChecklist). It combines the two readiness layers the
+// selector itself uses: the LOCAL half (p.Blocked — a same-plan dep absent or not
+// DONE) and the CROSS-submodule half (the combined links+status graph — a
+// qualified dep whose link is unauthorized or whose target task is not DONE). A
+// graph read/parse error propagates (fail-closed): the pass then does NOT falsely
+// complete on an unverifiable yield.
+func (r *Runner) taskYieldedBlocked(sel *selectt.Selection, p *plan.Plan, t *plan.Task) (bool, error) {
+	if p.Blocked(t) {
+		return true, nil
+	}
+	hasCross := false
+	for _, d := range t.Deps {
+		if strings.Contains(d, ":") {
+			hasCross = true
+			break
+		}
+	}
+	if !hasCross {
+		return false, nil
+	}
+	g, err := selectt.LoadEdges(r.Repo)
+	if err != nil {
+		return false, err
+	}
+	for _, d := range t.Deps {
+		if strings.Contains(d, ":") && !g.CrossDepSatisfied(sel.Submodule.Name, d) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *Runner) docPresent(sel *selectt.Selection, branch string) (bool, error) {

@@ -4264,6 +4264,7 @@ func TestVerifyGateGreenAllowsHandoffWithStaticInvocation(t *testing.T) {
 		t.Fatalf("a green gate must complete the handoff: %+v", res)
 	}
 	want := []gateCall{
+		{dir: wtDir, name: "git", args: []string{"status", "--porcelain"}},
 		{dir: wtDir, name: "gofmt", args: []string{"-l", "."}},
 		{dir: wtDir, name: "go", args: []string{"vet", "./..."}},
 		{dir: wtDir, name: "go", args: []string{"test", "./..."}},
@@ -4390,17 +4391,22 @@ func TestVerifyGateSkipsNonReviewFlip(t *testing.T) {
 	}
 }
 
-// TestVerifyGateSkipsWithoutGoMod: the gate runs the Go toolchain, so a worktree
-// with no go.mod is not a Go module and has nothing to verify — it must complete
-// WITHOUT the gate running (else non-Go targets would falsely red).
-func TestVerifyGateSkipsWithoutGoMod(t *testing.T) {
+// TestVerifyGateSkipsGoChecksWithoutGoMod: the Go toolchain checks only run for a
+// Go module, so a worktree with no go.mod skips gofmt/vet/test — but the
+// uncommitted-work check still runs for it (non-Go targets like flux/gostream are
+// exactly where the empty-branch bug bit). A CLEAN tree therefore completes with
+// ONLY the `git status --porcelain` call and none of the Go checks.
+func TestVerifyGateSkipsGoChecksWithoutGoMod(t *testing.T) {
 	ctx := context.Background()
-	g, rp, sm, planPath, _ := gateFixture(t, false) // no go.mod in the worktree
+	g, rp, sm, planPath, wtDir := gateFixture(t, false) // no go.mod in the worktree
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
 	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
-		return verifyOutcome{exitErr: true}, nil
+		if name == "git" {
+			return verifyOutcome{}, nil // clean tree
+		}
+		return verifyOutcome{exitErr: true}, nil // any Go check would red — prove none runs
 	}}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
@@ -4412,10 +4418,128 @@ func TestVerifyGateSkipsWithoutGoMod(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	if !res.Completed {
-		t.Fatalf("a non-Go-module worktree has nothing to gate and must complete: %+v", res)
+		t.Fatalf("a clean non-Go-module worktree must complete: %+v", res)
 	}
-	if len(gr.calls) != 0 {
-		t.Fatalf("the gate must NOT run without a go.mod, ran %+v", gr.calls)
+	want := []gateCall{{dir: wtDir, name: "git", args: []string{"status", "--porcelain"}}}
+	if !reflect.DeepEqual(gr.calls, want) {
+		t.Fatalf("only the uncommitted-work check must run without a go.mod:\n got %+v\nwant %+v", gr.calls, want)
+	}
+}
+
+// TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes: a code worktree that still
+// has uncommitted changes at the NEEDS-REVIEW handoff does NOT complete (finish()
+// would merge an empty branch and drop the edits); it keeps the claim and feeds
+// back the fix-forward prompt, and once the agent commits (the tree goes clean)
+// the same session completes. Uses a NON-Go module to prove the check guards
+// exactly the targets the live bug hit.
+func TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t, false)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	gitStatus := 0
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if name == "git" {
+			gitStatus++
+			if gitStatus == 1 { // dirty on the first handoff, clean after the agent commits
+				return verifyOutcome{out: " M infrastructure/zuul/config-repo.yaml\n?? scripts/provision-zuul-registry-push-secret.sh"}, nil
+			}
+		}
+		return verifyOutcome{}, nil
+	}}
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed || res.GCMarked {
+		t.Fatalf("a dirty tree must block once then complete after the fix: %+v", res)
+	}
+	if gitStatus < 2 {
+		t.Fatalf("expected the uncommitted-work check to re-run after the fix, ran %d time(s)", gitStatus)
+	}
+}
+
+// TestVerifyGateDirtyTreeNeverCompletes: while the code worktree stays dirty the
+// handoff never completes (the task is left GC-marked for retry, never a phantom
+// done that ships none of its code).
+func TestVerifyGateDirtyTreeNeverCompletes(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t, false)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if name == "git" {
+			return verifyOutcome{out: " M infrastructure/zuul/config-repo.yaml"}, nil // always dirty
+		}
+		return verifyOutcome{}, nil
+	}}
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("a persistently dirty tree must never complete the handoff: %+v", res)
+	}
+}
+
+// TestWorkPassYieldsOnFiledBlockingDep: a work pass that discovers a missing
+// prerequisite, files it, and blocks its OWN task on it (via `beehive task block`,
+// modeled here by leaving the task TODO with a not-DONE dep) COMPLETES as a
+// deliberate yield — the selector then holds it until the dep is DONE. Without
+// this the pass would spin to the idle cap with nothing left to do.
+func TestWorkPassYieldsOnFiledBlockingDep(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t, false)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte(
+			"## T1 [TODO] <!-- attempts=0 deps=T2 -->\n"+
+				"## T2 [TODO] <!-- attempts=0 deps= -->\nnewly filed prerequisite\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a work pass that filed a blocking dep must complete (yield): %+v", res)
+	}
+	_ = sm
+}
+
+// TestWorkPassTODOWithoutBlockDoesNotComplete: the yield predicate is NARROW — a
+// work pass that merely leaves its task TODO with NO unmet dep (did nothing) must
+// NOT be misread as a completed yield; it keeps going.
+func TestWorkPassTODOWithoutBlockDoesNotComplete(t *testing.T) {
+	ctx := context.Background()
+	g, rp, _, planPath, _ := gateFixture(t, false)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= -->\nunchanged\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 2, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("an unblocked, unchanged TODO must not complete as a yield: %+v", res)
 	}
 }
 

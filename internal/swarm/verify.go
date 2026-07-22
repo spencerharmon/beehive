@@ -73,10 +73,14 @@ func realRunVerify(ctx context.Context, dir, name string, args ...string) (verif
 }
 
 // verifyGate runs the handoff gate for a Work task the agent has just driven to
-// NEEDS-REVIEW. It returns "" when the gate PASSES or is INAPPLICABLE (any other
-// kind or status, no code worktree, or a worktree that is not a Go module); a
-// non-empty RED failure prompt to hand the agent so it fixes forward; or a non-nil
-// error when a check could not be run (fail-closed: the caller blocks completion).
+// NEEDS-REVIEW. Two layers, both scoped to that handoff: (1) an uncommitted-work
+// check for EVERY work submodule (a dirty code worktree means edits that were
+// never committed and would be silently dropped by finish()); and (2) the Go
+// toolchain checks (gofmt/vet/test) for a Go module. It returns "" when both PASS
+// or are INAPPLICABLE (any other kind or status, no code worktree, or — for the Go
+// checks — a worktree that is not a Go module); a non-empty RED failure prompt to
+// hand the agent so it fixes forward; or a non-nil error when a check could not be
+// run (fail-closed: the caller blocks completion).
 func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs string) (string, error) {
 	if sel.Kind != selectt.Work || wtAbs == "" {
 		return "", nil
@@ -97,6 +101,32 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs s
 	t := p.Find(sel.Task.ID)
 	if t == nil || t.Status != plan.NeedsReview {
 		return "", nil
+	}
+	// Uncommitted-work gate — applies to EVERY work submodule (Go or not) on the
+	// TODO->NEEDS-REVIEW handoff (the only completion edge a work pass may take;
+	// DONE is reached only through review/arbitration). A code worktree still
+	// carrying ANY change (modified OR untracked) at this handoff means the agent
+	// edited/created files but never committed them to bee-<taskid> — so finish()
+	// merges an EMPTY branch, the gitlink never advances, and the task lands with
+	// NONE of its code. Observed live 2026-07-21 (flux
+	// zuul-build-publish-image-base-job): the base-job manifests + push-secret
+	// script were written in the worktree, the task flipped NEEDS-REVIEW, but
+	// nothing was ever committed; the flux tip stayed at the tip that verifiably
+	// lacks the infra, and the dependent gostream task then escalated NEEDS-HUMAN on
+	// the still-absent dependency. Red => hand back to commit, same session (fix
+	// forward), exactly like the Go checks below. This runs BEFORE the go.mod gate
+	// so it protects non-Go submodules (flux, gostream, …) too.
+	{
+		o, err := r.runVerify(ctx, wtAbs, "git", "status", "--porcelain")
+		if err != nil {
+			return "", fmt.Errorf("verify gate: running `git status --porcelain` in %s: %w", wtAbs, err)
+		}
+		if o.exitErr {
+			return "", fmt.Errorf("verify gate: `git status --porcelain` failed in %s: %s", wtAbs, strings.TrimSpace(o.out))
+		}
+		if strings.TrimSpace(o.out) != "" {
+			return dirtyTreeFailPrompt(o.out), nil
+		}
 	}
 	// The gate runs the Go toolchain; a worktree with no go.mod at its root is not a
 	// Go module and there is nothing to verify — running `go vet ./...` there would
@@ -140,6 +170,28 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs s
 // prompt so a large `go test` log cannot blow the turn's token budget. The TAIL is
 // kept — Go prints the failing packages/tests last.
 const gateVerifyOutputCap = 4000
+
+// dirtyTreeFailPrompt renders the fix-forward continue prompt for the uncommitted-
+// work gate: the code worktree still has uncommitted changes at a completion
+// handoff, so the task is NOT accepted as done (finish() would merge an empty
+// branch and lose every edit). The porcelain listing is tail-capped like the Go
+// gate so a large diff cannot blow the turn's token budget.
+func dirtyTreeFailPrompt(out string) string {
+	out = strings.TrimRight(out, "\n")
+	if len(out) > gateVerifyOutputCap {
+		out = "…(truncated; showing the tail)\n" + out[len(out)-gateVerifyOutputCap:]
+	}
+	return fmt.Sprintf(
+		"Handoff verify-gate FAILED: your code worktree still has UNCOMMITTED changes, so "+
+			"the task is NOT accepted as done — the runner only ever merges commits that already "+
+			"exist on your bee-<taskid> branch, so an uncommitted edit would be silently discarded "+
+			"and the task would land with none of its code. Commit ALL of these to your "+
+			"bee-<taskid> branch (with the `Beehive: <task-id> <doc-path>` stamp) and push it to "+
+			"the submodule origin THIS session; if a listed file is scratch that must not ship, "+
+			"delete it. Then the gate re-runs automatically (leave the task status as-is). "+
+			"`git status --porcelain`:\n\n%s",
+		out)
+}
 
 // gateFailPrompt renders the fix-forward continue prompt for a red gate: what
 // failed, that the task is NOT handed to review until it is green, and the
