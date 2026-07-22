@@ -281,6 +281,12 @@ small, .small { font-size: var(--text-sm); }
   padding: var(--space-5) var(--space-5) var(--space-7);
 }
 
+/* chat-editor-fullwidth-panel-layout: a full-width shell modifier for panel-style
+   pages (the AI editor). It drops the centered 66rem column so the content spans
+   the whole window left-to-right, keeping the same side padding for breathing
+   room. Opt in per page via the header's .Wide flag (layout.html). */
+.container-wide { max-width: none; }
+
 /* Cards ------------------------------------------------------------------ */
 .cards {
   display: grid;
@@ -763,9 +769,30 @@ pre {
 section { margin: var(--space-5) 0; }
 
 /* AI editor -------------------------------------------------------------- */
-.editor-grid { display: flex; gap: var(--space-4); align-items: flex-start; }
-.editor-grid .chat { flex: 1; min-width: 18rem; max-height: 70vh; overflow: auto; }
-.editor-grid .diffpane { flex: 1.4; min-width: 24rem; }
+/* chat-editor-fullwidth-panel-layout: the editor is a dense, panel-driven
+   workspace (Midnight Commander / Emacs feel) rather than a narrow centered
+   column. Its page shell opts into .container-wide (see the layout rule below)
+   so the two-panel grid spans the whole window left-to-right, and each pane is a
+   bordered surface "panel" that fills the available height. Panels stretch to
+   equal height (align-items: stretch) and the diff pane carries the extra width. */
+.editor-grid {
+  display: flex;
+  gap: var(--space-4);
+  align-items: stretch;
+  width: 100%;
+  min-height: 72vh;
+}
+.editor-grid .chat,
+.editor-grid .diffpane {
+  background: var(--surface);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  box-shadow: var(--shadow);
+}
+.editor-grid .chat { flex: 1; min-width: 18rem; max-height: 80vh; overflow: auto; }
+.editor-grid .diffpane { flex: 1.6; min-width: 24rem; display: flex; flex-direction: column; }
+.editor-grid .diffpane pre.diff { flex: 1; }
 .msg {
   padding: var(--space-2) var(--space-3);
   margin: var(--space-2) 0;

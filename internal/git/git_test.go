@@ -1232,3 +1232,68 @@ func TestPublishPrimaryMainNoRemoteIsNoop(t *testing.T) {
 		t.Fatalf("no-remote publish moved HEAD: %s != %s", got, tip)
 	}
 }
+
+// TestRemoteContainsCommit exercises the pointer-bump reachability gate: a commit
+// must be DURABLY on the remote's branch (an ancestor of the advertised tip), not
+// merely a local object, for a gitlink bump to be allowed.
+func TestRemoteContainsCommit(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "f", "v1\n", "v1")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("seed main: %v", err)
+	}
+
+	t.Run("pushed-commit-is-reachable", func(t *testing.T) {
+		sha := commitFile(t, a, "g", "shared\n", "shared work")
+		if err := a.Push(ctx, "origin", "main"); err != nil {
+			t.Fatalf("push shared work: %v", err)
+		}
+		b := cloneOf(t, origin, "b-ok")
+		ok, err := b.RemoteContainsCommit(ctx, "origin", "main", sha)
+		if err != nil || !ok {
+			t.Fatalf("RemoteContainsCommit(pushed) = %v,%v want true,nil", ok, err)
+		}
+	})
+
+	t.Run("local-only-commit-is-refused", func(t *testing.T) {
+		// The chronic self-hosting defect: a worktree commit that was NEVER pushed
+		// to origin. It IS a local object (so the weaker CommitReachable would say
+		// true), but it is NOT reachable from origin/main, so a pointer bump must
+		// be refused.
+		if _, err := a.Run(ctx, "checkout", "-q", "main"); err != nil {
+			t.Fatalf("checkout main: %v", err)
+		}
+		sha := commitFile(t, a, "dangling", "never pushed\n", "dangling work")
+		if !a.CommitExists(ctx, sha) {
+			t.Fatalf("precondition: %s should be a local object", sha)
+		}
+		ok, err := a.RemoteContainsCommit(ctx, "origin", "main", sha)
+		if err != nil {
+			t.Fatalf("RemoteContainsCommit(local-only) err = %v", err)
+		}
+		if ok {
+			t.Fatalf("RemoteContainsCommit(local-only unpushed) = true, want false (would dangle on peers)")
+		}
+	})
+
+	t.Run("local-sharing-no-remote-falls-back-to-local", func(t *testing.T) {
+		sha := commitFile(t, a, "local2", "local\n", "local sharing work")
+		ok, err := a.RemoteContainsCommit(ctx, "", "main", sha)
+		if err != nil || !ok {
+			t.Fatalf("RemoteContainsCommit(no remote, local object) = %v,%v want true,nil", ok, err)
+		}
+	})
+
+	t.Run("remote-lacks-branch-reports-false", func(t *testing.T) {
+		sha := commitFile(t, a, "f2", "x\n", "x")
+		ok, err := a.RemoteContainsCommit(ctx, "origin", "no-such-branch", sha)
+		if err != nil {
+			t.Fatalf("RemoteContainsCommit(missing branch) err = %v", err)
+		}
+		if ok {
+			t.Fatalf("RemoteContainsCommit(missing remote branch) = true, want false")
+		}
+	})
+}

@@ -22,9 +22,10 @@ What to read:
 - The change doc at submodules/<sm>/docs/<branch>-<taskid>.md (read-only).
 
 Then decide and commit on main:
-- **APPROVE**: the work satisfies the task and ROI, tests pass. Merge the implementer's submodule
-  pointer bump into the submodule's tracked branch, set the PLAN.md task -> DONE, and unlock any
-  dependents (same plan or linked submodule). Commit.
+- **APPROVE**: the work satisfies the task and ROI, tests pass. Merge `bee-<taskid>` into the
+  submodule's tracked branch on its origin, set the PLAN.md task -> DONE, and unlock any
+  dependents (same plan or linked submodule). Commit. Do NOT touch the submodule pointer (gitlink) —
+  the runner pins it to the tracked-branch tip (see `docs/submodule-pointer-invariant.md`).
 - **REJECT**: it does not. Set the PLAN.md task -> NEEDS-ARBITRATION and write a rejection doc at
   submodules/<sm>/docs/<taskid>-review-reject.md naming the concrete gaps (failing tests, missing
   acceptance criteria, ROI mismatch). Commit. Do not delete or rewrite the implementer's branch. If review

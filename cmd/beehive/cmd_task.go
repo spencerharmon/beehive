@@ -31,6 +31,16 @@ func taskHumanCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Convergence protocol (docs/main-convergence-protocol.md): task human
+			// authors a PLAN.md commit DIRECTLY on the primary main, so it must merge
+			// the hive remote into local main BEFORE authoring (and publish after), or
+			// it manufactures the fork ff-only pullMain cannot heal. Mirrors
+			// syncSubmodule's sync-before/publish-after call-site pattern exactly.
+			rootGit := git.New(root)
+			remote, _ := rootGit.Remote(cmd.Context())
+			if err := rootGit.SyncMainFromRemote(cmd.Context(), remote); err != nil {
+				return err
+			}
 			cat, err := humanCategory(category)
 			if err != nil {
 				return err
@@ -65,6 +75,9 @@ func taskHumanCmd() *cobra.Command {
 			}
 			msg := fmt.Sprintf("plan: request human for %s (%s)\n\nBeehive: %s plan\nCategory: %s\nReason: %s", args[1], cat, args[1], cat, t.HumanReason())
 			if err := git.New(root).CommitPaths(cmd.Context(), msg, planRel); err != nil && err != git.ErrNothing {
+				return err
+			}
+			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
 				return err
 			}
 			fmt.Printf("%s %s -> %s\n", subName, args[1], plan.StatusHuman)

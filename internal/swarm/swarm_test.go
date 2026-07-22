@@ -2959,6 +2959,97 @@ func TestWorkSyncsWorktreeBaseToTrackedTip(t *testing.T) {
 	}
 }
 
+// TestWorkPinsPointerToTrackedTipDespiteAgentBeeBump is the enforcement half of
+// the submodule-pointer invariant (docs/submodule-pointer-invariant.md): the
+// gitlink MUST always equal the tracked-branch tip, NEVER a bee-<taskid> tip.
+// Even a misbehaving agent that commits the gitlink at its bee-branch tip (the
+// exact defect the old "bump the submodule pointer" instruction produced, which
+// dangled the pointer once the bee branch was reclaimed) must not survive: the
+// runner re-pins the published pointer to origin/<branch> tip at completion.
+func TestWorkPinsPointerToTrackedTipDespiteAgentBeeBump(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	ctx := context.Background()
+
+	origin := t.TempDir()
+	og := gitInit(t, origin)
+	os.WriteFile(filepath.Join(origin, "f"), []byte("base"), 0o644)
+	if err := og.Commit(ctx, "base"); err != nil {
+		t.Fatalf("origin base: %v", err)
+	}
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	os.WriteFile(filepath.Join(origin, "f"), []byte("tip"), 0o644)
+	if err := og.Commit(ctx, "tip"); err != nil {
+		t.Fatalf("origin tip: %v", err)
+	}
+	originTip, err := og.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("origin tip rev: %v", err)
+	}
+
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	wtDir := filepath.Join(subs[0].WorktreesDir(), "bee-T1")
+	var beeTip string
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		// Misbehaving agent: make a bee commit in the code worktree, then WRONGLY
+		// bump the shared submodule pointer to that bee-tip and commit it in the
+		// hive repo — exactly what the retired "bump the submodule pointer"
+		// instruction produced.
+		wt := git.New(wtDir)
+		os.WriteFile(filepath.Join(wtDir, "beework"), []byte("bee"), 0o644)
+		if err := wt.Commit(ctx, "bee work"); err != nil {
+			t.Errorf("bee commit: %v", err)
+			return
+		}
+		beeTip, _ = wt.RevParse(ctx, "HEAD")
+		if _, err := git.New(repoDir).Run(ctx, "checkout", beeTip); err != nil {
+			t.Errorf("checkout bee-tip in shared checkout: %v", err)
+			return
+		}
+		if err := g.CommitPaths(ctx, "agent WRONGLY bumped pointer to bee-tip", "submodules/sm/repo"); err != nil {
+			t.Errorf("agent bad pointer bump: %v", err)
+			return
+		}
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("want completed, got %+v", res)
+	}
+	if beeTip == "" || beeTip == originTip {
+		t.Fatalf("bee-tip not distinct from tracked tip (bee=%q tip=%q); test is vacuous", beeTip, originTip)
+	}
+	// The PUBLISHED gitlink must be the tracked tip, NOT the agent's bee-tip.
+	ptr, err := g.Run(ctx, "rev-parse", "HEAD:submodules/sm/repo")
+	if err != nil {
+		t.Fatalf("read committed gitlink: %v", err)
+	}
+	if ptr == beeTip {
+		t.Fatalf("INVARIANT VIOLATED: committed gitlink is the bee-tip %s; the runner failed to re-pin to the tracked tip", beeTip)
+	}
+	if ptr != originTip {
+		t.Fatalf("committed gitlink %s != tracked tip %s: pinPointerToTrackedTip did not enforce the invariant", ptr, originTip)
+	}
+}
+
 // TestWorkNoRemoteKeepsRecordedPointer proves the sync is a no-op without a
 // submodule remote (single-host install / nested test checkout): the worktree
 // still branches off the recorded pointer (HEAD) and NO spurious pointer-bump

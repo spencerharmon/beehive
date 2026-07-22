@@ -116,11 +116,13 @@ second-guess it. Each pass the runner has already, or will automatically:
   branch, streams the transcript to `sessions/`, and removes the worktree.
 
 What is still YOURS (per your role section): make and commit the code on `bee-<taskid>`, push that
-branch to the submodule origin, bump the submodule pointer, write the change doc, and flip STATUS. The
+branch to the submodule origin, write the change doc, and flip STATUS. The
 runner merges that to `main` — it does not author the change for you. These are ROUTINE, expected steps
 of every work pass — not irreversible actions that need confirmation. Pushing your `bee-<taskid>`
-branch and bumping the pointer is exactly the publish protocol; NEVER pause, checkpoint, or ask before
-them. Just do them and let the turn's completion check end the pass. A push rejected because your
+branch is exactly the publish protocol; NEVER pause, checkpoint, or ask before
+them. Just do them and let the turn's completion check end the pass. **NEVER touch the submodule
+pointer (gitlink) or `submodules/<sm>/repo` — the runner OWNS the pointer and pins it to the tracked-
+branch tip; a bee-branch tip must never be recorded (see `docs/submodule-pointer-invariant.md`).** A push rejected because your
 branch already exists on origin (a prior orphaned attempt) is NOT a problem to solve here — see the
 "NEVER force-push" rule: the runner reclaims it. Never treat the presence of a prior attempt's branch
 or a near-duplicate on origin as a reason to stop, re-plan, force-push, or escalate.
@@ -193,11 +195,10 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   claim's heartbeat goes stale, and the task gets redispatched from scratch having delivered nothing.
 - Commit the code on branch `bee-<taskid>` with the `Beehive: <taskid> <doc-path>` stamp and ensure that
   commit is PUSHED to the submodule's origin (an unpushed commit dangles the pointer for every other
-  host). Bump the submodule pointer: from the beehive-layer worktree (never `submodules/<sm>/repo`
-  itself), run `git update-index --cacheinfo 160000,<your-new-commit-sha>,submodules/<sm>/repo`, then
-  stage and commit it alongside `PLAN.md` and the doc. This only rewrites the gitlink INDEX entry — each
-  beehive-layer worktree already has its own private, worktree-local submodule checkout, so this is NOT
-  the forbidden "write to the shared checkout".
+  host). **Do NOT touch the submodule pointer (gitlink) or `submodules/<sm>/repo`.** The runner OWNS
+  the pointer: it pins the gitlink to the tracked-branch tip (`origin/<branch>`) at completion, which is
+  the ONLY value it may ever hold. Never run `git update-index --cacheinfo ... submodules/<sm>/repo`,
+  never stage or commit the gitlink. See `docs/submodule-pointer-invariant.md`.
 - Flip the `PLAN.md` task `TODO → NEEDS-REVIEW` on main and commit.
 
 ## Review task
@@ -206,15 +207,16 @@ NOT reimplement it, and do NOT open `PLAN.md` or `ROI.md` to read the task. Read
 implementer branch `bee-<taskid>` (fetch from the submodule origin if absent locally) and the change
 doc; the task's `Review:` note is already in your card. A **doc-only task** (its `Files:` touch only
 `docs/`, `PLAN.md`, or other beehive-layer text, no submodule code) has NO `bee-<taskid>` CODE branch —
-its change doc and any pointer bump are the only artifacts. A missing `bee-<taskid>` branch / `couldn't
+its change doc is the only artifact (there is no pointer to move — the runner owns the gitlink). A missing `bee-<taskid>` branch / `couldn't
 find remote ref` there is EXPECTED, not a defect: review the change doc and PLAN.md state directly and do
 NOT burn turns re-probing git (`git log/show/fetch bee-<taskid>`) for a branch that was never created —
 the runner already verified reachability before dispatching you.
 - APPROVE only when the change doc CARRIES the evidence: an automated regression test (command +
   passing result) for any behavioral change, and a live-effect confirmation for a deploy/service/
   migration task. No evidence in the doc ⇒ you cannot verify "done" ⇒ REJECT (do not approve on a
-  plausible-looking diff). When satisfied, merge the implementer's pointer bump into the tracked branch,
-  `NEEDS-REVIEW → DONE`, unlock dependents. Commit.
+  plausible-looking diff). When satisfied, merge `bee-<taskid>` into the submodule's tracked branch on
+  its origin, `NEEDS-REVIEW → DONE`, unlock dependents. Commit. Do NOT touch the submodule pointer — the
+  runner pins it to the tracked-branch tip.
 - REJECT: `NEEDS-REVIEW → NEEDS-ARBITRATION` plus a rejection doc at
   `submodules/<sm>/docs/<taskid>-review-reject.md` naming the concrete gaps. Commit. Never delete or
   rewrite the implementer branch.
@@ -224,8 +226,9 @@ Done when the task leaves `NEEDS-REVIEW`.
 Status is `NEEDS-ARBITRATION`. Settle the implementer-vs-reviewer dispute — do NOT reimplement, and do
 NOT open `PLAN.md` or `ROI.md` to read the task (it is in your card). Read the change doc and the
 reviewer's rejection doc.
-- SIDE WITH IMPLEMENTER: merge the pointer bump into the tracked branch, `NEEDS-ARBITRATION → DONE`,
-  unlock dependents. Commit.
+- SIDE WITH IMPLEMENTER: merge `bee-<taskid>` into the submodule's tracked branch on its origin,
+  `NEEDS-ARBITRATION → DONE`, unlock dependents. Commit. Do NOT touch the submodule pointer — the runner
+  pins it to the tracked-branch tip.
 - SIDE WITH REVIEWER: `NEEDS-ARBITRATION → TODO` with the binding rationale recorded in the task body /
   a doc so the next implementer knows what to fix. Commit.
 Done when the task leaves `NEEDS-ARBITRATION`.
@@ -286,7 +289,7 @@ reselects.
 STOP the instant your role section's completion predicate is met — end your turn and emit nothing
 further. This is kind-general (reconcile, work, review, arbitration alike) and relaxes NO predicate
 above: deliver in FULL first — your deliverable committed and, for a work task, the code pushed on
-`bee-<taskid>`, the pointer bumped, and the change doc present at its exact path, with the terminal
+`bee-<taskid>` and the change doc present at its exact path, with the terminal
 status set. Once that predicate holds, do NOT tack on trailing "housekeeping": no cleanup of scratch
 files or `$TMPDIR` (the runner tears your worktree down for you), no re-verification, no "one last
 check", no out-of-repo reads. Post-delivery your turn has no productive move left, so any such trailing

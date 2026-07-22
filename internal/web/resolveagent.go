@@ -349,9 +349,13 @@ func (m *resolveManager) publishRemote(ctx context.Context) (string, error) {
 // teardown removes the session's worktree and branch. It first CANCELS any
 // in-flight turn (so the background goroutine's prompt/commit unwinds) and then
 // takes wtMu, so the worktree is never removed out from under a live `git add
-// -A`. Best-effort: a failure to remove a clean, abandoned edit worktree is
-// reclaimed by the editor's startup GC (the edit- prefix is shared), so teardown
-// never blocks the caller.
+// -A`. Best-effort: teardown owns removing this resolve session's own
+// worktree+branch. It must NOT rely on the internal/editor Manager's startup GC
+// to sweep leaks — that Manager now owns only its own `hive-edit-*` namespace
+// and deliberately never touches these `edit-resolve-*` worktrees (that shared
+// reclaim was destroying live resolve sessions; see editor.editBranchPrefix and
+// the editor-session-wipe INVARIANT). A `edit-resolve-*` worktree left behind by
+// a crash is swept by the manual cleanup-stale dance, not automatically.
 func (s *resolveSession) teardown(ctx context.Context) {
 	s.mu.Lock()
 	if s.cancel != nil {

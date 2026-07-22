@@ -3303,6 +3303,46 @@ func TestEditorPageBreadcrumb(t *testing.T) {
 	}
 }
 
+// TestEditorComposerAutogrowsAndWraps proves chat-editor-input-autogrow-wrap:
+// the bottom user-input box on the /editor/{id} page is a wrapping,
+// auto-growing <textarea> (not a single-line, horizontally-scrolling <input>),
+// still posts to the same /editor/{id}/chat endpoint, and preserves
+// Enter-submits/Shift+Enter-newlines behavior.
+func TestEditorComposerAutogrowsAndWraps(t *testing.T) {
+	s, root := setup(t)
+	commitAndNormalizeMain(t, root)
+
+	id := openEditorSession(t, s, repo.InfraFile)
+	body := get(t, s, "/editor/"+id).Body.String()
+
+	if strings.Contains(body, `<input name="message"`) {
+		t.Fatalf("editor composer still a single-line <input>, want a wrapping/autogrow <textarea>:\n%s", body)
+	}
+	if !strings.Contains(body, `<textarea name="message"`) {
+		t.Fatalf("editor composer missing a <textarea name=\"message\">:\n%s", body)
+	}
+	// Vertical autogrow: oninput drives height from scrollHeight.
+	if !strings.Contains(body, "scrollHeight") {
+		t.Fatalf("editor composer textarea missing autogrow (scrollHeight) wiring:\n%s", body)
+	}
+	// Line wrapping: wraps long lines instead of horizontally scrolling one line.
+	if !strings.Contains(body, "overflow-wrap:break-word") && !strings.Contains(body, "word-wrap:break-word") {
+		t.Fatalf("editor composer textarea missing line-wrap styling:\n%s", body)
+	}
+	if !strings.Contains(body, "white-space:pre-wrap") {
+		t.Fatalf("editor composer textarea missing pre-wrap styling:\n%s", body)
+	}
+	// Preserved submit behavior: Enter (without Shift) still submits the form,
+	// not a bare newline.
+	if !strings.Contains(body, `event.key==='Enter'`) || !strings.Contains(body, `!event.shiftKey`) {
+		t.Fatalf("editor composer textarea missing Enter-submits/Shift+Enter-newline wiring:\n%s", body)
+	}
+	// Same endpoint, unchanged.
+	if !strings.Contains(body, `hx-post="/editor/`+id+`/chat"`) {
+		t.Fatalf("editor composer form no longer posts to /editor/{id}/chat:\n%s", body)
+	}
+}
+
 // TestDocExplorerListsWholeTree proves submodule-doc-explorer's core contract:
 // every file under docs/ — a top-level change doc, an audit report under
 // docs/audit/, and a task design doc under docs/tasks/ — is listed with a
@@ -7693,5 +7733,46 @@ func TestScrollPreserveScopedForMorph(t *testing.T) {
 	// The redundant per-pane top save/restore must be gone (it would fight morph).
 	if strings.Contains(page, "top: el.scrollTop") {
 		t.Fatalf("scroll-preserve still stashes per-pane scrollTop — morph makes that redundant and it fights the in-place patch:\n%s", page)
+	}
+}
+
+// TestEditorFullWidthPanelLayout is the chat-editor-fullwidth-panel-layout
+// contract: the AI chat-diff editor renders in a full-width, panel-style shell
+// (no narrow centered column) with a dense two-panel grid, while every other
+// page keeps the centered .container column. There is no browser here, so this
+// asserts the markup/CSS contract off the parsed templates + embedded stylesheet.
+func TestEditorFullWidthPanelLayout(t *testing.T) {
+	s, _ := setup(t)
+
+	// (1) The editor shell opts into the full-width modifier via the header .Wide
+	//     flag, so the two panels span the whole window left-to-right.
+	eShell := renderTmpl(t, s, "editor.html", map[string]interface{}{
+		"ID": "e1", "File": "ROI.md", "Wide": true,
+	})
+	if !strings.Contains(eShell, `class="container container-wide"`) {
+		t.Fatalf("editor page must render the full-width shell (.container-wide):\n%s", eShell)
+	}
+
+	// (2) A page that does NOT set Wide keeps the centered column — the modifier
+	//     is strictly opt-in and never leaks onto other pages.
+	dash := get(t, s, "/").Body.String()
+	if strings.Contains(dash, "container-wide") {
+		t.Fatalf("non-editor page must keep the centered .container column, got container-wide:\n%s", dash)
+	}
+
+	// (3) The CSS: the wide modifier drops the max-width cap, and the editor grid
+	//     fills the width as a dense two-panel layout (still stacking at the one
+	//     narrow-viewport breakpoint).
+	css := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		".container-wide { max-width: none; }",
+		"width: 100%;",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("style.css missing full-width layout rule %q:\n%s", want, css)
+		}
+	}
+	if !strings.Contains(css, "@media (max-width: 48rem)") {
+		t.Fatalf("style.css must keep the editor-grid narrow-viewport stack breakpoint:\n%s", css)
 	}
 }

@@ -34,8 +34,70 @@ func findRoot() (string, error) {
 func submoduleCmd() *cobra.Command {
 	c := &cobra.Command{Use: "submodule", Short: "manage beehive submodules"}
 	c.AddCommand(submoduleAddCmd(), submoduleLinkCmd(), submodulePlanCmd(),
-		submoduleWorktreeCmd(), submoduleSyncCmd(), submoduleRemoteCmd())
+		submoduleWorktreeCmd(), submoduleSyncCmd(), submoduleRemoteCmd(),
+		submodulePointerBumpCmd())
 	return c
+}
+
+// submodulePointerBumpCmd bumps the superproject gitlink for a submodule to a
+// specific commit, but ONLY after confirming that commit is durably pushed to
+// the submodule's origin. This closes the chronic self-hosting defect where the
+// gitlink was bumped to a worktree commit that never reached origin, leaving a
+// dangling pointer on every other host (e.g. 62243addcc, 672eabd857): the bump
+// is REFUSED with an error naming the unreachable sha rather than recording a
+// pointer no peer can resolve. The caller stages/commits the bumped gitlink.
+func submodulePointerBumpCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "pointer-bump <submodule> <commit>",
+		Short: "bump a submodule's gitlink to a commit confirmed pushed to its origin",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, a []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			return pointerBumpSubmodule(cmd.Context(), root, a[0], a[1])
+		},
+	}
+}
+
+// pointerBumpSubmodule resolves the submodule's tracked branch + origin, resolves
+// commit to a full sha in the submodule checkout, and refuses the gitlink bump
+// unless that sha is reachable from the origin's branch tip. On success it
+// rewrites the gitlink index entry in the beehive layer (root repo).
+func pointerBumpSubmodule(ctx context.Context, root, sm, commit string) error {
+	rel := filepath.Join("submodules", sm, "repo")
+	repoDir := filepath.Join(root, rel)
+	if _, err := os.Stat(repoDir); err != nil {
+		return fmt.Errorf("no repo at %s", rel)
+	}
+	rootGit := git.New(root)
+	subGit := git.New(repoDir)
+	sha, err := subGit.RevParse(ctx, commit)
+	if err != nil {
+		return fmt.Errorf("resolve %s in %s: %w", commit, rel, err)
+	}
+	branch, err := rootGit.Run(ctx, "config", "-f", ".gitmodules", "submodule."+rel+".branch")
+	if err != nil || branch == "" {
+		branch = "main"
+	}
+	remote, err := subGit.Remote(ctx)
+	if err != nil {
+		return err
+	}
+	pushed, err := subGit.RemoteContainsCommit(ctx, remote, branch, sha)
+	if err != nil {
+		return fmt.Errorf("confirm %s reachable on %s origin: %w", sha, sm, err)
+	}
+	if !pushed {
+		return fmt.Errorf("refusing to bump %s gitlink to %s: commit is NOT pushed to the submodule origin (%s/%s) — it would dangle on every other host; push the %s branch first",
+			sm, sha, remote, branch, branch)
+	}
+	if err := rootGit.BumpGitlink(ctx, rel, sha); err != nil {
+		return err
+	}
+	fmt.Printf("%s gitlink bumped to %s (confirmed on %s/%s)\n", rel, sha, remote, branch)
+	return nil
 }
 
 // submoduleRemoteCmd repoints a submodule's tracked remote URL through the shared
@@ -52,11 +114,24 @@ func submoduleRemoteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Convergence protocol (docs/main-convergence-protocol.md): this verb
+			// authors a .gitmodules commit DIRECTLY on the primary main, so it must
+			// merge the hive remote into local main BEFORE authoring, or it
+			// manufactures the fork ff-only pullMain cannot heal. Mirrors
+			// syncSubmodule's sync-before/publish-after call-site pattern exactly.
+			rootGit := git.New(root)
+			remote, _ := rootGit.Remote(cmd.Context())
+			if err := rootGit.SyncMainFromRemote(cmd.Context(), remote); err != nil {
+				return err
+			}
 			rel, err := submod.SetRemoteURL(cmd.Context(), root, args[0], args[1])
 			if err != nil {
 				return err
 			}
-			if err := git.New(root).CommitPaths(cmd.Context(), "submodule remote: "+args[0]+" -> "+args[1], ".gitmodules"); err != nil && err != git.ErrNothing {
+			if err := rootGit.CommitPaths(cmd.Context(), "submodule remote: "+args[0]+" -> "+args[1], ".gitmodules"); err != nil && err != git.ErrNothing {
+				return err
+			}
+			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
 				return err
 			}
 			fmt.Printf("%s remote set to %s\n", rel, args[1])

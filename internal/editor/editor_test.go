@@ -386,6 +386,118 @@ func branchExists(t *testing.T, g *git.Repo, branch string) bool {
 	return err == nil
 }
 
+// TestReloadNeverTouchesForeignEditWorktrees is the editor-session-wipe
+// namespace-ownership regression: the beehive-root .worktrees/ dir is SHARED
+// with the web layer's resolve agent (`edit-resolve-*`) and bootstrap chat
+// editor (`edit-*`), which hold their proposals in memory with no persistence
+// store. This Manager's startup/gc reclaim must own ONLY its own
+// `hive-edit-*` namespace: a foreign edit worktree — even one that is clean and
+// long past the TTL, i.e. exactly what USED to be adopted-then-deleted — must be
+// left entirely alone (worktree, local branch, and NOT adopted into the store).
+func TestReloadNeverTouchesForeignEditWorktrees(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	g := git.New(root)
+
+	addWt := func(branch string) string {
+		wt := filepath.Join(root, ".worktrees", branch)
+		if _, err := g.Run(ctx, "worktree", "add", "-b", branch, wt, "main"); err != nil {
+			t.Fatalf("worktree add %s: %v", branch, err)
+		}
+		return wt
+	}
+
+	// A live resolve-agent worktree and a bootstrap chat-editor worktree, both
+	// clean (proposal held in memory) — the exact shape that was being wiped.
+	resolveBranch := "edit-resolve-flux-sometask-1783835888732333469"
+	resolveWt := addWt(resolveBranch)
+	chatBranch := "edit-submodules-sm-ROI-md-1783835888"
+	chatWt := addWt(chatBranch)
+
+	m := newTestManager(t, root, &fakeClient{})
+	// Clock far past the TTL: if these were (wrongly) treated as this Manager's
+	// own stale+clean sessions, they would be reclaimed here.
+	m.now = func() time.Time { return time.Now().Add(1000 * time.Hour) }
+
+	if err := m.Reload(ctx); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	for _, wt := range []string{resolveWt, chatWt} {
+		if _, err := os.Stat(wt); err != nil {
+			t.Fatalf("foreign edit worktree %s must never be removed by the editor Manager: %v", wt, err)
+		}
+	}
+	for _, b := range []string{resolveBranch, chatBranch} {
+		if !branchExists(t, g, b) {
+			t.Fatalf("foreign edit branch %s must never be deleted by the editor Manager", b)
+		}
+		if _, ok := m.Get(b); ok {
+			t.Fatalf("foreign edit session %s must never be adopted into the editor Manager", b)
+		}
+	}
+	// The store must not have been polluted with foreign records.
+	recs, err := m.store.load()
+	if err != nil {
+		t.Fatalf("store load: %v", err)
+	}
+	for _, r := range recs {
+		t.Fatalf("store must be empty of foreign sessions, found %q", r.Branch)
+	}
+
+	// And Reclaimable (the gc dry-run) must likewise ignore them.
+	reclaimable, err := m.Reclaimable(ctx)
+	if err != nil {
+		t.Fatalf("reclaimable: %v", err)
+	}
+	if len(reclaimable) != 0 {
+		t.Fatalf("Reclaimable must never list a foreign edit worktree, got %v", reclaimable)
+	}
+}
+
+// TestReloadNeverReclaimsLiveRegisteredSession is the editor-session-wipe
+// never-reclaim-a-live-session regression: an operator's OPEN session (live in
+// byID) whose record has aged past the TTL and whose worktree is clean (a
+// freshly opened session, or one whose change already merged) must NEVER be
+// reclaimed by a reload/gc run on the LIVE daemon — doing so deletes the
+// worktree/branch out from under the operator and 404s their next turn.
+func TestReloadNeverReclaimsLiveRegisteredSession(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	g := git.New(root)
+	file := "submodules/sm/ROI.md"
+
+	m := newTestManager(t, root, &fakeClient{})
+	sess, err := m.Open(ctx, file) // registers a live session; worktree is clean
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	branch := sess.Branch
+
+	// Age the session past the TTL: its persisted record is now "stale", and the
+	// worktree carries no pending change — the stale+clean shape that IS reclaimed
+	// for an ABANDONED session, but must be KEPT for a LIVE (in-byID) one.
+	m.now = func() time.Time { return time.Now().Add(2 * m.ttl) }
+
+	if got, err := m.Reclaimable(ctx); err != nil {
+		t.Fatalf("reclaimable: %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("a LIVE registered session must never be reclaimable, got %v", got)
+	}
+	if err := m.Reload(ctx); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if _, ok := m.Get(branch); !ok {
+		t.Fatalf("live session %s was dropped from the Manager by Reload", branch)
+	}
+	if _, err := os.Stat(sess.wtPath); err != nil {
+		t.Fatalf("live session worktree must survive Reload: %v", err)
+	}
+	if !branchExists(t, g, branch) {
+		t.Fatalf("live session branch %s must survive Reload", branch)
+	}
+}
+
 // TestReloadPrunesStaleKeepsActivePendingAndBee is the startup-prune acceptance:
 // over a root repo carrying several worktrees, Reload removes EXACTLY the stale,
 // change-free edit worktrees (and their branches), while it keeps and re-registers
@@ -406,16 +518,16 @@ func TestReloadPrunesStaleKeepsActivePendingAndBee(t *testing.T) {
 	}
 
 	// 1) stale + clean (no pending change) -> PRUNED.
-	staleBranch := "edit-stale-100"
+	staleBranch := "hive-edit-stale-100"
 	staleWt := addWt(staleBranch)
 
 	// 2) active (fresh persisted record) + clean -> KEPT and re-registered.
-	activeBranch := "edit-active-200"
+	activeBranch := "hive-edit-active-200"
 	activeWt := addWt(activeBranch)
 
 	// 3) stale record-LESS worktree carrying a committed, unmerged change ->
 	//    KEPT (pending-change safety) and recovered via derived file.
-	pendingBranch := "edit-pending-300"
+	pendingBranch := "hive-edit-pending-300"
 	pendingWt := addWt(pendingBranch)
 	pf := filepath.Join(pendingWt, "submodules", "sm", repo.InfraFile)
 	if err := os.WriteFile(pf, []byte("pending infra\n"), 0o644); err != nil {

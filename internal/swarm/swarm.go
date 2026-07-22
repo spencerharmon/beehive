@@ -794,7 +794,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"(with its `Review:` note) is provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
 				"Implementer's work is on branch bee-%[2]s in submodules/%[1]s/repo — inspect read-only via git "+
 				"(fetch from origin if the branch is absent locally). Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md.\n"+
-				"APPROVE -> merge the submodule pointer bump + PLAN.md task DONE + unlock dependents. "+
+				"APPROVE -> merge bee-%[2]s into the submodule's tracked branch on its origin + PLAN.md task DONE + "+
+				"unlock dependents. Do NOT touch the submodule pointer (gitlink) yourself — the runner pins it to the "+
+				"tracked-branch tip; that is the ONLY value it may ever hold (see docs/submodule-pointer-invariant.md). "+
 				"REJECT -> PLAN.md task NEEDS-ARBITRATION + rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
 				"The run completes when the task leaves NEEDS-REVIEW. Act autonomously.\n\n",
 			smName, sel.Task.ID)
@@ -806,14 +808,19 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
 				"Implementer branch bee-%[2]s in submodules/%[1]s/repo; change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
 				"reviewer rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
-				"SIDE WITH IMPLEMENTER -> merge pointer bump + PLAN.md DONE + unlock dependents. "+
+				"SIDE WITH IMPLEMENTER -> merge bee-%[2]s into the submodule's tracked branch on its origin + PLAN.md DONE "+
+				"+ unlock dependents. Do NOT touch the submodule pointer (gitlink) yourself — the runner pins it to the "+
+				"tracked-branch tip (see docs/submodule-pointer-invariant.md). "+
 				"SIDE WITH REVIEWER -> PLAN.md TODO with the binding rationale; if a concrete operator blocker is exposed, "+
 				"run beehive task human %[1]s %[2]s --reason \"<specific blocker>\".\n"+
 				"The run completes when the task leaves NEEDS-ARBITRATION. Act autonomously.\n\n",
 			smName, sel.Task.ID)
 	case selectt.Work:
 		// The completion rule (flip to NEEDS-REVIEW, commit+push with the Beehive
-		// stamp, bump the pointer) is a static "what to do at the end" dump. In lean
+		// stamp) is a static "what to do at the end" dump. The agent NEVER writes the
+		// submodule pointer (gitlink) — the runner owns it and pins it to the tracked-
+		// branch tip (pinPointerToTrackedTip); see docs/submodule-pointer-invariant.md.
+		// In lean
 		// mode it is dropped from the up-front preamble and fired instead as an
 		// at-decision-point hint on the "continue" turn where the change doc is still
 		// missing (nextPrompt); its authoritative copy still lives in the retained
@@ -823,8 +830,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if !r.LeanInject {
 			onComplete = fmt.Sprintf(
 				"On completion of a Work task: PLAN.md -> NEEDS-REVIEW on main; commit the code on branch %[1]s "+
-					"with a `Beehive: %[2]s <doc-path>` stamp and ensure that commit is pushed to the submodule's origin; "+
-					"bump the submodule pointer.\n",
+					"with a `Beehive: %[2]s <doc-path>` stamp and ensure that commit is pushed to the submodule's origin. "+
+					"Do NOT bump or otherwise write the submodule pointer (gitlink) — the runner owns it and pins it to the "+
+					"tracked-branch tip; a bee-branch tip must NEVER be recorded (see docs/submodule-pointer-invariant.md).\n",
 				res.Branch, taskID(sel))
 		}
 		preamble = fmt.Sprintf(
@@ -1055,6 +1063,19 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	finish := func(warning string) error {
 		if err := finishTranscript(warning); err != nil {
 			return err
+		}
+		// Enforce the submodule-pointer invariant before publishing: the runner
+		// re-derives the gitlink from origin/<tracked-branch> tip so the PUBLISHED
+		// superproject records the tracked tip and nothing else (never a bee-<taskid>
+		// tip). This is a no-op when already pinned or on a no-remote install, and
+		// corrects any stray pointer an agent staged. Best-effort: a failure here must
+		// not block a publish the work already earned — the next pass's pin re-tries,
+		// and a genuinely unreachable tracked tip surfaces via preflight. See
+		// docs/submodule-pointer-invariant.md.
+		if hasTask(sel) {
+			if perr := r.pinPointerToTrackedTip(ctx, sel.Submodule, absRoot); perr != nil {
+				fmt.Fprintf(os.Stderr, "honeybee: WARNING could not pin %s submodule pointer to its tracked-branch tip (invariant): %v\n", sel.Submodule.Name, perr)
+			}
 		}
 		// Publish the WORK first and let its result gate completion. The work is what
 		// the task exists to produce; a convenience artifact must never block it.
@@ -1607,8 +1628,9 @@ func (r *Runner) nextPrompt(sel *selectt.Selection, branch string) string {
 	return fmt.Sprintf(
 		"continue. When the code change is made and tested, complete the task: write the change doc at "+
 			"EXACTLY submodules/%[1]s/docs/%[2]s-%[3]s.md, commit the code on branch %[2]s with a "+
-			"`Beehive: %[3]s <doc-path>` stamp and push it to the submodule's origin, bump the submodule "+
-			"pointer, then flip the PLAN.md task to NEEDS-REVIEW on main.",
+			"`Beehive: %[3]s <doc-path>` stamp and push it to the submodule's origin, then flip the PLAN.md "+
+			"task to NEEDS-REVIEW on main. Do NOT touch the submodule pointer (gitlink) — the runner pins it "+
+			"to the tracked-branch tip.",
 		sel.Submodule.Name, branch, sel.Task.ID)
 }
 
@@ -2086,16 +2108,56 @@ func hasTask(sel *selectt.Selection) bool {
 // (single-host install, most tests) is a no-op: the recorded pointer stands and
 // the worktree branches off HEAD as before.
 func (r *Runner) syncWorktreeBase(ctx context.Context, wg *git.Repo, sub repo.Submodule, absRoot string) error {
+	return r.pinPointerToTrackedTip(ctx, sub, absRoot)
+}
+
+// pinPointerToTrackedTip ENFORCES the submodule-pointer invariant: the
+// superproject gitlink for sub MUST ALWAYS equal the tip of sub's configured
+// tracked branch (.gitmodules submodule.<path>.branch, default "main") as it
+// exists on the submodule's origin — NEVER a bee-<taskid> tip, never an
+// intermediate merge parent, never any other commit. See
+// docs/submodule-pointer-invariant.md.
+//
+// It is the ONLY writer of the gitlink for a submodule under the swarm: the
+// runner calls it at work-pass start (so the code worktree branches off the live
+// tracked tip) AND at every task-bearing completion just before publishing (so
+// whatever the agent did in its checkout, the PUBLISHED pointer is re-derived
+// from origin/<branch> — correcting any stray bee-tip an agent might have staged).
+// A pointer that only ever names the tracked-branch tip can never dangle: the
+// tracked tip is, by definition, present on origin, so `git submodule update`
+// always resolves it and the primary tree stays healable.
+//
+// Self-contained: it (re)initializes the shared submodule checkout if a fresh
+// hive worktree left it an empty gitlink, fetches origin/<branch>, hard-resets
+// the checkout to that tip, and commits the gitlink (r.Git — the honeybee's
+// beehive worktree). Idempotent: ErrNothing when the recorded pointer already
+// equals the tip. A no-remote checkout (single-host install, most tests) has no
+// origin to pin against, so it keeps the recorded pointer (local-sharing: every
+// honeybee shares one object database, so "present locally" IS "shared").
+func (r *Runner) pinPointerToTrackedTip(ctx context.Context, sub repo.Submodule, absRoot string) error {
+	repoDir := sub.RepoDir()
+	rel, err := filepath.Rel(absRoot, repoDir)
+	if err != nil {
+		return fmt.Errorf("resolve submodule %s path: %w", sub.Name, err)
+	}
+	// A fresh `git worktree add` of the beehive repo does NOT populate submodules,
+	// so the checkout may be an empty gitlink; materialize it before reading its
+	// remote/branch. (No-op when already checked out.)
+	if !isSourceCheckout(ctx, repoDir) {
+		if _, err := r.Git.Run(ctx, "submodule", "update", "--init", "--", rel); err != nil {
+			return fmt.Errorf("init submodule %s checkout: %w", sub.Name, err)
+		}
+	}
+	if !isSourceCheckout(ctx, repoDir) {
+		return fmt.Errorf("submodule %s not checked out at %s", sub.Name, repoDir)
+	}
+	wg := git.New(repoDir)
 	rem, err := wg.Remote(ctx)
 	if err != nil {
 		return fmt.Errorf("submodule %s remote: %w", sub.Name, err)
 	}
 	if rem == "" {
-		return nil // no remote: nothing to sync, keep the recorded pointer
-	}
-	rel, err := filepath.Rel(absRoot, sub.RepoDir())
-	if err != nil {
-		return fmt.Errorf("resolve submodule %s path: %w", sub.Name, err)
+		return nil // no remote: nothing to pin against, keep the recorded pointer
 	}
 	branch := r.trackedBranch(ctx, rel)
 	if err := wg.Fetch(ctx, rem, branch); err != nil {
@@ -2104,16 +2166,16 @@ func (r *Runner) syncWorktreeBase(ctx context.Context, wg *git.Repo, sub repo.Su
 	if err := wg.HardReset(ctx, rem+"/"+branch); err != nil {
 		return fmt.Errorf("sync submodule %s to %s/%s: %w", sub.Name, rem, branch, err)
 	}
-	// Advance the beehive pointer to the synced tip (no review). Commit only the
-	// gitlink path so unrelated working-tree state is untouched; ErrNothing means
-	// the recorded pointer already matched the tip (no move to commit).
+	// Pin the beehive pointer to the tracked tip. Commit only the gitlink path so
+	// unrelated working-tree state is untouched; ErrNothing means the recorded
+	// pointer already matched the tip (nothing to move).
 	tip, err := wg.RevParse(ctx, "HEAD")
 	if err != nil {
-		return fmt.Errorf("resolve synced %s tip: %w", sub.Name, err)
+		return fmt.Errorf("resolve %s tracked tip: %w", sub.Name, err)
 	}
-	msg := fmt.Sprintf("beehive: sync %s worktree base to tracked tip %s", sub.Name, tip)
+	msg := fmt.Sprintf("beehive: pin %s pointer to tracked tip %s (invariant: gitlink == origin/%s)", sub.Name, tip, branch)
 	if err := r.Git.CommitPaths(ctx, msg, rel); err != nil && !errors.Is(err, git.ErrNothing) {
-		return fmt.Errorf("commit synced %s pointer: %w", sub.Name, err)
+		return fmt.Errorf("commit pinned %s pointer: %w", sub.Name, err)
 	}
 	return nil
 }
