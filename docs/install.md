@@ -155,3 +155,9 @@ system install's; a user install substitutes `~/.config/beehive`.
 Missing file/fields fall back to defaults. The installers write `gpg_recipient:
 beehive@localhost` to match the key they generate, so `beehive secret` works out
 of the box; bring your own key and set `gpg_recipient` to its identity.
+
+See [docs/sharing-modes.md](sharing-modes.md) for how a component detects
+local-sharing vs. remote-sharing from the repo's git remotes, and
+[docs/main-convergence-protocol.md](main-convergence-protocol.md) for the write
+protocol every remote-sharing writer to `main` must follow to avoid a
+silent-loss fork.
