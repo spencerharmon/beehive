@@ -185,6 +185,16 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   your pass COMPLETES as a clean yield (no doc needed for the yield — the FILED task carries its own).
   Only escalate `contradiction` when two intents genuinely OPPOSE and you cannot tell which is
   authoritative — never merely because a prerequisite is absent.
+- **A dependency looks `DONE` but its effect is absent → read it, then defer OR file — never escalate.**
+  Your cross-dep submodules are checked out at their tracked gitlink in your worktree
+  (`submodules/<dep-sm>/repo`), so INSPECT the dependency's real committed code before concluding
+  anything. Two honest outcomes, neither of them a human escalation: (a) the dep's work IS committed but
+  its running effect has not converged yet (GitOps reconcile, tenant reload, registry publish) — DEFER
+  per `skills/deferred-verification.md` and re-check; (b) the dep is marked `DONE` but the committed code
+  genuinely does NOT deliver what your task needs — `beehive task add` a corrective/follow-up task in the
+  OWNING submodule and `beehive task block` your task on it. A honeybee closes both; `beehive task human`
+  is for none of it. Do NOT `--category contradiction` here: a `DONE` status that disagrees with the
+  live world is a convergence-or-gap problem, not opposed intent.
 - Make the change in your worktree and PROVE it. Correctness is YOURS to establish, not the runner's to
   check: the runner verifies only protocol adherence (the change doc exists, the status transitioned,
   your work is committed) and never runs your tests, builds your code, or judges whether the change is
@@ -288,10 +298,17 @@ Done when the task leaves `NEEDS-ARBITRATION`.
      node, hardware/vendor, registrar/DNS, any out-of-GitOps / out-of-cluster op). **In-cluster
      kubectl is NOT this — it is your job.** Reason = the exact out-of-band action + why GitOps/in-
      cluster cannot do it.
-   - `contradiction` — the ROI is self-contradictory, the ROI and PLAN conflict, or two linked-
-     submodule ROIs oppose, and you cannot tell which is authoritative. Reason = the two conflicting
-     intents quoted with their locations + the decision needed. (Merely underspecified ≠
-     contradiction — pick a reading and continue.)
+   - `contradiction` — **strictly an INTENT conflict**: the ROI is self-contradictory, the ROI and
+     PLAN conflict, or two linked-submodule ROIs oppose, and you cannot tell which is authoritative.
+     Reason = the two conflicting intents quoted with their locations + the decision needed. (Merely
+     underspecified ≠ contradiction — pick a reading and continue.) A `contradiction` is a claim about
+     what the swarm was ASKED to do, never about what the world currently IS. A task status that
+     disagrees with observed reality is NOT a contradiction: a dependency marked `DONE` whose effect
+     you cannot yet observe is either (a) a running effect that has not converged — DEFER and re-check
+     (`skills/deferred-verification.md`), or (b) a genuine gap where the dep's real work is missing or
+     incomplete — FILE a follow-up task in the owning submodule and `beehive task block` your task on
+     it (see Work task / "Discovered a missing prerequisite" — a honeybee, not a human, closes that
+     gap). Escalate `contradiction` ONLY when two stated intents genuinely OPPOSE.
    - `architecture` — a high-level, hard-to-reverse, user-visible decision (wire format, on-disk
      schema, public API, an architecture fork). Reason = the options + each one's user-visible
      consequence. (An internal choice with no user-visible difference ≠ architecture — pick the

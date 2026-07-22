@@ -777,6 +777,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if err := wg.WorktreeAdd(ctx, wtAbs, res.Branch, "HEAD"); err != nil {
 			return res, fmt.Errorf("worktree add: %w", err)
 		}
+		// Populate the sibling submodule checkouts this task's cross-deps name, so the
+		// honeybee can READ its dependency's real code (not an empty gitlink). Best-
+		// effort: never aborts the pass. See initLinkedSubmoduleCheckouts.
+		r.initLinkedSubmoduleCheckouts(ctx, sel, absRoot)
 	}
 
 	// Context preamble: shipped in the binary (NOT the on-disk AGENTS.md, which is
@@ -2252,6 +2256,65 @@ func hasTask(sel *selectt.Selection) bool {
 // submodule's origin, so the bumped pointer never dangles. A no-remote checkout
 // (single-host install, most tests) is a no-op: the recorded pointer stands and
 // the worktree branches off HEAD as before.
+// initLinkedSubmoduleCheckouts populates the sibling submodule checkouts named in a
+// work task's cross-submodule dependencies (deps=<sm>:<id>) so the honeybee can READ
+// its dependency's real code. A fresh `git worktree add` of the beehive repo leaves
+// every sibling submodules/<sm>/repo an EMPTY gitlink — only the pass's OWN submodule
+// is initialized at worktree-creation time. A dependent that then inspects an empty
+// dependency tree draws false conclusions (the exact failure that turned a legitimate
+// "wait for the dependency's effect to converge" into a bogus contradiction escalation:
+// the honeybee could not see its cross-dep's committed code and fell back on stale
+// narrative). Each named dependency submodule is checked out at its RECORDED gitlink —
+// i.e. the commit the beehive pointer tracks on main, which is the dependency's landed
+// (DONE) state — never re-synced to origin, so the honeybee reads exactly what its
+// dependency committed.
+//
+// Best-effort per submodule: a sibling that cannot be checked out (offline, missing
+// gitlink) logs a warning but NEVER aborts the pass — the honeybee can still verify a
+// running effect against the live system. Only cross-submodule deps are handled; a bare
+// local dep has no ":" and is skipped, as is the pass's own submodule (already set up).
+func (r *Runner) initLinkedSubmoduleCheckouts(ctx context.Context, sel *selectt.Selection, absRoot string) {
+	if len(sel.Task.Deps) == 0 {
+		return
+	}
+	subs, err := r.Repo.Submodules()
+	if err != nil {
+		r.logConcise("[honeybee] warn: list submodules for cross-dep checkout: %v\n", err)
+		return
+	}
+	byName := make(map[string]repo.Submodule, len(subs))
+	for _, s := range subs {
+		byName[s.Name] = s
+	}
+	seen := make(map[string]bool)
+	for _, d := range sel.Task.Deps {
+		tsm, _, ok := strings.Cut(strings.TrimSpace(d), ":")
+		if !ok || tsm == "" || tsm == sel.Submodule.Name || seen[tsm] {
+			continue
+		}
+		seen[tsm] = true
+		sub, known := byName[tsm]
+		if !known {
+			r.logConcise("[honeybee] warn: cross-dep names unknown submodule %s; skipping checkout\n", tsm)
+			continue
+		}
+		repoDir := sub.RepoDir()
+		if isSourceCheckout(ctx, repoDir) {
+			continue // already populated (shared object DB / prior init)
+		}
+		rel, relErr := filepath.Rel(absRoot, repoDir)
+		if relErr != nil {
+			r.logConcise("[honeybee] warn: resolve cross-dep submodule %s path: %v\n", tsm, relErr)
+			continue
+		}
+		if _, uerr := r.Git.Run(ctx, "submodule", "update", "--init", "--", rel); uerr != nil {
+			r.logConcise("[honeybee] warn: init cross-dep submodule %s checkout (dependency code unreadable this pass): %v\n", tsm, uerr)
+			continue
+		}
+		r.logConcise("[honeybee] cross-dep submodule %s checked out at tracked gitlink for reading\n", tsm)
+	}
+}
+
 func (r *Runner) syncWorktreeBase(ctx context.Context, wg *git.Repo, sub repo.Submodule, absRoot string) error {
 	return r.pinPointerToTrackedTip(ctx, sub, absRoot)
 }

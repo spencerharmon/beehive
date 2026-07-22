@@ -101,6 +101,11 @@ exact complement. Each pass, the runner automatically:
   `submodules/<sm>/worktrees/bee-<taskid>/` off the submodule tip before turn 1. The
   agent edits there and never runs worktree/submodule plumbing or writes
   `submodules/<sm>/repo`.
+- **Checks out the cross-dep sibling submodules** a work task names in `deps=<sm>:<id>`
+  into the pass worktree at their tracked gitlink, so the agent can READ its
+  dependency's real committed code (`submodules/<dep-sm>/repo`) instead of an empty
+  gitlink. Best-effort (an unreachable sibling never aborts the pass); the agent never
+  runs the submodule plumbing itself.
 - **Reverts git-config / remote drift** every turn, so a stray remote never outlives
   a turn.
 - **Guards task removal** — pulls `main`; if the plan or the task vanished under it,
