@@ -11,3 +11,8 @@
   <span class="ago">{{.Ago}} ago</span>
 </li>{{else}}<li>no sessions yet</li>{{end}}
 </ul>
+{{with .Nav}}{{if gt .Pages 1}}<nav class="pagination" aria-label="sessions pages">
+  {{if .HasPrev}}<a href="/submodule/{{$.Name}}/sessions?page={{.PrevPage}}" rel="prev">← newer</a>{{else}}<span class="disabled">← newer</span>{{end}}
+  <span class="page-of">page {{.Page}} of {{.Pages}} · {{.Total}} sessions</span>
+  {{if .HasNext}}<a href="/submodule/{{$.Name}}/sessions?page={{.NextPage}}" rel="next">older →</a>{{else}}<span class="disabled">older →</span>{{end}}
+</nav>{{end}}{{end}}

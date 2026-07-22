@@ -5,7 +5,7 @@
      role="status" aria-live="polite"
      data-scroll-preserve
      hx-ext="morph"
-     hx-get="/submodule/{{.Name}}/sessions/body"
+     hx-get="/submodule/{{.Name}}/sessions/body?page={{.Page}}"
      hx-trigger="load, every 2s"
      hx-swap="morph:innerHTML">
   {{template "skeleton-list"}}

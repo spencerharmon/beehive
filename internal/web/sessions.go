@@ -155,8 +155,60 @@ func (s *Server) sessionLinksFor(ctx context.Context, head string, sm repo.Submo
 	return out
 }
 
+// sessionsPageSize bounds how many sessions the sessions view renders at once
+// (pageload-sessions-pagination): the sessions/ directory grows without limit as
+// a hive runs, so rendering EVERY session per paint makes load cost scale with
+// total session count. The list is windowed to one page of this many sessions
+// and the expensive per-session work (transcript read for stub/tags, live-branch
+// git resolution, and delivery-link resolution) is done ONLY for the page's
+// window, so a paint's cost is bounded by the page size regardless of how many
+// sessions the submodule has accumulated. Overridable at runtime via
+// BEEHIVE_SESSIONS_PAGE_SIZE (a positive integer) without a code change.
+const sessionsPageSize = 50
+
+// sessionsPageSizeFor returns the effective page size, honoring the
+// BEEHIVE_SESSIONS_PAGE_SIZE override (a positive integer) and falling back to
+// sessionsPageSize otherwise.
+func sessionsPageSizeFor() int {
+	if v := os.Getenv("BEEHIVE_SESSIONS_PAGE_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return sessionsPageSize
+}
+
+// pageParam parses a 1-based ?page= query value, defaulting to 1 and clamping
+// anything non-positive/unparseable up to 1. The upper bound is clamped by the
+// caller once the total page count is known.
+func pageParam(r *http.Request) int {
+	if v := r.URL.Query().Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 1 {
+			return n
+		}
+	}
+	return 1
+}
+
+// sessionPage is one bounded window of the sessions list plus the navigation
+// state the template needs to render prev/next controls
+// (pageload-sessions-pagination).
+type sessionPage struct {
+	Sessions []sessionInfo
+	Page     int  // 1-based current page
+	Pages    int  // total number of pages (>=1)
+	Total    int  // total session count across all pages
+	Size     int  // page size in effect
+	HasPrev  bool // a previous (newer) page exists
+	HasNext  bool // a following (older) page exists
+	PrevPage int  // page number to navigate back to
+	NextPage int  // page number to navigate forward to
+}
+
 // sessionsList is the page shell; the listing body auto-refreshes via HTMX so
-// new sessions appear and live ones update without a manual reload.
+// new sessions appear and live ones update without a manual reload. The current
+// page (?page=) is threaded into the body's poll URL so the auto-refresh stays
+// on the page the viewer navigated to (pageload-sessions-pagination).
 func (s *Server) sessionsList(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -166,13 +218,18 @@ func (s *Server) sessionsList(w http.ResponseWriter, r *http.Request) {
 	// Follow off-box runs: fast-forward local main so an agent's sessions on
 	// another host are visible on first paint, not only after the body poll.
 	s.followMain(r.Context(), time.Now())
-	s.render(w, "session_list.html", map[string]interface{}{"Name": sm.Name, "Title": pageTitle("sessions", sm.Name), "Crumbs": sessionsCrumbs(sm.Name)})
+	s.render(w, "session_list.html", map[string]interface{}{
+		"Name": sm.Name, "Title": pageTitle("sessions", sm.Name),
+		"Crumbs": sessionsCrumbs(sm.Name), "Page": pageParam(r),
+	})
 }
 
-// sessionsListBody returns just the <ul>, read live from the sessions dir.
-// Polled every 2s (session_list.html); renderConditional (web.go) ETags the
-// rendered bytes so a repeat poll with nothing new (the common case once a
-// submodule's sessions are all idle) 304s instead of re-sending the list.
+// sessionsListBody returns just the <ul> plus pagination nav, read live from the
+// sessions dir. Polled every 2s (session_list.html); renderConditional (web.go)
+// ETags the rendered bytes so a repeat poll with nothing new (the common case
+// once a submodule's sessions are all idle) 304s instead of re-sending the list.
+// It renders only the requested page's window (pageload-sessions-pagination) so
+// its cost is bounded by the page size, not the total session count.
 func (s *Server) sessionsListBody(w http.ResponseWriter, r *http.Request) {
 	sm, err := s.submodule(r.PathValue("name"))
 	if err != nil {
@@ -181,8 +238,9 @@ func (s *Server) sessionsListBody(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	sync := s.followMain(r.Context(), now)
+	page := s.sessionInfosPage(r.Context(), sm, now, s.ttl(), pageParam(r), sessionsPageSizeFor())
 	s.renderConditional(w, r, "session_list_body.html", map[string]interface{}{
-		"Name": sm.Name, "Sessions": s.sessionInfos(r.Context(), sm, now, s.ttl()), "Sync": sync,
+		"Name": sm.Name, "Sessions": page.Sessions, "Sync": sync, "Nav": page,
 	})
 }
 
@@ -466,38 +524,57 @@ func (s *Server) readSessionBranch(ctx context.Context, branch, rel string) (str
 	return "", false
 }
 
-// sessionInfos lists recorded sessions from the committed sessions dir. Live
-// unions the SAME two canonical signals activeHoneybees does (active-honeybee-
-// count-unify): a fresh PLAN-task claim on this session id (claimed, from sm's
-// own plan view), OR — the only signal available for a claimless Bootstrap/
-// Reconcile pass — a STUB file whose streaming branch still exists. It does not
-// call activeHoneybees directly: this is itself a sessions/ directory walk (run
-// on a 2s poll via sessionsListBody), so re-scanning the same directory a
-// second time would double the I/O for no benefit; claimedSessions (a cheap,
-// no-I/O map over the already-cached plan view) supplies the claim half
-// in-line instead. An entry whose file is a STUB is a running session: its
-// freshness/liveness come from the streaming branch's tip commit time, not the
-// stub's (fixed) mtime. A non-stub entry is a finished session, dated by its
-// file mtime.
+// sessionInfos lists ALL recorded sessions from the committed sessions dir,
+// newest-first. It is the un-paginated convenience form (a full window) retained
+// for callers/tests that want every session; the live sessions view uses the
+// bounded sessionInfosPage instead (pageload-sessions-pagination). See
+// sessionInfosPage for the Live/tags/link semantics.
+func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.Time, ttl time.Duration) []sessionInfo {
+	return s.sessionInfosPage(ctx, sm, now, ttl, 1, 1<<30).Sessions
+}
+
+// sessionInfosPage is the bounded, paginated form of sessionInfos
+// (pageload-sessions-pagination). It renders ONE window of at most `size`
+// sessions selected by the 1-based `page`, and — crucially — does the expensive
+// per-session work (reading the transcript to detect a stub and derive its
+// kind/model tags, the live stream-branch git resolution, and the delivery-link
+// resolution) ONLY for that window. The full directory is enumerated (a cheap
+// ReadDir with no per-file read) and pre-sorted newest-first by the entry's file
+// mtime so paging is stable and page 1 holds the most-recent sessions; the
+// window is then re-sorted by its refined Modified time (a stub's live-branch
+// tip) so ordering within the page stays exact. Cost is therefore bounded by
+// `size`, not by the total number of accumulated sessions — the whole point of
+// paginating this otherwise-unbounded list. Live/tags/link semantics are
+// identical to the un-paginated path; see the original notes below.
+//
+// Live unions the SAME two canonical signals activeHoneybees does (active-
+// honeybee-count-unify): a fresh PLAN-task claim on this session id (claimed,
+// from sm's own plan view), OR — the only signal available for a claimless
+// Bootstrap/Reconcile pass — a STUB file whose streaming branch still exists.
+// An entry whose file is a STUB is a running session: its freshness/liveness
+// come from the streaming branch's tip commit time, not the stub's (fixed)
+// mtime. A non-stub entry is a finished session, dated by its file mtime.
 //
 // Display/Kind/Model/sessionLink are session-list-links-labels' additions: a
 // shortened display name (sessionDisplayName), the kind+model tags stats-tag-
-// model's sessionTags already derives from the SAME transcript (a live/stub
-// session has no header yet, so both are leniently "" until it finalizes),
-// and the task/doc/commit resolution (sessionLinksFor) — "link every session
-// to the change(s) it moved".
-func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.Time, ttl time.Duration) []sessionInfo {
+// model's sessionTags derives from the SAME transcript, and the task/doc/commit
+// resolution (sessionLinksFor).
+func (s *Server) sessionInfosPage(ctx context.Context, sm repo.Submodule, now time.Time, ttl time.Duration, page, size int) sessionPage {
 	dir := sm.SessionsDir()
 	ents, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		return sessionPage{Page: 1, Pages: 1, Size: size}
 	}
-	head := s.headSHA(ctx)
-	p, _ := s.planView(head, sm.PlanPath(), now, ttl)
-	claimed := claimedSessions(p)
-	rem, _ := s.git.Remote(ctx)
-	var out []sessionInfo
-	var ids []string
+	if size < 1 {
+		size = 1
+	}
+	// Cheap pre-pass: collect .md entries with their file mtime (no file read),
+	// so the window can be chosen before paying any per-session I/O.
+	type entRef struct {
+		id  string
+		mod time.Time
+	}
+	var refs []entRef
 	for _, e := range ents {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
@@ -506,10 +583,43 @@ func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.T
 		if err != nil {
 			continue
 		}
-		id := strings.TrimSuffix(e.Name(), ".md")
-		mod := fi.ModTime()
+		refs = append(refs, entRef{id: strings.TrimSuffix(e.Name(), ".md"), mod: fi.ModTime()})
+	}
+	// Newest-first by file mtime so page 1 holds the freshest sessions.
+	sort.Slice(refs, func(i, j int) bool { return refs[i].mod.After(refs[j].mod) })
+
+	total := len(refs)
+	pages := (total + size - 1) / size
+	if pages < 1 {
+		pages = 1
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > pages {
+		page = pages
+	}
+	start := (page - 1) * size
+	if start > total {
+		start = total
+	}
+	end := start + size
+	if end > total {
+		end = total
+	}
+	window := refs[start:end]
+
+	head := s.headSHA(ctx)
+	p, _ := s.planView(head, sm.PlanPath(), now, ttl)
+	claimed := claimedSessions(p)
+	rem, _ := s.git.Remote(ctx)
+	out := make([]sessionInfo, 0, len(window))
+	ids := make([]string, 0, len(window))
+	for _, ref := range window {
+		id := ref.id
+		mod := ref.mod
 		live := claimed[id]
-		if raw, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
+		if raw, err := os.ReadFile(filepath.Join(dir, id+".md")); err == nil {
 			if branch, isStub := repo.ParseSessionStub(string(raw)); isStub {
 				// A stub streams to an isolated branch that the honeybee deletes on exit
 				// (deferred, even on error/orphaned publish). So branch existence tracks
@@ -522,7 +632,7 @@ func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.T
 				}
 			}
 		}
-		tags := s.sessionTags(sessionRef{submodule: sm.Name, path: filepath.Join(dir, e.Name())})
+		tags := s.sessionTags(sessionRef{submodule: sm.Name, path: filepath.Join(dir, id+".md")})
 		ids = append(ids, id)
 		out = append(out, sessionInfo{
 			ID:       id,
@@ -538,9 +648,20 @@ func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.T
 	for i := range out {
 		out[i].sessionLink = links[out[i].ID]
 	}
-	// Newest activity first so running sessions sit at the top.
+	// Refine ordering within the page by the resolved Modified time (a stub's
+	// live-branch tip can differ from its file mtime).
 	sort.Slice(out, func(i, j int) bool { return out[i].Modified.After(out[j].Modified) })
-	return out
+	return sessionPage{
+		Sessions: out,
+		Page:     page,
+		Pages:    pages,
+		Total:    total,
+		Size:     size,
+		HasPrev:  page > 1,
+		HasNext:  page < pages,
+		PrevPage: page - 1,
+		NextPage: page + 1,
+	}
 }
 
 // branchTipTime returns the last-commit time of a session branch (preferring the
