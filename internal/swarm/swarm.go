@@ -803,6 +803,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"unlock dependents. Do NOT touch the submodule pointer (gitlink) yourself — the runner pins it to the "+
 				"tracked-branch tip; that is the ONLY value it may ever hold (see docs/submodule-pointer-invariant.md). "+
 				"REJECT -> PLAN.md task NEEDS-ARBITRATION + rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
+				"HANDOFF GATE (same for every terminal flip): before your flip is accepted the runner requires a CLEAN "+
+				"submodules/%[1]s/repo checkout, your PLAN.md flip COMMITTED, the change doc "+
+				"submodules/%[1]s/docs/bee-%[2]s-%[2]s.md COMMITTED with a first-line `<!-- Beehive-Commits: <sha>,<sha> -->` "+
+				"header (or `none`), and a matching `commits=<sha>,<sha>` (or `commits=none`) tag on the PLAN.md task "+
+				"header naming EXACTLY the submodule commits THIS session produced (an APPROVE merge commit; `none` for a "+
+				"REJECT that changed no code) — every referenced sha must actually exist in %[1]s. Commit the PLAN flip "+
+				"and the doc together, THIS session.\n"+
 				"The run completes when the task leaves NEEDS-REVIEW. Act autonomously.\n\n",
 			smName, sel.Task.ID)
 	case selectt.Arbitrate:
@@ -818,6 +825,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"tracked-branch tip (see docs/submodule-pointer-invariant.md). "+
 				"SIDE WITH REVIEWER -> PLAN.md TODO with the binding rationale; if a concrete operator blocker is exposed, "+
 				"run beehive task human %[1]s %[2]s --reason \"<specific blocker>\".\n"+
+				"HANDOFF GATE (same for every terminal flip): before your flip is accepted the runner requires a CLEAN "+
+				"submodules/%[1]s/repo checkout, your PLAN.md flip COMMITTED, the change doc "+
+				"submodules/%[1]s/docs/bee-%[2]s-%[2]s.md COMMITTED with a first-line `<!-- Beehive-Commits: <sha>,<sha> -->` "+
+				"header (or `none`), and a matching `commits=<sha>,<sha>` (or `commits=none`) tag on the PLAN.md task "+
+				"header naming EXACTLY the submodule commits THIS session produced (a merge commit if you side with the "+
+				"implementer; `none` for a TODO reset) — every referenced sha must actually exist in %[1]s. Commit the PLAN "+
+				"flip and the doc together, THIS session.\n"+
 				"The run completes when the task leaves NEEDS-ARBITRATION. Act autonomously.\n\n",
 			smName, sel.Task.ID)
 	case selectt.Work:
@@ -834,8 +848,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		onComplete := ""
 		if !r.LeanInject {
 			onComplete = fmt.Sprintf(
-				"On completion of a Work task: PLAN.md -> NEEDS-REVIEW on main; commit the code on branch %[1]s "+
-					"with a `Beehive: %[2]s <doc-path>` stamp and ensure that commit is pushed to the submodule's origin. "+
+				"On completion of a Work task: commit the code on branch %[1]s with a `Beehive: %[2]s <doc-path>` stamp "+
+					"and push that commit to the submodule's origin FIRST; then record its sha(s) as a `commits=<sha>[,<sha>]` "+
+					"tag on the PLAN.md task header (or `commits=none` if this task changed no submodule code) AND as the "+
+					"change doc's first-line `<!-- Beehive-Commits: <sha>,<sha> -->` header (same set), flip PLAN.md -> "+
+					"NEEDS-REVIEW, and COMMIT the PLAN flip + doc together. The runner's handoff gate refuses the flip unless "+
+					"your code worktree is clean, the flip and doc are COMMITTED, and every commit named in the tag actually "+
+					"exists — so do the submodule commit+push BEFORE recording the tag. "+
 					"Do NOT bump or otherwise write the submodule pointer (gitlink) — the runner owns it and pins it to the "+
 					"tracked-branch tip; a bee-branch tip must NEVER be recorded (see docs/submodule-pointer-invariant.md).\n",
 				res.Branch, taskID(sel))

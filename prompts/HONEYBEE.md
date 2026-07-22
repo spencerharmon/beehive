@@ -248,19 +248,35 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   the pointer: it pins the gitlink to the tracked-branch tip (`origin/<branch>`) at completion, which is
   the ONLY value it may ever hold. Never run `git update-index --cacheinfo ... submodules/<sm>/repo`,
   never stage or commit the gitlink. See `docs/submodule-pointer-invariant.md`.
-- **The NEEDS-REVIEW handoff runs a deterministic two-part protocol gate.** Before the runner accepts
-  your flip as done it checks (1) `git status --porcelain` in your code worktree and (2) that your change
-  doc is COMMITTED in your beehive-layer (hive) worktree HEAD. If ANY change in the code worktree is still
-  uncommitted (modified OR untracked), OR your change doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md`
-  is written but not committed, the handoff is REFUSED and handed straight back for you to commit this same
-  session — because the runner only ever merges commits that already exist (the code on `bee-<taskid>`, the
-  doc + PLAN flip on your hive branch), so an edit written but never committed would be silently dropped.
-  Note the asymmetry: the runner commits your PLAN.md status flip for you (via its claim/heartbeat/release
-  commits) but NEVER commits your change doc — an uncommitted doc lands NEEDS-REVIEW on main with no doc and
-  the reviewer rejects it. "I wrote the files" is not "I committed the files": a task is not done until
-  both the code diff is a real commit on your pushed branch AND the change doc is a real commit on your hive
-  branch. (This is exactly the bug that shipped an empty flux base-job task and stranded its gostream
-  dependent, and later the doc-less flux zuul-github task that thrashed review→arbitration→TODO.)
+- **Every terminal handoff runs the SAME deterministic protocol gate — Work, Review, and Arbitrate
+  alike.** Before the runner accepts your flip as done (Work→{NEEDS-REVIEW,NEEDS-ARBITRATION,DONE},
+  Review→{DONE,NEEDS-ARBITRATION}, Arbitrate→{DONE,TODO}; a `NEEDS-HUMAN` escalation is never gated) it
+  verifies FOUR committed-artifact invariants, all protocol (never correctness):
+  1. **Clean submodule checkout** — `git status --porcelain` in the checkout you touched (your code
+     worktree for Work; `submodules/<sm>/repo` for a Review/Arbitrate that merged a bee-branch) is empty.
+     Any uncommitted change (modified OR untracked) means work you never committed, which the merge drops.
+  2. **Status flip COMMITTED** — your `TODO→…`/`NEEDS-REVIEW→…`/`NEEDS-ARBITRATION→…` edit to `PLAN.md`
+     is a real commit in your hive branch HEAD, not just on disk. The runner merges only committed
+     history and does NOT commit the flip for you: an on-disk-only flip is silently lost if the pass ends
+     on a wall-clock/GC boundary (this is exactly what stranded an arbitration whose TODO decision never
+     landed).
+  3. **Change doc COMMITTED** — the doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` is committed in
+     your hive branch HEAD (every terminal handoff writes/updates it, including Review and Arbitrate).
+  4. **`commits=` tag present, mirrored, and REAL** — record the submodule commits THIS session produced
+     on the task header (`commits=<sha>[,<sha>...]`, or `commits=none` if you made no submodule commit)
+     AND as the doc's first-line header `<!-- Beehive-Commits: <sha>,<sha> -->` / `<!-- Beehive-Commits:
+     none -->`; the two sets must MATCH, and every referenced sha must actually exist in the submodule.
+     Because the gate verifies the referenced commits exist, do the SUBMODULE work FIRST — commit your
+     code and push `bee-<taskid>` to the submodule origin — THEN record its sha(s) in the tag and commit
+     the PLAN flip + doc. A tag naming a commit that does not exist (a phantom/bad-object stamp) is
+     REFUSED with the requirement to create the commit or correct the tag.
+  Any failing invariant REFUSES the handoff and hands you back the ONE thing to fix, same session — leave
+  the status as-is and commit forward. "I wrote the files" is not "I committed the files": a task is not
+  done until the code diff is a real pushed commit, and the PLAN flip + doc (with a truthful `commits=`
+  tag) are real commits on your hive branch. (These are the exact bugs this gate exists to stop: an empty
+  flux base-job task that shipped no code, a doc-less flux task that thrashed review→arbitration→TODO, an
+  arbitration whose status flip was never committed, and phantom `review=` stamps pointing at commits
+  that exist nowhere.)
 - Flip the `PLAN.md` task `TODO → NEEDS-REVIEW` on main and commit.
 
 ## Review task

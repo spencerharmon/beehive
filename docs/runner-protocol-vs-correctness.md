@@ -59,12 +59,19 @@ judges whether the code a honeybee produced is CORRECT.**
 
 ## What this means in code
 
-- The handoff gate (`internal/swarm/verify.go`) runs exactly one thing on the
-  `TODO -> NEEDS-REVIEW` handoff: `git status --porcelain` in the code worktree,
-  and blocks the handoff if it is dirty (uncommitted work would be dropped by the
-  merge). It runs **no** `gofmt`/`go vet`/`go test` and inspects **no** go.mod —
-  those were removed precisely because they were a language special-case doing the
-  honeybee's job. See that file's header for the full rationale.
+- The handoff gate (`internal/swarm/verify.go`) is UNIFORM across every terminal
+  handoff (Work→{NEEDS-REVIEW,NEEDS-ARBITRATION,DONE}, Review→{DONE,NEEDS-ARBITRATION},
+  Arbitrate→{DONE,TODO}; `NEEDS-HUMAN` is never gated). It checks four committed-
+  artifact PROTOCOL facts: (1) the submodule checkout is clean (`git status
+  --porcelain`); (2) the status flip is COMMITTED in the hive HEAD (`git show
+  HEAD:…PLAN.md` — the agent commits its own flip, the runner only merges it); (3) the
+  change doc is COMMITTED (`git ls-tree`/`git show`); (4) the `commits=` tag on the
+  committed plan matches the doc's `<!-- Beehive-Commits: … -->` header and every
+  referenced sha exists in the submodule (`git cat-file -e`). It runs **no**
+  `gofmt`/`go vet`/`go test` and inspects **no** go.mod — those were removed precisely
+  because they were a language special-case doing the honeybee's job. Each of the four
+  is a language-agnostic fact (clean/dirty, committed/not, sha-exists/not); none judges
+  whether the code is correct. See that file's header for the full rationale.
 
 - The completion checklists (`workChecklist`, and the review/arbitrate/bootstrap/
   reconcile predicates in `completionChecklist`) read only the beehive layer —

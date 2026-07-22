@@ -110,15 +110,22 @@ exact complement. Each pass, the runner automatically:
   a turn.
 - **Guards task removal** — pulls `main`; if the plan or the task vanished under it,
   the pass ends rather than working something nobody wants.
-- **Checks completion deterministically** each turn, per kind — work: terminal status
-  (`DONE` / `NEEDS-REVIEW` / `NEEDS-ARBITRATION`, or `NEEDS-HUMAN` with a reason) AND
-  the change doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` AND (on a
-  `TODO`→`NEEDS-REVIEW` handoff) both a clean code worktree (`git status --porcelain`
-  empty, so your change is actually committed) AND that change doc COMMITTED in the hive
-  worktree HEAD (`git ls-tree`, so the doc actually publishes to main — the runner
-  commits your PLAN.md flip but never your doc); review: task left
-  `NEEDS-REVIEW`; arbitrate: task left `NEEDS-ARBITRATION`; reconcile: `PLAN.md`'s ROI
-  stamp matches `ROI.md` HEAD; bootstrap: `PLAN.md` exists. These are all PROTOCOL
+- **Checks completion deterministically** each turn, per kind, then runs the UNIFORM
+  HANDOFF GATE before accepting any terminal flip — Work→{NEEDS-REVIEW,NEEDS-ARBITRATION,
+  DONE}, Review→{DONE,NEEDS-ARBITRATION}, Arbitrate→{DONE,TODO}; a `NEEDS-HUMAN`
+  escalation is never gated. The gate verifies four committed-artifact PROTOCOL
+  invariants: (1) a clean submodule checkout (`git status --porcelain`); (2) the status
+  flip COMMITTED in the hive HEAD (the agent commits the flip — the runner merges it, it
+  does NOT commit the flip for the agent, so an on-disk-only flip is lost on a
+  wall-clock/GC exit); (3) the change doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md`
+  COMMITTED in HEAD (`git ls-tree`/`git show`); (4) a `commits=<sha>,…`/`commits=none` tag
+  on the committed PLAN task, a matching `<!-- Beehive-Commits: … -->` doc header, and
+  every referenced sha actually present in the submodule (`git cat-file -e`) — so a flip
+  can never reference a phantom/bad-object commit. Any failing invariant hands the agent
+  the ONE fix-forward requirement, same session. Base per-kind completion predicate:
+  work — terminal status AND the change doc present; review — task left `NEEDS-REVIEW`;
+  arbitrate — task left `NEEDS-ARBITRATION`; reconcile — `PLAN.md`'s ROI stamp matches
+  `ROI.md` HEAD; bootstrap — `PLAN.md` exists. These are all PROTOCOL
   checks — mechanical, language-agnostic facts. The runner NEVER runs your tests, builds
   your code, or judges correctness; correctness is owned by the work/review/arbitration
   honeybees using the target's own tests/pipelines (see
