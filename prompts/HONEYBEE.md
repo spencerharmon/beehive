@@ -190,7 +190,8 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   (`submodules/<dep-sm>/repo`), so INSPECT the dependency's real committed code before concluding
   anything. Two honest outcomes, neither of them a human escalation: (a) the dep's work IS committed but
   its running effect has not converged yet (GitOps reconcile, tenant reload, registry publish) — DEFER
-  per `skills/deferred-verification.md` and re-check; (b) the dep is marked `DONE` but the committed code
+  per `skills/deferred-verification.md` and re-check, BUT first confirm the effect can converge PASSIVELY
+  and is not merely a stale consumer you must restart/reload yourself (see "Deployed ≠ loaded" below); (b) the dep is marked `DONE` but the committed code
   genuinely does NOT deliver what your task needs — `beehive task add` a corrective/follow-up task in the
   OWNING submodule and `beehive task block` your task on it. A honeybee closes both; `beehive task human`
   is for none of it. Do NOT `--category contradiction` here: a `DONE` status that disagrees with the
@@ -214,6 +215,21 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   with the exact pending check named in the doc, or re-check until it converges — NEVER flip a
   deploy/service/migration task `DONE` on the ASSUMPTION it will reconcile. A service claimed done that
   was never actually deployed is precisely the failure this rule exists to prevent.
+- **Deployed ≠ loaded: converge it ACTIVELY before you defer.** Before you conclude "the effect will
+  appear on its own, I'll defer and re-check," answer ONE question: will a bounded PASSIVE process
+  produce it (a GitOps reconcile you already triggered, a CI run, a cache TTL), or is the change applied
+  but sitting inert because a CONSUMER has not picked it up? Many components read their config only at
+  START-UP (Zuul reads `[connection ...]`/tenant sources from `zuul.conf` only when the scheduler boots;
+  a Deployment reads a ConfigMap/Secret only at pod start), so an applied change is invisible FOREVER
+  until you restart/reload that consumer — no amount of polling will ever converge it. You have in-cluster
+  kubectl and it IS your job (not an operator escalation): check the live consumer (e.g.
+  `curl .../api/connections`, `.../api/tenant/<t>/projects`), and if the applied change is absent because
+  the consumer is stale, PERFORM the remediation yourself (`kubectl -n <ns> rollout restart deploy/<name>`,
+  force a reconcile, trigger the pipeline), re-verify the effect flipped live, THEN complete — and
+  DOCUMENT the requirement (in the change doc and the submodule `INFRASTRUCTURE.md`) so the next honeybee,
+  and ideally the manifests themselves, encode the restart. `skills/deferred-verification.md` covers ONLY
+  the passive case; deferring a change that needs an action you can take now is the loop that stranded
+  `gostream-image-build-verify` for a dozen passes.
 - Write the change doc at EXACTLY `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` (the beehive layer,
   NOT inside the code worktree). The runner's completion check requires it there; a doc elsewhere reads
   as "not done". The doc MUST carry the evidence from the two rules above — the regression test's command
