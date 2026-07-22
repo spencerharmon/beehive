@@ -4548,3 +4548,115 @@ func TestPredicateHardStopNoSpuriousCancel(t *testing.T) {
 		t.Fatalf("want the ordinary TurnTimeout warning, got %q", res.Warning)
 	}
 }
+
+// reportLine returns the checklist line (from a continuationReport) whose text
+// contains sub, or "" if none. Lines are the "  [x] label" entries.
+func reportLine(report, sub string) string {
+	for _, ln := range strings.Split(report, "\n") {
+		if strings.Contains(ln, sub) && strings.Contains(ln, "[") {
+			return ln
+		}
+	}
+	return ""
+}
+
+// TestContinuationReportEnumeratesPredicates proves the between-turn prompt the
+// runner sends (nextPrompt/continuationReport) is NOT the bare "continue" but a
+// per-kind checklist of the completion predicates each marked met/unmet, computed
+// from the SAME source as the deterministic completion check (completionChecklist,
+// which complete() reduces over). It also exercises the accept criterion that a
+// line flips unmet->met when the underlying artifact is produced, and the negative
+// control: the bare-"continue" text does not satisfy the assertions.
+func TestContinuationReportEnumeratesPredicates(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	os.WriteFile(filepath.Join(sm, "ROI.md"), []byte("intent\n"), 0o644)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	ctx := context.Background()
+	g.Commit(ctx, "seed")
+	roiHead, _ := g.LastCommit(ctx, "submodules/sm/ROI.md")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	r := &Runner{Repo: rp, Git: g}
+
+	// --- Work kind: two predicates, both initially unmet. ---
+	work := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+	rep := r.nextPrompt(work, "bee-T1")
+	// Negative control: a bare "continue" would fail every assertion below.
+	if rep == "continue" {
+		t.Fatal("work continuation prompt must be the checklist report, not the bare \"continue\"")
+	}
+	if !strings.HasPrefix(rep, "continue.") {
+		t.Fatalf("report must still lead with a continue instruction, got:\n%s", rep)
+	}
+	statusLine := reportLine(rep, "terminal STATUS set")
+	docLine := reportLine(rep, "change doc present at submodules/sm/docs/bee-T1-T1.md")
+	if statusLine == "" || docLine == "" {
+		t.Fatalf("work report missing the terminal-status and/or change-doc predicate:\n%s", rep)
+	}
+	if !strings.Contains(statusLine, "[ ]") || !strings.Contains(docLine, "[ ]") {
+		t.Fatalf("both work predicates should read UNMET at the start:\n%s", rep)
+	}
+	// The report agrees with the deterministic completion check.
+	if done, _ := r.complete(work, "bee-T1"); done {
+		t.Fatal("complete() must be false while both work predicates are unmet")
+	}
+
+	// Produce the change doc: its predicate line flips unmet -> met, the status
+	// line stays unmet, and completion is still not reached.
+	os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+	rep = r.nextPrompt(work, "bee-T1")
+	if l := reportLine(rep, "change doc present"); !strings.Contains(l, "[x]") {
+		t.Fatalf("change-doc line must flip to MET once the doc exists, got: %q", l)
+	}
+	if l := reportLine(rep, "terminal STATUS set"); !strings.Contains(l, "[ ]") {
+		t.Fatalf("status line must stay UNMET while PLAN is TODO, got: %q", l)
+	}
+	if done, _ := r.complete(work, "bee-T1"); done {
+		t.Fatal("complete() must stay false while the status predicate is unmet")
+	}
+
+	// Flip the status terminal: now every line is met and complete() agrees.
+	os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	rep = r.nextPrompt(work, "bee-T1")
+	if strings.Contains(rep, "[ ]") {
+		t.Fatalf("all work predicates should read MET now:\n%s", rep)
+	}
+	if done, err := r.complete(work, "bee-T1"); err != nil || !done {
+		t.Fatalf("a met-all report must coincide with completion: done=%v err=%v", done, err)
+	}
+
+	// --- Review kind: single predicate, flips when the task leaves NEEDS-REVIEW. ---
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	review := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+	rep = r.nextPrompt(review, "bee-R1")
+	if l := reportLine(rep, "NEEDS-REVIEW"); !strings.Contains(l, "[ ]") {
+		t.Fatalf("review predicate must be UNMET while the task sits at NEEDS-REVIEW:\n%s", rep)
+	}
+	os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	rep = r.nextPrompt(review, "bee-R1")
+	if l := reportLine(rep, "NEEDS-REVIEW"); !strings.Contains(l, "[x]") {
+		t.Fatalf("review predicate must flip to MET once the task left NEEDS-REVIEW:\n%s", rep)
+	}
+
+	// --- Reconcile kind: single ROI-stamp predicate. ---
+	recon := &selectt.Selection{Kind: selectt.Reconcile, Submodule: subs[0]}
+	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644) // no stamp
+	rep = r.nextPrompt(recon, "")
+	if l := reportLine(rep, "ROI stamp"); !strings.Contains(l, "[ ]") {
+		t.Fatalf("reconcile predicate must be UNMET with no matching ROI stamp:\n%s", rep)
+	}
+	os.WriteFile(planPath, []byte("<!-- Beehive-ROI: "+roiHead[:12]+" -->\n## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	rep = r.nextPrompt(recon, "")
+	if l := reportLine(rep, "ROI stamp"); !strings.Contains(l, "[x]") {
+		t.Fatalf("reconcile predicate must flip to MET once the stamp matches ROI HEAD:\n%s", rep)
+	}
+	if done, err := r.complete(recon, ""); err != nil || !done {
+		t.Fatalf("reconcile met report must coincide with completion: done=%v err=%v", done, err)
+	}
+}

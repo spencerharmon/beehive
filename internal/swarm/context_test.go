@@ -313,7 +313,8 @@ func TestLeanContextWrapsFollowUpTurn(t *testing.T) {
 }
 
 // TestLeanContextOffIsInert proves toggling LeanContext off changes nothing on the
-// per-turn path: the follow-up prompt is the byte-identical bare "continue".
+// per-turn path: the follow-up prompt is the byte-identical continuation status
+// report (nextPrompt) with no bounded-brief wrapper.
 func TestLeanContextOffIsInert(t *testing.T) {
 	g, sm, planPath, sel, rp := newWorkRun(t)
 
@@ -332,7 +333,9 @@ func TestLeanContextOffIsInert(t *testing.T) {
 	if !res.Completed {
 		t.Fatalf("want completed, got %+v", res)
 	}
-	if len(sent) < 2 || sent[1] != "continue" {
-		t.Fatalf("LeanContext off must leave the follow-up prompt the bare \"continue\", got: %q", sent)
+	if len(sent) < 2 || !strings.HasPrefix(sent[1], "continue. Completion status for this work pass") ||
+		!strings.Contains(sent[1], "[ ] change doc present at submodules/sm/docs/bee-T1-T1.md") ||
+		strings.Contains(sent[1], "# Bounded turn context") {
+		t.Fatalf("LeanContext off must leave the follow-up prompt the plain continuation report (no bounded brief), got: %q", sent)
 	}
 }

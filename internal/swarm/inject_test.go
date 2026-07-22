@@ -206,9 +206,10 @@ func TestLeanInjectTrimsSystemAndFiresInlineHint(t *testing.T) {
 	}
 }
 
-// TestDefaultInjectByteStable proves the default path is unchanged: the injected
-// system is the full protocol verbatim, the completion rule stays in the up-front
-// preamble, and the follow-up prompt is the bare "continue".
+// TestDefaultInjectByteStable proves the default path is unchanged where it must
+// be: the injected system is the full protocol verbatim and the completion rule
+// stays in the up-front preamble. The follow-up prompt is now the continuation
+// status report (nextPrompt), not the bare "continue".
 func TestDefaultInjectByteStable(t *testing.T) {
 	g, sm, planPath, sel, rp := newWorkRun(t)
 
@@ -239,8 +240,12 @@ func TestDefaultInjectByteStable(t *testing.T) {
 	if !strings.Contains(sent[0], "On completion of a Work task:") {
 		t.Errorf("default preamble dropped the completion rule:\n%s", sent[0])
 	}
-	// The follow-up prompt is the bare "continue".
-	if sent[1] != "continue" {
-		t.Errorf("default follow-up prompt = %q, want %q", sent[1], "continue")
+	// The follow-up prompt is the per-kind continuation status report, not the
+	// bare "continue": it leads with "continue." and enumerates the work
+	// predicates each marked met/unmet.
+	if !strings.HasPrefix(sent[1], "continue. Completion status for this work pass") ||
+		!strings.Contains(sent[1], "[ ] terminal STATUS set") ||
+		!strings.Contains(sent[1], "[ ] change doc present at submodules/sm/docs/bee-T1-T1.md") {
+		t.Errorf("default follow-up prompt is not the continuation status report:\n%s", sent[1])
 	}
 }

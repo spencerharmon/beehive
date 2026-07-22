@@ -1613,25 +1613,40 @@ func (r *Runner) progressSignal(ctx context.Context, wt *git.Repo) (string, bool
 }
 
 // nextPrompt is the "keep going" prompt sent on every turn after the first.
-// Default: the bare "continue" (byte-identical to the historical loop). In lean
-// mode, for a Work task whose change doc is still absent, it fires the completion
-// rule as an at-decision-point hint — the turn where the agent is most likely
-// wrapping up — instead of front-loading that static rule in the system preamble.
-// Once the doc exists (the agent is effectively done) it reverts to "continue".
+// Instead of the historical bare "continue", it sends continuationReport: a
+// runner-computed, deterministic status report that enumerates every completion
+// requirement for this pass's KIND and marks each met/unmet, so the agent sees
+// exactly what is left instead of re-deriving the finish conditions each turn
+// (which burned tokens on git archaeology and "am I done?" churn). The report is
+// computed from completionChecklist — the SAME source complete() reduces over —
+// so it can never disagree with what actually ends the pass.
 func (r *Runner) nextPrompt(sel *selectt.Selection, branch string) string {
-	if !r.LeanInject || sel.Kind != selectt.Work {
+	return r.continuationReport(sel, branch)
+}
+
+// continuationReport renders the per-kind completion checklist as the between-turn
+// prompt: a leading "continue." (so the instruction to keep working is explicit),
+// then one "[x]"/"[ ]" line per predicate from completionChecklist. It is
+// runner-authored, deterministic, and reads only the beehive layer. A checklist
+// read error never fails the turn — it degrades to the bare "continue" so the loop
+// proceeds exactly as the historical default path.
+func (r *Runner) continuationReport(sel *selectt.Selection, branch string) string {
+	items, err := r.completionChecklist(sel, branch)
+	if err != nil || len(items) == 0 {
 		return "continue"
 	}
-	if present, err := r.docPresent(sel, branch); err == nil && present {
-		return "continue"
+	var b strings.Builder
+	fmt.Fprintf(&b, "continue. Completion status for this %s pass (runner-computed, authoritative — "+
+		"do not re-derive or git-archaeology it). Finish the UNMET items, then STOP:\n", sel.Kind)
+	for _, it := range items {
+		mark := " "
+		if it.met {
+			mark = "x"
+		}
+		fmt.Fprintf(&b, "  [%s] %s\n", mark, it.label)
 	}
-	return fmt.Sprintf(
-		"continue. When the code change is made and tested, complete the task: write the change doc at "+
-			"EXACTLY submodules/%[1]s/docs/%[2]s-%[3]s.md, commit the code on branch %[2]s with a "+
-			"`Beehive: %[3]s <doc-path>` stamp and push it to the submodule's origin, then flip the PLAN.md "+
-			"task to NEEDS-REVIEW on main. Do NOT touch the submodule pointer (gitlink) — the runner pins it "+
-			"to the tracked-branch tip.",
-		sel.Submodule.Name, branch, sel.Task.ID)
+	b.WriteString("When every item above is [x] the pass completes automatically — no extra checks or confirmation.")
+	return b.String()
 }
 
 // leanContextPrompt is the LeanContext next-turn prompt for a Work task: it wraps
@@ -1804,23 +1819,70 @@ func (r *Runner) heartbeatKeepalive(turnCtx context.Context, cl *claim.Claimer, 
 }
 
 // complete is the deterministic per-turn completion check.
+// complete reports whether the pass's per-kind completion predicate is met. It
+// is defined as "every item in completionChecklist is met", so the deterministic
+// completion check and the between-turn status report (continuationReport) are
+// computed from a SINGLE source and can never disagree: a met-all report always
+// coincides with the pass actually completing.
 func (r *Runner) complete(sel *selectt.Selection, branch string) (bool, error) {
+	items, err := r.completionChecklist(sel, branch)
+	if err != nil {
+		return false, err
+	}
+	for _, it := range items {
+		if !it.met {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// completionItem is one enumerated completion predicate for a pass and whether it
+// is currently met. The ordered slice a pass's kind yields is the authoritative
+// decomposition of its completion check (see complete) AND the checklist the
+// runner renders between turns (see continuationReport).
+type completionItem struct {
+	label string
+	met   bool
+}
+
+// completionChecklist enumerates the exact completion predicates the runner checks
+// for sel's kind, each marked met/unmet, reusing the SAME helpers complete() is
+// built on (docPresent, statusLeft, reconciled, the PLAN.md status read) so the
+// list can never fork from what actually ends the pass. Deterministic and
+// beehive-layer only: it reads PLAN.md / the change-doc dir / the ROI stamp, never
+// anything out of the repo. A read/parse error propagates (fail-closed) exactly as
+// the old per-kind checks did, except bootstrap's os.Stat, which — matching the
+// prior behavior — treats any stat error as "PLAN.md absent" rather than failing.
+func (r *Runner) completionChecklist(sel *selectt.Selection, branch string) ([]completionItem, error) {
 	switch sel.Kind {
 	case selectt.Bootstrap:
 		_, err := os.Stat(sel.Submodule.PlanPath())
-		return err == nil, nil
+		return []completionItem{{"PLAN.md exists", err == nil}}, nil
 	case selectt.Reconcile:
-		return r.reconciled(sel)
+		ok, err := r.reconciled(sel)
+		if err != nil {
+			return nil, err
+		}
+		return []completionItem{{"PLAN.md ROI stamp matches ROI HEAD", ok}}, nil
 	case selectt.Review:
 		// Done once the reviewer moved the task out of NEEDS-REVIEW (-> DONE on
 		// approve, -> NEEDS-ARBITRATION on reject).
-		return r.statusLeft(sel, plan.NeedsReview)
+		ok, err := r.statusLeft(sel, plan.NeedsReview)
+		if err != nil {
+			return nil, err
+		}
+		return []completionItem{{"task moved out of NEEDS-REVIEW (-> DONE | NEEDS-ARBITRATION)", ok}}, nil
 	case selectt.Arbitrate:
 		// Done once the arbiter moved the task out of NEEDS-ARBITRATION (-> DONE,
 		// -> TODO, or -> NEEDS-HUMAN).
-		return r.statusLeft(sel, plan.NeedsArb)
+		ok, err := r.statusLeft(sel, plan.NeedsArb)
+		if err != nil {
+			return nil, err
+		}
+		return []completionItem{{"task moved out of NEEDS-ARBITRATION (-> DONE | TODO)", ok}}, nil
 	default:
-		return r.workDone(sel, branch)
+		return r.workChecklist(sel, branch)
 	}
 }
 
@@ -2025,32 +2087,53 @@ func (r *Runner) racePeerOwnsTask(ctx context.Context, sel *selectt.Selection) b
 	return t.Session != "" && t.Session != r.Session && t.Active(r.now(), r.TTL)
 }
 
-// workDone verifies the PLAN.md status transitioned to a terminal/handoff state
-// for a Work task and the branch+task change doc exists under submodule docs/.
-// The runner's own session/heartbeat stamp is NOT a completion signal (it is
-// released separately), so it is not checked here.
-func (r *Runner) workDone(sel *selectt.Selection, branch string) (bool, error) {
+// workChecklist enumerates a Work task's completion predicates each marked
+// met/unmet: the PLAN.md status transitioned to a terminal/handoff state and the
+// branch+task change doc exists under submodule docs/. The runner's own session/
+// heartbeat stamp is NOT a completion signal (it is released separately), so it is
+// not checked here. Its AND is exactly the old workDone predicate, so complete()
+// (which ANDs the items) is byte-for-byte the same completion check it always was:
+//   - task removed from PLAN.md         -> the terminal-status item is unmet;
+//   - status NEEDS-HUMAN                 -> the single item is "escalation ready"
+//     (a ready NEEDS-HUMAN completes without a doc, matching the prior early
+//     return), so the doc line is intentionally omitted in that case;
+//   - any other terminal status          -> terminal-status AND doc-present.
+func (r *Runner) workChecklist(sel *selectt.Selection, branch string) ([]completionItem, error) {
 	b, err := os.ReadFile(sel.Submodule.PlanPath())
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	p, err := plan.Parse(string(b))
 	if err != nil {
-		return false, err
+		return nil, err
+	}
+	doc, err := r.docPresent(sel, branch)
+	if err != nil {
+		return nil, err
+	}
+	docItem := completionItem{
+		fmt.Sprintf("change doc present at submodules/%s/docs/%s-%s.md",
+			sel.Submodule.Name, branch, sel.Task.ID),
+		doc,
 	}
 	t := p.Find(sel.Task.ID)
 	if t == nil {
-		return false, nil
+		return []completionItem{
+			{"task present in PLAN.md with a terminal status", false},
+			docItem,
+		}, nil
 	}
 	if t.Status == plan.NeedsHuman {
-		return t.EscalationReady(), nil
+		return []completionItem{
+			{"NEEDS-HUMAN escalation ready (--category + --reason set)", t.EscalationReady()},
+		}, nil
 	}
 	terminal := t.Status == plan.Done || t.Status == plan.NeedsReview ||
 		t.Status == plan.NeedsArb
-	if !terminal {
-		return false, nil
-	}
-	return r.docPresent(sel, branch)
+	return []completionItem{
+		{"terminal STATUS set (NEEDS-REVIEW | DONE | NEEDS-ARBITRATION)", terminal},
+		docItem,
+	}, nil
 }
 
 func (r *Runner) docPresent(sel *selectt.Selection, branch string) (bool, error) {
