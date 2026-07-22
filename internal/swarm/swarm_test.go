@@ -68,18 +68,26 @@ func gitInit(t *testing.T, dir string) *git.Repo {
 	return g
 }
 
-// commitReviewDoc writes the standard change doc (with the `Beehive-Commits`
-// header the uniform handoff gate requires) and commits it into the hive worktree
-// g, so a terminal handoff satisfies the committed-doc + commits-tag gate
-// (verifyGate): a real agent commits its own change doc; the runner never commits
-// the doc for it. Standard submodule "sm" / task "T1" the swarm tests use, with
-// `commits=none` (no submodule commit) to pair with a `commits=none` plan tag.
-// Ignores ErrNothing so it is safe to call on every turn.
+// commitDocFor writes the standard change doc (with the `Beehive-Commits: none`
+// header the uniform handoff gate requires) for submodule "sm" task taskID and
+// commits it into the hive worktree g — mirroring a real agent committing its own
+// change doc (the runner never commits the doc for it). Pairs with a
+// `commits=none` plan tag. Safe to call every turn.
+func commitDocFor(g *git.Repo, taskID string) {
+	rel := "submodules/sm/docs/bee-" + taskID + "-" + taskID + ".md"
+	p := filepath.Join(g.Dir, filepath.FromSlash(rel))
+	_ = os.MkdirAll(filepath.Dir(p), 0o755)
+	_ = os.WriteFile(p, []byte("<!-- Beehive-Commits: none -->\n\nchange doc\n"), 0o644)
+	// The agent commits its status flip AND its change doc together to the hive
+	// branch (the runner merges that); the uniform gate requires BOTH committed in
+	// HEAD. Commit PLAN.md alongside the doc so the flip is in HEAD, mirroring a
+	// real handoff. ErrNothing (already committed) is benign.
+	_ = g.CommitPaths(context.Background(), "handoff: flip + change doc", "submodules/sm/PLAN.md", rel)
+}
+
+// commitReviewDoc is the T1 convenience wrapper the swarm tests use most.
 func commitReviewDoc(g *git.Repo) {
-	doc := filepath.Join(g.Dir, "submodules", "sm", "docs", "bee-T1-T1.md")
-	_ = os.MkdirAll(filepath.Dir(doc), 0o755)
-	_ = os.WriteFile(doc, []byte("<!-- Beehive-Commits: none -->\n\nchange doc\n"), 0o644)
-	_ = g.CommitPaths(context.Background(), "change doc", "submodules/sm/docs/bee-T1-T1.md")
+	commitDocFor(g, "T1")
 }
 
 func TestRunCompletes(t *testing.T) {
@@ -104,8 +112,9 @@ func TestRunCompletes(t *testing.T) {
 	mc := &mockClient{}
 	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitDocFor(g, "T1")
 	}}}
 	r.Client = cl
 	res, err := r.Run(context.Background(), sel, "sys", "first")
@@ -590,7 +599,7 @@ func TestWorkPreambleHasDocPath(t *testing.T) {
 
 	var firstPrompt string
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	cl.sess.capture = &firstPrompt
@@ -628,6 +637,7 @@ func TestReviewCompletesOnStatusChange(t *testing.T) {
 	cl := &mockClient{sess: &mockSession{capture: &firstPrompt, onTurn: func(turn int) {
 		// Approve: move out of NEEDS-REVIEW to DONE (no doc written).
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
+		commitDocFor(g, "R1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
@@ -1025,6 +1035,7 @@ func TestReviewDispatchReachableLocalSharingUnchanged(t *testing.T) {
 
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
+		commitDocFor(g, "R1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -1632,6 +1643,7 @@ func TestReviewDispatchDoesNotFinalizeWithoutSourceBranchRemote(t *testing.T) {
 
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
+		commitDocFor(g, "R1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -1714,6 +1726,7 @@ func TestReviewDispatchDoesNotFinalizeWithoutSourceBranchLocalSharing(t *testing
 
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
+		commitDocFor(g, "R1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -1836,6 +1849,7 @@ func TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestryRemote(t *testing.
 
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
+		commitDocFor(g, "R1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -1939,6 +1953,7 @@ func TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestryLocalSharing(t *te
 
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
+		commitDocFor(g, "R1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -2034,8 +2049,8 @@ func TestCompletionWaitsForTurnIdle(t *testing.T) {
 
 	sess := &gateSession{started: make(chan struct{}), release: make(chan struct{}), onIdle: func() {
 		// Land the completion artifacts only as the turn settles.
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitDocFor(g, "T1")
 	}}
 	r := &Runner{Repo: rp, Git: g, Client: &gateClient{sess: sess}, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour}
 
@@ -2415,8 +2430,9 @@ func TestRunPublishFailureBlocksCompletion(t *testing.T) {
 
 	// Agent drives the task terminal + writes the change doc (completion check passes)…
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitDocFor(g, "T1")
 	}}}
 	// …but publishing to main fails once the work is terminal. Gate on [DONE] so the
 	// per-turn claim heartbeat (which shares this closure, pre-Prompt while still
@@ -2476,8 +2492,9 @@ func TestRunPublishFailureRecordsDurableTranscriptWarning(t *testing.T) {
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitDocFor(g, "T1")
 	}}}
 	r := &Runner{
 		Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour,
@@ -2546,7 +2563,7 @@ func TestRunClaimResolvedPublishFailureRecordsDurableTranscriptWarning(t *testin
 	// pass was dispatched with — so the very first heartbeat (turn 1, before any
 	// prompt) sees the mismatch and returns claim.ErrResolved.
 	os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z commits=none -->\ngo\n"), 0o644)
-	os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+	os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 	g.Commit(context.Background(), "seed")
 
 	rp, _ := repo.Open(root)
@@ -2660,8 +2677,9 @@ func TestRunSuccessfulPublishLeavesNoTranscriptWarning(t *testing.T) {
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitDocFor(g, "T1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(context.Background(), sel, "sys", "first")
@@ -2758,7 +2776,7 @@ func TestRunDetectsLostClaimRaceBeforePublish(t *testing.T) {
 		// docs/ dir, so this worktree checkout does not have it on disk yet.
 		os.WriteFile(subs[0].PlanPath(), []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		os.MkdirAll(filepath.Join(subs[0].Path, "docs"), 0o755)
-		os.WriteFile(filepath.Join(subs[0].Path, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(subs[0].Path, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		if err := wg.CommitPaths(ctx, "plan: needs-review T1",
 			"submodules/sm/PLAN.md", "submodules/sm/docs/bee-T1-T1.md"); err != nil {
 			t.Fatal(err)
@@ -2945,8 +2963,9 @@ func TestWorkSyncsWorktreeBaseToTrackedTip(t *testing.T) {
 		if b, err := git.New(wtDir).RevParse(ctx, "HEAD"); err == nil {
 			wtBase = b
 		}
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitDocFor(g, "T1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -3037,8 +3056,9 @@ func TestWorkPinsPointerToTrackedTipDespiteAgentBeeBump(t *testing.T) {
 			t.Errorf("agent bad pointer bump: %v", err)
 			return
 		}
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitDocFor(g, "T1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -3098,7 +3118,7 @@ func TestWorkNoRemoteKeepsRecordedPointer(t *testing.T) {
 		if b, err := git.New(wtDir).RevParse(ctx, "HEAD"); err == nil {
 			wtBase = b
 		}
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour}
@@ -3183,7 +3203,7 @@ func TestWorkCommitPathNeverStagesWorktreeGitlink(t *testing.T) {
 		if fi, err := os.Stat(wtDir); err == nil && fi.IsDir() {
 			wtExisted = true
 		}
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, Session: "bee-A"}
@@ -4088,7 +4108,7 @@ func TestWorkCompletionKeepsUnmergedSourceBranch(t *testing.T) {
 		os.WriteFile(filepath.Join(wtDir, "feature.txt"), []byte("work\n"), 0o644)
 		_ = git.New(wtDir).Commit(ctx, "feat: in-flight work")
 		// ...then complete the Work handoff: change doc + NEEDS-REVIEW.
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		commitReviewDoc(g)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
@@ -4163,7 +4183,7 @@ func TestWorkCompletionDemotesWhenSourceBranchCannotLand(t *testing.T) {
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(wtDir, "feature.txt"), []byte("work\n"), 0o644)
 		_ = git.New(wtDir).Commit(ctx, "feat: work")
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		commitReviewDoc(g)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
@@ -4254,6 +4274,24 @@ func (gr *gateRec) run(ctx context.Context, dir, name string, args ...string) (v
 	return verifyOutcome{}, nil
 }
 
+// gateSeamShow answers the uniform gate's committed-artifact `git show` reads for
+// the seam tests: `show HEAD:...PLAN.md` -> a task at `status` carrying
+// commits=none (or exitErr when status=="" to model an uncommitted flip);
+// `show HEAD:...doc` -> a doc with a matching Beehive-Commits header. Second
+// return reports whether it handled the call.
+func gateSeamShow(status string, args []string) (verifyOutcome, bool) {
+	if len(args) >= 2 && args[0] == "show" {
+		if strings.HasSuffix(args[1], "PLAN.md") {
+			if status == "" {
+				return verifyOutcome{exitErr: true}, true
+			}
+			return verifyOutcome{out: "## T1 [" + status + "] <!-- attempts=0 deps= commits=none -->\ngo\n"}, true
+		}
+		return verifyOutcome{out: "<!-- Beehive-Commits: none -->\n\ndoc\n"}, true
+	}
+	return verifyOutcome{}, false
+}
+
 // TestVerifyGateCleanTreeAllowsHandoff: a clean code worktree flips to NEEDS-REVIEW
 // and the gate lets the handoff stand. The gate is PROTOCOL-only and
 // language-agnostic: the SOLE command it runs is `git status --porcelain` in the
@@ -4266,13 +4304,16 @@ func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
 	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if o, ok := gateSeamShow("NEEDS-REVIEW", args); ok {
+			return o, nil
+		}
 		if len(args) > 0 && args[0] == "ls-tree" { // change doc is committed in HEAD
 			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
 		}
 		return verifyOutcome{}, nil // git status: clean
 	}}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
@@ -4286,27 +4327,36 @@ func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 	wantRoot, _ := filepath.Abs(rp.Root)
 	want := []gateCall{
 		{dir: wtDir, name: "git", args: []string{"status", "--porcelain"}},
+		{dir: wantRoot, name: "git", args: []string{"show", "HEAD:submodules/sm/PLAN.md"}},
 		{dir: wantRoot, name: "git", args: []string{"ls-tree", "-r", "--name-only", "HEAD", "--", "submodules/sm/docs"}},
+		{dir: wantRoot, name: "git", args: []string{"show", "HEAD:submodules/sm/docs/bee-T1-T1.md"}},
 	}
 	if !reflect.DeepEqual(gr.calls, want) {
-		t.Fatalf("the gate must run ONLY `git status --porcelain` (code worktree) then `git ls-tree HEAD` (committed doc) — no toolchain check:\n got %+v\nwant %+v", gr.calls, want)
+		t.Fatalf("the uniform gate must run status (worktree) -> show PLAN.md -> ls-tree -> show doc (all committed-artifact/protocol checks, no toolchain check):\n got %+v\nwant %+v", gr.calls, want)
 	}
 }
 
-// TestVerifyGateSkipsNonReviewFlip: the gate targets only the TODO->NEEDS-REVIEW
-// review handoff; a Work pass that lands DONE directly is out of scope and must
-// complete WITHOUT the gate ever running (a red stub would block it if it did).
-func TestVerifyGateSkipsNonReviewFlip(t *testing.T) {
+// TestVerifyGateGatesWorkDoneFlip: a Work pass that lands DONE directly is a
+// gated terminal handoff too (the uniform gate covers Work->{NEEDS-REVIEW,
+// NEEDS-ARBITRATION,DONE}); with a clean worktree, a committed flip, a committed
+// doc, and a matching commits=none tag it completes WITH the gate having run.
+func TestVerifyGateGatesWorkDoneFlip(t *testing.T) {
 	ctx := context.Background()
 	g, rp, sm, planPath, _ := gateFixture(t)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
 	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
-		return verifyOutcome{out: "should never run", exitErr: true}, nil
+		if o, ok := gateSeamShow("DONE", args); ok {
+			return o, nil
+		}
+		if len(args) > 0 && args[0] == "ls-tree" {
+			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
+		}
+		return verifyOutcome{}, nil // git status: clean
 	}}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
@@ -4315,10 +4365,10 @@ func TestVerifyGateSkipsNonReviewFlip(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	if !res.Completed {
-		t.Fatalf("a direct-to-DONE Work handoff is out of the gate's scope and must complete: %+v", res)
+		t.Fatalf("a direct-to-DONE Work handoff is a gated terminal handoff and must complete with the artifacts present: %+v", res)
 	}
-	if len(gr.calls) != 0 {
-		t.Fatalf("the gate must NOT run for a non-NEEDS-REVIEW flip, ran %+v", gr.calls)
+	if len(gr.calls) == 0 {
+		t.Fatalf("the gate must run for a DONE Work flip")
 	}
 }
 
@@ -4336,10 +4386,13 @@ func TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes(t *testing.T) {
 
 	gitStatus := 0
 	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if o, ok := gateSeamShow("NEEDS-REVIEW", args); ok {
+			return o, nil
+		}
 		if len(args) > 0 && args[0] == "ls-tree" { // change doc is committed in HEAD
 			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
 		}
-		if name == "git" {
+		if len(args) > 0 && args[0] == "status" {
 			gitStatus++
 			if gitStatus == 1 { // dirty on the first handoff, clean after the agent commits
 				return verifyOutcome{out: " M infrastructure/zuul/config-repo.yaml\n?? scripts/provision-zuul-registry-push-secret.sh"}, nil
@@ -4348,7 +4401,7 @@ func TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes(t *testing.T) {
 		return verifyOutcome{}, nil
 	}}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
@@ -4380,7 +4433,7 @@ func TestVerifyGateDirtyTreeNeverCompletes(t *testing.T) {
 		return verifyOutcome{}, nil
 	}}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
@@ -4406,13 +4459,16 @@ func TestVerifyGateUncommittedDocNeverCompletes(t *testing.T) {
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
 	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if o, ok := gateSeamShow("NEEDS-REVIEW", args); ok {
+			return o, nil
+		}
 		if len(args) > 0 && args[0] == "ls-tree" {
 			return verifyOutcome{out: ""}, nil // docs tree carries NO committed change doc
 		}
 		return verifyOutcome{}, nil // git status: clean code worktree
 	}}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644) // on disk, NOT committed
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644) // on disk, NOT committed
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
@@ -4557,7 +4613,7 @@ func TestPredicateHardStopCancelsTurnMidStream(t *testing.T) {
 	secondCallRan := &atomic.Bool{}
 	sess := &predicateHardStopSession{
 		deliver: func() {
-			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 			commitReviewDoc(g)
 			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		},
@@ -4676,7 +4732,7 @@ func TestContinuationReportEnumeratesPredicates(t *testing.T) {
 
 	// Produce the change doc: its predicate line flips unmet -> met, the status
 	// line stays unmet, and completion is still not reached.
-	os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
+	os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 	rep = r.nextPrompt(work, "bee-T1")
 	if l := reportLine(rep, "change doc present"); !strings.Contains(l, "[x]") {
 		t.Fatalf("change-doc line must flip to MET once the doc exists, got: %q", l)
