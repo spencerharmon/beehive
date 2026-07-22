@@ -185,7 +185,12 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   your pass COMPLETES as a clean yield (no doc needed for the yield — the FILED task carries its own).
   Only escalate `contradiction` when two intents genuinely OPPOSE and you cannot tell which is
   authoritative — never merely because a prerequisite is absent.
-- Make the change in your worktree and PROVE it. A behavioral change (bug fix, feature, config, script)
+- Make the change in your worktree and PROVE it. Correctness is YOURS to establish, not the runner's to
+  check: the runner verifies only protocol adherence (the change doc exists, the status transitioned,
+  your work is committed) and never runs your tests, builds your code, or judges whether the change is
+  right — that is the job of you (work), the reviewer, and the arbiter, using the target's own
+  tests/pipelines as its `INFRASTRUCTURE.md` / `LOCALS.md` / submodule `AGENTS.md` describe. A behavioral
+  change (bug fix, feature, config, script)
   REQUIRES an automated regression test that FAILS without your change and PASSES with it: write it, run
   it, and paste the exact command + its passing result into the change doc. "DONE" is NEVER a guess or a
   plausible-looking diff — it is a claim a reviewer can re-run from the evidence you recorded. If no

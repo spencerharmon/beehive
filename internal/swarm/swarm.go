@@ -237,11 +237,12 @@ type Runner struct {
 	// injectable seam: nil runs the real os.Setenv loop; tests set it to capture the
 	// exported map without mutating the real process env.
 	ExportEnv func(map[string]string)
-	// RunVerify runs one handoff verify-gate command (gofmt/go vet/go test) in the
-	// code worktree and reports whether it ran-and-failed (a red) versus could-not-
-	// run (an infra error). The injectable seam: nil uses realRunVerify (real exec
-	// inheriting the exported BuildEnv); tests set it to force red/green and to
-	// assert the static invocation. See verify.go.
+	// RunVerify runs the handoff protocol-gate command (`git status --porcelain`) in
+	// the code worktree and reports whether it ran-and-failed versus could-not-run
+	// (an infra error). The injectable seam: nil uses realRunVerify (real exec);
+	// tests set it to force a clean/dirty tree and to assert the invocation. The gate
+	// checks protocol adherence (work is committed), never code correctness. See
+	// verify.go and docs/runner-protocol-vs-correctness.md.
 	RunVerify func(ctx context.Context, dir, name string, args ...string) (verifyOutcome, error)
 }
 
@@ -1376,17 +1377,22 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 			return res, err
 		}
-		// Runner-owned handoff verify-gate: before ACCEPTING a Work task's flip to
-		// NEEDS-REVIEW as complete, the code worktree must pass the mechanical checks
-		// (gofmt/vet/test) so a reviewer never burns a whole session rejecting a
-		// regression a deterministic check catches. Red => do NOT complete: keep the
-		// claim and hand the agent the failure as the next prompt (fix forward, same
+		// Runner-owned handoff PROTOCOL gate: before ACCEPTING a Work task's flip to
+		// NEEDS-REVIEW as complete, the code worktree must have NO uncommitted work, so
+		// the change the agent made is actually committed for finish() to merge (an
+		// uncommitted edit would be silently dropped and the task would land with none
+		// of its code). This verifies adherence to the protocol, NOT code correctness —
+		// correctness is the honeybees' job (work/review/arbitration agents, via the
+		// target's own tests/pipelines); the runner never runs gofmt/vet/test or any
+		// toolchain check and assumes no submodule language. See
+		// docs/runner-protocol-vs-correctness.md. Red => do NOT complete: keep the
+		// claim and hand the agent the failure as the next prompt (commit forward, same
 		// session). Pin sel.Task.Status to the flipped status so the NEXT turn's
 		// heartbeat re-stamps (ownership — and the claim that keeps peers off a not-
 		// yet-ready NEEDS-REVIEW — stays fresh) instead of tripping ErrResolved on a
 		// terminal status we deliberately left in place. A non-Work kind, a non-
-		// NEEDS-REVIEW flip, and a green gate all return "" and leave completion
-		// unchanged; an infra failure to run a check is fail-closed (blocks it).
+		// NEEDS-REVIEW flip, and a clean tree all return "" and leave completion
+		// unchanged; an infra failure to run the check is fail-closed (blocks it).
 		if done {
 			hint, gerr := r.verifyGate(ctx, sel, wtAbs)
 			if gerr != nil {

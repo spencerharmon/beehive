@@ -81,11 +81,11 @@ func TestBuildEnvExportedAndStated(t *testing.T) {
 	}
 
 	// (2) Preamble: the told-once mandated invocation, with keys SORTED into a
-	// deterministic prefix, plus the concrete example.
+	// deterministic prefix, plus the language-neutral example.
 	wants := []string{
 		"# Build/test environment (host-mandated",
 		"CGO_ENABLED=0 GOCACHE=/n/gocache GOTMPDIR=/n/gotmp TMPDIR=/n/gotmp", // sorted, drift-free
-		"go test ./...",
+		"<your build/test command>",
 	}
 	for _, w := range wants {
 		if !contains(firstPrompt, w) {
@@ -164,8 +164,8 @@ func TestBuildEnvPreamble(t *testing.T) {
 	if !contains(got, wantPrefix) {
 		t.Fatalf("preamble missing sorted prefix %q; got:\n%s", wantPrefix, got)
 	}
-	if !contains(got, "go test ./...") {
-		t.Fatalf("preamble missing mandated invocation; got:\n%s", got)
+	if !contains(got, "<your build/test command>") {
+		t.Fatalf("preamble missing mandated invocation example; got:\n%s", got)
 	}
 
 	// Byte-stable across repeated renders (defends against map-order drift, which

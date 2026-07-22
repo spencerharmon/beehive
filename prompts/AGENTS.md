@@ -107,9 +107,15 @@ exact complement. Each pass, the runner automatically:
   the pass ends rather than working something nobody wants.
 - **Checks completion deterministically** each turn, per kind — work: terminal status
   (`DONE` / `NEEDS-REVIEW` / `NEEDS-ARBITRATION`, or `NEEDS-HUMAN` with a reason) AND
-  the change doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md`; review: task left
+  the change doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` AND (on a
+  `TODO`→`NEEDS-REVIEW` handoff) a clean code worktree (`git status --porcelain` empty,
+  so your change is actually committed); review: task left
   `NEEDS-REVIEW`; arbitrate: task left `NEEDS-ARBITRATION`; reconcile: `PLAN.md`'s ROI
-  stamp matches `ROI.md` HEAD; bootstrap: `PLAN.md` exists. The agent need not
+  stamp matches `ROI.md` HEAD; bootstrap: `PLAN.md` exists. These are all PROTOCOL
+  checks — mechanical, language-agnostic facts. The runner NEVER runs your tests, builds
+  your code, or judges correctness; correctness is owned by the work/review/arbitration
+  honeybees using the target's own tests/pipelines (see
+  `docs/runner-protocol-vs-correctness.md` in the beehive submodule). The agent need not
   self-declare done — meeting the predicate ends the pass.
 - **Publishes and cleans up** — merges the commits the agent made in its worktree (the
   `bee-<taskid>` code branch, `PLAN.md`/`docs/`) to `main`,

@@ -4187,12 +4187,12 @@ func TestWorkCompletionDemotesWhenSourceBranchCannotLand(t *testing.T) {
 
 // --- handoff verify-gate -----------------------------------------------------
 
-// gateFixture builds a Work-task fixture wired for the handoff verify-gate: a
+// gateFixture builds a Work-task fixture wired for the handoff protocol gate: a
 // superproject with one submodule whose repo has a committed HEAD (so Run can add
-// the code worktree) and, when goMod is set, a go.mod at its root (so the gate is
-// applicable). PLAN.md carries a single TODO task T1. Returns the pieces a Run
-// needs plus the code-worktree path the gate must execute in.
-func gateFixture(t *testing.T, goMod bool) (g *git.Repo, rp *repo.Repo, sm, planPath, wtDir string) {
+// the code worktree). PLAN.md carries a single TODO task T1. Returns the pieces a
+// Run needs plus the code-worktree path the gate must execute its `git status` in.
+// The gate is language-agnostic, so the fixture writes no toolchain marker.
+func gateFixture(t *testing.T) (g *git.Repo, rp *repo.Repo, sm, planPath, wtDir string) {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
@@ -4204,9 +4204,6 @@ func gateFixture(t *testing.T, goMod bool) (g *git.Repo, rp *repo.Repo, sm, plan
 	os.MkdirAll(repoDir, 0o755)
 	gitInit(t, repoDir)
 	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
-	if goMod {
-		os.WriteFile(filepath.Join(repoDir, "go.mod"), []byte("module x\n\ngo 1.21\n"), 0o644)
-	}
 	if err := git.New(repoDir).Commit(ctx, "base"); err != nil {
 		t.Fatalf("submodule base commit: %v", err)
 	}
@@ -4218,7 +4215,7 @@ func gateFixture(t *testing.T, goMod bool) (g *git.Repo, rp *repo.Repo, sm, plan
 	return
 }
 
-// gateCall records one verify-gate invocation for assertions.
+// gateCall records one gate invocation for assertions.
 type gateCall struct {
 	dir  string
 	name string
@@ -4226,8 +4223,8 @@ type gateCall struct {
 }
 
 // gateRec is an injectable RunVerify that records every gate invocation and
-// returns a programmed outcome (default: green). Single-threaded — the gate runs
-// sequentially within the turn loop — so no locking is needed.
+// returns a programmed outcome (default: clean/pass). Single-threaded — the gate
+// runs sequentially within the turn loop — so no locking is needed.
 type gateRec struct {
 	calls []gateCall
 	resp  func(name string, args []string) (verifyOutcome, error)
@@ -4241,16 +4238,18 @@ func (gr *gateRec) run(ctx context.Context, dir, name string, args ...string) (v
 	return verifyOutcome{}, nil
 }
 
-// TestVerifyGateGreenAllowsHandoffWithStaticInvocation: a clean worktree flips to
-// NEEDS-REVIEW and the gate — which ran exactly gofmt -l . / go vet ./... / go test
-// ./..., in the code worktree, and NEVER `go test -race` — lets the handoff stand.
-func TestVerifyGateGreenAllowsHandoffWithStaticInvocation(t *testing.T) {
+// TestVerifyGateCleanTreeAllowsHandoff: a clean code worktree flips to NEEDS-REVIEW
+// and the gate lets the handoff stand. The gate is PROTOCOL-only and
+// language-agnostic: the SOLE command it runs is `git status --porcelain` in the
+// code worktree — never gofmt/vet/test or any toolchain/correctness check (that is
+// the honeybees' job, see docs/runner-protocol-vs-correctness.md).
+func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 	ctx := context.Background()
-	g, rp, sm, planPath, wtDir := gateFixture(t, true)
+	g, rp, sm, planPath, wtDir := gateFixture(t)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
-	gr := &gateRec{} // default: every check green
+	gr := &gateRec{} // default: clean tree
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
@@ -4261,104 +4260,11 @@ func TestVerifyGateGreenAllowsHandoffWithStaticInvocation(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	if !res.Completed || res.GCMarked {
-		t.Fatalf("a green gate must complete the handoff: %+v", res)
+		t.Fatalf("a clean tree must complete the handoff: %+v", res)
 	}
-	want := []gateCall{
-		{dir: wtDir, name: "git", args: []string{"status", "--porcelain"}},
-		{dir: wtDir, name: "gofmt", args: []string{"-l", "."}},
-		{dir: wtDir, name: "go", args: []string{"vet", "./..."}},
-		{dir: wtDir, name: "go", args: []string{"test", "./..."}},
-	}
+	want := []gateCall{{dir: wtDir, name: "git", args: []string{"status", "--porcelain"}}}
 	if !reflect.DeepEqual(gr.calls, want) {
-		t.Fatalf("gate invocation mismatch:\n got %+v\nwant %+v", gr.calls, want)
-	}
-	for _, c := range gr.calls {
-		for _, a := range c.args {
-			if a == "-race" {
-				t.Fatalf("gate must use the static invocation, never -race: %+v", c)
-			}
-		}
-	}
-}
-
-// TestVerifyGateRedBlocksThenFixForwardCompletes: a red gate does NOT complete the
-// handoff — it keeps the claim and feeds the failure back as the next prompt — and
-// once the agent fixes it (the gate goes green) the same session completes.
-func TestVerifyGateRedBlocksThenFixForwardCompletes(t *testing.T) {
-	ctx := context.Background()
-	g, rp, sm, planPath, _ := gateFixture(t, true)
-	subs, _ := rp.Submodules()
-	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
-
-	goTest := 0
-	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
-		if name == "go" && len(args) > 0 && args[0] == "test" {
-			goTest++
-			if goTest == 1 { // red on the first handoff, green after the agent fixes
-				return verifyOutcome{out: "--- FAIL: TestX\nFAIL\tx\t0.1s", exitErr: true}, nil
-			}
-		}
-		return verifyOutcome{}, nil
-	}}
-	var prompts []string
-	cl := &mockClient{sess: &mockSession{all: &prompts, onTurn: func(turn int) {
-		if turn == 1 {
-			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
-			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
-		}
-	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
-	res, err := r.Run(ctx, sel, "sys", "first")
-	if err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if !res.Completed || res.GCMarked {
-		t.Fatalf("fix-forward should complete once the gate goes green: %+v", res)
-	}
-	if len(prompts) < 2 {
-		t.Fatalf("want a fix-forward turn after the red gate, got prompts %v", prompts)
-	}
-	if !strings.Contains(prompts[1], "Handoff verify-gate FAILED") || !strings.Contains(prompts[1], "FAIL: TestX") {
-		t.Fatalf("the fix-forward prompt must carry the gate failure, got %q", prompts[1])
-	}
-}
-
-// TestVerifyGateRedNeverCompletes: a persistently red gate NEVER reports the
-// handoff complete — the run exhausts its turn cap, is GC-marked for retry (the
-// claim intentionally left as the stale-GC signal), and each blocked turn re-feeds
-// the failure so the agent keeps fixing forward.
-func TestVerifyGateRedNeverCompletes(t *testing.T) {
-	ctx := context.Background()
-	g, rp, sm, planPath, _ := gateFixture(t, true)
-	subs, _ := rp.Submodules()
-	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
-
-	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
-		if name == "go" && len(args) > 0 && args[0] == "test" {
-			return verifyOutcome{out: "FAIL", exitErr: true}, nil // always red
-		}
-		return verifyOutcome{}, nil
-	}}
-	var prompts []string
-	cl := &mockClient{sess: &mockSession{all: &prompts, onTurn: func(turn int) {
-		if turn == 1 {
-			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
-			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
-		}
-	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
-	res, err := r.Run(ctx, sel, "sys", "first")
-	if err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if res.Completed {
-		t.Fatalf("a persistently red gate must NOT report completion: %+v", res)
-	}
-	if !res.GCMarked {
-		t.Fatalf("a blocked handoff at the turn cap must be GC-marked for retry: %+v", res)
-	}
-	if len(prompts) < 2 || !strings.Contains(prompts[len(prompts)-1], "Handoff verify-gate FAILED") {
-		t.Fatalf("each blocked turn must re-feed the gate failure, got %v", prompts)
+		t.Fatalf("the gate must run ONLY `git status --porcelain` and no toolchain check:\n got %+v\nwant %+v", gr.calls, want)
 	}
 }
 
@@ -4367,7 +4273,7 @@ func TestVerifyGateRedNeverCompletes(t *testing.T) {
 // complete WITHOUT the gate ever running (a red stub would block it if it did).
 func TestVerifyGateSkipsNonReviewFlip(t *testing.T) {
 	ctx := context.Background()
-	g, rp, sm, planPath, _ := gateFixture(t, true)
+	g, rp, sm, planPath, _ := gateFixture(t)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
@@ -4391,50 +4297,15 @@ func TestVerifyGateSkipsNonReviewFlip(t *testing.T) {
 	}
 }
 
-// TestVerifyGateSkipsGoChecksWithoutGoMod: the Go toolchain checks only run for a
-// Go module, so a worktree with no go.mod skips gofmt/vet/test — but the
-// uncommitted-work check still runs for it (non-Go targets like flux/gostream are
-// exactly where the empty-branch bug bit). A CLEAN tree therefore completes with
-// ONLY the `git status --porcelain` call and none of the Go checks.
-func TestVerifyGateSkipsGoChecksWithoutGoMod(t *testing.T) {
-	ctx := context.Background()
-	g, rp, sm, planPath, wtDir := gateFixture(t, false) // no go.mod in the worktree
-	subs, _ := rp.Submodules()
-	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
-
-	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
-		if name == "git" {
-			return verifyOutcome{}, nil // clean tree
-		}
-		return verifyOutcome{exitErr: true}, nil // any Go check would red — prove none runs
-	}}
-	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
-		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
-		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
-	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, WallCap: time.Hour, TTL: time.Hour, RunVerify: gr.run}
-	res, err := r.Run(ctx, sel, "sys", "first")
-	if err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if !res.Completed {
-		t.Fatalf("a clean non-Go-module worktree must complete: %+v", res)
-	}
-	want := []gateCall{{dir: wtDir, name: "git", args: []string{"status", "--porcelain"}}}
-	if !reflect.DeepEqual(gr.calls, want) {
-		t.Fatalf("only the uncommitted-work check must run without a go.mod:\n got %+v\nwant %+v", gr.calls, want)
-	}
-}
-
 // TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes: a code worktree that still
 // has uncommitted changes at the NEEDS-REVIEW handoff does NOT complete (finish()
 // would merge an empty branch and drop the edits); it keeps the claim and feeds
 // back the fix-forward prompt, and once the agent commits (the tree goes clean)
-// the same session completes. Uses a NON-Go module to prove the check guards
-// exactly the targets the live bug hit.
+// the same session completes. Language-agnostic: the gate never inspects the
+// worktree's toolchain, only whether it is clean.
 func TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes(t *testing.T) {
 	ctx := context.Background()
-	g, rp, sm, planPath, _ := gateFixture(t, false)
+	g, rp, sm, planPath, _ := gateFixture(t)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
@@ -4470,7 +4341,7 @@ func TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes(t *testing.T) {
 // done that ships none of its code).
 func TestVerifyGateDirtyTreeNeverCompletes(t *testing.T) {
 	ctx := context.Background()
-	g, rp, sm, planPath, _ := gateFixture(t, false)
+	g, rp, sm, planPath, _ := gateFixture(t)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
@@ -4501,7 +4372,7 @@ func TestVerifyGateDirtyTreeNeverCompletes(t *testing.T) {
 // this the pass would spin to the idle cap with nothing left to do.
 func TestWorkPassYieldsOnFiledBlockingDep(t *testing.T) {
 	ctx := context.Background()
-	g, rp, sm, planPath, _ := gateFixture(t, false)
+	g, rp, sm, planPath, _ := gateFixture(t)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
@@ -4526,7 +4397,7 @@ func TestWorkPassYieldsOnFiledBlockingDep(t *testing.T) {
 // NOT be misread as a completed yield; it keeps going.
 func TestWorkPassTODOWithoutBlockDoesNotComplete(t *testing.T) {
 	ctx := context.Background()
-	g, rp, _, planPath, _ := gateFixture(t, false)
+	g, rp, _, planPath, _ := gateFixture(t)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
@@ -4544,16 +4415,17 @@ func TestWorkPassTODOWithoutBlockDoesNotComplete(t *testing.T) {
 }
 
 // TestRealRunVerifyClassifies pins the real exec path (used when RunVerify is nil):
-// a clean exit is green, a command that RUNS but exits non-zero is a red (exitErr),
-// and a binary that cannot be executed at all is an infra error.
+// a clean exit is a pass, a command that RUNS but exits non-zero is a red (exitErr),
+// and a binary that cannot be executed at all is an infra error. Uses git (the gate's
+// actual command) so the test asserts no toolchain beyond what the gate runs.
 func TestRealRunVerifyClassifies(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	if o, err := realRunVerify(ctx, dir, "go", "version"); err != nil || o.exitErr {
-		t.Fatalf("`go version` must be green: outcome=%+v err=%v", o, err)
+	if o, err := realRunVerify(ctx, dir, "git", "version"); err != nil || o.exitErr {
+		t.Fatalf("`git version` must pass: outcome=%+v err=%v", o, err)
 	}
-	if o, err := realRunVerify(ctx, dir, "go", "beehive-not-a-subcommand"); err != nil || !o.exitErr {
-		t.Fatalf("an unknown go subcommand must be a red (ran, non-zero): outcome=%+v err=%v", o, err)
+	if o, err := realRunVerify(ctx, dir, "git", "beehive-not-a-subcommand"); err != nil || !o.exitErr {
+		t.Fatalf("an unknown git subcommand must be a red (ran, non-zero): outcome=%+v err=%v", o, err)
 	}
 	if _, err := realRunVerify(ctx, dir, "beehive-no-such-binary-xyz"); err == nil {
 		t.Fatalf("a missing binary must surface an infra error, got nil")

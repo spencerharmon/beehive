@@ -80,6 +80,7 @@ beehive instruction list|update
 - `docs/install.md` — install, packaging, `/etc/beehive`, release verification.
 - `docs/secrets.md` — gpg secrets workflow.
 - `docs/honeybee.md` — honeybee operation and turn loop.
+- `docs/runner-protocol-vs-correctness.md` — the runner verifies protocol, honeybees verify correctness (load-bearing separation of concerns).
 - `docs/orchestration.md` — `install-systemd-user.sh` and systemd user unit examples for frontend and scheduled honeybee passes.
 - `docs/opencode.md` — agent backend setup.
 - `docs/cli.md` — CLI reference.

@@ -16,15 +16,17 @@ import (
 // honeybee process env.
 //
 //  1. exportBuildEnv applies BuildEnv to the HONEYBEE's own process env at agent
-//     spawn, so any build/test subprocess the honeybee itself spawns (e.g. a
-//     future handoff verify-gate's `go test`) inherits it. It does NOT reach
-//     opencode's sibling bash tool.
+//     spawn, so any build/test subprocess the honeybee itself spawns inherits it.
+//     It does NOT reach opencode's sibling bash tool.
 //  2. buildEnvPreamble states the mandated invocation ONCE in the injected prompt
 //     so the AGENT's own commands (the opencode bash tool) stop re-deriving it.
 //
 // Both read the one BuildEnv map, so the exported env and the stated line can
 // never drift. Both are inert (no export, byte-identical preamble) when BuildEnv
-// is empty, so a normal host is unaffected.
+// is empty, so a normal host is unaffected. BuildEnv is a generic KEY=VALUE map:
+// it carries whatever host environment the target's build/test tooling needs and
+// assumes NO specific language — the runner passes it through, it does not know or
+// judge the submodule's toolchain (see docs/runner-protocol-vs-correctness.md).
 
 // exportBuildEnv applies the resolved BuildEnv to the honeybee process
 // environment so build/test subprocesses the honeybee spawns inherit the host
@@ -46,11 +48,11 @@ func (r *Runner) exportBuildEnv() {
 
 // buildEnvPreamble renders the told-once build-env block: the exact `KEY=VALUE …`
 // prefix (keys SORTED so the line is deterministic and never drifts) the agent
-// must put in front of every Go build/test command, plus a concrete `go test
-// ./...` example. It deliberately does NOT claim the vars are already set in the
-// agent's shell — they are not (opencode is a sibling process) — it instructs the
-// agent to PREFIX its Go commands. Returns "" when unconfigured so the default
-// injected preamble is byte-identical.
+// must put in front of every build/test command it runs. It deliberately does NOT
+// claim the vars are already set in the agent's shell — they are not (opencode is
+// a sibling process) — it instructs the agent to PREFIX its commands. The block is
+// language-neutral: it states the host environment, never a toolchain. Returns ""
+// when unconfigured so the default injected preamble is byte-identical.
 func buildEnvPreamble(env map[string]string) string {
 	if len(env) == 0 {
 		return ""
@@ -67,11 +69,12 @@ func buildEnvPreamble(env map[string]string) string {
 	prefix := b.String()
 	return fmt.Sprintf(
 		"# Build/test environment (host-mandated — the runner owns this; do NOT re-derive it)\n"+
-			"This host requires a specific Go build/test invocation. opencode's shell does NOT "+
-			"inherit it, so PREFIX every Go build/test command with these exact settings:\n"+
+			"This host requires specific environment settings for build/test commands. opencode's "+
+			"shell does NOT inherit them, so PREFIX every build or test command you run with these "+
+			"exact settings:\n"+
 			"    %[1]s\n"+
-			"e.g. `%[1]s go test ./...`. Use this instead of a bare `go test`/`go build`; it is the "+
-			"mandated static invocation for this host (do not spend turns rediscovering it).\n\n",
+			"e.g. `%[1]s <your build/test command>`. Use this instead of a bare invocation; it is "+
+			"the mandated setup for this host (do not spend turns rediscovering it).\n\n",
 		prefix)
 }
 
