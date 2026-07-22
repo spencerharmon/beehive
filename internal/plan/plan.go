@@ -141,6 +141,18 @@ type Task struct {
 	// and the task loops. Tested for ancestry-of-main, never trusted as a status.
 	// Serialized as `review=<sha>` in the header comment.
 	ReviewCommit string
+	// Commits is the agent-authored, gate-verified list of submodule commit shas
+	// this session produced (the session-attribution tag the handoff protocol
+	// requires on EVERY terminal flip — Work/Review/Arbitrate). It is distinct
+	// from ReviewCommit (which the RUNNER records post-hoc for the review-
+	// reachability/finalize machinery): Commits is what the AGENT declares and the
+	// runner's handoff gate verifies exists in the submodule before accepting the
+	// flip, so a flip can never reference a phantom/bad-object commit. CommitsSet
+	// distinguishes "declared none" (CommitsSet && len==0) from "tag absent"
+	// (!CommitsSet), which the gate treats as an unmet requirement. Serialized as
+	// `commits=<sha>[,<sha>...]` or `commits=none` in the header comment.
+	Commits    []string
+	CommitsSet bool
 	// HumanCategory, when set, is the machine-readable class of a NEEDS-HUMAN
 	// escalation (see Category). Set by RequestHuman on a honeybee-initiated
 	// escalation (always one of the four valid values) and cleared by Resolve.
@@ -251,6 +263,11 @@ func parseHeader(m []string) (*Task, error) {
 			t.NotBefore = ts
 		case "review":
 			t.ReviewCommit = v
+		case "commits":
+			t.CommitsSet = true
+			if v != "" && v != "none" {
+				t.Commits = strings.Split(v, ",")
+			}
 		case "category":
 			// Stored verbatim; validity is enforced at the write/completion
 			// boundary (RequestHuman, the CLI, the runner completion checks), not
@@ -320,6 +337,13 @@ func (t *Task) header() string {
 	}
 	if t.ReviewCommit != "" {
 		meta += " review=" + t.ReviewCommit
+	}
+	if t.CommitsSet {
+		if len(t.Commits) == 0 {
+			meta += " commits=none"
+		} else {
+			meta += " commits=" + strings.Join(t.Commits, ",")
+		}
 	}
 	if t.HumanCategory != "" {
 		meta += " category=" + string(t.HumanCategory)

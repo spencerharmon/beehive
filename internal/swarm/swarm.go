@@ -1199,6 +1199,22 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					return res, derr
 				}
 				if done {
+					// Uniform handoff gate also guards THIS completion path (a flip
+					// detected at top-of-turn heartbeat rather than post-turn): if the
+					// committed artifacts are incomplete, feed the agent the one failing
+					// requirement and keep working (commit forward) instead of finalizing.
+					if hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch); gerr != nil {
+						if ferr := finish(""); ferr != nil {
+							return res, errors.Join(gerr, ferr)
+						}
+						return res, gerr
+					} else if hint != "" {
+						if st, serr := r.taskStatus(sel); serr == nil {
+							sel.Task.Status = st
+						}
+						prompt = hint
+						continue
+					}
 					// Publish first; only release + report complete if main advanced.
 					if ferr := finish(""); ferr != nil {
 						cleanup()
@@ -1408,7 +1424,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			if hint != "" {
 				done = false
 				gateHint = hint
-				sel.Task.Status = plan.NeedsReview
+				// Pin to the terminal status the agent actually left (NEEDS-REVIEW /
+				// NEEDS-ARBITRATION / DONE / TODO by kind), NOT a hardcoded one, so the
+				// next turn's heartbeat re-stamps that status (keeping the claim fresh)
+				// instead of tripping ErrResolved on a mismatch. Falls back to the
+				// selection's prior status if the plan can't be re-read.
+				if st, serr := r.taskStatus(sel); serr == nil {
+					sel.Task.Status = st
+				}
 			}
 		}
 		// Claim-ttl-wallcap race guard (session-audit-013 F1): the heartbeat above

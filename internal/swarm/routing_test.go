@@ -62,7 +62,7 @@ func workFixture(t *testing.T) (*repo.Repo, *git.Repo, string, string, *selectt.
 func completeWork(sm, planPath string) func(int) {
 	return func(int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("doc"), 0o644)
-		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	}
 }
 

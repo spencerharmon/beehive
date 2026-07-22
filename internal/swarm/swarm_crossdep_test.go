@@ -69,7 +69,7 @@ func TestInitLinkedSubmoduleCheckoutsPopulatesCrossDep(t *testing.T) {
 		t.Fatalf("submodule add dep: %v", err)
 	}
 	os.MkdirAll(filepath.Join(root, "submodules", "dep", "docs"), 0o755)
-	os.WriteFile(root+"/submodules/dep/PLAN.md", []byte("## base-job [DONE] <!-- attempts=0 deps= -->\ngo\n"), 0o644)
+	os.WriteFile(root+"/submodules/dep/PLAN.md", []byte("## base-job [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 	if _, err := g.Run(ctx, "add", "-A"); err != nil {
 		t.Fatalf("add: %v", err)
 	}
