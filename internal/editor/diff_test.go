@@ -119,3 +119,46 @@ func TestValidateFile(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderMultiFileDiffOneBoxPerFile is the multi-file-diff-boxes core
+// guarantee: N touched files produce exactly N independent FileDiffBoxes, in
+// order, each box's rows computed SOLELY from its own file's old/new pair (never
+// merged into one blob and never bleeding another file's lines).
+func TestRenderMultiFileDiffOneBoxPerFile(t *testing.T) {
+	changes := []FileChange{
+		{Path: "a.txt", Old: "one\n", New: "one changed\n"},
+		{Path: "b.txt", Old: "two\n", New: "two\nadded\n"},
+		{Path: "c.txt", Old: "gone\n", New: ""},
+	}
+	boxes := RenderMultiFileDiff(changes)
+	if len(boxes) != len(changes) {
+		t.Fatalf("expected %d boxes (one per file), got %d", len(changes), len(boxes))
+	}
+	for i, b := range boxes {
+		if b.Path != changes[i].Path {
+			t.Errorf("box %d: path = %q, want %q (order must match input)", i, b.Path, changes[i].Path)
+		}
+		// Each box's rows must equal the standalone single-file render of ITS OWN
+		// pair — proving no cross-file contamination.
+		want := rowsText(RenderDiffHTML(changes[i].Old, changes[i].New, nil, nil))
+		if got := rowsText(b.Rows); got != want {
+			t.Errorf("box %d (%s): rows not computed from its own pair only\n got=%q\nwant=%q", i, b.Path, got, want)
+		}
+	}
+	// No box's content may appear in another box (independence).
+	if strings.Contains(rowsText(boxes[0].Rows), "two") || strings.Contains(rowsText(boxes[1].Rows), "one") {
+		t.Errorf("file diffs bled across boxes (merged blob), boxes must be independent")
+	}
+}
+
+// TestRenderMultiFileDiffSkipsEmptyPath verifies an over-allocated slice entry
+// with no path never emits a phantom box.
+func TestRenderMultiFileDiffSkipsEmptyPath(t *testing.T) {
+	boxes := RenderMultiFileDiff([]FileChange{
+		{Path: "keep.txt", Old: "x\n", New: "y\n"},
+		{Path: "", Old: "a\n", New: "b\n"},
+	})
+	if len(boxes) != 1 || boxes[0].Path != "keep.txt" {
+		t.Fatalf("expected exactly the one keyed box, got %#v", boxes)
+	}
+}

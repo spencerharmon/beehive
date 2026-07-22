@@ -221,6 +221,52 @@ func RenderDiffHTML(old, new string, oldHTML, newHTML []template.HTML) []DiffRow
 	return rows
 }
 
+// FileChange is one file's old/new content pair within a multi-file edit, keyed
+// by its repo-relative path. It is the input unit of RenderMultiFileDiff: the
+// caller supplies one FileChange per file the change touches, plus that file's
+// OPTIONAL precomputed syntax-highlighted lines (OldHTML/NewHTML, same
+// convention as RenderDiffHTML — nil for the plain/char-diff fallback).
+type FileChange struct {
+	Path    string
+	Old     string
+	New     string
+	OldHTML []template.HTML
+	NewHTML []template.HTML
+}
+
+// FileDiffBox is one file's independently rendered diff within a multi-file
+// change: its path plus the diff rows computed SOLELY from that file's own
+// old/new pair. The frontend renders each box as its own collapsible/expanding
+// container (a <details> box), so a multi-file edit shows one box per file — not
+// one merged blob — and expanding or collapsing one file never affects another
+// (each box is a self-contained node with its own rows).
+type FileDiffBox struct {
+	Path string
+	Rows []DiffRow
+}
+
+// RenderMultiFileDiff groups a multi-file edit into one independently rendered
+// FileDiffBox per input FileChange, in the order given. Each box's rows are
+// computed ONLY from that file's own Old/New (via RenderDiffHTML), so N files
+// ALWAYS yield exactly N non-overlapping boxes and no file's diff can ever bleed
+// into another's — the property the "multi-file diffs as separate expanding
+// boxes" UI relies on. A FileChange with an empty Path is skipped (there is no
+// box to key), so a caller that over-allocates its slice never emits a
+// phantom box.
+func RenderMultiFileDiff(changes []FileChange) []FileDiffBox {
+	boxes := make([]FileDiffBox, 0, len(changes))
+	for _, c := range changes {
+		if c.Path == "" {
+			continue
+		}
+		boxes = append(boxes, FileDiffBox{
+			Path: c.Path,
+			Rows: RenderDiffHTML(c.Old, c.New, c.OldHTML, c.NewHTML),
+		})
+	}
+	return boxes
+}
+
 // diffRowKind maps a diffOp's kind byte to DiffRow's Kind string.
 func diffRowKind(kind byte) string {
 	switch kind {

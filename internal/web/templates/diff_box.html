@@ -1,0 +1,15 @@
+{{/* diff-file-box renders ONE file's diff as its own independently
+     collapsible/expanding box (multi-file-diff-boxes): a native <details>
+     (no JS, same convention as the agent-step affordances) whose summary is
+     the file path and whose body is that file's own diff rows. Because each
+     file is a self-contained <details> node, a multi-file change shows one box
+     per file — never a single merged blob — and expanding or collapsing one
+     file's box never affects any other's. The model is an editor.FileDiffBox
+     (.Path, .Rows). Open by default so the change is visible without a click,
+     but collapsible per-file on demand. */}}
+{{define "diff-file-box"}}<details class="diffbox" open>
+  <summary class="diffbox-path"><code>{{.Path}}</code></summary>
+  <pre class="diff" data-scroll-preserve>{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
+{{else}}<span class="muted">no line changes</span>{{end}}</pre>
+</details>
+{{end}}

@@ -19,11 +19,9 @@
   {{end}}
 </div>
 {{if $.Diffs}}
-{{range $.Diffs}}
-<p class="muted"><code>{{.Path}}</code></p>
-<pre class="diff" data-scroll-preserve>{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
-{{end}}</pre>
-{{end}}
+<div class="diff-boxes">
+{{range $.Diffs}}{{template "diff-file-box" .}}{{end}}
+</div>
 {{end}}
 {{if not .ReportOnly}}{{if not .Empty}}
 {{if $.Confirming}}
