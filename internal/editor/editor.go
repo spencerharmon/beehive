@@ -236,17 +236,30 @@ func ValidateFile(file string) error {
 // ever used as an edit base, a merge push target, or (chat-diff-session-
 // durability) a per-turn durability push/fetch/recovery target.
 func (m *Manager) trustedRemote(ctx context.Context) (string, error) {
-	remote, err := m.primary.Remote(ctx)
+	return trustedRemote(ctx, m.primary)
+}
+
+// trustedRemote resolves primary's configured remote and verifies it is this
+// repo's OWN — it shares history with local main (editor-safety-guards) —
+// before returning it. Both "no remote configured" (local sharing) and "a
+// foreign/unrelated remote is configured" (never trusted) report as "" — the
+// safe sharing-modes no-op signal. A trusted remote is the ONLY remote ever
+// used as an edit base, a merge push target, or (chat-diff-session-durability)
+// a per-turn durability push/fetch/recovery target. Package-level so both the
+// chat Manager and PublishFile (the `beehive edit` CLI's one-shot path) resolve
+// the base identically.
+func trustedRemote(ctx context.Context, primary *git.Repo) (string, error) {
+	remote, err := primary.Remote(ctx)
 	if err != nil {
 		return "", err
 	}
 	if remote == "" {
 		return "", nil
 	}
-	if err := m.primary.Fetch(ctx, remote, "main"); err != nil {
+	if err := primary.Fetch(ctx, remote, "main"); err != nil {
 		return "", fmt.Errorf("fetch %s main: %w", remote, err)
 	}
-	own, err := m.primary.SharesHistory(ctx, "main", remote+"/main")
+	own, err := primary.SharesHistory(ctx, "main", remote+"/main")
 	if err != nil {
 		return "", err
 	}
@@ -1014,21 +1027,123 @@ func (s *Session) merge(ctx context.Context, confirmDelete bool) error {
 	if serr := s.stripTranscriptSidecar(ctx); serr != nil {
 		return serr
 	}
-	if s.remote != "" {
-		// A configured remote is authoritative: publish to remote main (hard fail if
-		// the remote rejects). Then fast-forward local main so beehived's own views
-		// and the dirty/live state reflect it immediately; a dirty primary tree only
-		// downgrades that local sync to a soft warning — the remote already has it.
-		if err := s.wt.PublishToMain(ctx, s.remote); err != nil {
-			return err
-		}
-		if err := s.wt.UpdateLocalMain(ctx); err != nil {
-			s.setErr("pushed to remote main; local working tree not updated: " + err.Error())
-		}
-		return nil
+	// PublishWorktree is the shared worktree->main convergence step: PublishToMain
+	// (only with a trusted remote) then UpdateLocalMain. It is the exact sequence
+	// PublishFile (the `beehive edit` CLI's one-shot path) reuses, so both a
+	// chat-driven merge and a direct CLI edit converge to main identically.
+	fatal, local := PublishWorktree(ctx, s.wt, s.remote)
+	if fatal != nil {
+		return fatal
 	}
-	// No remote: local main is the only target and is what makes the proposal live.
-	return s.wt.UpdateLocalMain(ctx)
+	if local != nil {
+		// A configured remote is authoritative and already has the change; a
+		// failure to also fast-forward the local main projection is a soft
+		// warning, not a merge failure.
+		s.setErr("pushed to remote main; local working tree not updated: " + local.Error())
+	}
+	return nil
+}
+
+// PublishWorktree runs the shared git convergence sequence a proposed change on
+// wt's checked-out branch takes to reach main: PublishToMain(remote) — skipped
+// when remote=="" (no trusted remote / local sharing) — then UpdateLocalMain so
+// the primary working tree reflects it immediately. Session.merge and
+// PublishFile (the `beehive edit` CLI command's one-shot path) both call this,
+// so a chat-driven merge and a direct CLI edit converge to main through the
+// identical sequence (hive-edit-command).
+//
+// Two errors are returned rather than one because the two steps have different
+// severity for a caller with a trusted remote: fatal is the remote publish
+// failure (nil when remote=="" or the push succeeded) — the proposal never
+// reached main, always a hard failure. local is the local-main fast-forward
+// failure; when remote != "" the remote (the authoritative copy) already has
+// the change, so callers may downgrade it to a soft warning exactly as
+// Session.merge does. When remote=="", UpdateLocalMain IS the publish, so its
+// failure is returned as fatal instead.
+func PublishWorktree(ctx context.Context, wt *git.Repo, remote string) (fatal, local error) {
+	if remote != "" {
+		if err := wt.PublishToMain(ctx, remote); err != nil {
+			return err, nil
+		}
+		if err := wt.UpdateLocalMain(ctx); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if err := wt.UpdateLocalMain(ctx); err != nil {
+		return err, nil
+	}
+	return nil, nil
+}
+
+// PublishFile is the CLI-facing counterpart of Session.Merge: a single
+// deterministic worktree -> write -> commit -> publish -> cleanup call for an
+// operator who already has the new file content in hand (no agent chat) —
+// e.g. the `beehive edit` CLI command (hive-edit-command). It runs the exact
+// worktree/base-selection/delete-guard logic Open uses and shares
+// PublishWorktree with Session.merge, so both paths converge to main
+// identically. root is the beehive repo root (the primary checkout); file is
+// repo-relative and validated exactly like Open (ValidateFile — the same
+// editable coordination-file set the frontend's "edit with AI" exposes, which
+// does NOT include PLAN.md, secrets, or submodule code). A whole-file deletion
+// of a human-owned file (ROI.md) is blocked unless confirmDelete is true, the
+// same guard Merge/MergeConfirm enforce. The worktree and its branch are always
+// removed before returning, whether or not the publish succeeded, so a failed
+// or successful call never leaks either.
+func PublishFile(ctx context.Context, root, file, content, commitMsg string, confirmDelete bool) error {
+	file = filepath.ToSlash(filepath.Clean(file))
+	if err := ValidateFile(file); err != nil {
+		return err
+	}
+	primary := git.New(root)
+	trusted, err := trustedRemote(ctx, primary)
+	if err != nil {
+		return err
+	}
+	base := "main"
+	if trusted != "" {
+		base = trusted + "/main"
+	}
+	if primary.Exists(ctx, "main", file) && !primary.Exists(ctx, base, file) {
+		return fmt.Errorf("editor: %s exists on main but not at edit base %q; refusing to open a destructive edit (the base may be a wrong or foreign main)", file, base)
+	}
+	branch := "edit-cli-" + slugFile(file) + "-" + fmt.Sprint(time.Now().UnixNano())
+	wtPath := filepath.Join(root, ".worktrees", branch)
+	if err := primary.WorktreeAdd(ctx, wtPath, branch, base); err != nil {
+		return fmt.Errorf("worktree add: %w", err)
+	}
+	defer func() {
+		_ = primary.WorktreeRemove(ctx, wtPath)
+		_, _ = primary.Run(ctx, "branch", "-D", branch)
+	}()
+	wt := git.New(wtPath)
+	if !confirmDelete {
+		baseContent, _ := wt.Show(ctx, "main", file)
+		if ProtectedDeletion(file, baseContent, content) {
+			return ErrDeleteNeedsConfirm
+		}
+	}
+	abs := filepath.Join(wtPath, filepath.FromSlash(file))
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		return err
+	}
+	if commitMsg == "" {
+		commitMsg = "editor: " + file
+	}
+	if err := wt.CommitPaths(ctx, commitMsg, file); err != nil && !errors.Is(err, git.ErrNothing) {
+		return err
+	}
+	fatal, local := PublishWorktree(ctx, wt, trusted)
+	if fatal != nil {
+		return fatal
+	}
+	if local != nil {
+		return fmt.Errorf("pushed to remote main; local working tree not updated: %w", local)
+	}
+	return nil
 }
 
 // Diff returns the file content on main (base) and in the worktree (proposed).

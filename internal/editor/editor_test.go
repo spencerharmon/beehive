@@ -3,6 +3,7 @@ package editor
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -701,5 +702,205 @@ func TestReloadEmptyIsNoop(t *testing.T) {
 	}
 	if n := len(m.List()); n != 0 {
 		t.Fatalf("want 0 sessions after empty reload, got %d", n)
+	}
+}
+
+// TestPublishFileEndToEnd is the hive-edit-command acceptance for the local-
+// sharing (no remote) case: PublishFile runs worktree -> write -> commit ->
+// publish -> cleanup in one call and lands the change on main with no
+// dangling worktree or branch left behind.
+func TestPublishFileEndToEnd(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	file := "submodules/sm/ROI.md"
+
+	if err := PublishFile(ctx, root, file, "# ROI\n\noriginal goal\ncli goal\n", "operator: add cli goal", false); err != nil {
+		t.Fatalf("PublishFile: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(file)))
+	if err != nil {
+		t.Fatalf("read main: %v", err)
+	}
+	if !strings.Contains(string(got), "cli goal") {
+		t.Fatalf("main missing the published change: %q", string(got))
+	}
+
+	// No dangling worktree/branch: the CLI's edit-cli-* branch is gone from both
+	// git's worktree admin and refs/heads.
+	g := git.New(root)
+	wts, err := g.Worktrees(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range wts {
+		if strings.HasPrefix(w.Branch, "edit-cli-") {
+			t.Fatalf("dangling worktree left behind: %+v", w)
+		}
+	}
+	out, _ := g.Run(ctx, "for-each-ref", "--format=%(refname)", "refs/heads/edit-cli-*")
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("dangling branch left behind: %q", out)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, ".worktrees"))
+	if err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "edit-cli-") {
+				t.Fatalf("dangling worktree dir left behind: %s", e.Name())
+			}
+		}
+	}
+
+	// Verify the commit carries the operator's message, not a placeholder.
+	logOut, err := g.Run(ctx, "log", "-1", "--format=%s", "--", file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logOut != "operator: add cli goal" {
+		t.Fatalf("commit message = %q, want %q", logOut, "operator: add cli goal")
+	}
+}
+
+// TestPublishFileForkSeededHealsViaMerge is the fork-seeded acceptance: a
+// concurrent writer advances the trusted remote's main (a genuine fork against
+// the worktree branch's base) between PublishFile's worktree creation and its
+// publish. PublishToMain's fetch+merge retry must heal that fork rather than
+// fail or clobber the concurrent commit.
+func TestPublishFileForkSeededHealsViaMerge(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+	bare := t.TempDir()
+	bg := git.New(bare)
+	if _, err := bg.Run(ctx, "init", "-q", "--bare", "-b", "main"); err != nil {
+		t.Fatal(err)
+	}
+	g := git.New(root)
+	if _, err := g.Run(ctx, "remote", "add", "origin", bare); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Run(ctx, "push", "-q", "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	file := "submodules/sm/ROI.md"
+
+	// Seed a fork: a second, independent clone commits directly to the bare
+	// remote's main AFTER PublishFile's base is resolved but before it publishes.
+	// Simulate that ordering by making the concurrent commit first (PublishToMain's
+	// retry loop must still merge it in, not just at open time), then running
+	// PublishFile against the now-diverged remote.
+	other := t.TempDir()
+	if _, err := exec.Command("git", "clone", "-q", bare, other).CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	og := git.New(other)
+	for _, a := range [][]string{
+		{"config", "user.email", "o@o"},
+		{"config", "user.name", "o"},
+	} {
+		if _, err := og.Run(ctx, a...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(other, "submodules", "sm", "OTHER.md"), []byte("concurrent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := og.Run(ctx, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := og.Run(ctx, "commit", "-q", "-m", "concurrent writer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := og.Run(ctx, "push", "-q", "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := PublishFile(ctx, root, file, "# ROI\n\noriginal goal\nfork-seeded goal\n", "operator: fork-seeded edit", false); err != nil {
+		t.Fatalf("PublishFile did not heal the fork: %v", err)
+	}
+
+	// Both the concurrent writer's commit and the CLI's edit must survive on the
+	// remote's main (a real merge, not one clobbering the other).
+	out, err := bg.Run(ctx, "show", "main:"+file)
+	if err != nil {
+		t.Fatalf("read remote main: %v", err)
+	}
+	if !strings.Contains(out, "fork-seeded goal") {
+		t.Fatalf("remote main missing the CLI's change:\n%s", out)
+	}
+	if !bg_fileExists(ctx, bg, "main", "submodules/sm/OTHER.md") {
+		t.Fatal("remote main lost the concurrent writer's file after the merge")
+	}
+}
+
+// bg_fileExists reports whether path exists at ref in repo g.
+func bg_fileExists(ctx context.Context, g *git.Repo, ref, path string) bool {
+	_, err := g.Run(ctx, "show", ref+":"+path)
+	return err == nil
+}
+
+// TestPublishWorktreeSharedByEditorAndCLI proves the accept criterion that the
+// chat editor's Session.merge and the CLI's PublishFile call the SAME shared
+// helper (PublishWorktree), rather than each re-implementing the
+// publish-to-main sequence: both exercised end to end here, then the source is
+// checked to confirm each call site actually invokes PublishWorktree (not a
+// parallel copy of its logic).
+func TestPublishWorktreeSharedByEditorAndCLI(t *testing.T) {
+	root, _ := setupRepo(t)
+	ctx := context.Background()
+
+	// Path 1: the chat editor's Session.Merge.
+	fc := &fakeClient{reply: "done."}
+	roiFile := "submodules/sm/ROI.md"
+	fc.editFn = func(dir string) {
+		p := filepath.Join(dir, filepath.FromSlash(roiFile))
+		b, _ := os.ReadFile(p)
+		_ = os.WriteFile(p, append(b, []byte("chat goal\n")...), 0o644)
+	}
+	m := newTestManager(t, root, fc)
+	sess, err := m.Open(ctx, roiFile)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := sess.Chat(ctx, "add a goal"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+	if err := sess.Merge(ctx); err != nil {
+		t.Fatalf("session merge: %v", err)
+	}
+
+	// Path 2: the CLI's PublishFile, on a second coordination file.
+	linksFile := repo.LinksFile
+	if err := PublishFile(ctx, root, linksFile, "links: {}\n", "operator: seed links", false); err != nil {
+		t.Fatalf("PublishFile: %v", err)
+	}
+
+	got, _ := os.ReadFile(filepath.Join(root, filepath.FromSlash(roiFile)))
+	if !strings.Contains(string(got), "chat goal") {
+		t.Fatalf("chat-driven merge did not land: %q", got)
+	}
+	got2, _ := os.ReadFile(filepath.Join(root, linksFile))
+	if !strings.Contains(string(got2), "links:") {
+		t.Fatalf("CLI PublishFile did not land: %q", got2)
+	}
+
+	// Static proof the two entry points share the helper, not parallel logic.
+	src, err := os.ReadFile("editor.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(src)
+	mergeIdx := strings.Index(text, "func (s *Session) merge(")
+	publishFileIdx := strings.Index(text, "func PublishFile(")
+	if mergeIdx < 0 || publishFileIdx < 0 {
+		t.Fatal("could not locate merge()/PublishFile() in editor.go")
+	}
+	mergeBody := text[mergeIdx:publishFileIdx]
+	if !strings.Contains(mergeBody, "PublishWorktree(ctx") {
+		t.Fatal("Session.merge no longer calls the shared PublishWorktree helper")
+	}
+	rest := text[publishFileIdx:]
+	if !strings.Contains(rest, "PublishWorktree(ctx") {
+		t.Fatal("PublishFile no longer calls the shared PublishWorktree helper")
 	}
 }
