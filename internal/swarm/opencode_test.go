@@ -283,3 +283,60 @@ func TestIdleWatchdogSpareProgressingTurn(t *testing.T) {
 		t.Fatalf("reply = %q, want the settled text %q", reply, "landed")
 	}
 }
+
+// TestFingerprintCountsAllAgentSignals proves the liveness fingerprint advances
+// on EVERY distinct agent signal — not only text/output/status. Each variant is
+// the same base part with exactly ONE additional signal populated (a tool name,
+// call id, streamed input arg, error, or human title); every one must yield a
+// fingerprint different from the base, so any of them resets the idle watchdog.
+func TestFingerprintCountsAllAgentSignals(t *testing.T) {
+	// base: a bare in-flight tool part with none of the extra signals set.
+	base := `{"type":"tool","state":{"status":"running"}}`
+	variants := map[string]string{
+		"tool-name":  `{"type":"tool","tool":"bash","state":{"status":"running"}}`,
+		"call-id":    `{"type":"tool","callID":"call_abc","state":{"status":"running"}}`,
+		"input-arg":  `{"type":"tool","state":{"status":"running","input":{"command":"go test ./..."}}}`,
+		"tool-error": `{"type":"tool","state":{"status":"error","error":"boom"}}`,
+		"tool-title": `{"type":"tool","state":{"status":"running","title":"Running the suite"}}`,
+	}
+
+	fpFor := func(t *testing.T, part string) int64 {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"info":{"id":"a1","role":"assistant","time":{}},"parts":[` + part + `]}]`))
+		}))
+		defer srv.Close()
+		oc := &Opencode{Base: srv.URL, Model: "m", HTTP: srv.Client()}
+		s := &ocSession{oc: oc, id: "sess1", dir: "/wt", system: "sys"}
+		_, _, fp, err := s.turnPoll(context.Background(), "a1")
+		if err != nil {
+			t.Fatalf("turnPoll: %v", err)
+		}
+		return fp
+	}
+
+	baseFP := fpFor(t, base)
+	for name, part := range variants {
+		if got := fpFor(t, part); got == baseFP {
+			t.Errorf("signal %q did not advance the fingerprint (fp=%d == base %d); a live agent emitting only this signal would be wrongly abandoned as idle", name, got, baseFP)
+		}
+	}
+}
+
+// TestInputFingerprintOrderIndependent guards the one hazard the input fold could
+// introduce: Go map iteration order is random, so the same input map must always
+// fold to the same value or a live agent could suffer a false idle-reset churn.
+func TestInputFingerprintOrderIndependent(t *testing.T) {
+	in := map[string]any{"a": "one", "bb": 22, "ccc": []string{"x", "y"}, "dddd": map[string]any{"k": "v"}}
+	want := inputFingerprint(in)
+	for i := 0; i < 50; i++ {
+		if got := inputFingerprint(in); got != want {
+			t.Fatalf("inputFingerprint not stable across iterations: %d != %d", got, want)
+		}
+	}
+	// A longer arg value (streamed input growth) MUST change it.
+	if inputFingerprint(map[string]any{"a": "one"}) == inputFingerprint(map[string]any{"a": "one-longer"}) {
+		t.Fatal("growing an input value did not change the fingerprint")
+	}
+}

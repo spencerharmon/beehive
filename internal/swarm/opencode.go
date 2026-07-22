@@ -371,15 +371,30 @@ func (s *ocSession) awaitTurn(ctx context.Context, assistantID string) (string, 
 	}
 }
 
+// inputFingerprint folds a tool call's input arguments into the liveness
+// fingerprint. The sum is order-INDEPENDENT (commutative over entries) so the
+// random iteration order of a Go map can never by itself change the value and
+// trip a false idle-reset; it grows when a key is added or an argument's rendered
+// value lengthens (e.g. streamed tool input), which is exactly the "agent is
+// still doing something" signal watchIdle resets on.
+func inputFingerprint(in map[string]any) int64 {
+	var n int64
+	for k, v := range in {
+		n += int64(len(k)) + int64(len(fmt.Sprint(v)))
+	}
+	return n
+}
+
 // turnPoll fetches the session message list and reports (a) whether the tracked
 // assistant turn has completed, returning its concatenated text when so, and (b) a
 // progress fingerprint over the WHOLE turn transcript. opencode stamps a message's
 // info.time.completed when its turn finishes; an in-flight assistant message has
 // no completed timestamp, and a turn that has not yet created its assistant
-// message reports done=false. The fingerprint sums every part's text, streamed
-// tool output, and status length across all messages (plus a per-part constant),
-// so a new tool call, more streamed output, or a running->completed transition all
-// advance it — the signal the idle watchdog resets on.
+// message reports done=false. The fingerprint sums every part's text, tool
+// name/id/input/output/error/title and status length across all messages (plus a
+// per-part constant), so a new part, more streamed output, changing tool input, a
+// running->completed transition, or a surfaced error all advance it — the signal
+// the idle watchdog resets on, so ANY sign of agent life keeps the turn alive.
 func (s *ocSession) turnPoll(ctx context.Context, assistantID string) (text string, done bool, fp int64, err error) {
 	var raw []struct {
 		Info struct {
@@ -390,11 +405,16 @@ func (s *ocSession) turnPoll(ctx context.Context, assistantID string) (text stri
 			} `json:"time"`
 		} `json:"info"`
 		Parts []struct {
-			Type  string `json:"type"`
-			Text  string `json:"text"`
-			State struct {
-				Status string `json:"status"`
-				Output string `json:"output"`
+			Type   string `json:"type"`
+			Text   string `json:"text"`
+			Tool   string `json:"tool"`
+			CallID string `json:"callID"`
+			State  struct {
+				Status string         `json:"status"`
+				Input  map[string]any `json:"input"`
+				Output string         `json:"output"`
+				Error  string         `json:"error"`
+				Title  string         `json:"title"`
 			} `json:"state"`
 		} `json:"parts"`
 	}
@@ -404,7 +424,16 @@ func (s *ocSession) turnPoll(ctx context.Context, assistantID string) (text stri
 	idx := -1
 	for i := range raw {
 		for _, p := range raw[i].Parts {
-			fp += int64(len(p.Text)) + int64(len(p.State.Output)) + int64(len(p.State.Status)) + 7
+			// Liveness fingerprint: fold EVERY field the agent can mutate so ANY sign of
+			// life resets the idle clock — a new part (+7), streamed text/reasoning
+			// (Text), a tool call's name/id/args (Tool, CallID, Input), its streamed
+			// stdout (Output), its status transition (Status), a human title, or an
+			// error. Anything the agent does — thinking, calling a tool, editing a file,
+			// emitting output — changes at least one of these and proves it is alive.
+			fp += int64(len(p.Text)) + int64(len(p.Tool)) + int64(len(p.CallID)) +
+				int64(len(p.State.Output)) + int64(len(p.State.Status)) +
+				int64(len(p.State.Error)) + int64(len(p.State.Title)) +
+				inputFingerprint(p.State.Input) + 7
 		}
 		if raw[i].Info.Role != "assistant" {
 			continue
