@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	selectt "github.com/spencerharmon/beehive/internal/select"
 )
@@ -99,9 +100,13 @@ const repoPlanFile = "PLAN.md"
 //     in HEAD;
 //  4. the task carries a `commits=` tag (the session's submodule commits, or
 //     `commits=none`) in the COMMITTED plan, the doc's `<!-- Beehive-Commits: -->`
-//     header names the SAME set, and every referenced commit EXISTS in the
-//     submodule — so a flip can never reference a phantom/bad-object commit (the
-//     be7e394/d4fdf97 stamps, 2026-07-22).
+//     header names the SAME set, and every referenced commit is REACHABLE ON THE
+//     SUBMODULE ORIGIN (pushed, not merely present in this pass's ephemeral local
+//     object store) — so a flip can never reference a phantom/bad-object commit (the
+//     be7e394/d4fdf97 stamps, 2026-07-22) NOR a local-only commit that dies on
+//     worktree teardown (chat-editor-fullwidth-panel-layout, 2026-07-22). A
+//     remote-less local-sharing hive has no origin to push to and falls back to
+//     local existence, which is durable there.
 //
 // It returns "" when every invariant holds or the gate is INAPPLICABLE (a non-task
 // kind, or a status that is not a gated terminal handoff); a non-empty commit-
@@ -214,20 +219,37 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	if !sameCommitSet(ct.Commits, docShas) {
 		return commitsMismatchFailPrompt(docPath, ct.Commits, docShas), nil
 	}
-	// Reachability: every referenced sha must exist as a commit in the submodule
-	// object store (a phantom/bad-object sha fails `cat-file -e`). `commits=none`
-	// (len 0) trivially passes; the clean-checkout gate above already guards an
-	// undeclared uncommitted change.
-	for _, sha := range ct.Commits {
+	// Durability: every referenced sha must be reachable on the submodule ORIGIN,
+	// not merely in this pass's ephemeral local object store. The agent commits on
+	// bee-<taskid> and PUSHES it to origin; at gate time the local code worktree
+	// still holds the object, so a bare local `cat-file -e` PASSES even for a commit
+	// that was never pushed — which then vanishes on worktree teardown + gc, leaving
+	// a bad-object pointer that strands every later review/arbitration (observed
+	// live: chat-editor-fullwidth-panel-layout flipped NEEDS-REVIEW with a local-only
+	// commit, went bad-object, then burned review→arbitration→NEEDS-HUMAN, 2026-07-22).
+	// git.Repo.RemoteContainsCommit fetches remote/<branch> and asks
+	// `merge-base --is-ancestor sha remote/<branch>`, so an unpushed local commit is
+	// REFUSED with the fix-forward "push bee-<taskid> to origin" prompt. A remote-less
+	// local-sharing hive (rem=="") falls back to local existence, which IS durable
+	// there (one shared object database). `commits=none` (len 0) trivially passes; the
+	// clean-checkout gate above already guards an undeclared uncommitted change.
+	if len(ct.Commits) > 0 {
 		if !checkoutExists {
-			return commitsUnreachableFailPrompt(sel.Submodule.Name, sha, ct.Commits), nil
+			return commitsUnreachableFailPrompt(sel.Submodule.Name, ct.Commits[0], ct.Commits), nil
 		}
-		co, err := r.runVerify(ctx, checkoutDir, "git", "cat-file", "-e", sha+"^{commit}")
+		sg := git.New(checkoutDir)
+		rem, err := sg.Remote(ctx)
 		if err != nil {
-			return "", fmt.Errorf("verify gate: checking commit %s in %s: %w", sha, checkoutDir, err)
+			return "", fmt.Errorf("verify gate: resolving submodule %s remote in %s: %w", sel.Submodule.Name, checkoutDir, err)
 		}
-		if co.exitErr {
-			return commitsUnreachableFailPrompt(sel.Submodule.Name, sha, ct.Commits), nil
+		for _, sha := range ct.Commits {
+			ok, err := sg.RemoteContainsCommit(ctx, rem, branch, sha)
+			if err != nil {
+				return "", fmt.Errorf("verify gate: checking commit %s durability on %s/%s: %w", sha, rem, branch, err)
+			}
+			if !ok {
+				return commitsUnreachableFailPrompt(sel.Submodule.Name, sha, ct.Commits), nil
+			}
 		}
 	}
 	return "", nil

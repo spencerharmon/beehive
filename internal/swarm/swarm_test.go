@@ -4726,3 +4726,139 @@ func TestContinuationReportEnumeratesPredicates(t *testing.T) {
 		t.Fatalf("reconcile met report must coincide with completion: done=%v err=%v", done, err)
 	}
 }
+
+// durabilityFixture builds a real Work-handoff shape for the step-4 origin-
+// durability check: a hive repo, a submodule with a REAL git repo at repo/, an
+// optional bare origin remote, and a bee-T1 code worktree carrying one commit
+// (whose sha is returned). The on-disk PLAN.md flips T1 to NEEDS-REVIEW with
+// commits=<sha>. push controls whether bee-T1 is pushed to origin; withRemote
+// controls whether the submodule has a configured origin at all (a remote-less
+// local-sharing hive). Returns the runner (wired with a seam answering the
+// committed-artifact reads for <sha>), the selection, the worktree dir, the hive
+// root, and the commit sha.
+func durabilityFixture(t *testing.T, withRemote, push bool) (r *Runner, sel *selectt.Selection, wtDir, root, sha string) {
+	t.Helper()
+	ctx := context.Background()
+	root = t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	repoDir := filepath.Join(sm, "repo")
+	os.MkdirAll(repoDir, 0o755)
+	rg := gitInit(t, repoDir)
+	os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+	if err := rg.Commit(ctx, "base"); err != nil {
+		t.Fatalf("submodule base commit: %v", err)
+	}
+	if withRemote {
+		origin := filepath.Join(t.TempDir(), "origin.git")
+		if err := os.MkdirAll(origin, 0o755); err != nil {
+			t.Fatalf("mkdir origin: %v", err)
+		}
+		if _, err := git.New(origin).Run(ctx, "init", "-q", "--bare", "-b", "main"); err != nil {
+			t.Fatalf("bare origin init: %v", err)
+		}
+		if _, err := rg.Run(ctx, "remote", "add", "origin", origin); err != nil {
+			t.Fatalf("remote add: %v", err)
+		}
+		if _, err := rg.Run(ctx, "push", "-q", "origin", "main"); err != nil {
+			t.Fatalf("push main: %v", err)
+		}
+	}
+	// The code worktree the Work pass authored in, carrying one bee-T1 commit.
+	wtDir = filepath.Join(sm, "worktrees", "bee-T1")
+	if _, err := rg.Run(ctx, "worktree", "add", "-q", "-b", "bee-T1", wtDir); err != nil {
+		t.Fatalf("worktree add: %v", err)
+	}
+	wg := git.New(wtDir)
+	os.WriteFile(filepath.Join(wtDir, "f"), []byte("y"), 0o644)
+	if err := wg.Commit(ctx, "Beehive: T1 submodules/sm/docs/bee-T1-T1.md"); err != nil {
+		t.Fatalf("worktree commit: %v", err)
+	}
+	sha, err := wg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse worktree HEAD: %v", err)
+	}
+	if withRemote && push {
+		if _, err := wg.Run(ctx, "push", "-q", "origin", "bee-T1"); err != nil {
+			t.Fatalf("push bee-T1: %v", err)
+		}
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z commits="+sha+" -->\ngo\n"), 0o644)
+	g.Commit(ctx, "seed")
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel = &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	// Seam answers checks 1-3 (clean status, committed flip, committed doc) plus
+	// the committed PLAN.md/doc reads carrying commits=<sha>, so the run reaches
+	// the real step-4 durability check unmodified.
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if len(args) >= 2 && args[0] == "show" {
+			if strings.HasSuffix(args[1], "PLAN.md") {
+				return verifyOutcome{out: "## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=" + sha + " -->\ngo\n"}, nil
+			}
+			return verifyOutcome{out: "<!-- Beehive-Commits: " + sha + " -->\n\ndoc\n"}, nil
+		}
+		if len(args) > 0 && args[0] == "ls-tree" {
+			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
+		}
+		return verifyOutcome{}, nil // git status --porcelain: clean
+	}}
+	r = &Runner{Repo: rp, Git: g, MaxTurns: 5, TTL: time.Hour, RunVerify: gr.run}
+	return
+}
+
+// TestVerifyGateRefusesLocalOnlyUnpushedCommit is the regression for
+// chat-editor-fullwidth-panel-layout (2026-07-22): a Work pass committed on
+// bee-T1 but NEVER pushed it to origin. The commit is in the worktree's (shared)
+// local object store, so the old `cat-file -e` durability check PASSED — then the
+// commit died on worktree teardown + gc, leaving a bad-object pointer that burned
+// review -> arbitration -> NEEDS-HUMAN. The origin-durability gate must REFUSE the
+// handoff and hand back the push-to-origin fix-forward prompt.
+func TestVerifyGateRefusesLocalOnlyUnpushedCommit(t *testing.T) {
+	ctx := context.Background()
+	r, sel, wtDir, root, sha := durabilityFixture(t, true /*withRemote*/, false /*push*/)
+	hint, err := r.verifyGate(ctx, sel, wtDir, root, "bee-T1")
+	if err != nil {
+		t.Fatalf("verifyGate: %v", err)
+	}
+	if hint == "" {
+		t.Fatalf("gate must REFUSE a local-only unpushed commit (%s); it passed", sha)
+	}
+	if !contains(hint, "origin") || !contains(hint, "push") {
+		t.Fatalf("refusal must name the push-to-origin fix-forward, got: %q", hint)
+	}
+}
+
+// TestVerifyGateAllowsPushedCommit is the positive control: the same shape with
+// bee-T1 pushed to origin passes the durability check cleanly.
+func TestVerifyGateAllowsPushedCommit(t *testing.T) {
+	ctx := context.Background()
+	r, sel, wtDir, root, _ := durabilityFixture(t, true /*withRemote*/, true /*push*/)
+	hint, err := r.verifyGate(ctx, sel, wtDir, root, "bee-T1")
+	if err != nil {
+		t.Fatalf("verifyGate: %v", err)
+	}
+	if hint != "" {
+		t.Fatalf("a pushed commit is durable on origin and must pass the gate, got refusal: %q", hint)
+	}
+}
+
+// TestVerifyGateLocalSharingAllowsUnpushedCommit: a remote-less local-sharing hive
+// has no origin to push to; every honeybee shares one object database, so a
+// committed-but-unpushed commit IS durable there. The gate must fall back to local
+// existence and allow the handoff (mirrors CommitReachable's rem=="" branch).
+func TestVerifyGateLocalSharingAllowsUnpushedCommit(t *testing.T) {
+	ctx := context.Background()
+	r, sel, wtDir, root, _ := durabilityFixture(t, false /*withRemote*/, false /*push*/)
+	hint, err := r.verifyGate(ctx, sel, wtDir, root, "bee-T1")
+	if err != nil {
+		t.Fatalf("verifyGate: %v", err)
+	}
+	if hint != "" {
+		t.Fatalf("a remote-less local-sharing hive has no origin; a local commit is durable and must pass, got refusal: %q", hint)
+	}
+}
