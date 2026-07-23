@@ -19,12 +19,17 @@ import (
 	"github.com/spencerharmon/beehive/internal/swarm"
 )
 
-// agentClient is the slice of the opencode client the editor needs: a session
+// AgentClient is the slice of the opencode client a Session needs: a session
 // seeded with a system prompt and a first message, returning the reply. Narrowed
-// to an interface so tests can inject a fake. (*swarm.Opencode) satisfies it.
-type agentClient interface {
+// to an interface so tests (and alternate transports) can inject a fake.
+// (*swarm.Opencode) satisfies it.
+type AgentClient interface {
 	NewSession(ctx context.Context, cwd, system, first string) (swarm.Session, string, error)
 }
+
+// agentClient is the internal alias for AgentClient, kept so existing internal
+// references read unchanged.
+type agentClient = AgentClient
 
 // mergeMarker is the control token the agent appends to its reply when the user
 // has explicitly approved merging. beehived performs the merge on its behalf, so
@@ -42,19 +47,16 @@ const mergeMarker = "<<<MERGE>>>"
 // Two concrete rules enforce it, both in this file:
 //
 //  1. NAMESPACE OWNERSHIP. This Manager owns EXACTLY the branches it creates:
-//     those under editBranchPrefix. It is NOT the only subsystem that cuts
-//     `edit-*` worktrees in the shared beehive-root .worktrees/ dir — the web
-//     layer's resolve agent (internal/web/resolveagent.go, `edit-resolve-*`)
-//     and the bootstrap chat editor (internal/web/chatedit.go, `edit-*`) do
-//     too, and they hold their proposals in memory with NO persistence store.
-//     If this Manager's reclaim/adoption enumerated the bare `edit-*` prefix it
-//     would (a) adopt a live foreign worktree into its own store as a bogus
-//     editor session and (b) delete that foreign worktree/branch the moment it
-//     looked "clean" (a Q&A-only turn, or a proposal still held in memory) —
-//     silently wiping another subsystem's in-flight edit. So every enumeration
-//     here (isEditBranch, the local worktree scan, the trusted-remote branch
-//     glob) is scoped to editBranchPrefix and NEVER touches a foreign edit-*
-//     branch.
+//     those under editBranchPrefix. Since edit-session-consolidation the resolve
+//     agent and the bootstrap agent are ALSO editor.Sessions of this Manager
+//     (Kind resolve / bootstrap), so they use this same hive-edit- namespace and
+//     are recovered/reclaimed by the same rules — no separate in-memory copy
+//     exists to be adopted or destroyed. Any OTHER subsystem that ever cuts a
+//     bare `edit-*` worktree in the shared beehive-root .worktrees/ dir is still
+//     foreign: every enumeration here (isEditBranch, the local worktree scan,
+//     the trusted-remote branch glob) is scoped to editBranchPrefix and NEVER
+//     touches a foreign edit-* branch, so a future subsystem's in-flight edit is
+//     never adopted or deleted.
 //
 //  2. NEVER RECLAIM A LIVE SESSION. A branch currently registered in m.byID is
 //     a live, in-memory session (an operator has it open); it is NEVER
@@ -142,32 +144,96 @@ func ProtectedDeletion(file, base, proposed string) bool {
 
 // Turn is one chat message in a session's log.
 type Turn struct {
-	Role string    `json:"role"` // "user" | "agent"
+	Role string    `json:"role"` // "user" | "agent" | "system"
 	Text string    `json:"text"`
 	At   time.Time `json:"at"`
 }
 
-// Session is one collaborative single-file edit on its own worktree branch.
+// Kind classifies a session's edit model and lifecycle so ONE Manager/Session
+// engine serves every AI edit surface (edit-session-consolidation). Before this
+// the web layer ran two PARALLEL, in-memory-only copies of this machinery — the
+// blocker-resolution agent (resolveManager) and the bootstrap chat editor
+// (chatManager) — each cutting its own edit-* worktree with no persistence, no
+// transcript replay, and (the editor-session-wipe incident) no protection from
+// this Manager's reclaim. Folding them in here gives all three the SAME durable
+// worktree/opencode/transcript/publish/reclaim path; Kind only varies the few
+// axes that genuinely differ (single-file vs whole-tree, the allowlist, the
+// system prompt, whether the agent may self-merge).
+type Kind string
+
+const (
+	// KindFile is the canonical coordination-file editor: exactly one allowlisted
+	// file, agent edits it directly, MERGE-marker self-merge honored.
+	KindFile Kind = "file"
+	// KindResolve is a NEEDS-HUMAN blocker-resolution agent: a whole-tree,
+	// unrestricted, tool-using session over arbitrary beehive-layer files;
+	// publish is operator-only (no self-merge).
+	KindResolve Kind = "resolve"
+	// KindBootstrap is the setup agent over the fixed LOCALS.md; publish is
+	// operator-only.
+	KindBootstrap Kind = "bootstrap"
+)
+
+// Spec is the full description of a session to open. It generalizes the
+// single-file coordination editor (File set, Kind==KindFile, AutoMerge) to also
+// express the resolve agent (WholeTree+Unrestricted, a caller-supplied blocker
+// System prompt, a one-shot orientation Preamble) and the bootstrap agent (a
+// fixed File, a caller-supplied System, a seeded Intro), so a single
+// Manager.OpenSession covers all three.
+type Spec struct {
+	File         string            // single-file mode: repo-relative target file
+	WholeTree    bool              // resolve: `git add -A` commit + main...HEAD multi-file diff
+	Unrestricted bool              // skip the editableBasenames allowlist (internal callers only)
+	System       string            // opencode system prompt ("" -> default systemPrompt(File), KindFile only)
+	Preamble     string            // one-shot orientation prepended to the FIRST fresh turn ("" = none)
+	Kind         Kind              // classifier; "" -> KindFile
+	Slug         string            // branch slug ("" -> slugFile(File); required when File=="")
+	Meta         map[string]string // opaque caller tags, persisted for web re-association after restart
+	TurnCeiling  time.Duration     // absolute per-turn wall-clock ceiling (0 = none)
+	AutoMerge    bool              // honor the agent's MERGE marker (KindFile only)
+	Intro        []Turn            // visible turns to seed the log with (bootstrap intro)
+}
+
+// Session is one collaborative edit on its own worktree branch. Depending on its
+// Kind it edits a single allowlisted file (KindFile) or the whole tree across
+// arbitrary files (KindResolve); the shared worktree/opencode/transcript/publish/
+// reclaim machinery is identical.
 type Session struct {
 	ID       string `json:"id"`
-	File     string `json:"file"` // repo-relative, e.g. submodules/x/ROI.md
+	File     string `json:"file"` // repo-relative, e.g. submodules/x/ROI.md; "" for a whole-tree session
 	Branch   string `json:"branch"`
 	wtPath   string // absolute worktree path
 	sys      string // opencode system prompt
 	remote   string
 	baseMain string
 
+	kind         Kind
+	wholeTree    bool
+	unrestricted bool
+	preamble     string // one-shot first-turn orientation (consumed after the first fresh turn)
+	meta         map[string]string
+	turnCeiling  time.Duration
+	autoMerge    bool
+
 	client agentClient
 	wt     *git.Repo // worktree git
 	mgr    *Manager  // owner, for persistence on activity
 
-	mu       sync.Mutex
-	oc       swarm.Session // opencode session (lazy: created on first chat)
-	log      []Turn
-	busy     bool      // UI-facing "working…" status; clears the instant the reply is ready (chat-editor-status-poll-fix), NOT when publish work finishes
-	turnOn   bool      // serializes turns end-to-end (reply + commit/transcript/push/merge); NEVER surfaced to the UI
-	err      string    // last turn error, surfaced in the panel
-	activity time.Time // last open/chat/merge, drives startup staleness
+	// wtMu serializes every git operation that touches this session's worktree
+	// index or refs (the post-turn commit, the multi-file range reads, publish/
+	// merge) so a panel poll or a Publish can never race the background turn's
+	// commit on index.lock. Lock order when both are held is wtMu THEN mu.
+	wtMu sync.Mutex
+
+	mu           sync.Mutex
+	oc           swarm.Session // opencode session (lazy: created on first chat)
+	cancel       context.CancelFunc
+	preambleUsed bool
+	log          []Turn
+	busy         bool      // UI-facing "working…" status; clears the instant the reply is ready (chat-editor-status-poll-fix), NOT when publish work finishes
+	turnOn       bool      // serializes turns end-to-end (reply + commit/transcript/push/merge); NEVER surfaced to the UI
+	err          string    // last turn error, surfaced in the panel
+	activity     time.Time // last open/chat/merge, drives startup staleness
 }
 
 // Manager owns active editor sessions and the worktrees backing them.
@@ -192,6 +258,19 @@ type Manager struct {
 // always kept regardless of age.
 const defaultSessionTTL = 60 * time.Minute
 
+// idleTimeout is the per-turn PROGRESS watchdog for a session's opencode turns:
+// a turn that produces no new transcript activity for this long is cut (a wedged
+// tool call, a hung provider). Tool-using resolve turns especially need it so a
+// stuck turn can never pin a session at "working…" forever. From config, with a
+// sane default when unset. Package-level so NewManager wires it into the one
+// client every session shares.
+func idleTimeout(cfg config.Config) time.Duration {
+	if cfg.TurnIdleTimeoutMinutes > 0 {
+		return time.Duration(cfg.TurnIdleTimeoutMinutes) * time.Minute
+	}
+	return 5 * time.Minute
+}
+
 // NewManager builds a Manager over the beehive repo at root.
 func NewManager(root string, cfg config.Config) (*Manager, error) {
 	abs, err := filepath.Abs(root)
@@ -207,7 +286,7 @@ func NewManager(root string, cfg config.Config) (*Manager, error) {
 		absRoot: abs,
 		cfg:     cfg,
 		primary: git.New(root),
-		client:  &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}},
+		client:  &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}, IdleTimeout: idleTimeout(cfg)},
 		store:   newStore(filepath.Join(abs, ".worktrees", sessionsFile)),
 		ttl:     ttl,
 		now:     time.Now,
@@ -215,14 +294,40 @@ func NewManager(root string, cfg config.Config) (*Manager, error) {
 	}, nil
 }
 
-// ValidateFile reports whether file (repo-relative) is an editable coordination
-// file and is safe (no traversal). It does not require the file to exist yet.
-func ValidateFile(file string) error {
+// NewManagerWithClient is NewManager with an injected opencode transport, so a
+// test (or a caller supplying its own agent client) drives sessions through a
+// fake instead of a real opencode server.
+func NewManagerWithClient(root string, cfg config.Config, client AgentClient) (*Manager, error) {
+	m, err := NewManager(root, cfg)
+	if err != nil {
+		return nil, err
+	}
+	m.client = client
+	return m, nil
+}
+
+// safePath rejects a repo-relative path that could escape the repo (absolute,
+// traversal) or reach into git metadata. It does NOT require the file to exist
+// (a new-file edit is legitimate) and does NOT apply the coordination-file
+// allowlist — that is ValidateFile's added restriction for the public editor.
+func safePath(file string) error {
 	clean := filepath.ToSlash(filepath.Clean(file))
 	if clean == "." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "..") || strings.Contains(clean, "../") {
 		return fmt.Errorf("invalid file path %q", file)
 	}
-	if !editableBasenames[filepath.Base(clean)] {
+	if clean == ".git" || strings.HasPrefix(clean, ".git/") {
+		return fmt.Errorf("refusing to edit git metadata %q", file)
+	}
+	return nil
+}
+
+// ValidateFile reports whether file (repo-relative) is an editable coordination
+// file and is safe (no traversal). It does not require the file to exist yet.
+func ValidateFile(file string) error {
+	if err := safePath(file); err != nil {
+		return err
+	}
+	if !editableBasenames[filepath.Base(filepath.ToSlash(filepath.Clean(file)))] {
 		return fmt.Errorf("%q is not an editable file", file)
 	}
 	return nil
@@ -269,19 +374,51 @@ func trustedRemote(ctx context.Context, primary *git.Repo) (string, error) {
 	return remote, nil
 }
 
-// Open creates a worktree+branch for editing file and registers a session.
+// Open creates a worktree+branch for editing a single coordination file and
+// registers a KindFile session with agent self-merge enabled. It is the public
+// entry point for the "edit with AI" surface; it delegates to OpenSession.
+func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
+	return m.OpenSession(ctx, Spec{File: file, Kind: KindFile, AutoMerge: true})
+}
+
+// OpenSession creates a worktree+branch for a session described by spec and
+// registers it. It is the single generalized open path behind the coordination
+// editor (Open), the resolve agent, and the bootstrap agent
+// (edit-session-consolidation).
 //
 // Base selection is safety-hardened (editor-safety-guards): a configured remote
 // is trusted as the worktree base ONLY when it is the repo's OWN — its main
 // shares history with local main. A foreign/unrelated origin/main is ignored in
-// favor of local main and is never used as a merge push target. The chosen base
-// is then validated to contain the target file whenever local main does, so a
-// session can never open onto a destructive whole-file-deletion diff produced by
-// a wrong/foreign base. Genuine new-file creation (absent at both) stays allowed.
-func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
-	file = filepath.ToSlash(filepath.Clean(file))
-	if err := ValidateFile(file); err != nil {
-		return nil, err
+// favor of local main and is never used as a merge push target. For a single-file
+// spec the chosen base is then validated to contain the target file whenever
+// local main does, so a session can never open onto a destructive whole-file-
+// deletion diff produced by a wrong/foreign base. Genuine new-file creation
+// (absent at both) stays allowed. A whole-tree spec skips that per-file check.
+func (m *Manager) OpenSession(ctx context.Context, spec Spec) (*Session, error) {
+	kind := spec.Kind
+	if kind == "" {
+		kind = KindFile
+	}
+	file := ""
+	if spec.File != "" {
+		file = filepath.ToSlash(filepath.Clean(spec.File))
+	}
+	if !spec.WholeTree {
+		if file == "" {
+			return nil, fmt.Errorf("editor: a single-file session requires a file")
+		}
+		if spec.Unrestricted {
+			if err := safePath(file); err != nil {
+				return nil, err
+			}
+		} else if err := ValidateFile(file); err != nil {
+			return nil, err
+		}
+	} else if spec.Slug == "" {
+		return nil, fmt.Errorf("editor: a whole-tree session requires a Slug")
+	}
+	if spec.System == "" && (file == "" || kind != KindFile) {
+		return nil, fmt.Errorf("editor: %s session requires a System prompt", kind)
 	}
 	// trusted is "" unless the configured remote is verified as the repo's OWN
 	// (shared history) — never a foreign/unrelated one. Only a trusted remote is
@@ -301,27 +438,44 @@ func (m *Manager) Open(ctx context.Context, file string) (*Session, error) {
 	}
 	// Validate the edit base: the target MUST exist at base when it exists on local
 	// main, else the worktree (cut from base) renders an existing file as a
-	// destructive deletion. Fail session-open with a clear error instead.
-	if m.primary.Exists(ctx, "main", file) && !m.primary.Exists(ctx, base, file) {
+	// destructive deletion. Fail session-open with a clear error instead. Single-
+	// file only — a whole-tree session edits many files and has no single target.
+	if file != "" && !spec.WholeTree && m.primary.Exists(ctx, "main", file) && !m.primary.Exists(ctx, base, file) {
 		return nil, fmt.Errorf("editor: %s exists on main but not at edit base %q; refusing to open a destructive edit (the base may be a wrong or foreign main)", file, base)
 	}
-	branch := editBranchPrefix + slugFile(file) + "-" + fmt.Sprint(time.Now().Unix())
+	slug := spec.Slug
+	if slug == "" {
+		slug = slugFile(file)
+	}
+	branch := editBranchPrefix + slug + "-" + fmt.Sprint(time.Now().UnixNano())
 	wtPath := filepath.Join(m.absRoot, ".worktrees", branch)
 	if err := m.primary.WorktreeAdd(ctx, wtPath, branch, base); err != nil {
 		return nil, fmt.Errorf("worktree add: %w", err)
 	}
+	sys := spec.System
+	if sys == "" {
+		sys = systemPrompt(file)
+	}
 	s := &Session{
-		ID:       branch,
-		File:     file,
-		Branch:   branch,
-		wtPath:   wtPath,
-		remote:   trusted,
-		baseMain: baseMain,
-		client:   m.client,
-		wt:       git.New(wtPath),
-		mgr:      m,
-		sys:      systemPrompt(file),
-		activity: m.now(),
+		ID:           branch,
+		File:         file,
+		Branch:       branch,
+		wtPath:       wtPath,
+		remote:       trusted,
+		baseMain:     baseMain,
+		kind:         kind,
+		wholeTree:    spec.WholeTree,
+		unrestricted: spec.Unrestricted,
+		preamble:     spec.Preamble,
+		meta:         spec.Meta,
+		turnCeiling:  spec.TurnCeiling,
+		autoMerge:    spec.AutoMerge,
+		client:       m.client,
+		wt:           git.New(wtPath),
+		mgr:          m,
+		sys:          sys,
+		log:          append([]Turn(nil), spec.Intro...),
+		activity:     m.now(),
 	}
 	m.mu.Lock()
 	m.byID[s.ID] = s
@@ -363,12 +517,19 @@ func (m *Manager) Close(ctx context.Context, id string) error {
 		return nil
 	}
 	s.mu.Lock()
+	if s.cancel != nil {
+		s.cancel() // unwind any in-flight turn before removing its worktree
+	}
 	if s.oc != nil {
 		_ = s.oc.Close()
 	}
 	s.mu.Unlock()
+	// Serialize worktree removal against a commit still draining in the cancelled
+	// turn (wtMu is the turn path's index guard).
+	s.wtMu.Lock()
 	_ = m.primary.WorktreeRemove(ctx, s.wtPath)
 	_, _ = m.primary.Run(ctx, "branch", "-D", s.Branch)
+	s.wtMu.Unlock()
 	if s.remote != "" {
 		// chat-diff-session-durability: an intentionally closed session must
 		// never resurrect itself from its own pushed copy on a later Reload's
@@ -386,15 +547,31 @@ func (s *Session) snapshot() sessionRecord {
 	defer s.mu.Unlock()
 	logCopy := make([]Turn, len(s.log))
 	copy(logCopy, s.log)
+	var meta map[string]string
+	if len(s.meta) > 0 {
+		meta = make(map[string]string, len(s.meta))
+		for k, v := range s.meta {
+			meta[k] = v
+		}
+	}
 	return sessionRecord{
-		ID:       s.ID,
-		File:     s.File,
-		Branch:   s.Branch,
-		WtPath:   s.wtPath,
-		Remote:   s.remote,
-		BaseMain: s.baseMain,
-		Activity: s.activity,
-		Log:      logCopy,
+		ID:           s.ID,
+		File:         s.File,
+		Branch:       s.Branch,
+		WtPath:       s.wtPath,
+		Remote:       s.remote,
+		BaseMain:     s.baseMain,
+		Activity:     s.activity,
+		Log:          logCopy,
+		Kind:         string(s.kind),
+		WholeTree:    s.wholeTree,
+		Unrestricted: s.unrestricted,
+		System:       s.sys,
+		Preamble:     s.preamble,
+		PreambleUsed: s.preambleUsed,
+		Meta:         meta,
+		TurnCeiling:  s.turnCeiling,
+		AutoMerge:    s.autoMerge,
 	}
 }
 
@@ -755,19 +932,43 @@ func (m *Manager) restore(ctx context.Context, w git.Worktree, rec sessionRecord
 	if sidecar, ok := readTranscriptSidecar(w.Path); ok {
 		log = sidecar
 	}
+	// Kind and its associated axes come from the persisted record; a record-less
+	// recovery (or an older pre-consolidation record) defaults to the coordination
+	// file editor (KindFile, self-merge, single-file, allowlisted), which is what
+	// every session before edit-session-consolidation was.
+	kind := Kind(rec.Kind)
+	if kind == "" {
+		kind = KindFile
+	}
+	sys := rec.System
+	if sys == "" {
+		sys = systemPrompt(file)
+	}
+	autoMerge := rec.AutoMerge
+	if rec.Kind == "" {
+		autoMerge = true // legacy record: the file editor always self-merged
+	}
 	s := &Session{
-		ID:       w.Branch,
-		File:     file,
-		Branch:   w.Branch,
-		wtPath:   w.Path,
-		remote:   remote,
-		baseMain: baseMain,
-		client:   m.client,
-		wt:       git.New(w.Path),
-		mgr:      m,
-		sys:      systemPrompt(file),
-		log:      log,
-		activity: activity,
+		ID:           w.Branch,
+		File:         file,
+		Branch:       w.Branch,
+		wtPath:       w.Path,
+		remote:       remote,
+		baseMain:     baseMain,
+		kind:         kind,
+		wholeTree:    rec.WholeTree,
+		unrestricted: rec.Unrestricted,
+		preamble:     rec.Preamble,
+		preambleUsed: rec.PreambleUsed,
+		meta:         rec.Meta,
+		turnCeiling:  rec.TurnCeiling,
+		autoMerge:    autoMerge,
+		client:       m.client,
+		wt:           git.New(w.Path),
+		mgr:          m,
+		sys:          sys,
+		log:          log,
+		activity:     activity,
 	}
 	return s, nil
 }
@@ -836,9 +1037,14 @@ func (s *Session) StartChat(bg context.Context, msg string) error {
 	s.busy = true
 	s.err = ""
 	s.log = append(s.log, Turn{Role: "user", Text: msg, At: time.Now()})
+	ctx, cancel := s.turnContext(bg)
+	s.cancel = cancel
 	s.mu.Unlock()
 
-	go s.runTurn(bg, msg)
+	go func() {
+		defer cancel()
+		_, _ = s.runTurn(ctx, msg)
+	}()
 	return nil
 }
 
@@ -854,8 +1060,50 @@ func (s *Session) Chat(ctx context.Context, msg string) (string, error) {
 	s.busy = true
 	s.err = ""
 	s.log = append(s.log, Turn{Role: "user", Text: msg, At: time.Now()})
+	tctx, cancel := s.turnContext(ctx)
+	s.cancel = cancel
 	s.mu.Unlock()
-	return s.runTurn(ctx, msg)
+	defer cancel()
+	return s.runTurn(tctx, msg)
+}
+
+// turnContext derives the per-turn context: bounded by turnCeiling when set (the
+// absolute wall-clock backstop a tool-using resolve turn needs so a wedged tool
+// call can never pin the session at "working…" forever), else just cancelable so
+// Close can unwind an in-flight turn. Caller stores cancel in s.cancel and must
+// invoke it when the turn ends.
+func (s *Session) turnContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if s.turnCeiling > 0 {
+		return context.WithTimeout(parent, s.turnCeiling)
+	}
+	return context.WithCancel(parent)
+}
+
+// commitMsg is the per-kind commit subject for a turn's proposal commit.
+func (s *Session) commitMsg() string {
+	switch s.kind {
+	case KindResolve:
+		return "resolve: agent turn"
+	case KindBootstrap:
+		return "bootstrap: " + s.File
+	default:
+		return "editor: " + s.File
+	}
+}
+
+// commitProposal captures whatever the agent wrote this turn onto the branch. A
+// whole-tree session commits the ENTIRE worktree (`git add -A`, new files
+// included) since it edits arbitrary files; a single-file session commits ONLY
+// its one target. Serialized on wtMu so a concurrent panel diff/publish never
+// races the index. ErrNothing (the agent only answered/investigated) is returned
+// to the caller to tolerate.
+func (s *Session) commitProposal(ctx context.Context) error {
+	s.wtMu.Lock()
+	defer s.wtMu.Unlock()
+	if s.wholeTree {
+		return s.wt.Commit(ctx, s.commitMsg())
+	}
+	return s.wt.CommitPaths(ctx, s.commitMsg(), s.File)
 }
 
 func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
@@ -865,10 +1113,14 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 		s.err = err.Error()
 		s.busy = false
 		s.turnOn = false
+		s.cancel = nil
 		s.mu.Unlock()
 		return "", err
 	}
-	doMerge := strings.Contains(reply, mergeMarker)
+	// The one-shot orientation preamble (resolve) is consumed on a SUCCESSFUL turn
+	// only, so a turn that failed to reach the model still re-seeds it next time.
+	s.preambleUsed = true
+	doMerge := s.autoMerge && strings.Contains(reply, mergeMarker)
 	display := strings.TrimSpace(strings.ReplaceAll(reply, mergeMarker, ""))
 	s.log = append(s.log, Turn{Role: "agent", Text: display, At: time.Now()})
 	// chat-editor-status-poll-fix: the assistant's reply is now ready and
@@ -882,7 +1134,7 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 
 	// Commit whatever the agent wrote so the branch carries the proposal (and a
 	// merge can fast-forward). Nothing-to-commit is fine (agent only answered).
-	if cerr := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); cerr != nil && cerr != git.ErrNothing {
+	if cerr := s.commitProposal(ctx); cerr != nil && cerr != git.ErrNothing {
 		s.setErr("commit: " + cerr.Error())
 	}
 	// Remote durability (chat-diff-session-durability): a trusted remote means
@@ -911,6 +1163,7 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 	}
 	s.mu.Lock()
 	s.turnOn = false
+	s.cancel = nil
 	s.activity = s.mgr.now()
 	s.mu.Unlock()
 	if perr := s.mgr.persist(); perr != nil {
@@ -927,6 +1180,8 @@ func (s *Session) runTurn(ctx context.Context, msg string) (string, error) {
 // publishing to main. Nothing-to-commit (the log serializes identically to
 // what is already committed) is tolerated.
 func (s *Session) commitTranscript(ctx context.Context) error {
+	s.wtMu.Lock()
+	defer s.wtMu.Unlock()
 	s.mu.Lock()
 	logCopy := make([]Turn, len(s.log))
 	copy(logCopy, s.log)
@@ -1013,20 +1268,33 @@ func (s *Session) prompt(ctx context.Context, msg string) (string, error) {
 func (s *Session) resumeFirstMessage(msg string) string {
 	s.mu.Lock()
 	// The current user turn is already appended (StartChat/Chat) as the LAST log
-	// entry; everything before it is the prior conversation to replay.
+	// entry; everything before it is the prior conversation to replay. A seeded
+	// intro turn (bootstrap) is a visible "system" note, not a real exchange, so it
+	// is not replayed as a user/agent turn.
 	var prior []Turn
-	if n := len(s.log); n > 1 {
-		prior = append(prior, s.log[:n-1]...)
+	for _, t := range s.log[:max0(len(s.log)-1)] {
+		if t.Role == "user" || t.Role == "agent" {
+			prior = append(prior, t)
+		}
 	}
+	preamble := s.preamble
+	used := s.preambleUsed
 	s.mu.Unlock()
 	if len(prior) == 0 {
+		// Fresh session (no prior exchange). Prepend the one-shot orientation
+		// preamble on the very first turn when one is set and not yet consumed
+		// (resolve's "investigate before proposing" preamble); otherwise send msg
+		// verbatim, byte-identical to the coordination editor's first turn.
+		if preamble != "" && !used {
+			return preamble + "\n\n" + msg
+		}
 		return msg
 	}
 	var b strings.Builder
 	b.WriteString("You are RESUMING an in-progress editing session that was interrupted " +
 		"(a restart dropped the live session, but the conversation and your earlier " +
-		"edits were saved). The file on disk already reflects every edit you made " +
-		"earlier in this conversation — treat it as the current state and do NOT redo " +
+		"edits were saved). The file(s) on disk already reflect every edit you made " +
+		"earlier in this conversation — treat them as the current state and do NOT redo " +
 		"those edits. For context, here is the conversation so far:\n\n")
 	for _, t := range prior {
 		text := strings.TrimSpace(t.Text)
@@ -1042,6 +1310,15 @@ func (s *Session) resumeFirstMessage(msg string) string {
 	b.WriteString("Now continue the session. The user's next message is:\n\n")
 	b.WriteString(msg)
 	return b.String()
+}
+
+// max0 returns n when positive, else 0 — a small guard so slicing s.log[:n-1] is
+// safe when the log is empty (n==0) or holds only the current turn (n==1).
+func max0(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (s *Session) setErr(msg string) {
@@ -1063,13 +1340,23 @@ func (s *Session) Merge(ctx context.Context) error { return s.merge(ctx, false) 
 func (s *Session) MergeConfirm(ctx context.Context) error { return s.merge(ctx, true) }
 
 func (s *Session) merge(ctx context.Context, confirmDelete bool) error {
-	if cerr := s.wt.CommitPaths(ctx, "editor: "+s.File, s.File); cerr != nil && cerr != git.ErrNothing {
+	s.wtMu.Lock()
+	defer s.wtMu.Unlock()
+	var cerr error
+	if s.wholeTree {
+		cerr = s.wt.Commit(ctx, s.commitMsg())
+	} else {
+		cerr = s.wt.CommitPaths(ctx, s.commitMsg(), s.File)
+	}
+	if cerr != nil && cerr != git.ErrNothing {
 		return cerr
 	}
 	// Delete guard: never auto-merge a whole-file deletion of a human-owned file.
 	// An empty/absent proposed against a non-empty base is a red flag (the wrong-
-	// base incident), so require an explicit, separate confirmation.
-	if !confirmDelete {
+	// base incident), so require an explicit, separate confirmation. A whole-tree
+	// session edits many arbitrary files and has no single human-owned target, so
+	// the single-file deletion guard does not apply to it.
+	if !s.wholeTree && !confirmDelete {
 		base, proposed, derr := s.Diff(ctx)
 		if derr != nil {
 			return derr
@@ -1215,11 +1502,23 @@ func (s *Session) Diff(ctx context.Context) (base, proposed string, err error) {
 	return base, string(b), nil
 }
 
-// State reports "dirty" when the worktree file differs from main (an unmerged
-// proposal exists) or "live" when they match (nothing pending / merged). This is
+// State reports "dirty" when the session carries an unmerged change or "live"
+// when nothing is pending (nothing proposed, or already merged). A single-file
+// session compares its one file's worktree content against main; a whole-tree
+// session reports dirty when it has ANY committed changed file over main. This is
 // computed from git reality, so an agent-performed merge is detected the same as
 // a button merge.
 func (s *Session) State(ctx context.Context) string {
+	if s.wholeTree {
+		files, err := s.ChangedFiles(ctx)
+		if err != nil {
+			return "unknown"
+		}
+		if len(files) == 0 {
+			return "live"
+		}
+		return "dirty"
+	}
 	base, proposed, err := s.Diff(ctx)
 	if err != nil {
 		return "unknown"
@@ -1228,6 +1527,113 @@ func (s *Session) State(ctx context.Context) string {
 		return "live"
 	}
 	return "dirty"
+}
+
+// Kind reports the session's edit model (file / resolve / bootstrap). The web
+// layer uses it to re-associate a recovered session with its surface after a
+// restart and to pick the right panel.
+func (s *Session) Kind() Kind { return s.kind }
+
+// Meta returns a copy of the session's opaque caller tags (e.g. a resolve
+// session's sub/task), persisted across restart for re-association.
+func (s *Session) Meta() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.meta) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(s.meta))
+	for k, v := range s.meta {
+		out[k] = v
+	}
+	return out
+}
+
+// Note appends a visible "system" line to the log (e.g. "Published the change to
+// main.") and persists it. It is the operator-visible counterpart of an agent
+// turn for actions the human took, not the model.
+func (s *Session) Note(text string) {
+	s.mu.Lock()
+	s.log = append(s.log, Turn{Role: "system", Text: text, At: s.mgr.now()})
+	s.mu.Unlock()
+	_ = s.mgr.persist()
+}
+
+// ChangedFiles lists the files a whole-tree session has changed over main (the
+// three-dot main...HEAD range), excluding the in-flight transcript sidecar
+// (bookkeeping, never part of the proposal). Empty for a single-file session or
+// one that has not committed a real change yet. Serialized on wtMu against the
+// turn commit.
+func (s *Session) ChangedFiles(ctx context.Context) ([]string, error) {
+	s.wtMu.Lock()
+	defer s.wtMu.Unlock()
+	return s.changedFilesLocked(ctx)
+}
+
+func (s *Session) changedFilesLocked(ctx context.Context) ([]string, error) {
+	out, err := s.wt.Run(ctx, "diff", "--name-only", "main...HEAD")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, f := range strings.Split(out, "\n") {
+		if f = strings.TrimSpace(f); f != "" && f != transcriptSidecarPath {
+			files = append(files, f)
+		}
+	}
+	return files, nil
+}
+
+// DiffStat is the `git diff --stat main...HEAD` summary of a whole-tree session's
+// accumulated change (the transcript sidecar line, if present, is dropped).
+// Serialized on wtMu against the turn commit.
+func (s *Session) DiffStat(ctx context.Context) (string, error) {
+	s.wtMu.Lock()
+	defer s.wtMu.Unlock()
+	out, err := s.wt.Run(ctx, "diff", "--stat", "main...HEAD")
+	if err != nil {
+		return "", err
+	}
+	var lines []string
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.Contains(ln, transcriptSidecarPath) {
+			continue
+		}
+		lines = append(lines, ln)
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n")), nil
+}
+
+// TreeDiff renders a whole-tree session's accumulated branch change as one
+// FileChange per changed file (Old = merge-base(main,HEAD), New = HEAD),
+// matching git's own "..." triple-dot range semantics so main advancing after
+// the branch forked never reads as the session's own change. The transcript
+// sidecar is excluded; OldHTML/NewHTML are left nil for the caller to fill in
+// with syntax highlighting. Best-effort per file: a path git can't read at
+// either side renders as an empty old/new rather than failing the whole call.
+// Serialized on wtMu against the turn commit.
+func (s *Session) TreeDiff(ctx context.Context) ([]FileChange, error) {
+	s.wtMu.Lock()
+	defer s.wtMu.Unlock()
+	files, err := s.changedFilesLocked(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return nil, nil
+	}
+	base, err := s.wt.Run(ctx, "merge-base", "main", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	base = strings.TrimSpace(base)
+	out := make([]FileChange, 0, len(files))
+	for _, path := range files {
+		before, _ := s.wt.Show(ctx, base, path)  // "" when path is new on HEAD
+		after, _ := s.wt.Show(ctx, "HEAD", path) // "" when path was deleted on HEAD
+		out = append(out, FileChange{Path: path, Old: before, New: after})
+	}
+	return out, nil
 }
 
 // Log returns a copy of the chat log.
@@ -1256,6 +1662,14 @@ func slugFile(file string) string {
 	r := strings.NewReplacer("/", "-", ".", "-", " ", "-")
 	return strings.Trim(r.Replace(file), "-")
 }
+
+// FilePrompt returns the default collaborative-editor system prompt for a single
+// file (the coordination editor's direct-edit contract: edit ONLY this file with
+// your tools; the system commits/merges; MERGE marker on explicit approval).
+// Exported so a caller building a specialized single-file session — the bootstrap
+// setup agent over LOCALS.md — can layer its own preamble on the SAME contract
+// instead of forking a parallel one (edit-session-consolidation).
+func FilePrompt(file string) string { return systemPrompt(file) }
 
 func systemPrompt(file string) string {
 	return fmt.Sprintf(`You are a collaborative editor for ONE file in a git repository: %s.

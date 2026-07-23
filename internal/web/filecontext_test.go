@@ -1,13 +1,10 @@
 package web
 
 import (
-	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
@@ -94,109 +91,30 @@ func TestRulesFileContextKeysOffConstant(t *testing.T) {
 	}
 }
 
-// TestChatSystemPromptSeedsFileRules: the system prompt built for a path carries
-// that file's rules, AND the same prompt is what is seeded into the opencode
-// session (captured end-to-end via the fake client). This is the "seeded prompt
-// contains the target's rules" acceptance.
-func TestChatSystemPromptSeedsFileRules(t *testing.T) {
-	// White-box: the prompt for a path embeds the resolved preamble.
+// TestFileContextTokensAndBootstrapSeed: resolveFileContext resolves a path to
+// that file's distinct rules, and the bootstrap setup agent's system prompt
+// embeds LOCALS.md's rules (the surviving per-file-context injection path after
+// edit-session-consolidation — the coordination editor itself uses the generic
+// FilePrompt, as it did before this change).
+func TestFileContextTokensAndBootstrapSeed(t *testing.T) {
 	for _, tc := range []struct{ path, want string }{
 		{"submodules/alpha/ROI.md", "FORBIDDEN"},
 		{"submodules/alpha/PLAN.md", "NEEDS-REVIEW"},
 		{"submodules/alpha/notes.md", "ordinary file"},
 	} {
-		sp := chatSystemPrompt(tc.path)
-		if !strings.Contains(sp, tc.path) {
-			t.Errorf("system prompt for %q missing the path", tc.path)
-		}
+		sp := resolveFileContext(tc.path)
 		if !strings.Contains(sp, tc.want) {
-			t.Errorf("system prompt for %q missing rules token %q:\n%s", tc.path, tc.want, sp)
+			t.Errorf("file context for %q missing rules token %q:\n%s", tc.path, tc.want, sp)
 		}
 	}
-
-	// End-to-end: opening a PLAN.md session and running a turn seeds the opencode
-	// session with the PLAN rules (the exact string the resolver produces).
-	fc := &fakeChatClient{reply: "ok"}
-	s, _ := chatFixtureClient(t, fc)
-	ctx := context.Background()
-	sess, err := s.chat.open(ctx, "submodules/alpha/PLAN.md")
-	if err != nil {
-		t.Fatalf("open: %v", err)
+	// The bootstrap agent's system prompt embeds LOCALS.md's editing rules on the
+	// coordination editor's direct-edit contract.
+	sys := bootstrapSystemPrompt("guide", bootstrapState{})
+	if !strings.Contains(sys, "SITE-SPECIFIC") {
+		t.Fatalf("bootstrap system prompt missing LOCALS.md rules:\n%s", sys)
 	}
-	if sess.sys != chatSystemPrompt("submodules/alpha/PLAN.md") {
-		t.Fatalf("session system prompt not seeded from the resolver")
-	}
-	if err := sess.chat(ctx, "hello"); err != nil {
-		t.Fatalf("chat: %v", err)
-	}
-	if !strings.Contains(fc.system, "NEEDS-REVIEW") || !strings.Contains(fc.system, "Beehive-ROI") {
-		t.Fatalf("opencode session was not seeded with PLAN rules; got system:\n%s", fc.system)
-	}
-	// A different target seeds different rules through the same generic surface.
-	fc2 := &fakeChatClient{reply: "ok"}
-	s2, _ := chatFixtureClient(t, fc2)
-	roiSess, err := s2.chat.open(ctx, "submodules/alpha/ROI.md")
-	if err != nil {
-		t.Fatalf("open roi: %v", err)
-	}
-	if err := roiSess.chat(ctx, "hello"); err != nil {
-		t.Fatalf("chat roi: %v", err)
-	}
-	if !strings.Contains(fc2.system, "FORBIDDEN") {
-		t.Fatalf("ROI session not seeded with ROI rules; got system:\n%s", fc2.system)
-	}
-	if strings.Contains(fc2.system, "NEEDS-REVIEW") {
-		t.Fatalf("ROI session leaked PLAN rules; got system:\n%s", fc2.system)
-	}
-}
-
-// TestChatEditPlanRoundTrips: editing PLAN.md through the chat-diff surface still
-// yields a file that round-trips through plan.Parse — the propose -> normalize ->
-// approve path preserves the strict line format. This is the "editing PLAN.md
-// still round-trips plan.Parse" acceptance.
-func TestChatEditPlanRoundTrips(t *testing.T) {
-	newPlan := "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n" +
-		"## demo [TODO] <!-- attempts=0 deps= -->\nA demo task body."
-	fc := &fakeChatClient{reply: proposeReply("Added a demo task.", newPlan)}
-	s, _ := chatFixtureClient(t, fc)
-	ctx := context.Background()
-	path := "submodules/alpha/PLAN.md"
-
-	sess, err := s.chat.open(ctx, path)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	if err := sess.chat(ctx, "add a demo task"); err != nil {
-		t.Fatalf("chat: %v", err)
-	}
-	if _, ok := sess.pending(); !ok {
-		t.Fatalf("expected a pending PLAN.md proposal (err=%q)", sess.errText())
-	}
-	if err := sess.approve(ctx); err != nil {
-		t.Fatalf("approve: %v", err)
-	}
-	raw, err := os.ReadFile(filepath.Join(sess.wtPath, filepath.FromSlash(path)))
-	if err != nil {
-		t.Fatalf("read committed PLAN.md: %v", err)
-	}
-	// The surface must not mangle the bytes: exactly the proposal + one trailing LF.
-	if string(raw) != newPlan+"\n" {
-		t.Fatalf("committed PLAN.md not byte-faithful:\n%q", string(raw))
-	}
-	// And it must parse cleanly through the real plan parser.
-	p, err := plan.Parse(string(raw))
-	if err != nil {
-		t.Fatalf("plan.Parse failed on the edited PLAN.md: %v", err)
-	}
-	if p.ROI != "abc123" {
-		t.Errorf("ROI stamp lost: %q", p.ROI)
-	}
-	if len(p.Tasks) != 1 || p.Tasks[0].ID != "demo" || p.Tasks[0].Status != plan.StatusTODO {
-		t.Fatalf("parsed tasks wrong: %+v", p.Tasks)
-	}
-	// Idempotent round-trip: re-serialize and re-parse to the same shape.
-	if p2, err := plan.Parse(p.String()); err != nil || len(p2.Tasks) != 1 || p2.Tasks[0].ID != "demo" {
-		t.Fatalf("plan did not round-trip through String()->Parse: err=%v tasks=%+v", err, p2)
+	if !strings.Contains(sys, repo.LocalsFile) {
+		t.Fatalf("bootstrap system prompt missing the LOCALS.md target")
 	}
 }
 
@@ -284,24 +202,5 @@ func TestRootInstructionFileContextNotConflated(t *testing.T) {
 	}
 	if strings.Contains(locals, "beehive-MANAGED") {
 		t.Errorf("LOCALS.md is site-authored; its context must not mark it beehive-MANAGED:\n%s", locals)
-	}
-
-	// The end-to-end seed carries the resolved rules into the opencode session for
-	// a root file opened through the generic chat-diff surface.
-	fc := &fakeChatClient{reply: "ok"}
-	s, _ := chatFixtureClient(t, fc)
-	ctx := context.Background()
-	sess, err := s.chat.open(ctx, repo.HoneybeeFile)
-	if err != nil {
-		t.Fatalf("open HONEYBEE.md: %v", err)
-	}
-	if sess.sys != chatSystemPrompt(repo.HoneybeeFile) {
-		t.Fatal("root-file session not seeded from the resolver")
-	}
-	if err := sess.chat(ctx, "hello"); err != nil {
-		t.Fatalf("chat: %v", err)
-	}
-	if !strings.Contains(fc.system, "runtime protocol") {
-		t.Fatalf("HONEYBEE.md session not seeded with its protocol rules:\n%s", fc.system)
 	}
 }

@@ -24,8 +24,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/config"
+	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spencerharmon/beehive/prompts"
 )
@@ -133,19 +135,23 @@ func readBootstrapGuide(root string) string {
 	return prompts.BootstrapGuide
 }
 
-// bootstrapSystemPrompt builds the setup agent's system prompt: the ordinary
-// chat-diff editor contract over LOCALS.md (so the propose-then-approve markers
-// and "no tools, human approves" rules carry over verbatim) plus a bootstrap
-// preamble that states the role, the detected unmet steps, and the hard rule to
-// route submodule adds through the CLI (never a bare mkdir) — then the full
-// BOOTSTRAP.md guide as reference.
+// bootstrapSystemPrompt builds the setup agent's system prompt: the coordination
+// editor's direct-edit contract over LOCALS.md (edit-session-consolidation — the
+// bootstrap agent is now an editor.Session of Kind bootstrap, so it edits
+// LOCALS.md directly with its tools and the operator reviews the diff and clicks
+// Merge, exactly like every other edit-with-AI surface) plus LOCALS.md's own
+// editing rules (resolveFileContext) and a bootstrap preamble that states the
+// role, the detected unmet steps, and the hard rule to route submodule adds
+// through the CLI (never a bare mkdir) — then the full BOOTSTRAP.md guide.
 func bootstrapSystemPrompt(guide string, st bootstrapState) string {
 	var b strings.Builder
-	b.WriteString(chatSystemPrompt(repo.LocalsFile))
+	b.WriteString(editor.FilePrompt(repo.LocalsFile))
+	b.WriteString("\n\n----\n\n")
+	b.WriteString(resolveFileContext(repo.LocalsFile))
 	b.WriteString("\n\n----\n\n")
 	b.WriteString("This beehive install is NOT fully set up yet, and you are its setup guide. ")
 	b.WriteString("Walk the operator through the remaining steps below, following the BOOTSTRAP.md guide. ")
-	b.WriteString("Your one editable file is LOCALS.md (setup step 2): help the operator author it, and propose it through the approval loop above — never claim it is written until they approve. ")
+	b.WriteString("Your one editable file is LOCALS.md (setup step 2): edit it directly to help the operator author it — the operator reviews the diff and clicks Merge to publish it; nothing is live until they do, so never claim it is written until they merge. ")
 	b.WriteString("To add a target, tell the operator to run `beehive submodule add <name> <git-url>` or use the dashboard's add-submodule form; NEVER create submodule directories by hand. ")
 	b.WriteString("Do not run setup commands yourself and do not report a step done until the operator confirms it.\n\n")
 	if len(st.Unmet) > 0 {
@@ -173,48 +179,40 @@ func bootstrapIntro(st bootstrapState) string {
 	if len(titles) > 0 {
 		msg += " Outstanding steps: " + strings.Join(titles, "; ") + "."
 	}
-	msg += " Tell me where you'd like to start, or ask me to draft LOCALS.md — nothing is written or committed until you approve it."
+	msg += " Tell me where you'd like to start, or ask me to draft LOCALS.md — nothing is written to main until you review the diff and click Merge."
 	return msg
 }
 
-// openBootstrap opens (or returns the already-open) SINGLETON setup agent: a
-// chat-edit session over LOCALS.md seeded with the bootstrap system prompt and a
-// visible intro. It is idempotent — repeated dashboard opens reuse the one
-// session (and its single edit worktree) rather than cutting a fresh one each
-// time. bootstrapMu serializes the check-or-open so concurrent loads converge.
-func (m *chatManager) openBootstrap(ctx context.Context, sys, intro string) (*chatSession, error) {
-	m.bootstrapMu.Lock()
-	defer m.bootstrapMu.Unlock()
-	if id := m.bootstrapID; id != "" {
-		if s, ok := m.get(id); ok {
-			return s, nil
+// openBootstrapSession opens (or returns the already-open) SINGLETON setup agent:
+// an editor.Session of Kind bootstrap over LOCALS.md seeded with the bootstrap
+// system prompt and a visible intro. It is idempotent — repeated dashboard opens
+// reuse the one session (found by Kind, so it survives a restart via editor
+// recovery) rather than cutting a fresh worktree each time. bootstrapMu
+// serializes the check-or-open so concurrent loads converge on one session.
+func (s *Server) openBootstrapSession(ctx context.Context, sys, intro string) (*editor.Session, error) {
+	s.bootstrapMu.Lock()
+	defer s.bootstrapMu.Unlock()
+	for _, sess := range s.editors.List() {
+		if sess.Kind() == editor.KindBootstrap {
+			return sess, nil
 		}
 	}
-	// LOCALS.md is a fixed, already-clean repo-relative path.
-	s, err := m.openWith(ctx, repo.LocalsFile, sys)
-	if err != nil {
-		return nil, err
-	}
-	s.seedSystem(intro)
-	m.bootstrapID = s.ID
-	return s, nil
-}
-
-// seedSystem records text as a visible "system" turn in the session log. Used to
-// open the bootstrap agent with an intro the operator can read immediately.
-func (s *chatSession) seedSystem(text string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.log = append(s.log, chatTurn{Role: "system", Text: text, At: s.mgr.now()})
+	return s.editors.OpenSession(ctx, editor.Spec{
+		File:   repo.LocalsFile,
+		Kind:   editor.KindBootstrap,
+		System: sys,
+		Slug:   "bootstrap",
+		Intro:  []editor.Turn{{Role: "system", Text: intro, At: time.Now()}},
+	})
 }
 
 // bootstrapAgent (GET /bootstrap) lazily surfaces the setup agent for the
 // dashboard banner's htmx load. It re-detects first: a repo that has become
 // bootstrapped returns 204 (the banner clears, no worktree is cut). Otherwise it
 // opens/reuses the singleton session and renders the agent fragment. Opening the
-// session cuts ONE ephemeral edit worktree (the chat-diff-editor-core seam,
-// GC-reclaimable) but writes nothing to LOCALS.md or main — that only happens on
-// explicit approval.
+// session cuts ONE ephemeral edit worktree (the shared editor Manager's, GC-
+// reclaimable) but writes nothing to LOCALS.md or main — that only happens on an
+// explicit Merge.
 func (s *Server) bootstrapAgent(w http.ResponseWriter, r *http.Request) {
 	st := s.bootstrapState()
 	if st.Bootstrapped() {
@@ -222,12 +220,12 @@ func (s *Server) bootstrapAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	guide := readBootstrapGuide(s.repo.Root)
-	sess, err := s.chat.openBootstrap(r.Context(), bootstrapSystemPrompt(guide, st), bootstrapIntro(st))
+	sess, err := s.openBootstrapSession(r.Context(), bootstrapSystemPrompt(guide, st), bootstrapIntro(st))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.render(w, "bootstrap_agent.html", map[string]interface{}{
-		"ID": sess.ID, "Path": sess.Path, "Unmet": st.Unmet,
+		"ID": sess.ID, "Path": sess.File, "Unmet": st.Unmet,
 	})
 }

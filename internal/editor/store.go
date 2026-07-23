@@ -29,6 +29,20 @@ type sessionRecord struct {
 	BaseMain string    `json:"base_main,omitempty"`
 	Activity time.Time `json:"activity"`
 	Log      []Turn    `json:"log,omitempty"`
+
+	// edit-session-consolidation: the axes that let ONE record type describe the
+	// coordination-file editor, the resolve agent, and the bootstrap agent. All
+	// omitempty so a legacy (pre-consolidation) record — which had none of them —
+	// round-trips unchanged and restores as the KindFile editor it was.
+	Kind         string            `json:"kind,omitempty"`
+	WholeTree    bool              `json:"whole_tree,omitempty"`
+	Unrestricted bool              `json:"unrestricted,omitempty"`
+	System       string            `json:"system,omitempty"`
+	Preamble     string            `json:"preamble,omitempty"`
+	PreambleUsed bool              `json:"preamble_used,omitempty"`
+	Meta         map[string]string `json:"meta,omitempty"`
+	TurnCeiling  time.Duration     `json:"turn_ceiling,omitempty"`
+	AutoMerge    bool              `json:"auto_merge,omitempty"`
 }
 
 // store is the small JSON persistence file behind a Manager. It is safe for

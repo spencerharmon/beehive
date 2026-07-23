@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/spencerharmon/beehive/internal/config"
+	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spencerharmon/beehive/prompts"
 )
@@ -193,11 +194,12 @@ func TestBootstrapSystemPrompt(t *testing.T) {
 	sys := bootstrapSystemPrompt(guide, st)
 
 	for _, want := range []string{
-		// the chat-diff editor contract, bound to LOCALS.md
+		// the coordination editor's direct-edit contract, bound to LOCALS.md
 		repo.LocalsFile,
-		"do NOT have permission to modify files",
-		// bootstrap preamble
+		"collaborative editor for ONE file",
+		// bootstrap preamble (direct-edit + Merge, not propose-then-approve)
 		"setup guide",
+		"clicks Merge",
 		"beehive submodule add",
 		"NEVER create submodule directories by hand",
 		// the detected unmet steps, by title
@@ -221,42 +223,42 @@ func TestBootstrapSystemPrompt(t *testing.T) {
 // — only one ephemeral edit worktree is cut. chatFixture seeds a committed repo so
 // a worktree can be cut from main.
 func TestOpenBootstrapIdempotentReadOnly(t *testing.T) {
-	s, root := chatFixture(t, "")
+	s, root := editorFixture(t, "")
 	ctx := context.Background()
 	headBefore := s.headSHA(ctx)
 
 	const sysSentinel = "SYS-SENTINEL"
 	const introSentinel = "INTRO-SENTINEL: repo not bootstrapped"
 
-	sess, err := s.chat.openBootstrap(ctx, sysSentinel, introSentinel)
+	sess, err := s.openBootstrapSession(ctx, sysSentinel, introSentinel)
 	if err != nil {
-		t.Fatalf("openBootstrap: %v", err)
+		t.Fatalf("openBootstrapSession: %v", err)
 	}
-	if sess.Path != repo.LocalsFile {
-		t.Fatalf("bootstrap session path = %q, want %q", sess.Path, repo.LocalsFile)
+	if sess.File != repo.LocalsFile {
+		t.Fatalf("bootstrap session file = %q, want %q", sess.File, repo.LocalsFile)
 	}
-	if sess.sys != sysSentinel {
-		t.Fatalf("bootstrap session sys = %q, want the supplied prompt", sess.sys)
+	if sess.Kind() != editor.KindBootstrap {
+		t.Fatalf("bootstrap session kind = %q, want bootstrap", sess.Kind())
 	}
 	// The intro is seeded as a single visible system turn.
-	log := sess.logCopy()
+	log := sess.Log()
 	if len(log) != 1 || log[0].Role != "system" || log[0].Text != introSentinel {
 		t.Fatalf("intro not seeded as one system turn: %+v", log)
 	}
 
 	// Second open: same singleton session, no re-seed, no extra worktree.
-	sess2, err := s.chat.openBootstrap(ctx, "OTHER-SYS", "OTHER-INTRO")
+	sess2, err := s.openBootstrapSession(ctx, "OTHER-SYS", "OTHER-INTRO")
 	if err != nil {
-		t.Fatalf("openBootstrap (reuse): %v", err)
+		t.Fatalf("openBootstrapSession (reuse): %v", err)
 	}
 	if sess2.ID != sess.ID {
-		t.Fatalf("openBootstrap not idempotent: ids %q != %q", sess2.ID, sess.ID)
+		t.Fatalf("openBootstrapSession not idempotent: ids %q != %q", sess2.ID, sess.ID)
 	}
-	if l := sess2.logCopy(); len(l) != 1 {
+	if l := sess2.Log(); len(l) != 1 {
 		t.Fatalf("reuse must not re-seed the intro: log = %+v", l)
 	}
-	if wts := editWorktrees(t, root, "edit-LOCALS-md-"); len(wts) != 1 {
-		t.Fatalf("want exactly one LOCALS.md edit worktree, got %v", wts)
+	if wts := editWorktrees(t, root, "hive-edit-bootstrap-"); len(wts) != 1 {
+		t.Fatalf("want exactly one bootstrap edit worktree, got %v", wts)
 	}
 
 	// Read-only: the real LOCALS.md is untouched and main HEAD did not move.
@@ -316,7 +318,7 @@ func TestDashboardBannerHiddenWhenBootstrapped(t *testing.T) {
 // unbootstrapped repo: it opens the singleton agent and returns the fragment
 // wired to the shared chat-edit panel/message endpoints (chat-diff-editor-core).
 func TestBootstrapAgentHandlerUnbootstrapped(t *testing.T) {
-	s, _ := chatFixture(t, "")
+	s, _ := editorFixture(t, "")
 	w := get(t, s, "/bootstrap")
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET /bootstrap = %d, want 200: %s", w.Code, w.Body)
@@ -324,8 +326,8 @@ func TestBootstrapAgentHandlerUnbootstrapped(t *testing.T) {
 	body := w.Body.String()
 	for _, want := range []string{
 		`class="bootstrap-agent"`,
-		`/panel"`,   // hx-get="/edit/<id>/panel"
-		`/message"`, // hx-post="/edit/<id>/message"
+		`/panel"`, // hx-get="/editor/<id>/panel"
+		`/chat"`,  // hx-post="/editor/<id>/chat"
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("bootstrap agent fragment missing %q:\n%s", want, body)
@@ -343,18 +345,18 @@ func TestBootstrapAgentHandlerUnbootstrapped(t *testing.T) {
 // editor_panel.html's own idle backoff. See TestPollBackoffWhenEndedOrIdle for
 // the full cadence contract this closes the last polled surface of.
 func TestBootstrapAgentPanelPollsRepeatedly(t *testing.T) {
-	s, _ := chatFixture(t, "")
+	s, _ := editorFixture(t, "")
 	// The shell polls the panel once on load — no forever interval on idle.
 	body := get(t, s, "/bootstrap").Body.String()
 	if !strings.Contains(body, `hx-trigger="load"`) || strings.Contains(body, "every 1500ms") {
-		t.Fatalf("#chatedit must fetch once on load, not poll on an interval:\n%s", body)
+		t.Fatalf("#editor must fetch once on load, not poll on an interval:\n%s", body)
 	}
 	// A working turn keeps refreshing: the busy panel re-arms a hidden 1.5s poll
-	// targeting #chatedit, so the loop continues until the turn settles and the
-	// final reply lands (the snappy-polish guarantee, now scoped to .Busy).
-	busy := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{"ID": "c1", "Busy": true})
-	if !strings.Contains(busy, `hx-trigger="load delay:1500ms"`) || !strings.Contains(busy, `hx-target="#chatedit"`) {
-		t.Fatalf("a busy chatedit panel must re-arm the poll so a working turn keeps refreshing:\n%s", busy)
+	// targeting #editor, so the loop continues until the turn settles and the final
+	// reply lands (the snappy-polish guarantee, now scoped to .Busy).
+	busy := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "c1", "Busy": true})
+	if !strings.Contains(busy, `hx-trigger="load delay:1500ms"`) || !strings.Contains(busy, `hx-target="#editor"`) {
+		t.Fatalf("a busy editor panel must re-arm the poll so a working turn keeps refreshing:\n%s", busy)
 	}
 }
 
@@ -362,7 +364,7 @@ func TestBootstrapAgentPanelPollsRepeatedly(t *testing.T) {
 // read-only when the repo is already set up: GET /bootstrap returns 204 with an
 // empty body and cuts NO worktree (the banner clears on its own).
 func TestBootstrapAgentHandlerBootstrapped(t *testing.T) {
-	s, root := chatFixture(t, "")
+	s, root := editorFixture(t, "")
 	write(t, filepath.Join(root, repo.LocalsFile), "# site facts\n")
 	write(t, filepath.Join(root, config.FileName), "model: x\n")
 
@@ -373,7 +375,7 @@ func TestBootstrapAgentHandlerBootstrapped(t *testing.T) {
 	if w.Body.Len() != 0 {
 		t.Fatalf("204 response must have an empty body, got %q", w.Body.String())
 	}
-	if wts := editWorktrees(t, root, "edit-LOCALS-md-"); len(wts) != 0 {
+	if wts := editWorktrees(t, root, "hive-edit-bootstrap-"); len(wts) != 0 {
 		t.Fatalf("bootstrapped /bootstrap must not open an agent worktree, got %v", wts)
 	}
 }

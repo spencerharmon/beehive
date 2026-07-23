@@ -396,7 +396,7 @@ func TestPollPaneLoadingSkeletons(t *testing.T) {
 			data:  map[string]interface{}{"ID": "b1"},
 			shape: "skeleton-transcript",
 			gone:  "loading setup assistant",
-			extra: []string{`id="chatedit"`},
+			extra: []string{`id="editor"`},
 		},
 		{
 			name:  "bootstrap banner agent",
@@ -493,22 +493,22 @@ func TestPollBackoffWhenEndedOrIdle(t *testing.T) {
 		t.Errorf("busy human_resolve_panel must re-arm the poll while a turn is in flight:\n%s", rBusy)
 	}
 
-	// (4) bootstrap chat (setup wizard): bootstrap_agent.html polls the chat panel
-	// once on load and chatedit_panel.html re-arms the poll ONLY while a turn is in
-	// flight (.Busy) — an idle setup chat stops. This is the last polled surface
-	// poll-backoff-trigger-landing missed (its scope named only the
-	// editor/human-resolve/session-view panels).
+	// (4) bootstrap chat (setup wizard): the setup agent is now an editor.Session
+	// (edit-session-consolidation), so bootstrap_agent.html polls editor_panel.html
+	// once on load and the panel re-arms the poll ONLY while a turn is in flight
+	// (.Busy) — an idle setup chat stops. Same idle-backoff contract as the
+	// coordination editor it now shares.
 	bShell := renderTmpl(t, s, "bootstrap_agent.html", map[string]interface{}{"ID": "c1"})
 	if !strings.Contains(bShell, `hx-trigger="load"`) || strings.Contains(bShell, "every") {
-		t.Errorf("bootstrap_agent.html shell must poll the chat panel once on load, not on an interval:\n%s", bShell)
+		t.Errorf("bootstrap_agent.html shell must poll the editor panel once on load, not on an interval:\n%s", bShell)
 	}
-	bIdle := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{"ID": "c1", "Busy": false})
+	bIdle := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "c1", "Busy": false})
 	if strings.Contains(bIdle, "hx-trigger") {
-		t.Errorf("idle chatedit_panel must carry NO poller (nothing to watch):\n%s", bIdle)
+		t.Errorf("idle editor_panel must carry NO poller (nothing to watch):\n%s", bIdle)
 	}
-	bBusy := renderTmpl(t, s, "chatedit_panel.html", map[string]interface{}{"ID": "c1", "Busy": true})
-	if !strings.Contains(bBusy, `hx-trigger="load delay:1500ms"`) || !strings.Contains(bBusy, `hx-target="#chatedit"`) {
-		t.Errorf("busy chatedit_panel must re-arm the poll while a turn is in flight:\n%s", bBusy)
+	bBusy := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "c1", "Busy": true})
+	if !strings.Contains(bBusy, `hx-trigger="load delay:1500ms"`) || !strings.Contains(bBusy, `hx-target="#editor"`) {
+		t.Errorf("busy editor_panel must re-arm the poll while a turn is in flight:\n%s", bBusy)
 	}
 }
 
@@ -2410,37 +2410,36 @@ func TestExplorerOptionalFileLinks(t *testing.T) {
 // file's rules (chat-diff-file-context), and the new file is written ONLY on
 // approval (never auto-generated).
 func TestExplorerAbsentFileEmptyBaseCreate(t *testing.T) {
-	fc := &fakeChatClient{reply: proposeReply("Drafted infra.", "# Infra\nActive: blue")}
-	s, _ := chatFixtureClient(t, fc)
+	client := &fakeAgentClient{
+		reply: "Drafted infra.",
+		editFn: func(cwd string) {
+			p := filepath.Join(cwd, "submodules", "alpha", repo.InfraFile)
+			_ = os.MkdirAll(filepath.Dir(p), 0o755)
+			_ = os.WriteFile(p, []byte("# Infra\nActive: blue\n"), 0o644)
+		},
+	}
+	s, root := editorFixtureClient(t, client)
 	ctx := context.Background()
 	path := "submodules/alpha/" + repo.InfraFile // absent in the fixture
 
-	sess, err := s.chat.open(ctx, path)
+	sess, err := s.editors.Open(ctx, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if base, _ := sess.base(ctx); base != "" {
+	if base, _, _ := sess.Diff(ctx); base != "" {
 		t.Fatalf("absent optional file must open on an empty base, got %q", base)
 	}
-	if sess.sys != chatSystemPrompt(path) {
-		t.Fatal("session not seeded from resolveFileContext (chat-diff-file-context)")
-	}
-	if err := sess.chat(ctx, "draft infra"); err != nil {
+	if _, err := sess.Chat(ctx, "draft infra"); err != nil {
 		t.Fatalf("chat: %v", err)
 	}
-	// The opencode session was seeded with the INFRASTRUCTURE.md rules.
-	if !strings.Contains(fc.system, "internal/artifacts") {
-		t.Fatalf("empty-base create not seeded with INFRASTRUCTURE rules:\n%s", fc.system)
+	if sess.State(ctx) != "dirty" {
+		t.Fatalf("a proposed create must show as dirty until merged")
 	}
-	// Nothing on disk before approval.
-	if _, err := os.Stat(filepath.Join(sess.wtPath, filepath.FromSlash(path))); !os.IsNotExist(err) {
-		t.Fatalf("file must not exist before approval (err=%v)", err)
+	if err := sess.Merge(ctx); err != nil {
+		t.Fatalf("merge: %v", err)
 	}
-	if err := sess.approve(ctx); err != nil {
-		t.Fatalf("approve: %v", err)
-	}
-	if got := gitShow(t, sess.wtPath, "HEAD", path); got != "# Infra\nActive: blue" {
-		t.Fatalf("empty-base create did not commit the new file: %q", got)
+	if got := gitShow(t, root, "HEAD", path); got != "# Infra\nActive: blue" {
+		t.Fatalf("empty-base create did not publish the new file: %q", got)
 	}
 }
 
@@ -2454,33 +2453,38 @@ func TestExplorerROICreateThroughEditorNoAutogen(t *testing.T) {
 	if !strings.Contains(body, "/edit?path=submodules/alpha/"+repo.ROIFile) {
 		t.Fatalf("explorer must route ROI create/edit through the editor:\n%s", body)
 	}
-	sp := chatSystemPrompt("submodules/alpha/" + repo.ROIFile)
+	// The ROI file's editing context marks it human-owned / honeybee-FORBIDDEN.
+	sp := resolveFileContext("submodules/alpha/" + repo.ROIFile)
 	for _, want := range []string{"human-owned", "FORBIDDEN"} {
 		if !strings.Contains(sp, want) {
 			t.Errorf("ROI editor context missing ownership token %q:\n%s", want, sp)
 		}
 	}
 
-	// Never auto-generated: a proposed ROI edit stays unwritten until approval.
-	fc := &fakeChatClient{reply: proposeReply("Draft.", "# alpha\nGoals: ship it.")}
-	s, _ := chatFixtureClient(t, fc)
+	// Never auto-generated: a proposed ROI edit stays unpublished (state dirty)
+	// until an explicit Merge; the real ROI on main is untouched meanwhile.
+	client := &fakeAgentClient{
+		reply: "Drafted the ROI.",
+		editFn: func(cwd string) {
+			p := filepath.Join(cwd, "submodules", "alpha", repo.ROIFile)
+			_ = os.WriteFile(p, []byte("# alpha\nGoals: ship it.\n"), 0o644)
+		},
+	}
+	s, root := editorFixtureClient(t, client)
 	ctx := context.Background()
 	path := "submodules/alpha/" + repo.ROIFile
-	sess, err := s.chat.open(ctx, path)
+	sess, err := s.editors.Open(ctx, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if !strings.Contains(sess.sys, "human-owned") {
-		t.Fatal("ROI session not seeded with human-owned rules")
-	}
-	if err := sess.chat(ctx, "draft"); err != nil {
+	if _, err := sess.Chat(ctx, "draft"); err != nil {
 		t.Fatalf("chat: %v", err)
 	}
-	if _, ok := sess.pending(); !ok {
-		t.Fatal("expected a pending ROI proposal")
+	if sess.State(ctx) != "dirty" {
+		t.Fatal("expected a pending (dirty) ROI proposal")
 	}
-	if got := gitShow(t, sess.wtPath, "HEAD", path); got != "# alpha" {
-		t.Fatalf("ROI must not be auto-generated before approval, got %q", got)
+	if got := gitShow(t, root, "HEAD", path); got != "# alpha" {
+		t.Fatalf("ROI must not be auto-published before Merge, got %q", got)
 	}
 }
 
@@ -2834,39 +2838,35 @@ func TestInstructionUpdateRestoresManagedFiles(t *testing.T) {
 // seeded with LOCALS.md's site-authored / never-auto-generated rules (chat-diff-
 // file-context), and the file is written ONLY on approval (never auto-generated).
 func TestRootAbsentFileEmptyBaseCreateSeeded(t *testing.T) {
-	fc := &fakeChatClient{reply: proposeReply("Drafted locals.", "# LOCALS\nHost: spray")}
-	s, _ := chatFixtureClient(t, fc)
+	client := &fakeAgentClient{
+		reply: "Drafted locals.",
+		editFn: func(cwd string) {
+			_ = os.WriteFile(filepath.Join(cwd, repo.LocalsFile), []byte("# LOCALS\nHost: spray\n"), 0o644)
+		},
+	}
+	s, root := editorFixtureClient(t, client)
 	ctx := context.Background()
 	path := repo.LocalsFile // absent in the fixture (Init does not lay it down)
 
-	sess, err := s.chat.open(ctx, path)
+	sess, err := s.editors.Open(ctx, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if base, _ := sess.base(ctx); base != "" {
+	if base, _, _ := sess.Diff(ctx); base != "" {
 		t.Fatalf("absent root file must open on an empty base, got %q", base)
 	}
-	if sess.sys != chatSystemPrompt(path) {
-		t.Fatal("session not seeded from resolveFileContext (chat-diff-file-context)")
-	}
-	if err := sess.chat(ctx, "draft locals"); err != nil {
+	if _, err := sess.Chat(ctx, "draft locals"); err != nil {
 		t.Fatalf("chat: %v", err)
 	}
-	// Seeded with the LOCALS.md ownership rules: site-authored, never auto-generated.
-	for _, want := range []string{repo.LocalsFile, "auto-generated"} {
-		if !strings.Contains(fc.system, want) {
-			t.Fatalf("empty-base create not seeded with LOCALS rules (missing %q):\n%s", want, fc.system)
-		}
+	// Not auto-published: LOCALS.md is not on main until an explicit Merge.
+	if sess.State(ctx) != "dirty" {
+		t.Fatal("LOCALS.md draft must show dirty until merged")
 	}
-	// Nothing on disk before approval — LOCALS.md is never auto-generated.
-	if _, err := os.Stat(filepath.Join(sess.wtPath, filepath.FromSlash(path))); !os.IsNotExist(err) {
-		t.Fatalf("LOCALS.md must not exist before approval (err=%v)", err)
+	if err := sess.Merge(ctx); err != nil {
+		t.Fatalf("merge: %v", err)
 	}
-	if err := sess.approve(ctx); err != nil {
-		t.Fatalf("approve: %v", err)
-	}
-	if got := gitShow(t, sess.wtPath, "HEAD", path); got != "# LOCALS\nHost: spray" {
-		t.Fatalf("empty-base create did not commit the new LOCALS.md: %q", got)
+	if got := gitShow(t, root, "HEAD", path); got != "# LOCALS\nHost: spray" {
+		t.Fatalf("empty-base create did not publish the new LOCALS.md: %q", got)
 	}
 }
 
@@ -4036,10 +4036,20 @@ func TestCommitViewDiffAddDelClasses(t *testing.T) {
 // raw {{.Patch}} <pre> of unified-diff text. The #resolve-diff container id and
 // data-scroll-preserve poll wiring stay exactly as before.
 func TestHumanResolvePanelDiffAddDelClasses(t *testing.T) {
-	s, root, ts := humanFixture(t, "")
-	// Seed a tracked file with real content on main BEFORE cutting the
-	// resolution worktree, so the session branch's change has a genuine base
-	// to diff against (not a from-nothing add).
+	// The agent rewrites INFRASTRUCTURE.md on its turn (editFn), so the session
+	// branch carries a real add/del change over main.
+	client := &fakeAgentClient{
+		reply: "Updated the infra doc.",
+		editFn: func(cwd string) {
+			p := filepath.Join(cwd, "submodules", "alpha", "INFRASTRUCTURE.md")
+			_ = os.MkdirAll(filepath.Dir(p), 0o755)
+			_ = os.WriteFile(p, []byte("# alpha infra\nnew line\n"), 0o644)
+		},
+	}
+	s, root := editorFixtureClient(t, client)
+	// Seed a tracked infra doc with real content on main BEFORE cutting the
+	// resolution worktree, plus the NEEDS-HUMAN task, so the branch's change has a
+	// genuine base to diff against.
 	infraPath := filepath.Join(root, "submodules", "alpha", "INFRASTRUCTURE.md")
 	if err := os.MkdirAll(filepath.Dir(infraPath), 0o755); err != nil {
 		t.Fatal(err)
@@ -4047,21 +4057,21 @@ func TestHumanResolvePanelDiffAddDelClasses(t *testing.T) {
 	if err := os.WriteFile(infraPath, []byte("# alpha infra\nold line\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := git.New(root).Commit(context.Background(), "seed infra doc"); err != nil {
+	write(t, filepath.Join(root, "submodules/alpha/PLAN.md"), "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+		"## needs-token [NEEDS-HUMAN] <!-- attempts=0 deps= weight=4 category=secret -->\nWire it.\n")
+	if err := git.New(root).Commit(context.Background(), "seed infra doc + needs-human"); err != nil {
 		t.Fatal(err)
 	}
+	ts := httptest.NewServer(s.Routes())
+	t.Cleanup(ts.Close)
 
 	it := PlanItem{ID: "needs-token", Desc: "Wire the client.", HumanReason: "token"}
 	sess, err := s.humans.session(context.Background(), "alpha", it)
 	if err != nil {
 		t.Fatal(err)
 	}
-	target := filepath.Join(sess.wtPath, "submodules", "alpha", "INFRASTRUCTURE.md")
-	if err := os.WriteFile(target, []byte("# alpha infra\nnew line\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := sess.wt.Commit(context.Background(), "resolve: agent turn"); err != nil {
-		t.Fatal(err)
+	if _, err := sess.Chat(context.Background(), "update the infra doc"); err != nil {
+		t.Fatalf("chat: %v", err)
 	}
 
 	body := httpGet(t, ts.URL+"/human/alpha/needs-token/panel/"+sess.ID)
@@ -4682,21 +4692,12 @@ func TestPolledPanelFragmentETag304(t *testing.T) {
 	}
 
 	t.Run("editorPanel", func(t *testing.T) {
-		s, _ := chatFixture(t, "")
+		s, _ := editorFixture(t, "")
 		sess, err := s.editors.Open(ctx, "submodules/alpha/"+repo.ROIFile)
 		if err != nil {
 			t.Fatalf("open editor session: %v", err)
 		}
 		assertETag304(t, s, "/editor/"+sess.ID+"/panel")
-	})
-
-	t.Run("chatPanel", func(t *testing.T) {
-		s, _ := chatFixture(t, "")
-		sess, err := s.chat.open(ctx, "submodules/alpha/notes.md")
-		if err != nil {
-			t.Fatalf("open chat session: %v", err)
-		}
-		assertETag304(t, s, "/edit/"+sess.ID+"/panel")
 	})
 
 	t.Run("humanResolvePanel", func(t *testing.T) {
@@ -7715,7 +7716,7 @@ func TestPollPanesMorphSwap(t *testing.T) {
 		{"session-body", "session_view.html", map[string]interface{}{"Name": "alpha", "Branch": "bee-x", "Live": true}},
 		{"session-list", "session_list.html", map[string]interface{}{"Name": "alpha"}},
 		{"editor", "editor.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"}},
-		{"chatedit", "bootstrap_agent.html", map[string]interface{}{"ID": "c1"}},
+		{"editor", "bootstrap_agent.html", map[string]interface{}{"ID": "c1"}},
 		{"resolve", "human_resolve.html", map[string]interface{}{"Sub": "alpha", "Item": PlanItem{ID: "t1"}, "SessID": "s1"}},
 	}
 	for _, c := range cases {
@@ -7752,7 +7753,6 @@ func TestBusyPanelPollMorphs(t *testing.T) {
 		data interface{}
 	}{
 		{"editor_panel", "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Busy": true}},
-		{"chatedit_panel", "chatedit_panel.html", map[string]interface{}{"ID": "c1", "Busy": true}},
 		{"human_resolve_panel", "human_resolve_panel.html", map[string]interface{}{"Sub": "alpha", "TaskID": "t1", "SessID": "s1", "Busy": true}},
 	} {
 		out := renderTmpl(t, s, c.tmpl, c.data)

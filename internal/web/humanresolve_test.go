@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/editor"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 )
@@ -22,10 +23,7 @@ import (
 // a live httptest server so path values populate.
 func humanFixture(t *testing.T, reply string) (*Server, string, *httptest.Server) {
 	t.Helper()
-	client := &fakeChatClient{reply: reply}
-	s, root := chatFixtureClient(t, client)
-	// Rewire the resolution agent manager onto the same fake-backed client.
-	s.humans = newResolveManager(root, client)
+	s, root := editorFixtureClient(t, &fakeAgentClient{reply: reply})
 	// Seed a real NEEDS-HUMAN task and commit it so headSHA/planView see it.
 	planRel := "submodules/alpha/PLAN.md"
 	write(t, root+"/"+planRel, "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
@@ -41,14 +39,10 @@ func humanFixture(t *testing.T, reply string) (*Server, string, *httptest.Server
 }
 
 // waitIdle polls until the task's resolution session finishes its background turn.
-func waitIdle(t *testing.T, s *Server, sub, id string) *resolveSession {
+func waitIdle(t *testing.T, s *Server, sub, id string) *editor.Session {
 	t.Helper()
-	key := taskKey(sub, id)
 	for i := 0; i < 200; i++ {
-		s.humans.mu.Lock()
-		sess := s.humans.byTask[key]
-		s.humans.mu.Unlock()
-		if sess != nil && !sess.isBusy() {
+		if sess, ok := s.humans.find(sub, id); ok && !sess.Busy() {
 			return sess
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -121,7 +115,7 @@ func TestHumanResolvePageOpensSession(t *testing.T) {
 	}
 	s.humans.mu.Lock()
 	id1 := ""
-	if sess := s.humans.byTask["alpha/needs-token"]; sess != nil {
+	if sess, ok := s.humans.find("alpha", "needs-token"); ok {
 		id1 = sess.ID
 	}
 	s.humans.mu.Unlock()
@@ -130,7 +124,8 @@ func TestHumanResolvePageOpensSession(t *testing.T) {
 	}
 	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
 	s.humans.mu.Lock()
-	id2 := s.humans.byTask["alpha/needs-token"].ID
+	sess2, _ := s.humans.find("alpha", "needs-token")
+	id2 := sess2.ID
 	s.humans.mu.Unlock()
 	if id1 != id2 {
 		t.Fatalf("reload cut a new session: %s != %s", id1, id2)
@@ -187,41 +182,38 @@ func TestHumanResolveBreadcrumb(t *testing.T) {
 // live for the swarm. (The fake client makes no edits, so the test writes the
 // change into the worktree directly, exercising the real commit+publish path.)
 func TestResolvePublishLandsChangesOnMain(t *testing.T) {
-	s, root, _ := humanFixture(t, "")
+	// The agent edits a beehive-layer file in its worktree; a turn commits it, and
+	// Publish lands it on main. editFn writes INFRASTRUCTURE.md on the turn so the
+	// real commit+publish path runs on real content.
+	client := &fakeAgentClient{
+		reply: "Documented the process in INFRASTRUCTURE.md.",
+		editFn: func(cwd string) {
+			p := filepath.Join(cwd, "submodules", "alpha", "INFRASTRUCTURE.md")
+			_ = os.MkdirAll(filepath.Dir(p), 0o755)
+			_ = os.WriteFile(p, []byte("# alpha infra\ndocumented the process\n"), 0o644)
+		},
+	}
+	s, root := editorFixtureClient(t, client)
 	it := PlanItem{ID: "needs-token", Desc: "Wire the client.", HumanReason: "token"}
 	sess, err := s.humans.session(context.Background(), "alpha", it)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Simulate the agent editing a beehive-layer file in its worktree.
-	target := filepath.Join(sess.wtPath, "submodules", "alpha", "INFRASTRUCTURE.md")
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		t.Fatal(err)
+	if _, err := sess.Chat(context.Background(), "document the process"); err != nil {
+		t.Fatalf("chat: %v", err)
 	}
-	if err := os.WriteFile(target, []byte("# alpha infra\ndocumented the process\n"), 0o644); err != nil {
-		t.Fatal(err)
+	if sess.State(context.Background()) != "dirty" {
+		t.Fatalf("expected a pending change after the turn")
 	}
-	// Commit the agent's work onto the branch (runTurn does this after a turn).
-	if err := sess.wt.Commit(context.Background(), "resolve: agent turn"); err != nil {
-		t.Fatal(err)
-	}
-	has, err := sess.hasChanges(context.Background())
-	if err != nil || !has {
-		t.Fatalf("expected pending change, has=%v err=%v", has, err)
-	}
-	remote, err := s.humans.publishRemote(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := sess.publish(context.Background(), remote); err != nil {
+	if err := resolvePublish(context.Background(), sess); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	got := gitShow(t, root, "HEAD", "submodules/alpha/INFRASTRUCTURE.md")
 	if !strings.Contains(got, "documented the process") {
 		t.Fatalf("published content not on main HEAD: %q", got)
 	}
-	if !sess.isPublished() {
-		t.Fatal("session not marked published")
+	if sess.State(context.Background()) != "live" {
+		t.Fatal("session should be live (published) after publish")
 	}
 }
 
@@ -234,7 +226,7 @@ func TestResolvePublishNothingIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.publish(context.Background(), ""); err != errNothingToPub {
+	if err := resolvePublish(context.Background(), sess); err != errNothingToPub {
 		t.Fatalf("publish with no change = %v, want errNothingToPub", err)
 	}
 }
@@ -244,20 +236,21 @@ func TestResolvePublishNothingIsRejected(t *testing.T) {
 func TestResolveMessageRunsTurnAndCommits(t *testing.T) {
 	s, _, ts := humanFixture(t, "I inspected the blocker; add api_token in the Secrets panel.")
 	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
-	resp := httpPostForm(t, ts.URL+"/human/alpha/needs-token/message/"+s.humans.byTask["alpha/needs-token"].ID,
+	sess0, _ := s.humans.find("alpha", "needs-token")
+	resp := httpPostForm(t, ts.URL+"/human/alpha/needs-token/message/"+sess0.ID,
 		url.Values{"message": {"what does this need?"}})
 	if resp != http.StatusOK {
 		t.Fatalf("message status = %d", resp)
 	}
 	sess := waitIdle(t, s, "alpha", "needs-token")
 	found := false
-	for _, tn := range sess.logCopy() {
+	for _, tn := range sess.Log() {
 		if tn.Role == "agent" && strings.Contains(tn.Text, "Secrets panel") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("agent reply not recorded: %+v", sess.logCopy())
+		t.Fatalf("agent reply not recorded: %+v", sess.Log())
 	}
 }
 
@@ -266,15 +259,16 @@ func TestResolveMessageRunsTurnAndCommits(t *testing.T) {
 func TestHumanResolveDiscardResetsSession(t *testing.T) {
 	s, _, ts := humanFixture(t, "")
 	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
-	s.humans.mu.Lock()
-	before := s.humans.byTask["alpha/needs-token"].ID
-	s.humans.mu.Unlock()
+	sessBefore, _ := s.humans.find("alpha", "needs-token")
+	before := sessBefore.ID
 	if code := httpPost(t, ts.URL+"/human/alpha/needs-token/discard/"+before); code != http.StatusOK && code != http.StatusSeeOther {
 		t.Fatalf("discard status = %d", code)
 	}
-	s.humans.mu.Lock()
-	after := s.humans.byTask["alpha/needs-token"].ID
-	s.humans.mu.Unlock()
+	sessAfter, _ := s.humans.find("alpha", "needs-token")
+	after := ""
+	if sessAfter != nil {
+		after = sessAfter.ID
+	}
 	if after == before {
 		t.Fatalf("discard did not reset the session: still %s", after)
 	}

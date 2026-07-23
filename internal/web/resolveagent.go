@@ -6,384 +6,134 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/spencerharmon/beehive/internal/git"
-	"github.com/spencerharmon/beehive/internal/swarm"
+	"github.com/spencerharmon/beehive/internal/editor"
 )
 
-// resolve-agent: the AI resolution surface for a NEEDS-HUMAN task. Unlike the
-// generic chat-diff editor (chatManager, a single-file propose-then-approve
-// loop), a resolution session is a GENERAL, tool-using agent working in a private
-// worktree of the beehive coordination repo. It has the full opencode "build"
-// toolset (read, grep, bash, edit, write) auto-approved, so it can investigate
-// the repo, run read-only commands to understand the blocker, and make
-// MULTI-FILE beehive-layer changes (ROI.md, INFRASTRUCTURE.md, ARTIFACTS.md,
-// docs/, notes) to help clear it. Nothing it does is live until the operator
-// clicks Publish (merge the worktree branch to the hive's main); Discard drops
-// the worktree.
+// resolve-agent: the AI resolution surface for a NEEDS-HUMAN task. A resolution
+// session is a GENERAL, tool-using agent working in a private worktree of the
+// beehive coordination repo: the full opencode "build" toolset (read, grep,
+// bash, edit, write) auto-approved, so it can investigate the repo, run
+// read-only commands to understand the blocker, and make MULTI-FILE beehive-layer
+// changes (ROI.md, INFRASTRUCTURE.md, ARTIFACTS.md, docs/, notes) to help clear
+// it. Nothing it does is live until the operator clicks Publish (merge the
+// worktree branch to the hive's main); Discard drops the worktree.
+//
+// edit-session-consolidation: this is NO LONGER a bespoke, in-memory-only session
+// type. A resolution session is an editor.Session of Kind resolve (whole-tree +
+// unrestricted + a caller-supplied blocker System prompt + no agent self-merge),
+// so it rides the SAME durable worktree/opencode/transcript/publish/reclaim
+// engine as the coordination-file editor and the bootstrap agent — it gains
+// persistence across a beehived restart, transcript replay on resume, and the
+// editor-session-wipe protection, none of which the old resolveSession had.
+// resolveManager is now just a task-keyed facade that maps a blocked task
+// (sub/id) to its one editor.Session and builds the blocker-seeded Spec.
 //
 // The agent can NEVER un-escalate the task itself: flipping NEEDS-HUMAN -> TODO
 // is a separate deterministic operator action (humanResolveApply), so a model can
-// never silently reopen a blocker or free-rewrite the multi-task PLAN.md. The
-// resolution page therefore carries three orthogonal levers, matching the ways a
-// blocker actually clears: the Secrets panel (a credential), this agent + Publish
-// (a coordination-layer change), and Mark resolved (the deterministic reopen).
+// never silently reopen a blocker or free-rewrite the multi-task PLAN.md.
 
 var (
-	errResolveBusy    = errors.New("resolve-agent: a turn is already in progress")
-	errNothingToPub   = errors.New("resolve-agent: no changes to publish")
-	errResolveMissing = errors.New("resolve-agent: session not found")
+	errNothingToPub = errors.New("resolve-agent: no changes to publish")
+	errResolveBusy  = errors.New("resolve-agent: a turn is already in progress")
 )
 
-// resolveManager owns the per-task resolution agent sessions and the worktrees
-// backing them. Sessions are keyed by task (one general agent per blocked task,
-// reused across page reloads) and live in-memory only.
+// resolveManager maps each NEEDS-HUMAN task to its one resolution session over
+// the shared editor.Manager. It owns no worktrees or sessions of its own — the
+// editor.Manager does — so a restart's editor.Reload transparently recovers every
+// resolution session, and find() re-associates it with its task by persisted Meta.
 type resolveManager struct {
-	root   string
-	git    *git.Repo // root repo (cuts the per-task worktrees)
-	client swarm.Client
-	now    func() time.Time
-
-	mu     sync.Mutex
-	byTask map[string]*resolveSession // taskKey(sub,id) -> session
+	editors *editor.Manager
+	mu      sync.Mutex // serializes session() so two page loads can't double-open one task
 }
 
-// newResolveManager builds a resolveManager over the beehive repo at root driving
-// the given opencode client. A hung turn (e.g. an opencode permission elicitation
-// that never resolves) is cut by the client's own IdleTimeout watchdog — the one
-// liveness bound; there is no separate absolute per-turn ceiling.
-func newResolveManager(root string, client swarm.Client) *resolveManager {
-	return &resolveManager{
-		root:   root,
-		git:    git.New(root),
-		client: client,
-		now:    time.Now,
-		byTask: map[string]*resolveSession{},
-	}
+// newResolveManager builds the facade over the given editor.Manager. A resolution
+// turn's wedge protection is the editor client's IdleTimeout watchdog (wired in
+// editor.NewManager), so a turn stuck on a hung tool call is cut and can never
+// leave a session "working…" forever.
+func newResolveManager(editors *editor.Manager) *resolveManager {
+	return &resolveManager{editors: editors}
 }
 
-// resolveSession is one blocked task's resolution agent: a tool-using opencode
-// session over a throwaway worktree branch off main. The opencode session is
-// opened lazily on the first turn; each turn's file changes are committed to the
-// branch so the diff/publish reflect exactly what the agent produced.
-type resolveSession struct {
-	ID     string
-	Branch string
-	Sub    string
-	TaskID string
-	wtPath string
-	sys    string
-	mgr    *resolveManager
-	wt     *git.Repo
-
-	mu        sync.Mutex
-	oc        swarm.Session      // lazy: opened on first turn
-	cancel    context.CancelFunc // cancels the in-flight turn's context (teardown)
-	log       []chatTurn
-	busy      bool
-	errMsg    string
-	published bool
-	first     bool // first turn seeds an orientation preamble
-
-	// wtMu serializes ALL git operations against this session's worktree (the
-	// post-turn commit, diff/hasChanges reads, publish, teardown). s.mu guards the
-	// in-memory session state; wtMu guards the on-disk worktree/index so a panel
-	// poll or Publish can never race the background turn's `git add -A` commit on
-	// index.lock. Lock order when both are held is wtMu THEN s.mu.
-	wtMu sync.Mutex
-}
-
-// taskKey is the per-task session key; sub and id are validated basenames.
-func taskKey(sub, id string) string { return sub + "/" + id }
-
-// session returns the resolution agent for a task, opening one on first use over
-// a fresh worktree under a blocker-seeded system prompt and reusing it on later
-// loads. A session whose worktree was reclaimed out from under it is transparently
-// reopened.
-func (m *resolveManager) session(ctx context.Context, sub string, it PlanItem) (*resolveSession, error) {
-	key := taskKey(sub, it.ID)
-	// Hold m.mu across the whole check-create-insert so two concurrent page loads
-	// cannot both miss and both cut a worktree (the loser would leak its worktree
-	// and its returned SessID would 404 on every panel poll). WorktreeAdd runs
-	// under the lock; session creation is infrequent, so the serialization is
-	// cheap relative to the orphan-worktree bug it prevents.
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if s, ok := m.byTask[key]; ok {
-		return s, nil
-	}
-	branch := "edit-resolve-" + slugPath(sub+"-"+it.ID) + "-" + fmt.Sprint(m.now().UnixNano())
-	wtPath := m.root + "/.worktrees/" + branch
-	if err := m.git.WorktreeAdd(ctx, wtPath, branch, "main"); err != nil {
-		return nil, fmt.Errorf("worktree add: %w", err)
-	}
-	s := &resolveSession{
-		ID:     branch,
-		Branch: branch,
-		Sub:    sub,
-		TaskID: it.ID,
-		wtPath: wtPath,
-		sys:    resolveSystemPrompt(sub, it),
-		mgr:    m,
-		wt:     git.New(wtPath),
-		first:  true,
-	}
-	m.byTask[key] = s
-	return s, nil
-}
-
-// get returns a live session by id.
-func (m *resolveManager) get(id string) (*resolveSession, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, s := range m.byTask {
-		if s.ID == id {
+// find returns the live resolution session for a task, matched by its persisted
+// Meta tags so it is found again after a restart recovers it from the store.
+func (m *resolveManager) find(sub, id string) (*editor.Session, bool) {
+	for _, s := range m.editors.List() {
+		if s.Kind() != editor.KindResolve {
+			continue
+		}
+		md := s.Meta()
+		if md["sub"] == sub && md["task"] == id {
 			return s, true
 		}
 	}
 	return nil, false
 }
 
+// session returns the resolution agent for a task, opening one on first use over
+// a fresh whole-tree worktree under a blocker-seeded system prompt and reusing it
+// on later loads. m.mu is held across the whole find-or-open so two concurrent
+// page loads cannot both miss and both cut a worktree (the loser would leak its
+// worktree and its returned id would 404 on every panel poll).
+func (m *resolveManager) session(ctx context.Context, sub string, it PlanItem) (*editor.Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.find(sub, it.ID); ok {
+		return s, nil
+	}
+	return m.editors.OpenSession(ctx, editor.Spec{
+		WholeTree:    true,
+		Unrestricted: true,
+		Kind:         editor.KindResolve,
+		System:       resolveSystemPrompt(sub, it),
+		Preamble:     resolveFirstTurnPreamble,
+		Slug:         "resolve-" + slugPath(sub+"-"+it.ID),
+		Meta:         map[string]string{"sub": sub, "task": it.ID},
+	})
+}
+
+// get returns a live resolution session by id (rejecting a non-resolve session id).
+func (m *resolveManager) get(id string) (*editor.Session, bool) {
+	s, ok := m.editors.Get(id)
+	if !ok || s.Kind() != editor.KindResolve {
+		return nil, false
+	}
+	return s, true
+}
+
 // forget drops and tears down a task's resolution session (called after resolve,
 // so a later re-escalation of the same id opens a fresh agent with no stale
-// blocker context). The worktree/branch is removed; a Publish already landed its
-// changes on main, so nothing worth keeping is lost.
+// blocker context). The worktree/branch is removed via editor.Close; a Publish
+// already landed its changes on main, so nothing worth keeping is lost.
 func (m *resolveManager) forget(ctx context.Context, sub, id string) {
-	key := taskKey(sub, id)
-	m.mu.Lock()
-	s, ok := m.byTask[key]
-	delete(m.byTask, key)
-	m.mu.Unlock()
-	if ok {
-		s.teardown(ctx)
+	if s, ok := m.find(sub, id); ok {
+		_ = m.editors.Close(ctx, s.ID)
 	}
 }
 
-// startChat records the user message and runs the agent turn in the background,
-// so the HTTP handler returns immediately and the panel poll renders progress and
-// the resulting multi-file diff. One turn at a time per session.
-func (s *resolveSession) startChat(bg context.Context, msg string) error {
-	s.mu.Lock()
-	if s.busy {
-		s.mu.Unlock()
+// resolvePublish lands a resolution session's committed changes on the hive main
+// via the editor's shared publish path (own-remote-or-local, resolved at open).
+// It refuses when a turn is still writing the worktree or when there is nothing
+// to publish, then notes the publish in the log. The caller MUST serialize this
+// against other primary-checkout writers (Server.gitMu).
+func resolvePublish(ctx context.Context, s *editor.Session) error {
+	if s.Busy() {
 		return errResolveBusy
 	}
-	s.busy = true
-	s.errMsg = ""
-	s.log = append(s.log, chatTurn{Role: "user", Text: msg, At: s.mgr.now()})
-	first := s.first
-	// The resolve agent's opencode client carries the idle watchdog (IdleTimeout);
-	// a hung turn returns ErrTurnIdle. A cancellable ctx is all we need here — there
-	// is no absolute per-turn ceiling (the idle watchdog is the one liveness bound).
-	ctx, cancel := context.WithCancel(bg)
-	s.cancel = cancel
-	s.mu.Unlock()
-
-	go s.runTurn(ctx, msg, first)
-	return nil
-}
-
-func (s *resolveSession) runTurn(ctx context.Context, msg string, first bool) {
-	reply, err := s.prompt(ctx, msg, first)
-	s.mu.Lock()
-	if err != nil {
-		s.errMsg = err.Error()
-		s.busy = false
-		s.cancel = nil
-		s.mu.Unlock()
-		return
-	}
-	// Turn succeeded: consume the one-shot orientation preamble now (not at
-	// dispatch), so a turn that failed to reach the model still re-seeds it.
-	s.first = false
-	display := strings.TrimSpace(reply)
-	if display == "" {
-		display = "(no reply)"
-	}
-	s.log = append(s.log, chatTurn{Role: "agent", Text: display, At: s.mgr.now()})
-	s.mu.Unlock()
-
-	// Capture whatever the agent wrote this turn onto the branch so the diff and a
-	// later Publish reflect it exactly (new files included). Nothing-to-commit is
-	// normal (the agent only investigated or answered). Serialized on wtMu so a
-	// concurrent panel diff/Publish never races the index.
-	s.wtMu.Lock()
-	cerr := s.wt.Commit(ctx, "resolve "+s.TaskID+": agent turn")
-	s.wtMu.Unlock()
-	s.mu.Lock()
-	if cerr != nil && !errors.Is(cerr, git.ErrNothing) {
-		s.errMsg = "commit agent changes: " + cerr.Error()
-	} else if cerr == nil {
-		// New content landed on the branch after a prior Publish: it is no longer
-		// fully published, so the panel must offer Publish again.
-		s.published = false
-	}
-	s.busy = false
-	s.cancel = nil
-	s.mu.Unlock()
-}
-
-// prompt opens the opencode session on first use (seeding the blocker system
-// prompt) and reuses it for later turns. The first user turn is prefixed with a
-// short orientation so the agent knows to investigate before proposing.
-func (s *resolveSession) prompt(ctx context.Context, msg string, first bool) (string, error) {
-	s.mu.Lock()
-	oc := s.oc
-	s.mu.Unlock()
-	if oc == nil {
-		sess, err := s.mgr.client.Open(ctx, s.wtPath, s.sys)
-		if err != nil {
-			return "", err
-		}
-		s.mu.Lock()
-		s.oc = sess
-		s.mu.Unlock()
-		oc = sess
-	}
-	if first {
-		msg = resolveFirstTurnPreamble + "\n\n" + msg
-	}
-	return oc.Prompt(ctx, msg)
-}
-
-func (s *resolveSession) setErr(msg string) {
-	s.mu.Lock()
-	s.errMsg = msg
-	s.mu.Unlock()
-}
-
-// diff returns the accumulated multi-file change of the session branch against
-// main: a --stat summary and the full unified patch. Both are "" when the agent
-// has made no committed change yet. Serialized on wtMu against the turn commit.
-func (s *resolveSession) diff(ctx context.Context) (stat, patch string, err error) {
-	s.wtMu.Lock()
-	defer s.wtMu.Unlock()
-	stat, err = s.wt.Run(ctx, "diff", "--stat", "main...HEAD")
-	if err != nil {
-		return "", "", err
-	}
-	patch, err = s.wt.Run(ctx, "diff", "main...HEAD")
-	if err != nil {
-		return "", "", err
-	}
-	return strings.TrimSpace(stat), patch, nil
-}
-
-// hasChanges reports whether the branch carries any committed change over main.
-// Callers hold wtMu (publish) or accept a best-effort read.
-func (s *resolveSession) hasChanges(ctx context.Context) (bool, error) {
-	out, err := s.wt.Run(ctx, "diff", "--name-only", "main...HEAD")
-	if err != nil {
-		return false, err
-	}
-	return strings.TrimSpace(out) != "", nil
-}
-
-// publish lands the session's committed changes on the hive's main, making the
-// coordination-layer change live. It first captures any residual working-tree
-// change, refuses when there is nothing to publish, then publishes to the repo's
-// own remote (when it has one that shares history) or, for a local-only hive, to
-// the checked-out main via updateInstead. The caller MUST serialize this against
-// other primary-checkout writers (Server.gitMu).
-func (s *resolveSession) publish(ctx context.Context, remote string) error {
-	// Never publish while a turn is still writing the worktree: the branch tip may
-	// be a half-written tree. The operator retries once the turn settles.
-	if s.isBusy() {
-		return errResolveBusy
-	}
-	s.wtMu.Lock()
-	defer s.wtMu.Unlock()
-	if cerr := s.wt.Commit(ctx, "resolve "+s.TaskID+": publish"); cerr != nil && !errors.Is(cerr, git.ErrNothing) {
-		return cerr
-	}
-	has, err := s.hasChanges(ctx)
-	if err != nil {
-		return err
-	}
-	if !has {
+	if s.State(ctx) != "dirty" {
 		return errNothingToPub
 	}
-	if err := s.wt.PublishToMain(ctx, remote); err != nil {
+	if err := s.Merge(ctx); err != nil {
 		return err
 	}
-	if remote != "" {
-		// Sync the local projection so beehived's own views reflect it at once; a
-		// dirty primary tree only downgrades this to a soft note (remote has it).
-		if uerr := s.wt.UpdateLocalMain(ctx); uerr != nil {
-			s.setErr("published to remote main; local tree not updated: " + uerr.Error())
-		}
-	}
-	s.mu.Lock()
-	s.published = true
-	s.log = append(s.log, chatTurn{Role: "system", Text: "Published the change to main.", At: s.mgr.now()})
-	s.mu.Unlock()
+	s.Note("Published the change to main.")
 	return nil
 }
 
-// publishRemote returns the remote to publish to: the repo's OWN remote (one
-// whose main shares history with local main) when present, else "" for a
-// local-only hive that publishes to its checked-out main. Mirrors the editor's
-// trusted-remote rule so a foreign origin/main is never a publish target.
-func (m *resolveManager) publishRemote(ctx context.Context) (string, error) {
-	remote, err := m.git.Remote(ctx)
-	if err != nil || remote == "" {
-		return "", err
-	}
-	if err := m.git.Fetch(ctx, remote, "main"); err != nil {
-		return "", err
-	}
-	own, err := m.git.SharesHistory(ctx, "main", remote+"/main")
-	if err != nil {
-		return "", err
-	}
-	if own {
-		return remote, nil
-	}
-	return "", nil
-}
-
-// teardown removes the session's worktree and branch. It first CANCELS any
-// in-flight turn (so the background goroutine's prompt/commit unwinds) and then
-// takes wtMu, so the worktree is never removed out from under a live `git add
-// -A`. Best-effort: teardown owns removing this resolve session's own
-// worktree+branch. It must NOT rely on the internal/editor Manager's startup GC
-// to sweep leaks — that Manager now owns only its own `hive-edit-*` namespace
-// and deliberately never touches these `edit-resolve-*` worktrees (that shared
-// reclaim was destroying live resolve sessions; see editor.editBranchPrefix and
-// the editor-session-wipe INVARIANT). A `edit-resolve-*` worktree left behind by
-// a crash is swept by the manual cleanup-stale dance, not automatically.
-func (s *resolveSession) teardown(ctx context.Context) {
-	s.mu.Lock()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	if s.oc != nil {
-		_ = s.oc.Close()
-		s.oc = nil
-	}
-	s.mu.Unlock()
-	// Serialize against any commit still draining in the cancelled turn.
-	s.wtMu.Lock()
-	defer s.wtMu.Unlock()
-	_ = s.mgr.git.WorktreeRemove(ctx, s.wtPath)
-	_, _ = s.mgr.git.Run(ctx, "branch", "-D", s.Branch)
-}
-
-func (s *resolveSession) isBusy() bool    { s.mu.Lock(); defer s.mu.Unlock(); return s.busy }
-func (s *resolveSession) errText() string { s.mu.Lock(); defer s.mu.Unlock(); return s.errMsg }
-func (s *resolveSession) isPublished() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.published
-}
-
-func (s *resolveSession) logCopy() []chatTurn {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]chatTurn, len(s.log))
-	copy(out, s.log)
-	return out
+// slugPath turns a repo path (or a sub-id key) into a branch-safe slug.
+func slugPath(p string) string {
+	r := strings.NewReplacer("/", "-", ".", "-", " ", "-")
+	return strings.Trim(r.Replace(p), "-")
 }
 
 // resolveFirstTurnPreamble orients the agent on its first turn: investigate the
@@ -396,7 +146,7 @@ const resolveFirstTurnPreamble = "Before proposing anything, use your tools to i
 	"here), leaving the operator only the action that must be theirs."
 
 // resolveSystemPrompt seeds the resolution agent with the concrete blocker, its
-// full tool authority and boundaries, and \u2014 crucially \u2014 the explicit set of ways a
+// full tool authority and boundaries, and — crucially — the explicit set of ways a
 // NEEDS-HUMAN task actually clears, so the agent drives the operator to a real
 // unblock instead of dead-ending.
 func resolveSystemPrompt(sub string, it PlanItem) string {
@@ -435,23 +185,23 @@ available here, and that is intentional (see below).
 
 WHAT YOU MAY CHANGE
   - Beehive-layer coordination files for this target: its ROI.md (human-owned
-    intent \u2014 propose careful edits), INFRASTRUCTURE.md and ARTIFACTS.md
-    (operational / process docs \u2014 the right home for "document the process"), and
+    intent — propose careful edits), INFRASTRUCTURE.md and ARTIFACTS.md
+    (operational / process docs — the right home for "document the process"), and
     change docs under submodules/%[2]s/docs/. You may create new files here.
-  - Multiple files in one session \u2014 you are not limited to a single file.
+  - Multiple files in one session — you are not limited to a single file.
 
 WHAT YOU MUST NOT DO
   - Do NOT edit the target's application SOURCE CODE (anything under
     submodules/%[2]s/repo/). That is a separate git checkout; code changes go
     through a normal swarm WORK task, not this dialog. If the blocker needs code,
     describe precisely what a work task must implement and capture that intent in
-    ROI.md so the swarm builds it after you unblock \u2014 do not tell the operator you
+    ROI.md so the swarm builds it after you unblock — do not tell the operator you
     "can't help".
   - Do NOT run destructive or irreversible commands, and do NOT touch external
     systems, clusters, or networks. Read-only inspection only.
   - Do NOT ask for, print, or write secret values. Credentials are provided
     out-of-band via the Secrets panel and never pass through this chat or a file.
-  - Do NOT commit, merge, push, or flip the task status yourself \u2014 the operator
+  - Do NOT commit, merge, push, or flip the task status yourself — the operator
     drives Publish and "Mark resolved" through the UI.
 
 HOW THIS BLOCKER GETS CLEARED (drive the operator to exactly one; state which)

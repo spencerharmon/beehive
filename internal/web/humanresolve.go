@@ -106,29 +106,25 @@ func (s *Server) humanResolveMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg := strings.TrimSpace(r.FormValue("message")); msg != "" {
-		_ = sess.startChat(context.Background(), msg)
+		_ = sess.StartChat(context.Background(), msg)
 	}
 	s.render(w, "human_resolve_panel.html", s.resolvePanelData(r.Context(), sess))
 }
 
 // humanResolvePublish lands the agent's committed changes on the hive main. It
 // serializes against the follow-the-remote pull and other frontend writes
-// (Server.gitMu), and resolves the publish target with the same trusted-remote
-// rule as the editor (own remote, else local main).
+// (Server.gitMu); the editor.Session resolves its own publish target with the
+// trusted-remote rule (own remote, else local main) at open time.
 func (s *Server) humanResolvePublish(w http.ResponseWriter, r *http.Request) {
 	sess, ok := s.humans.get(r.PathValue("sid"))
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	// Hold gitMu across BOTH the remote probe (which fetches on the primary repo)
-	// and the publish, so neither races the follow-the-remote pull or another
-	// frontend write on the primary checkout's index/refs.
+	// Hold gitMu across the publish so it never races the follow-the-remote pull
+	// or another frontend write on the primary checkout's index/refs.
 	s.gitMu.Lock()
-	remote, err := s.humans.publishRemote(r.Context())
-	if err == nil {
-		err = sess.publish(r.Context(), remote)
-	}
+	err := resolvePublish(r.Context(), sess)
 	s.gitMu.Unlock()
 	data := s.resolvePanelData(r.Context(), sess)
 	if err != nil {
@@ -149,7 +145,8 @@ func (s *Server) humanResolveDiscard(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/human", http.StatusSeeOther)
 		return
 	}
-	s.humans.forget(r.Context(), sess.Sub, sess.TaskID)
+	md := sess.Meta()
+	s.humans.forget(r.Context(), md["sub"], md["task"])
 	// Re-open only if the task is still blocked; otherwise there is nothing to work.
 	if sm, it, blocked := s.humanTask(r.Context(), sub, id); blocked {
 		if _, err := s.humans.session(r.Context(), sm.Name, it); err != nil {
@@ -175,65 +172,60 @@ func (s *Server) humanResolveDiscard(w http.ResponseWriter, r *http.Request) {
 // of the range renders as an empty box rather than failing the whole panel; a
 // path new on HEAD (before "") or removed on HEAD (after "") is the same
 // root/add/delete edge RenderDiffHTML already tolerates for every other caller.
-func resolveSessionDiffs(ctx context.Context, sess *resolveSession) ([]editor.FileDiffBox, error) {
-	sess.wtMu.Lock()
-	defer sess.wtMu.Unlock()
-	names, err := sess.wt.Run(ctx, "diff", "--name-only", "main...HEAD")
+func resolveSessionDiffs(ctx context.Context, sess *editor.Session) ([]editor.FileDiffBox, error) {
+	changes, err := sess.TreeDiff(ctx)
 	if err != nil {
 		return nil, err
 	}
-	names = strings.TrimSpace(names)
-	if names == "" {
-		return nil, nil
-	}
-	base, err := sess.wt.Run(ctx, "merge-base", "main", "HEAD")
-	if err != nil {
-		return nil, err
-	}
-	base = strings.TrimSpace(base)
-	paths := strings.Split(names, "\n")
-	changes := make([]editor.FileChange, 0, len(paths))
-	for _, path := range paths {
-		if path == "" {
-			continue
-		}
-		before, _ := sess.wt.Show(ctx, base, path)  // "" when path is new on HEAD
-		after, _ := sess.wt.Show(ctx, "HEAD", path) // "" when path was deleted on HEAD
-		lexer := lexerFor(path)
-		changes = append(changes, editor.FileChange{
-			Path:    path,
-			Old:     before,
-			New:     after,
-			OldHTML: highlightLines(before, lexer),
-			NewHTML: highlightLines(after, lexer),
-		})
+	for i := range changes {
+		lexer := lexerFor(changes[i].Path)
+		changes[i].OldHTML = highlightLines(changes[i].Old, lexer)
+		changes[i].NewHTML = highlightLines(changes[i].New, lexer)
 	}
 	return editor.RenderMultiFileDiff(changes), nil
 }
 
 // resolvePanelData projects a resolution session into the panel template model.
-func (s *Server) resolvePanelData(ctx context.Context, sess *resolveSession) map[string]interface{} {
-	stat, _, err := sess.diff(ctx)
+func (s *Server) resolvePanelData(ctx context.Context, sess *editor.Session) map[string]interface{} {
+	stat, err := sess.DiffStat(ctx)
 	diffs, derr := resolveSessionDiffs(ctx, sess)
 	if err == nil {
 		err = derr
 	}
+	md := sess.Meta()
+	log := sess.Log()
+	state := sess.State(ctx)
 	data := map[string]interface{}{
 		"SessID":    sess.ID,
-		"Sub":       sess.Sub,
-		"TaskID":    sess.TaskID,
-		"Log":       sess.logCopy(),
+		"Sub":       md["sub"],
+		"TaskID":    md["task"],
+		"Log":       log,
 		"Stat":      stat,
 		"Diffs":     diffs,
 		"HasChange": len(diffs) > 0,
-		"Busy":      sess.isBusy(),
-		"Published": sess.isPublished(),
-		"Error":     sess.errText(),
+		"Busy":      sess.Busy(),
+		// Published: the branch has landed on main and nothing new is pending (state
+		// "live") after at least one agent turn. A fresh session with no work yet is
+		// also "live" but has no agent turn, so it does not read as published; a turn
+		// that adds new changes flips state back to "dirty" and offers Publish again.
+		"Published": state == "live" && anyAgentTurn(log),
+		"Error":     sess.Err(),
 	}
 	if err != nil {
 		data["Error"] = err.Error()
 	}
 	return data
+}
+
+// anyAgentTurn reports whether the log carries at least one agent message (the
+// session actually did work), distinguishing a published session from a fresh one.
+func anyAgentTurn(log []editor.Turn) bool {
+	for _, t := range log {
+		if t.Role == "agent" {
+			return true
+		}
+	}
+	return false
 }
 
 // humanResolveApply flips a NEEDS-HUMAN task back to TODO (plan.Task.Resolve) and

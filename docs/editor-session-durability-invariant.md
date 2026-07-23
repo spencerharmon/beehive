@@ -84,3 +84,27 @@ turn through the model (that would re-execute the agent's earlier file edits and
 burn tokens), and it explicitly tells the agent the file on disk already
 reflects those edits so it must not redo them. A brand-new session has no prior
 turns, so the seed message is the raw user message, byte-identical to before.
+
+## One engine for every AI edit surface (edit-session-consolidation)
+
+The resolve agent (NEEDS-HUMAN blocker resolution) and the bootstrap setup agent
+are no longer separate subsystems with their own in-memory session machinery.
+They are `editor.Session`s of `Kind` resolve / bootstrap over the SAME
+`editor.Manager`, opened via `Manager.OpenSession(Spec{...})`:
+
+- **resolve**: `WholeTree` + `Unrestricted` + a caller-supplied blocker `System`
+  prompt + a one-shot `Preamble`; publish is operator-only (`AutoMerge` off).
+  Commits `git add -A` and diffs `main...HEAD` across arbitrary beehive-layer
+  files (`ChangedFiles`/`TreeDiff`/`DiffStat`).
+- **bootstrap**: a single-file (`LOCALS.md`) session seeded with an `Intro`
+  turn; publish is operator-only. The agent edits `LOCALS.md` directly and the
+  operator reviews the diff and clicks Merge (the coordination editor's model),
+  replacing the old propose-then-approve loop.
+
+Because they now live under the `hive-edit-` namespace with a persisted store
+record (`Kind`/`WholeTree`/`System`/`Preamble`/`Meta`/`AutoMerge`), they inherit
+the whole durability contract for free: they survive a beehived restart
+(`Manager.Reload` recovers them), replay their transcript on resume, and are
+protected by the two invariant rules above. The web layer re-associates a
+recovered resolve session with its task by its persisted `Meta` (`sub`/`task`);
+the bootstrap singleton is found by `Kind`.

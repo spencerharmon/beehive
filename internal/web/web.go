@@ -25,7 +25,6 @@ import (
 	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spencerharmon/beehive/internal/submod"
-	"github.com/spencerharmon/beehive/internal/swarm"
 )
 
 //go:embed templates/*.html
@@ -92,17 +91,20 @@ type Server struct {
 	editors *editor.Manager
 	cache   *viewCache
 
-	// chat is the generic chat-diff editor over ANY repo file: a per-edit ROOT
-	// worktree + opencode session that proposes a full-file change rendered as a
-	// unified diff, applied+committed only on human approval (chat-diff-editor-core).
-	chat *chatManager
-
 	// humans owns the AI resolution AGENT for each NEEDS-HUMAN task and drives the
-	// deterministic reopen (NEEDS-HUMAN -> TODO). Each session is a general,
-	// tool-using opencode agent in a private worktree that can investigate the
-	// blocker and make multi-file beehive-layer changes (resolveagent.go); the
-	// operator reviews the diff and Publishes, then flips status via Mark resolved.
+	// deterministic reopen (NEEDS-HUMAN -> TODO). Each session is an
+	// editor.Session of Kind resolve over the shared editor.Manager
+	// (edit-session-consolidation): a general, tool-using opencode agent in a
+	// private worktree that can investigate the blocker and make multi-file
+	// beehive-layer changes (resolveagent.go); the operator reviews the diff and
+	// Publishes, then flips status via Mark resolved.
 	humans *resolveManager
+
+	// bootstrapMu serializes the setup agent's singleton open (bootstrap.go's
+	// openBootstrapSession): concurrent dashboard loads of an unbootstrapped repo
+	// converge on ONE editor.Session of Kind bootstrap rather than each cutting a
+	// fresh LOCALS.md worktree.
+	bootstrapMu sync.Mutex
 
 	// gitMu serializes operations that mutate the primary beehive checkout (where
 	// main is checked out): the viewer's periodic `git pull --ff-only main` that
@@ -151,30 +153,13 @@ func New(r *repo.Repo, cfg config.Config) (*Server, error) {
 		return nil, err
 	}
 	g := git.New(r.Root)
-	// The chat-diff editor drives its own opencode client (same server/model as
-	// the single-file editor); it opens a per-edit ROOT worktree and awaits each
-	// turn (opencode-turn-poll) before rendering the proposed diff.
-	oc := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}}
-	chat := newChatManager(r.Root, oc)
-	// The resolution agent is a headless tool-using turn, so it needs the same
-	// wedge protection the honeybee runner gives its passes: a progress watchdog
-	// (IdleTimeout) that cuts a turn stuck on a hung tool call (e.g. an opencode
-	// permission elicitation that nothing can answer), plus an absolute per-turn
-	// ceiling. Without them a single wedged turn pins the session at "working…"
-	// forever. It drives its OWN client so tuning it never perturbs the chat-diff
-	// editor's behavior.
-	resolveOC := &swarm.Opencode{Base: cfg.AgentURL, Model: cfg.Model, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, HTTP: &http.Client{Timeout: 0}, IdleTimeout: turnIdleTimeout(cfg)}
-	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), chat: chat, humans: newResolveManager(r.Root, resolveOC)}, nil
-}
-
-// turnIdleTimeout is the resolution agent's per-turn PROGRESS watchdog (a turn
-// with no new transcript activity for this long is cut), from config with a
-// sane default when unset.
-func turnIdleTimeout(cfg config.Config) time.Duration {
-	if cfg.TurnIdleTimeoutMinutes > 0 {
-		return time.Duration(cfg.TurnIdleTimeoutMinutes) * time.Minute
-	}
-	return 5 * time.Minute
+	// The resolution agent and bootstrap agent are now editor.Sessions over the
+	// SAME editor.Manager (edit-session-consolidation), so there is no separate
+	// chat/resolve opencode client: the Manager owns the one client, and its
+	// IdleTimeout wedge-watchdog (wired in editor.NewManager) is what cuts a
+	// resolution turn stuck on a hung tool call — the protection the resolve agent
+	// needs so a wedged turn can never pin a session at "working…" forever.
+	return &Server{repo: r, cfg: cfg, git: g, tmpl: t, editors: em, cache: newViewCache(), pullIvl: pullInterval(cfg), humans: newResolveManager(em)}, nil
 }
 
 // repoCookie carries the selected repo handle for a multi-repo daemon. Selection
@@ -387,18 +372,13 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /dances/{name}/apply", b((*Server).danceApplyHandler))
 	// AI editor chat (browser): one worktree branch per session. GET /edit is
 	// the ONE entry point for every edit-with-AI link (dashboard/explorer/
-	// roi_editor) and always opens the publish-capable internal/editor Manager
-	// (editEntry -> editNew), never chatManager (ai-edit-publish-to-main). The
-	// /edit/{id}/panel|message|approve|reject fragments remain registered
-	// because they ALSO back the bootstrap wizard's embedded agent (its own
-	// fixed LOCALS.md session, opened only via GET /bootstrap) — chatManager's
-	// generic, never-published full-page /edit/{id} view and its POST /edit
-	// open are retired along with it.
+	// roi_editor) and opens the publish-capable internal/editor Manager
+	// (editEntry -> editNew). The bootstrap wizard's setup agent and each
+	// NEEDS-HUMAN resolution agent are now ALSO editor.Sessions over that same
+	// Manager (edit-session-consolidation), so they share the /editor/{id}/*
+	// fragments below instead of the retired chatManager's own /edit/{id}/*
+	// approve-and-stop surface.
 	mux.HandleFunc("GET /edit", b((*Server).editEntry))
-	mux.HandleFunc("GET /edit/{id}/panel", b((*Server).chatPanel))
-	mux.HandleFunc("POST /edit/{id}/message", b((*Server).chatMessage))
-	mux.HandleFunc("POST /edit/{id}/approve", b((*Server).chatApprove))
-	mux.HandleFunc("POST /edit/{id}/reject", b((*Server).chatReject))
 	mux.HandleFunc("GET /editor/{id}", b((*Server).editorPage))
 	mux.HandleFunc("GET /editor/{id}/panel", b((*Server).editorPanel))
 	mux.HandleFunc("POST /editor/{id}/chat", b((*Server).editorChat))

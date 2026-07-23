@@ -1,18 +1,18 @@
 <div class="bootstrap-agent">
-  {{/* Poll only while a turn is in flight: the shell fetches the panel ONCE on
-     load, and chatedit_panel.html re-arms this poll (a hidden load-delay fetch)
-     only while .Busy. An idle chat (the setup guide waiting for the next message)
-     therefore stops polling instead of re-rendering an unchanged transcript every
-     1.5s; sending a message makes the panel Busy again, which restarts the poll. */}}
-  <div id="chatedit"
+  {{/* edit-session-consolidation: the setup agent is an editor.Session now, so it
+     shares the coordination editor's panel + routes (/editor/{id}/*). The panel
+     re-arms its own poll only while a turn is in flight; an idle chat stops
+     polling. The agent edits LOCALS.md directly and the operator reviews the diff
+     and clicks Merge in the panel — nothing is written to main until then. */}}
+  <div id="editor"
        role="status" aria-live="polite"
        hx-ext="morph"
-       hx-get="/edit/{{.ID}}/panel"
+       hx-get="/editor/{{.ID}}/panel"
        hx-trigger="load"
        hx-swap="morph:innerHTML">
     {{template "skeleton-transcript"}}
   </div>
-  <form hx-post="/edit/{{.ID}}/message" hx-target="#chatedit" hx-swap="innerHTML"
+  <form hx-post="/editor/{{.ID}}/chat" hx-target="#editor" hx-swap="innerHTML"
         hx-on::after-request="this.reset()">
     <input name="message" placeholder="Ask the setup guide, or say &ldquo;draft LOCALS.md&rdquo;&hellip;" aria-label="message to the setup guide" autocomplete="off" style="width:70%">
     <button>send</button>
