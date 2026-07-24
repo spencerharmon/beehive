@@ -16,8 +16,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/checkpolicy"
 	"github.com/spencerharmon/beehive/internal/claim"
 	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 	selectt "github.com/spencerharmon/beehive/internal/select"
@@ -217,6 +219,17 @@ type Runner struct {
 	// checks protocol adherence (work is committed), never code correctness. See
 	// verify.go and docs/runner-protocol-vs-correctness.md.
 	RunVerify func(ctx context.Context, dir, name string, args ...string) (verifyOutcome, error)
+
+	// CheckPolicy is the sandbox/policy for a task's `Check:` DoD command (command
+	// allowlist + filesystem confinement scoped to the task's submodule and its
+	// LINKED submodules). Nil = legacy path: the check runs as a bare `sh -c` in the
+	// gate's dir with no validation or confinement (keeps every existing test
+	// byte-identical). Production (cmd/honeybee) always sets it from layered config.
+	CheckPolicy *checkpolicy.Policy
+	// Links is the parsed SUBMODULE-LINKS.yaml, used to DERIVE (never hardcode) the
+	// linked-submodule checkouts a `Check:` may read under the sandbox. Nil = only the
+	// task's own submodule checkout is reachable.
+	Links *links.Links
 }
 
 // streamSession commits the current transcript to the isolated session branch

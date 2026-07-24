@@ -8,12 +8,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/checkpolicy"
+	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 	selectt "github.com/spencerharmon/beehive/internal/select"
 	"github.com/spencerharmon/beehive/internal/submod"
+	"github.com/spencerharmon/beehive/internal/swarm"
 	"github.com/spf13/cobra"
 )
 
@@ -452,11 +455,48 @@ func taskCheckCmd() *cobra.Command {
 			if _, statErr := os.Stat(runDir); statErr != nil {
 				runDir = root
 			}
-			ex := exec.CommandContext(cmd.Context(), "sh", "-c", check)
+			// Confine identically to the runner's gate: build the same check policy from
+			// layered config, enforce the command allowlist, and run under the same
+			// filesystem sandbox scoped to this submodule + its linked submodules.
+			pol := checkpolicy.Default()
+			if eff, cerr := config.Resolve(root, subName); cerr == nil {
+				if len(eff.CheckAllowedCommands) > 0 {
+					pol.Allowed = eff.CheckAllowedCommands
+				}
+				if eff.CheckSandbox != "" {
+					pol.Sandbox = eff.CheckSandbox
+				}
+				if eff.CheckRequireSandbox != nil {
+					pol.RequireSandbox = *eff.CheckRequireSandbox
+				}
+				pol.ReadPaths = eff.CheckReadPaths
+			}
+			if verr := pol.Validate(check); verr != nil {
+				return fmt.Errorf("check for %s:%s is REJECTED by the check-command policy: %w", subName, t.ID, verr)
+			}
+			rp, rerr := repo.Open(root)
+			if rerr != nil {
+				return rerr
+			}
+			lk, _ := links.Load(filepath.Join(root, repo.LinksFile))
+			sub := repo.Submodule{Name: subName, Path: filepath.Join(root, "submodules", subName)}
+			rw, ro := swarm.CheckBinds(cmd.Context(), rp, lk, sub, runDir, root, pol.ReadPaths)
+			pl, aerr := pol.Argv(check, runDir, rw, ro)
+			if aerr != nil {
+				return aerr
+			}
+			if pl.Note != "" {
+				fmt.Fprintf(os.Stderr, "beehive: %s\n", pl.Note)
+			}
+			ex := exec.CommandContext(cmd.Context(), pl.Name, pl.Args...)
 			ex.Dir = runDir
 			ex.Stdout = os.Stdout
 			ex.Stderr = os.Stderr
-			fmt.Fprintf(os.Stderr, "beehive: running check for %s:%s in %s\n  %s\n", subName, t.ID, runDir, check)
+			sbx := "unconfined"
+			if pl.Sandboxed {
+				sbx = "sandboxed"
+			}
+			fmt.Fprintf(os.Stderr, "beehive: running check for %s:%s in %s (%s)\n  %s\n", subName, t.ID, runDir, sbx, check)
 			if err := ex.Run(); err != nil {
 				return fmt.Errorf("check FAILED for %s:%s: %w", subName, t.ID, err)
 			}

@@ -219,23 +219,76 @@ history). A reconcile pass backfills `Check:` / `check=none` onto open tasks;
   `task defer`, `task check`, `plan lint`); the generated-prompt edits
   (HONEYBEE / review / reconcile / bootstrap); **post-select check context
   injection** (`checkGroundTruth`); **runner auto-spawn of the `Verify-After-Merge`
-  successor check task** (`spawnMergeVerifySuccessor`).
-- **Planned (sequenced follow-ups):** none of the core mechanism remains; the one
-  open runner refinement is the review-ran-check completion predicate below.
+  successor check task** (`spawnMergeVerifySuccessor`); the **review-ran-check
+  completion predicate** (`verifyGate` invariant 6); the **check-command
+  sandbox/policy** (`internal/checkpolicy`: command allowlist + bubblewrap
+  filesystem confinement), wired into the DONE gate, the pass-start injection, and
+  `beehive task check`.
+- **Planned (sequenced follow-ups):** none — the mechanism is complete. Remaining
+  work is per-install tuning (the `check_*` config keys) and reconcile backfilling
+  checks onto the open backlog.
+
+## Check sandbox & policy (`internal/checkpolicy`)
+
+A `Check:` runs against the LIVE environment (curls real endpoints, talks to the
+cluster, pulls images) at three points — the DONE gate, the pass-start ground-truth
+injection, and `beehive task check` — all through the SAME policy so they confine
+identically. Two independent layers:
+
+- **Command allowlist (always enforced, host-independent).** Every command word the
+  check invokes must be in the allowlist (`DefaultAllowedCommands`: read-only
+  inspection, text processing, hashing, DNS, and the network/cluster clients a real
+  check needs — curl/kubectl/helm/skopeo/git). It deliberately excludes shells and
+  interpreters as a command word (so `… | sh`, `bash -c …`, `python -c …` are
+  refused) and destructive tools. A static shell lexer extracts command-position
+  words across pipes/`;`/`&&`/subshells/command-substitution and fails CLOSED on any
+  construct it cannot resolve to a concrete command (a `$VAR` command, `$(pick)` in
+  command position). A violation at the gate is a fix-forward prompt (the author
+  rewrites the check), not a silent GC loop.
+- **Filesystem confinement (bubblewrap when present).** The check runs in a
+  namespace whose only writable paths are its OWN submodule checkout + that
+  checkout's git-common-dir (so `git` checks resolve their object store); its only
+  extra readable paths are its LINKED submodule checkouts (DERIVED at runtime from
+  `SUBMODULE-LINKS.yaml`, never hardcoded), the operator-declared `check_read_paths`
+  (site creds/config: a kubeconfig outside `~/.kube`, a CA bundle), and the minimal
+  system dirs tools need; the network is shared (checks must reach
+  endpoints/clusters). Writes and reads outside those binds do not reach the host
+  (verified: an escaping write lands in an ephemeral tmpfs; an unbound secret is
+  absent).
+
+Config (`config.yaml`, layered; documented in `LOCALS.md`): `check_allowed_commands`
+(replaces the default set when non-empty), `check_sandbox` (`auto` default = bwrap
+if present else degrade to allowlist-only + a warning; `bwrap`; `off`),
+`check_require_sandbox` (make a missing bwrap fail-closed), `check_read_paths`. The
+allowlist is real enforcement; bwrap is the filesystem-containment layer on top. On
+a host without bwrap the DoD gate never wedges — the allowlist still applies.
+
+## Review-ran-check (verifyGate invariant 6)
+
+A Review that approves a task carrying a real `Check:` (not `check=none`) must have
+EXECUTED that check and RECORDED its live result in the change doc as a
+`<!-- Beehive-Check: pass — <one-line evidence> -->` marker (mirrors the
+`Beehive-Commits:` header). Missing marker → the DONE handoff is refused with a
+prompt telling the reviewer to run `beehive task check` and record the result. This
+is the reviewer's INDEPENDENT confirmation, distinct from the runner's own gate
+(invariant 5) — it closes the "approved a check they never ran" gap. Migration-safe:
+only gates when a real check is present, only for the Review kind.
 
 ## Open decisions (operator to rule)
 
-- **Review-ran-check as a hard completion predicate** — make "the reviewer recorded
-  the check's live result in the review doc" a runner-checked review-completion
-  predicate, so a reviewer cannot approve a check they never executed.
-- **Probe sandbox** — which read-only verbs + which credentials a `Check:` may use
-  when the runner runs it against the live environment (the DONE gate AND the
-  pass-start injection execute task-authored commands with the runner's
-  environment). Lives with LOCALS/ROI per install.
+- **None outstanding.** Both prior open decisions are resolved (below); remaining
+  choices are per-install config tuning, not mechanism.
 
-*Resolved:* successor authorship — **runner-auto** (operator ruling); if the
-deterministic publish cannot merge the spawned successor, the existing
-conflict-resolution path hands it to the agent.
+*Resolved:*
+- **Successor authorship** — **runner-auto** (operator ruling); a publish that
+  cannot merge the spawned successor routes through the existing
+  conflict-resolution path to the agent.
+- **Review-ran-check** — **adopted as a hard completion predicate** (verifyGate
+  invariant 6, above).
+- **Probe sandbox** — **command allowlist + bubblewrap filesystem confinement**
+  scoped to the submodule + its linked submodules (derived from
+  `SUBMODULE-LINKS.yaml`), with site creds/config declared in `check_read_paths`
+  and the low-risk tool set the default (`internal/checkpolicy`, above).
 
 ## Enforcement-point map (keep current)
 
@@ -248,6 +301,8 @@ conflict-resolution path hands it to the agent.
 | yield ships a doc | completion predicate | `workChecklist` |
 | DoD check run at pass start (ground truth) | brief build | `checkGroundTruth` (`internal/swarm/verify.go`) |
 | Verify-After-Merge successor auto-spawn | completion, pre-publish | `spawnMergeVerifySuccessor` (`internal/swarm/swarm.go`) |
+| reviewer ran + recorded the check | handoff gate | `verifyGate` invariant 6 (`docRecordsCheck`), `internal/swarm/verify.go` |
+| check command allowlist + FS confinement | every check run (gate, injection, CLI) | `internal/checkpolicy`, `swarm.runCheck`/`CheckBinds` |
 | check / verify_after_merge / check=none schema | parse / serialize | `internal/plan/plan.go` |
 | convergence-wait self-defer + bound | yield-completion + counter | `taskYieldedBlocked`, `plan.MaxDefers`, `Task.Defer` |
 | DoD/dep hygiene surfaced deterministically | CLI | `beehive plan lint` (`cmd/beehive/cmd_plan.go`) |

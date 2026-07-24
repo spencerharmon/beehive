@@ -175,6 +175,26 @@ type Config struct {
 	// true, AgentURL is ignored by the honeybee pass (the frontend/editor, which
 	// need a persistent interactive server, keep using AgentURL).
 	AgentEphemeral *bool `yaml:"agent_ephemeral"`
+
+	// CheckAllowedCommands is the command allowlist for a task's `Check:` DoD command
+	// (internal/checkpolicy). A non-empty list REPLACES the built-in low-risk default
+	// (checkpolicy.DefaultAllowedCommands) so an install states the full set it wants;
+	// empty = the default set. Documented in LOCALS.md.
+	CheckAllowedCommands []string `yaml:"check_allowed_commands"`
+	// CheckSandbox selects the filesystem-confinement layer for a `Check:` command:
+	// "auto" (default; bubblewrap if present else degrade to allowlist-only), "bwrap"
+	// (require it — see CheckRequireSandbox), or "off". Empty = "auto".
+	CheckSandbox string `yaml:"check_sandbox"`
+	// CheckRequireSandbox, when true, makes a requested-but-missing bubblewrap a HARD
+	// failure (the DoD check is refused rather than run unconfined). *bool so unset is
+	// distinguishable from an explicit false. Default false.
+	CheckRequireSandbox *bool `yaml:"check_require_sandbox"`
+	// CheckReadPaths are extra absolute host paths bound READ-ONLY into the check
+	// sandbox — the site-specific credentials/config an allowlisted check tool needs
+	// (a kubeconfig outside ~/.kube, a CA bundle, a cloud config). The submodule and
+	// its LINKED submodule checkouts are NOT listed here; they are derived at runtime
+	// from SUBMODULE-LINKS.yaml. Documented in LOCALS.md.
+	CheckReadPaths []string `yaml:"check_read_paths"`
 }
 
 // boolPtr returns a pointer to b, for *bool config fields whose default is not the
@@ -327,6 +347,18 @@ func merge(base, over Config) Config {
 	}
 	if over.AgentEphemeral != nil {
 		out.AgentEphemeral = over.AgentEphemeral
+	}
+	if len(over.CheckAllowedCommands) > 0 {
+		out.CheckAllowedCommands = over.CheckAllowedCommands
+	}
+	if over.CheckSandbox != "" {
+		out.CheckSandbox = over.CheckSandbox
+	}
+	if over.CheckRequireSandbox != nil {
+		out.CheckRequireSandbox = over.CheckRequireSandbox
+	}
+	if len(over.CheckReadPaths) > 0 {
+		out.CheckReadPaths = over.CheckReadPaths
 	}
 	out.Tags = mergeTags(base.Tags, over.Tags)
 	return out

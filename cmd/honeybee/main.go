@@ -15,10 +15,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/checkpolicy"
 	"github.com/spencerharmon/beehive/internal/claim"
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/instruct"
+	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/repo"
 	selectt "github.com/spencerharmon/beehive/internal/select"
 	"github.com/spencerharmon/beehive/internal/swarm"
@@ -285,6 +287,26 @@ func run() error {
 	// honeybee. Stamped on whatever task we work so peers see it as actively held.
 	session := wtBranch
 
+	// Check-command policy (DoD `Check:` sandbox): command allowlist + filesystem
+	// confinement scoped to the task's submodule and its LINKED submodules. Assembled
+	// from the layered config over the low-risk default; the linked-submodule set is
+	// DERIVED at runtime from SUBMODULE-LINKS.yaml (never hardcoded).
+	checkPol := checkpolicy.Default()
+	if len(eff.CheckAllowedCommands) > 0 {
+		checkPol.Allowed = eff.CheckAllowedCommands
+	}
+	if eff.CheckSandbox != "" {
+		checkPol.Sandbox = eff.CheckSandbox
+	}
+	if eff.CheckRequireSandbox != nil {
+		checkPol.RequireSandbox = *eff.CheckRequireSandbox
+	}
+	checkPol.ReadPaths = eff.CheckReadPaths
+	hiveLinks, lerr := links.Load(filepath.Join(primaryRoot, repo.LinksFile))
+	if lerr != nil {
+		fmt.Fprintf(os.Stderr, "honeybee: WARNING could not load %s (%v); check sandbox will confine to the task's own submodule only\n", repo.LinksFile, lerr)
+	}
+
 	runner := &swarm.Runner{
 		Repo: rp, Git: gitRepo, MaxTurns: eff.MaxTurns, MergeRetries: eff.MergeRetries, TTL: ttl, Publish: publish,
 		// RejectLimit bounds how many times a Work task's implementer commit can
@@ -333,6 +355,10 @@ func run() error {
 		// no honeybee re-derives the build env (audit session-audit-001 F1). Inert
 		// (nil) on a normal host — LOCALS.md is the human record of what to set.
 		BuildEnv: eff.BuildEnv,
+		// DoD `Check:` sandbox/policy (command allowlist + filesystem confinement) and
+		// the parsed links used to DERIVE the linked-submodule read paths.
+		CheckPolicy: &checkPol,
+		Links:       hiveLinks,
 	}
 	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, IdleTimeout: time.Duration(eff.TurnIdleTimeoutMinutes) * time.Minute, HTTP: &http.Client{Timeout: 0}}
 	// Ephemeral agent (agent_ephemeral=true): spawn a dedicated opencode server for

@@ -161,6 +161,11 @@ plausible diff merged. It is a task-body field, and the runner ENFORCES it (prom
   not assumption. Write a check that asserts the REAL effect (curl the endpoint and grep the expected
   body, `kubectl rollout status`, pull the image by digest) — never one that passes on a 404 or greps the
   wrong string. Run it yourself any time with `beehive task check <sm> <id>`.
+  Checks run under a SANDBOX: only ALLOWLISTED low-risk tools (curl, kubectl, git,
+  grep, jq, skopeo, … — no shells/interpreters as a command, no `… | sh`), confined
+  to your submodule's checkout and its LINKED submodules. Keep the check to those
+  tools and paths; if a check needs a credential/config outside them, that is an
+  operator `check_read_paths` decision, not a reason to widen the check.
 - **`Verify-After-Merge:` <command>** — a DoD whose effect only exists AFTER the merge (GitOps and
   anything the reviewer lands). You cannot run it in-session (the merge does not exist yet at
   NEEDS-REVIEW); when this task reaches DONE the runner AUTO-spawns a successor CHECK task

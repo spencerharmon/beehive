@@ -31,6 +31,9 @@ Then decide and commit on main:
   wrong string, hits the wrong host, or is absent where the task has an observable effect (an
   unjustified `check=none`) is a rejection just like failing tests: the runner will gate DONE on this
   same check, and approving a lying check is the empty-checksum disease one layer down.
+  Then RECORD the live result in the change doc as a `<!-- Beehive-Check: pass — <one-line evidence,
+  e.g. curl … 200 / rollout complete> -->` marker before you approve: the runner REFUSES a DONE that
+  approves a real check whose result the doc does not record (you may not approve a check you never ran).
 - **REJECT**: it does not. Set the PLAN.md task -> NEEDS-ARBITRATION and write a rejection doc at
   submodules/<sm>/docs/<taskid>-review-reject.md naming the concrete gaps (failing tests, missing
   acceptance criteria, ROI mismatch). Commit. Do not delete or rewrite the implementer's branch. If review

@@ -264,11 +264,53 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	// gate on a check IF PRESENT, never retro-block a legacy DONE). An infra failure
 	// to RUN the check is fail-closed (block completion).
 	if t.Status == plan.Done && t.Check() != "" {
-		if hint, err := r.checkGate(ctx, t.ID, t.Check(), hiveAbs); err != nil || hint != "" {
+		if hint, err := r.checkGate(ctx, sel, t.ID, t.Check(), hiveAbs); err != nil || hint != "" {
 			return hint, err
 		}
 	}
+
+	// (6) Review-ran-check. A REVIEW that approves a task carrying a `Check:` must
+	// have actually RUN that check and RECORDED its live result in the change doc
+	// (a `<!-- Beehive-Check: … -->` line) — the reviewer's INDEPENDENT confirmation
+	// that the definition of done holds, distinct from the runner's own gate above.
+	// This closes the "approved a check they never executed" gap. Scoped to Review
+	// (arbitration and successor-check finalizes are different roles) and only when a
+	// real check is present (a `check=none` task declared no machine check to run).
+	if sel.Kind == selectt.Review && t.Status == plan.Done && t.Check() != "" && !t.CheckNone {
+		if !docRecordsCheck(docShow.out) {
+			return reviewCheckUnrecordedFailPrompt(docPath, t.ID), nil
+		}
+	}
 	return "", nil
+}
+
+// docRecordsCheck reports whether a change doc carries a non-empty `Beehive-Check:`
+// marker — the reviewer's recorded live definition-of-done result (mirrors the
+// `Beehive-Commits:` header convention).
+func docRecordsCheck(doc string) bool {
+	for _, line := range strings.Split(doc, "\n") {
+		_, rest, ok := strings.Cut(line, "Beehive-Check:")
+		if !ok {
+			continue
+		}
+		rest, _, _ = strings.Cut(rest, "-->")
+		if strings.TrimSpace(rest) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// reviewCheckUnrecordedFailPrompt tells a reviewer to actually run the task's check
+// and record its live result before approving DONE.
+func reviewCheckUnrecordedFailPrompt(docPath, taskID string) string {
+	return fmt.Sprintf(
+		"Handoff gate FAILED: this review approved %[1]s to DONE, but the change doc %[2]s records NO live "+
+			"definition-of-done result. A reviewer must EXECUTE the task's `Check:` (run `beehive task check "+
+			"<submodule> %[1]s`) and RECORD what it returned in the doc as a `<!-- Beehive-Check: pass — "+
+			"<one-line evidence, e.g. curl … 200 / rollout complete> -->` line — do NOT approve a check you "+
+			"never ran. Add that line, commit the doc, and leave the status DONE; the gate re-runs.",
+		taskID, docPath)
 }
 
 // checkGate runs a task's definition-of-done command (its `Check:` body field) as
@@ -279,15 +321,36 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 // handoff with a commit-forward prompt carrying the check's output tail (same
 // mechanism as the other gate invariants — the caller keeps the claim and re-runs
 // the gate). A failure to RUN the command at all is an infra error (fail-closed).
-func (r *Runner) checkGate(ctx context.Context, taskID, check, hiveAbs string) (string, error) {
-	o, err := r.runVerify(ctx, hiveAbs, "sh", "-c", check)
+func (r *Runner) checkGate(ctx context.Context, sel *selectt.Selection, taskID, check, hiveAbs string) (string, error) {
+	o, err := r.runCheck(ctx, sel, check, hiveAbs)
 	if err != nil {
+		var pv policyViolationError
+		if errors.As(err, &pv) {
+			// The check itself violates the command allowlist (an author defect, not an
+			// infra failure): hand it back as a fix-forward prompt so the agent rewrites
+			// the check, rather than fail-closed looping the task through GC.
+			return checkPolicyFailPrompt(taskID, check, err), nil
+		}
 		return "", fmt.Errorf("verify gate: running DoD check for %s: %w", taskID, err)
 	}
 	if o.exitErr {
 		return checkFailPrompt(taskID, check, o.out), nil
 	}
 	return "", nil
+}
+
+// checkPolicyFailPrompt renders the fix-forward prompt for a check that violates
+// the command-allowlist policy (checkpolicy.Validate). The task cannot be DONE
+// until the check is rewritten with allowlisted, low-risk tools (or the operator
+// widens check_allowed_commands).
+func checkPolicyFailPrompt(taskID, check string, err error) string {
+	return fmt.Sprintf(
+		"Handoff gate FAILED: %[1]s's definition-of-done check is REJECTED by the check-command policy "+
+			"before it can run — %[2]v. A `Check:` must use low-risk, read-only/inspection tools scoped to "+
+			"this submodule (and its linked submodules); it may not invoke a shell/interpreter to smuggle code "+
+			"or reach outside its lane. Rewrite the check with allowlisted commands (or, if a tool is genuinely "+
+			"needed, ask the operator to add it to check_allowed_commands). `Check:` was `%[3]s`.",
+		taskID, err, oneLineCheck(check))
 }
 
 // checkFailPrompt renders the commit-forward prompt for a task whose definition-
@@ -529,8 +592,20 @@ func (r *Runner) checkGroundTruth(ctx context.Context, sel *selectt.Selection, h
 	if check == "" {
 		return ""
 	}
-	o, err := r.runVerify(ctx, hiveAbs, "sh", "-c", check)
+	o, err := r.runCheck(ctx, sel, check, hiveAbs)
 	if err != nil {
+		var pv policyViolationError
+		if errors.As(err, &pv) {
+			// The check violates the command-allowlist policy: it will be REFUSED at the
+			// DONE gate. Say so now so the agent fixes the check early instead of
+			// discovering it only at handoff.
+			return fmt.Sprintf(
+				"## Ground truth (definition-of-done check)\n"+
+					"This task's `Check:` is REJECTED by the check-command policy (%v) and will be refused at "+
+					"the DONE gate. Rewrite it with allowlisted low-risk tools scoped to this submodule before "+
+					"handing off. `Check:` was `%s`.\n\n",
+				pv.err, oneLineCheck(check))
+		}
 		// Could not even run the check (infra). Do not fabricate a result; the gate
 		// enforces, this is only a hint. Tell the agent it is unknown.
 		return fmt.Sprintf(
