@@ -244,3 +244,110 @@ func reparsePlan(t *testing.T, root, rel string) *plan.Plan {
 	}
 	return p
 }
+
+// task reopen returns a false-DONE task to TODO, clearing stale bookkeeping.
+func TestTaskReopen(t *testing.T) {
+	root, origin := newHive(t)
+	writeFileMW(t, root, "submodules/jellyfin/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## img [DONE] <!-- attempts=2 deps= review=abc123 commits=none defers=1 -->\nbuild+publish the image.\nCheck: curl -sf https://reg/v2/x/tags/list\n")
+	commitPush(t, root, "seed jellyfin plan")
+	peer := seedRemoteAhead(t, origin)
+	inDir(t, root, func() {
+		c := taskReopenCmd()
+		c.SetArgs([]string{"jellyfin", "img", "--reason", "image never confirmed pullable (false-DONE)"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("task reopen: %v", err)
+		}
+	})
+	assertHealedAndPushed(t, root, origin, peer, "plan: reopen img")
+	nt := reparsePlan(t, root, "submodules/jellyfin/PLAN.md").Find("img")
+	if nt == nil || nt.Status != plan.StatusTODO {
+		t.Fatalf("task not reopened to TODO: %+v", nt)
+	}
+	if nt.Attempts != 0 || nt.Defers != 0 || nt.ReviewCommit != "" || nt.CommitsSet {
+		t.Fatalf("stale bookkeeping not cleared: %+v", nt)
+	}
+	if nt.Check() != "curl -sf https://reg/v2/x/tags/list" {
+		t.Fatalf("reopen must keep the Check: %q", nt.Check())
+	}
+	if len(nt.Body) == 0 || !strings.Contains(nt.Body[0], "Reopened") {
+		t.Fatalf("reopen note missing from body: %+v", nt.Body)
+	}
+	// reopening an already-TODO task errors.
+	inDir(t, root, func() {
+		c := taskReopenCmd()
+		c.SetArgs([]string{"jellyfin", "img", "--reason", "again"})
+		if err := c.Execute(); err == nil {
+			t.Fatal("reopening a TODO task must error")
+		}
+	})
+}
+
+// task set-check backfills a real check onto an existing task.
+func TestTaskSetCheck(t *testing.T) {
+	root, origin := newHive(t)
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## deploy [TODO] <!-- attempts=0 deps= -->\nrepin + roll out.\n")
+	commitPush(t, root, "seed flux plan")
+	peer := seedRemoteAhead(t, origin)
+	inDir(t, root, func() {
+		c := taskSetCheckCmd()
+		c.SetArgs([]string{"flux", "deploy", "--check", "curl -sf https://jellyfin.polyfam.studio/health"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("task set-check: %v", err)
+		}
+	})
+	assertHealedAndPushed(t, root, origin, peer, "plan: set Check on deploy")
+	nt := reparsePlan(t, root, "submodules/flux/PLAN.md").Find("deploy")
+	if nt.Check() != "curl -sf https://jellyfin.polyfam.studio/health" {
+		t.Fatalf("check not set: %q", nt.Check())
+	}
+	// replacing keeps a single Check; and mutual-exclusion with check-none.
+	inDir(t, root, func() {
+		c := taskSetCheckCmd()
+		c.SetArgs([]string{"flux", "deploy", "--check-none"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("set-check --check-none: %v", err)
+		}
+	})
+	nt = reparsePlan(t, root, "submodules/flux/PLAN.md").Find("deploy")
+	if !nt.CheckNone || nt.Check() != "" {
+		t.Fatalf("check-none did not clear the Check: %+v", nt)
+	}
+	inDir(t, root, func() {
+		c := taskSetCheckCmd()
+		c.SetArgs([]string{"flux", "deploy"}) // no flag
+		if err := c.Execute(); err == nil {
+			t.Fatal("set-check with no flag must error")
+		}
+	})
+}
+
+// task retarget-dep fixes a wrong/dangling dependency.
+func TestTaskRetargetDep(t *testing.T) {
+	root, origin := newHive(t)
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## repin [TODO] <!-- attempts=0 deps=jellyfin:jellyfin-image-build -->\nrepin images.\n")
+	commitPush(t, root, "seed flux plan")
+	peer := seedRemoteAhead(t, origin)
+	inDir(t, root, func() {
+		c := taskRetargetDepCmd()
+		c.SetArgs([]string{"flux", "repin", "--from", "jellyfin:jellyfin-image-build", "--to", "jellyfin:zuul-image-build-publish"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("task retarget-dep: %v", err)
+		}
+	})
+	assertHealedAndPushed(t, root, origin, peer, "plan: retarget repin dep")
+	nt := reparsePlan(t, root, "submodules/flux/PLAN.md").Find("repin")
+	if len(nt.Deps) != 1 || nt.Deps[0] != "jellyfin:zuul-image-build-publish" {
+		t.Fatalf("dep not retargeted: %+v", nt.Deps)
+	}
+	// retargeting a dep that isn't present errors.
+	inDir(t, root, func() {
+		c := taskRetargetDepCmd()
+		c.SetArgs([]string{"flux", "repin", "--from", "nope:x", "--to", "y"})
+		if err := c.Execute(); err == nil {
+			t.Fatal("retargeting an absent dep must error")
+		}
+	})
+}

@@ -27,6 +27,9 @@ func taskCmd() *cobra.Command {
 	c.AddCommand(taskBlockCmd())
 	c.AddCommand(taskCheckCmd())
 	c.AddCommand(taskDeferCmd())
+	c.AddCommand(taskReopenCmd())
+	c.AddCommand(taskSetCheckCmd())
+	c.AddCommand(taskRetargetDepCmd())
 	return c
 }
 
@@ -597,4 +600,163 @@ func parseUntil(s string, now time.Time) (time.Time, error) {
 		return ts.UTC(), nil
 	}
 	return time.Time{}, fmt.Errorf("%q is neither an RFC3339 time nor a duration (e.g. 30m, 2h)", s)
+}
+
+// mutatePlanTask runs the sanctioned operator-directed PLAN.md mutation protocol
+// (identical to task defer/block/human): sync primary main from the hive remote,
+// parse the submodule's plan, apply `mut` (which returns the commit subject),
+// write, commit the plan path, and publish primary main. It keeps every operator
+// task verb converging through the same non-racing path.
+func mutatePlanTask(cmd *cobra.Command, subArg string, mut func(*plan.Plan) (string, error)) error {
+	root, err := findRoot()
+	if err != nil {
+		return err
+	}
+	rootGit := git.New(root)
+	remote, _ := rootGit.Remote(cmd.Context())
+	if err := rootGit.SyncMainFromRemote(cmd.Context(), remote); err != nil {
+		return err
+	}
+	subName, err := taskSubmoduleName(subArg)
+	if err != nil {
+		return err
+	}
+	planRel := filepath.Join("submodules", subName, repo.PlanFile)
+	planPath := filepath.Join(root, planRel)
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		return err
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		return err
+	}
+	subject, err := mut(p)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+		return err
+	}
+	if err := rootGit.CommitPaths(cmd.Context(), subject, planRel); err != nil && err != git.ErrNothing {
+		return err
+	}
+	return rootGit.PublishPrimaryMain(cmd.Context(), remote)
+}
+
+// taskReopenCmd returns a terminal task (a false-DONE, a stuck NEEDS-REVIEW, an
+// escalated NEEDS-HUMAN) to TODO so the swarm re-drives it — the sanctioned way to
+// reopen a task whose recorded DONE does not match reality (the class the DoD
+// contract exists to catch). It clears the stale claim/attempts/stamps and records
+// the operator's reason. It syncs the hive remote before and publishes after,
+// exactly like `task defer`/`task block`.
+func taskReopenCmd() *cobra.Command {
+	var reason string
+	cmd := &cobra.Command{
+		Use:   "reopen <submodule> <task-id> --reason <why>",
+		Short: "return a terminal task (e.g. a false-DONE) to TODO so the swarm re-drives it",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(reason) == "" {
+				return fmt.Errorf("--reason is required (why is this task being reopened?)")
+			}
+			return mutatePlanTask(cmd, args[0], func(p *plan.Plan) (string, error) {
+				if err := p.Reopen(args[1], reason); err != nil {
+					return "", err
+				}
+				fmt.Printf("reopened %s to TODO\n", args[1])
+				return fmt.Sprintf("plan: reopen %s to TODO\n\nReason: %s\nBeehive: %s plan", args[1], strings.Join(strings.Fields(reason), " "), args[1]), nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&reason, "reason", "", "why the task is being reopened (recorded in the commit + a body note)")
+	return cmd
+}
+
+// taskSetCheckCmd attaches or replaces the definition-of-done on an EXISTING task
+// (unlike `task add --check`, which only applies at creation) — used to backfill a
+// real check onto a task that lacked one, or to correct a weak/wrong check. Exactly
+// one of --check / --verify-after-merge / --check-none.
+func taskSetCheckCmd() *cobra.Command {
+	var check, vam string
+	var checkNone bool
+	cmd := &cobra.Command{
+		Use:   "set-check <submodule> <task-id> (--check <cmd> | --verify-after-merge <cmd> | --check-none)",
+		Short: "attach or replace a task's definition-of-done Check: (backfill/correct a DoD)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			n := 0
+			if strings.TrimSpace(check) != "" {
+				n++
+			}
+			if strings.TrimSpace(vam) != "" {
+				n++
+			}
+			if checkNone {
+				n++
+			}
+			if n != 1 {
+				return fmt.Errorf("exactly one of --check, --verify-after-merge, --check-none is required")
+			}
+			return mutatePlanTask(cmd, args[0], func(p *plan.Plan) (string, error) {
+				t := p.Find(args[1])
+				if t == nil {
+					return "", fmt.Errorf("task %q not found", args[1])
+				}
+				var subject string
+				switch {
+				case checkNone:
+					t.SetCheckNone()
+					subject = "set check=none on " + t.ID
+				case strings.TrimSpace(vam) != "":
+					if err := t.ReplaceVerifyAfterMerge(vam); err != nil {
+						return "", err
+					}
+					subject = "set Verify-After-Merge on " + t.ID
+				default:
+					if err := t.ReplaceCheck(check); err != nil {
+						return "", err
+					}
+					subject = "set Check on " + t.ID
+				}
+				fmt.Printf("%s: %s\n", t.ID, subject)
+				return "plan: " + subject + "\n\nBeehive: " + t.ID + " plan", nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&check, "check", "", "definition-of-done command (its exit 0 IS done; the gate enforces it)")
+	cmd.Flags().StringVar(&vam, "verify-after-merge", "", "post-merge DoD command (effect exists only after merge; the runner auto-spawns a successor check task carrying it at DONE)")
+	cmd.Flags().BoolVar(&checkNone, "check-none", false, "declare this task has NO machine-checkable DoD (justify in the body)")
+	return cmd
+}
+
+// taskRetargetDepCmd fixes a wrong/dangling dependency on a task — e.g. a
+// cross-submodule dep naming a task id that does not exist (which the selector
+// holds forever). Replaces --from with --to.
+func taskRetargetDepCmd() *cobra.Command {
+	var from, to string
+	cmd := &cobra.Command{
+		Use:   "retarget-dep <submodule> <task-id> --from <dep> --to <dep>",
+		Short: "replace a wrong/dangling dependency on a task with the correct one",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(from) == "" || strings.TrimSpace(to) == "" {
+				return fmt.Errorf("both --from and --to are required")
+			}
+			return mutatePlanTask(cmd, args[0], func(p *plan.Plan) (string, error) {
+				t := p.Find(args[1])
+				if t == nil {
+					return "", fmt.Errorf("task %q not found", args[1])
+				}
+				if err := t.RetargetDep(from, to); err != nil {
+					return "", err
+				}
+				fmt.Printf("%s: dep %s -> %s\n", t.ID, from, to)
+				return fmt.Sprintf("plan: retarget %s dep %s -> %s\n\nBeehive: %s plan", t.ID, strings.TrimSpace(from), strings.TrimSpace(to), t.ID), nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&from, "from", "", "the current (wrong/dangling) dependency to remove")
+	cmd.Flags().StringVar(&to, "to", "", "the correct dependency to add in its place")
+	return cmd
 }

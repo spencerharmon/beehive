@@ -14,7 +14,11 @@ You are given the diff of ROI.md from the last-reconciled commit to HEAD (ROI.md
   `--verify-after-merge '<cmd>'` for an effect that only exists after merge, or `--check-none` (justified
   in the body) for a task with no observable effect. The runner GATES DONE on this check. Translate the
   operator's stated criteria into an executable check; do not invent a DoD the ROI never asked for. Run
-  `beehive plan lint <sm>` to see which tasks still lack one.
+  `beehive plan lint <sm>` to see which tasks still lack one. For EXISTING tasks, use
+  `beehive task set-check <sm> <id> --check '<cmd>'` to backfill/correct a check, `beehive task reopen
+  <sm> <id> --reason '<why>'` to return a false-DONE (a DONE whose real effect the check would fail) to
+  TODO so it is re-driven, and `beehive task retarget-dep <sm> <id> --from <dep> --to <dep>` to fix a
+  dangling/wrong dependency — all converge through the same non-racing protocol as the other task verbs.
 - Cross-submodule dependencies are REAL tasks, never placeholders:
   - A dep is LOCAL (bare id -> a task in THIS PLAN.md) or CROSS-SUBMODULE (qualified `<other-sm>:<taskid>`,
     authorized by a registered link, satisfied only when that task is DONE). A bare dep naming no local

@@ -150,6 +150,113 @@ func (t *Task) Defer(until, now time.Time) error {
 	return nil
 }
 
+// removeBodyField deletes a labeled body field span (Check:/Verify-After-Merge:)
+// if present, returning whether anything was removed.
+func (t *Task) removeBodyField(prefix string) bool {
+	s, e := t.bodyFieldSpan(prefix)
+	if s == -1 {
+		return false
+	}
+	t.Body = append(t.Body[:s], t.Body[e:]...)
+	return true
+}
+
+// ReplaceCheck sets (or replaces) the task's `Check:` definition-of-done command,
+// clearing any existing Check span and any `check=none` declaration first. Unlike
+// SetCheck (which refuses when a Check already exists — the `task add` contract),
+// this is the replace semantics behind `beehive task set-check`, for attaching or
+// correcting a DoD on an EXISTING task.
+func (t *Task) ReplaceCheck(cmd string) error {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return fmt.Errorf("plan: empty check command")
+	}
+	t.removeBodyField(checkPrefix)
+	t.CheckNone = false
+	t.Body = append(t.Body, checkPrefix+" "+cmd)
+	return nil
+}
+
+// ReplaceVerifyAfterMerge sets (or replaces) the task's `Verify-After-Merge:`
+// post-merge DoD command. Replace semantics behind `beehive task set-check
+// --verify-after-merge`.
+func (t *Task) ReplaceVerifyAfterMerge(cmd string) error {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return fmt.Errorf("plan: empty verify-after-merge command")
+	}
+	t.removeBodyField(verifyAfterMergePrefix)
+	t.Body = append(t.Body, verifyAfterMergePrefix+" "+cmd)
+	return nil
+}
+
+// SetCheckNone records an explicit, justified absence of a machine check (clears
+// any `Check:` body first, since the two are mutually exclusive). Behind
+// `beehive task set-check --check-none`.
+func (t *Task) SetCheckNone() {
+	t.removeBodyField(checkPrefix)
+	t.CheckNone = true
+}
+
+// RemoveDep deletes a dependency from the task, returning whether it was present.
+func (t *Task) RemoveDep(dep string) bool {
+	dep = strings.TrimSpace(dep)
+	for i, d := range t.Deps {
+		if d == dep {
+			t.Deps = append(t.Deps[:i], t.Deps[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// RetargetDep replaces a dependency `from` with `to` (fixing a wrong/dangling dep,
+// e.g. a cross-submodule ref naming a non-existent task). Errors if `from` is not a
+// current dep or `to` is malformed. Behind `beehive task retarget-dep`.
+func (t *Task) RetargetDep(from, to string) error {
+	to = strings.TrimSpace(to)
+	if !ValidDep(to) {
+		return fmt.Errorf("plan: invalid target dep %q (allowed: <taskid> or <submodule>:<taskid>)", to)
+	}
+	if !t.RemoveDep(from) {
+		return fmt.Errorf("plan: task %s has no dependency %q to retarget", t.ID, strings.TrimSpace(from))
+	}
+	_, err := t.AddDep(to)
+	return err
+}
+
+// Reopen returns a terminal (DONE/NEEDS-REVIEW/NEEDS-ARBITRATION/NEEDS-HUMAN) task
+// to TODO so the swarm re-drives it — the sanctioned mechanism to reopen a task
+// whose recorded DONE does not match reality (a false-DONE the DoD contract exists
+// to catch). It clears the stale bookkeeping a fresh attempt must not inherit
+// (claim, attempts, defers, not_before, the review/commit stamps) and prepends a
+// dated reopen note (with the operator's reason) to the body so the record is
+// self-explaining. It deliberately KEEPS the body's `Check:`/`Verify-After-Merge:`
+// and deps so the reopened task carries its definition of done forward. Errors if
+// the task is absent or already TODO.
+func (p *Plan) Reopen(id, reason string) error {
+	t := p.Find(id)
+	if t == nil {
+		return fmt.Errorf("plan: task %q not found", id)
+	}
+	if t.Status == StatusTODO {
+		return fmt.Errorf("plan: task %s is already TODO", id)
+	}
+	t.Status = StatusTODO
+	t.Attempts = 0
+	t.Defers = 0
+	t.Session = ""
+	t.Heartbeat = time.Time{}
+	t.NotBefore = time.Time{}
+	t.ReviewCommit = ""
+	t.Commits = nil
+	t.CommitsSet = false
+	t.HumanCategory = ""
+	note := "Reopened " + time.Now().UTC().Format("2006-01-02") + ": " + strings.Join(strings.Fields(reason), " ")
+	t.Body = append([]string{note}, t.Body...)
+	return nil
+}
+
 // Blocked reports whether a TODO task is currently held OUT of selection by an
 // unmet LOCAL dependency — a dep naming a same-plan task that is absent or not
 // DONE. Cross-submodule deps (containing ":") are the selector's graph

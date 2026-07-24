@@ -180,6 +180,22 @@ rollback task.
   declared (warn; `--strict` to error), dangling local deps (error), and defer-cap
   breaches (error). The deterministic replacement for a "periodic efficacy-
   evaluation pass".
+- `beehive task set-check <sm> <id> (--check '<cmd>' | --verify-after-merge '<cmd>'
+  | --check-none)` — attach or REPLACE the definition of done on an EXISTING task
+  (backfill a missing check, correct a weak/wrong one). The migration/repair
+  counterpart to `task add --check`.
+- `beehive task reopen <sm> <id> --reason '<why>'` — return a terminal task (a
+  false-DONE, a stuck NEEDS-REVIEW, a NEEDS-HUMAN) to TODO so the swarm re-drives
+  it; clears the stale claim/attempts/defers/review/commit stamps, keeps the body's
+  `Check:`/deps, records the reason. The sanctioned way to reopen a DONE whose
+  recorded state does not match reality.
+- `beehive task retarget-dep <sm> <id> --from <dep> --to <dep>` — fix a wrong or
+  dangling dependency (e.g. a cross-submodule ref naming a task id that does not
+  exist, which the selector holds forever).
+
+All five mutating verbs converge through the same operator-directed protocol
+(sync-before / commit / publish-after / claim-release) as `task defer`/`block`, so
+they never race the running swarm.
 
 ## Review contract
 

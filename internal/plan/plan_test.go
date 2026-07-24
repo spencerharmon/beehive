@@ -832,3 +832,70 @@ func TestSetCheckMutualExclusion(t *testing.T) {
 		t.Fatalf("fields wrong after both set: check=%q vam=%q", tk.Check(), tk.VerifyAfterMerge())
 	}
 }
+
+func TestReopenClearsBookkeepingKeepsCheck(t *testing.T) {
+	src := "## img [DONE] <!-- attempts=3 deps=a review=abc commits=none defers=2 -->\nbody line.\nCheck: curl -sf https://x/health\n"
+	p, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Reopen("img", "false-DONE: never verified"); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	tk := p.Find("img")
+	if tk.Status != StatusTODO || tk.Attempts != 0 || tk.Defers != 0 || tk.ReviewCommit != "" || tk.CommitsSet {
+		t.Fatalf("bookkeeping not cleared: %+v", tk)
+	}
+	if tk.Check() != "curl -sf https://x/health" {
+		t.Fatalf("Check must survive reopen: %q", tk.Check())
+	}
+	if len(tk.Deps) != 1 || tk.Deps[0] != "a" {
+		t.Fatalf("deps must survive reopen: %+v", tk.Deps)
+	}
+	// round-trips through serialize/parse as TODO with the reopen note.
+	p2, err := Parse(p.String())
+	if err != nil {
+		t.Fatalf("reparse: %v", err)
+	}
+	if p2.Find("img").Status != StatusTODO {
+		t.Fatal("reopened status did not round-trip")
+	}
+	if err := p.Reopen("img", "again"); err == nil {
+		t.Fatal("reopening a TODO must error")
+	}
+}
+
+func TestRetargetAndReplaceCheckRoundTrip(t *testing.T) {
+	p, err := Parse("## repin [TODO] <!-- attempts=0 deps=jellyfin:jellyfin-image-build -->\nx\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk := p.Find("repin")
+	if err := tk.RetargetDep("jellyfin:jellyfin-image-build", "jellyfin:zuul-image-build-publish"); err != nil {
+		t.Fatalf("retarget: %v", err)
+	}
+	if len(tk.Deps) != 1 || tk.Deps[0] != "jellyfin:zuul-image-build-publish" {
+		t.Fatalf("dep not retargeted: %+v", tk.Deps)
+	}
+	if err := tk.RetargetDep("absent", "x"); err == nil {
+		t.Fatal("retargeting an absent dep must error")
+	}
+	// ReplaceCheck replaces (not duplicates) and clears check=none.
+	tk.CheckNone = true
+	if err := tk.ReplaceCheck("kubectl -n gostream rollout status deploy/phantom-library-blue"); err != nil {
+		t.Fatalf("replace check: %v", err)
+	}
+	if tk.CheckNone {
+		t.Fatal("ReplaceCheck must clear check=none")
+	}
+	if err := tk.ReplaceCheck("curl -sf https://x"); err != nil {
+		t.Fatalf("replace check 2: %v", err)
+	}
+	if got := tk.Check(); got != "curl -sf https://x" {
+		t.Fatalf("check not replaced (single): %q", got)
+	}
+	p2, _ := Parse(p.String())
+	if p2.Find("repin").Check() != "curl -sf https://x" {
+		t.Fatal("replaced check did not round-trip")
+	}
+}
