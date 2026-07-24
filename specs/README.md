@@ -105,6 +105,30 @@ Configs:
   `NoDuplicateDispatch` violated. `AtMostOneLands` still holds (checked here to
   show the publish-conflict backstop survives the bug).
 
+### `EditorSessionNamespace.tla`
+The beehived chat-diff editor Manager and its reclaim/gc dance over the shared
+beehive-root `.worktrees/` dir (faithful to `internal/editor/editor.go`). Three
+protections, each a CONSTANT toggle guarding one invariant.
+
+- `NoForeignReclaim` — the Manager never reclaims/adopts a foreign subsystem's
+  bare `edit-*` worktree (it owns only the private `hive-edit-` prefix).
+- `LiveSessionNeverReclaimed` — a session an operator has open (in `byID`) is
+  never reclaimed, whatever its record age or worktree cleanliness.
+- `SessionDurable` — a session with an unpublished pending edit is always
+  recoverable (local ref preferred, else the trusted-remote copy).
+
+Configs:
+- `EditorSessionNamespace_fixed.cfg` — all three protections on. No error.
+- `EditorSessionNamespace_buggy_namespace.cfg` — bare `edit-*` namespace
+  (**`b08c995`**, capture half): reclaims a foreign worktree — `NoForeignReclaim`
+  violated.
+- `EditorSessionNamespace_buggy_liveguard.cfg` — no live guard (**`b08c995`**,
+  wipe half): the gc dance deletes an open-but-idle, stale-record session —
+  `LiveSessionNeverReclaimed` violated (the 404-next-turn symptom).
+- `EditorSessionNamespace_buggy_remote.cfg` — no trusted-remote push
+  (**`c64efe7`** pre-fix): a pending session that loses its local worktree is
+  unrecoverable — `SessionDurable` violated.
+
 ## Running
 
 Needs Java and `tla2tools.jar` (https://github.com/tlaplus/tlaplus/releases).

@@ -30,6 +30,10 @@ CASES=(
     "TaskStatus|TaskStatus_buggy.cfg|fail"
     "ClaimRace|ClaimRace_fixed.cfg|pass"
     "ClaimRace|ClaimRace_buggy.cfg|fail"
+    "EditorSessionNamespace|EditorSessionNamespace_fixed.cfg|pass"
+    "EditorSessionNamespace|EditorSessionNamespace_buggy_namespace.cfg|fail"
+    "EditorSessionNamespace|EditorSessionNamespace_buggy_liveguard.cfg|fail"
+    "EditorSessionNamespace|EditorSessionNamespace_buggy_remote.cfg|fail"
 )
 
 rc=0

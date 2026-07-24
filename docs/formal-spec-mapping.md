@@ -97,13 +97,35 @@ the `Resolve` action and treats `NEEDS-HUMAN` as terminal; this was surfaced by 
 | `NoDuplicateDispatch` | invariant | mid-turn keepalive + decoupled liveness window (`plan.Plan.Candidates`) + pre-dispatch re-confirm (`301964d`) | `ClaimRace_buggy.cfg` proves duplicate dispatch reachable without them |
 | `EventuallyLanded` | liveness | `claim` + selection fairness | `ClaimRace_fixed.cfg` |
 
-## Planned layer (roadmap)
-The three `edit-*` subsystems sharing `.worktrees/` and the Manager's reclaim/gc
-dance (`internal/editor/editor.go`: `editBranchPrefix = "hive-edit-"` at `:73`,
-`isEditBranch` `:421`, `Reload` `:458`, `Reclaimable` `:634`).
-- `NoForeignReclaim` — the Manager never adopts/deletes another subsystem's
-  worktree. Covers `b08c995`.
-- `LiveSessionNeverReclaimed`, `SessionDurable` — covers `b08c995`, `c64efe7`.
+## Layer 3 (delivered) — `EditorSessionNamespace.tla`
+
+The beehived chat-diff editor Manager reclaim/gc dance (faithful to
+`internal/editor/editor.go`).
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `OpenSession` / `TurnEdit` / `CloseSession` | actions | `editor/editor.go` Open + `runTurn` (commit sidecar `transcriptSidecarPath` :84 + `git.go:419 PushBranchReconciled`, never force) | `editor/durability_test.go:41 TestSessionDurabilityPushesEditBranchAfterTurnAndIsFetchable` |
+| `Reclaim` KEEP-or-RECLAIM decision | action + guards | `editor/editor.go:716 evaluateWorktree`, `:811 Reclaimable`, `:889 reclaim` (delete worktree+local+remote) | `editor/reclaimable_test.go:21 TestReclaimableListsStaleCleanOnly`, `:382 TestReclaimDeletesRemoteBranchPreventingResurrection` |
+| `RecoverReload` | action | `editor/editor.go:635 Reload`, `:774 recoverMissingWorktree` (prefer local ref, else trusted remote) | `durability_test.go:150 TestReloadRebuildsWorktreeWhenOnlyCheckoutDirWiped`, `:206 TestReloadRecoversAfterLocalWorktreeAndBranchLost` |
+| `NamespaceScoped` guard | guard | `editor/editor.go:75 editBranchPrefix="hive-edit-"`, `:598 isEditBranch`, remote glob `editBranchPrefix+"*"` | `editor_test.go:405 TestReloadNeverTouchesForeignEditWorktrees` |
+| `LiveGuard` | guard | `evaluateWorktree` live-`byID` skip (`editor.go` INVARIANT block :52) | `editor_test.go:472 TestReloadNeverReclaimsLiveRegisteredSession` |
+| `RemoteDurable` | toggle | `trustedRemote` gate (`editor.go:343`) + `git.go:468 ListRemoteBranches` remote-recovery scan | `durability_test.go:105 TestNoRemoteSkipsDurabilityAsNoOp` |
+| `NoForeignReclaim` | invariant | namespace scoping (every enumeration bound to `hive-edit-`) | `buggy_namespace.cfg` proves foreign reclaim reachable when unscoped |
+| `LiveSessionNeverReclaimed` | invariant | live-`byID` skip in `evaluateWorktree` + `Reclaimable` | `buggy_liveguard.cfg` proves live reclaim reachable without the guard |
+| `SessionDurable` | invariant | per-turn push + local-ref-preferred recovery | `buggy_remote.cfg` proves a pending session is lost without remote push |
+
+**Modeling note:** b08c995's SECONDARY symptom (the Manager *adopting* a foreign
+worktree into its store as a bogus session) is not separately encoded — the
+destructive `Reclaim`-of-foreign it also caused is the strictly worse effect and
+is what `NoForeignReclaim` catches; the same namespace scoping fixes both.
+`recoverMissingWorktree`'s "prefer the surviving local ref over an older remote
+tip" is captured by `Recoverable` counting `localBranch` first.
+
+## Roadmap
+
+None — Layers 1–3 cover every catalogued bug. Future targets are DEEPENING (not
+new layers): richer multi-task / multi-submodule interaction, and the cross-layer
+composition where a Layer-2 false-DONE would corrupt the Layer-1 gitlink.
 
 ## Caveats (how much confidence this actually buys)
 
