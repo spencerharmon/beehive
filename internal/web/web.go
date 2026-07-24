@@ -1003,10 +1003,30 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	p, err := s.planView(s.headSHA(r.Context()), sm.PlanPath(), time.Now(), s.ttl())
+	ctx := r.Context()
+	now, ttl := time.Now(), s.ttl()
+	p, err := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
+	}
+	// active-honeybee-plan-view-unify: a task's "running" row state is the
+	// SAME canonical per-session predicate sessionLive/sessionInfos already
+	// use (active-honeybee-count-unify's union) — never re-derived from the
+	// raw Active/Stale claim flags alone, which is the plan renderer's OWN
+	// stale-claim-only heuristic that disagreed with the sessions list/
+	// dashboard counter (a stale claim whose session's own stream branch was
+	// still live read wrongly "idle" here). A task's Running row links to its
+	// session (SessionHref) so it is a WORKING LINK, never inert text.
+	for i := range p.Items {
+		it := &p.Items[i]
+		if it.Session == "" {
+			continue
+		}
+		it.Running = s.sessionLive(ctx, sm, it.Session, now, ttl)
+		if it.Running {
+			it.SessionHref = "/submodule/" + sm.Name + "/session/" + it.Session
+		}
 	}
 	// Link each task to a viewable doc — never inert when one is locatable
 	// (plan-view-detail-polish's "none inert" fix, auditing plan-view-pills'
@@ -1017,7 +1037,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 	// (e.g. a still-in-flight task's docs/tasks/<id>.md design doc). Both
 	// paths go through resolveDocHref (traversal + existence guarded), so a
 	// row with neither locatable is still never a dead link.
-	docs := changeDocsByTask(r.Context(), sm.RepoDir())
+	docs := changeDocsByTask(ctx, sm.RepoDir())
 	for i := range p.Items {
 		p.Items[i].DocHref = resolveDocHref(sm, docs[p.Items[i].ID])
 		if p.Items[i].DocHref == "" && p.Items[i].Doc != "" {
