@@ -108,10 +108,11 @@ gate-refused, per surface).
    a future `not_before` is not selectable; a task with a dep that is not DONE is
    not selectable. **New:** a dep whose target *does not exist* is a dangling dep
    — see (5).
-2. **Post-select context injection** *(planned)*: the runner runs the task's
-   `Check` once at pass start and injects the result (exit + output tail) into the
-   agent brief, so the agent starts from ground truth instead of re-deriving state.
-   *(Env-coupled — see "Environment coupling"; deferred with the sandbox decision.)*
+2. **Post-select context injection**: the runner runs the task's `Check` once at
+   pass start (`checkGroundTruth`) and injects the result (exit + output tail) into
+   the agent brief as a "Ground truth" section, so the agent starts from reality
+   instead of re-deriving state. Same command and execution surface as the DONE
+   gate — no new environment coupling beyond the gate that already runs the check.
 3. **DONE gate** (in `verifyGate`, invariant 5): when the accepted terminal
    handoff **enters DONE**, the runner runs `Check` via the `runVerify` seam. Pass
    (exit 0) → DONE stands. Non-zero → the handoff is refused and the agent gets a
@@ -135,13 +136,15 @@ gate-refused, per surface).
    header token) against `plan.MaxDefers` — past the bound the yield fails loudly so
    the next pass escalates to NEEDS-HUMAN rather than deferring forever. The
    `beehive task defer` verb is its sanctioned atomic form.
-7. **Successor spawn** *(planned; authorship pending operator decision)*: a task
-   carrying `Verify-After-Merge` has a merge-gated DoD verified by a separate
-   successor CHECK task (a normal task whose `Check:` is that command, gated
-   post-merge). Whether the runner AUTO-spawns it at merge (preferred — cannot be
-   forgotten) or the approving reviewer/reconcile FILES it (`beehive task add
-   --check`, works today) is the open decision below; until it is ruled, the field
-   RECORDS the merge-gated DoD and a successor check task is filed explicitly.
+7. **Successor spawn**: when a task carrying `Verify-After-Merge` reaches DONE,
+   the runner AUTO-spawns a successor CHECK task (`spawnMergeVerifySuccessor`):
+   id `<taskid>-verify-after-merge`, a normal TODO whose `Check:` IS that command,
+   depending on the now-DONE original and carrying no `Verify-After-Merge` (so it
+   never recurses). It is committed to the submodule's PLAN.md on the completing
+   pass's working-tree HEAD, so the DONE flip and the successor publish to main
+   together; if that publish conflicts, `publishWithResolution` routes it back to
+   the agent like any other merge. Deterministic + idempotent — the merge-gated
+   DoD can never be forgotten. (Operator ruling: runner-auto, not agent-filed.)
 
 ## Merge ordering and blue/green
 
@@ -214,25 +217,25 @@ history). A reconcile pass backfills `Check:` / `check=none` onto open tasks;
   `not_before` self-defer acceptance in the yield branch + defer-cap (`MaxDefers`);
   the CLI verbs (`task add --check/--verify-after-merge/--check-none/--not-before`,
   `task defer`, `task check`, `plan lint`); the generated-prompt edits
-  (HONEYBEE / review / reconcile / bootstrap) that teach the contract.
-- **Planned (sequenced follow-ups, tracked in PLAN.md):** post-select check
-  context injection (env-coupled, deferred with the sandbox decision); runner
-  AUTO-spawn of the `Verify-After-Merge` successor check task (vs the
-  file-it-explicitly path that works today) — pending the authorship decision below.
+  (HONEYBEE / review / reconcile / bootstrap); **post-select check context
+  injection** (`checkGroundTruth`); **runner auto-spawn of the `Verify-After-Merge`
+  successor check task** (`spawnMergeVerifySuccessor`).
+- **Planned (sequenced follow-ups):** none of the core mechanism remains; the one
+  open runner refinement is the review-ran-check completion predicate below.
 
 ## Open decisions (operator to rule)
 
-- **Successor authorship** — runner AUTO-spawns the `Verify-After-Merge` successor
-  check task at merge (deterministic, cannot be forgotten, but couples the merge
-  path to plan mutation) vs the approving reviewer/reconcile FILES it (`beehive
-  task add --check`, simpler, works today, relies on the agent). Lean: runner-auto.
 - **Review-ran-check as a hard completion predicate** — make "the reviewer recorded
   the check's live result in the review doc" a runner-checked review-completion
   predicate, so a reviewer cannot approve a check they never executed.
 - **Probe sandbox** — which read-only verbs + which credentials a `Check:` may use
-  when the runner runs it against the live environment (the DONE gate and the
-  planned pass-start injection both execute task-authored commands). Lives with
-  LOCALS/ROI per install.
+  when the runner runs it against the live environment (the DONE gate AND the
+  pass-start injection execute task-authored commands with the runner's
+  environment). Lives with LOCALS/ROI per install.
+
+*Resolved:* successor authorship — **runner-auto** (operator ruling); if the
+deterministic publish cannot merge the spawned successor, the existing
+conflict-resolution path hands it to the agent.
 
 ## Enforcement-point map (keep current)
 
@@ -243,6 +246,8 @@ history). A reconcile pass backfills `Check:` / `check=none` onto open tasks;
 | no dangling dep (any writer) | parse / lint | `Plan.DanglingDeps`, `beehive plan lint`, `beehive task block` |
 | no dangling dep (yield) | yield-completion | `taskYieldedBlocked` |
 | yield ships a doc | completion predicate | `workChecklist` |
+| DoD check run at pass start (ground truth) | brief build | `checkGroundTruth` (`internal/swarm/verify.go`) |
+| Verify-After-Merge successor auto-spawn | completion, pre-publish | `spawnMergeVerifySuccessor` (`internal/swarm/swarm.go`) |
 | check / verify_after_merge / check=none schema | parse / serialize | `internal/plan/plan.go` |
 | convergence-wait self-defer + bound | yield-completion + counter | `taskYieldedBlocked`, `plan.MaxDefers`, `Task.Defer` |
 | DoD/dep hygiene surfaced deterministically | CLI | `beehive plan lint` (`cmd/beehive/cmd_plan.go`) |

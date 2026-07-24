@@ -262,7 +262,7 @@ func taskAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&docFile, "doc-file", "", "read design doc content from file (required)")
 	cmd.Flags().StringVar(&deps, "deps", "", "comma-separated deps for the NEW task (bare id or <submodule>:<taskid>)")
 	cmd.Flags().StringVar(&check, "check", "", "definition-of-done command (its exit 0 is the machine DoD the runner gates DONE on)")
-	cmd.Flags().StringVar(&verifyAfterMerge, "verify-after-merge", "", "post-merge DoD command (effect exists only after merge; verified by a separate successor check task)")
+	cmd.Flags().StringVar(&verifyAfterMerge, "verify-after-merge", "", "post-merge DoD command (effect exists only after merge; the runner auto-spawns a successor check task carrying it at DONE)")
 	cmd.Flags().BoolVar(&checkNone, "check-none", false, "declare this task has NO machine-checkable DoD (justify in --body); mutually exclusive with --check")
 	cmd.Flags().StringVar(&notBefore, "not-before", "", "hold the task out of selection until this time (RFC3339 or a duration like 30m/2h from now)")
 	cmd.Flags().IntVar(&weight, "weight", 1, "selection weight (default 1)")

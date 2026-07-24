@@ -156,14 +156,16 @@ A reconcile pass rewrites `PLAN.md` wholesale rather than moving one task; see i
 Every task carries a machine-checkable definition of done, so "DONE" means reality agrees — not that a
 plausible diff merged. It is a task-body field, and the runner ENFORCES it (prompts only remind):
 - **`Check:` <command>** — the DoD. Its exit 0 IS "done." The runner runs it on entry to DONE and refuses
-  DONE if it fails. Write a check that asserts the REAL effect (curl the endpoint and grep the expected
+  DONE if it fails, AND runs it once at your pass START and injects the result as a "Ground truth"
+  section in your brief — so you begin from reality (does the effect already hold? is it still broken?),
+  not assumption. Write a check that asserts the REAL effect (curl the endpoint and grep the expected
   body, `kubectl rollout status`, pull the image by digest) — never one that passes on a 404 or greps the
   wrong string. Run it yourself any time with `beehive task check <sm> <id>`.
 - **`Verify-After-Merge:` <command>** — a DoD whose effect only exists AFTER the merge (GitOps and
   anything the reviewer lands). You cannot run it in-session (the merge does not exist yet at
-  NEEDS-REVIEW); its live effect is verified by a SEPARATE successor CHECK task — a normal task carrying
-  this command as its `Check:`, filed against the merged result and gated to run post-merge. Use
-  `Verify-After-Merge:` to record that merge-gated DoD on the originating task.
+  NEEDS-REVIEW); when this task reaches DONE the runner AUTO-spawns a successor CHECK task
+  (id `<taskid>-verify-after-merge`, carrying this command as its `Check:`, depending on this task) that
+  the swarm works post-merge — you never file it yourself. Put the merge-gated DoD here.
 - **`check=none`** (header token) — an explicit, justified declaration that the task has NO machine check
   (a pure doc/refactor with no observable effect). Justify it in the body prose; a reviewer judges the
   justification. It is mutually exclusive with `Check:`. Silent absence is a defect `beehive plan lint`

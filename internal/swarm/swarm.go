@@ -861,6 +861,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"DONE); never read PLAN.md or ROI.md for task context.\n\n",
 			sel.Task.Card(), smName)
 	}
+	// Post-select ground truth: run this task's definition-of-done check now, before
+	// the agent starts, and inject the result so it begins from reality (the effect
+	// already holds / is still broken) rather than re-deriving state. Same command and
+	// execution surface as the DONE gate; inert ("") for a task with no check.
+	if hasTask(sel) {
+		preamble += r.checkGroundTruth(ctx, sel, absRoot)
+	}
 	if hasTask(sel) {
 		preamble += fmt.Sprintf(
 			"Claim: the runner stamped this task session=%[1]s and re-stamps it each turn. Before doing work "+
@@ -1408,6 +1415,22 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			// fails, do NOT release the claim or report Completed — leave the task
 			// claimed (stale -> GC -> retry) so the work is re-driven, never silently
 			// dropped as a phantom DONE.
+			//
+			// First, if this completion put a Verify-After-Merge task into DONE, spawn its
+			// merge-gated successor CHECK task and commit it to the working-tree HEAD so
+			// finish()'s publish carries it to main together with the DONE flip. A failure
+			// here BLOCKS completion (leave the claim for retry) rather than silently
+			// losing the live-effect definition of done — the successor must never be
+			// forgotten (docs/dod-verification-spec.md).
+			if serr := r.spawnMergeVerifySuccessor(ctx, sel, absRoot); serr != nil {
+				cleanup()
+				res.GCMarked = true
+				res.Warning = fmt.Sprintf(
+					"task %s reached completion locally but spawning its merge-verify successor failed: %v; left unreleased for retry",
+					taskID(sel), serr)
+				r.recordPublishFailureWarning(ctx, rec, sessionRel, res.Warning)
+				return res, nil
+			}
 			if ferr := finish(res.Warning); ferr != nil {
 				cleanup()
 				if isSessionTranscriptError(ferr) {
@@ -3181,4 +3204,77 @@ func (r *Runner) reclaimSourceBranch(ctx context.Context, sub repo.Submodule, br
 	// The remote branch is gone and the commit survives on main; drop the local ref.
 	_ = sg.DeleteBranch(ctx, branch)
 	return ""
+}
+
+// mergeVerifySuccessorID is the deterministic id of the successor check task the
+// runner spawns for a task that carried a `Verify-After-Merge:` command.
+func mergeVerifySuccessorID(origID string) string { return origID + "-verify-after-merge" }
+
+// spawnMergeVerifySuccessor auto-creates the successor CHECK task for a task that
+// just reached DONE carrying a `Verify-After-Merge:` command — the merge-gated
+// definition of done that could not be verified in-session (the merge did not
+// exist yet at NEEDS-REVIEW). The successor is a normal TODO task whose `Check:`
+// IS that command (and which carries NO Verify-After-Merge, so it never recurses),
+// depending on the now-DONE original. It is committed to the submodule's PLAN.md
+// on the working-tree HEAD the completing pass already advanced, so finish()'s
+// publish carries it to main atomically with the DONE flip; if that publish then
+// conflicts, publishWithResolution routes the merge back to the agent exactly like
+// any other change. Deterministic and idempotent (a no-op once the successor
+// exists, or when the task is not DONE / has no Verify-After-Merge), so the
+// live-effect DoD can never be silently forgotten. See docs/dod-verification-spec.md.
+func (r *Runner) spawnMergeVerifySuccessor(ctx context.Context, sel *selectt.Selection, absRoot string) error {
+	if !hasTask(sel) {
+		return nil
+	}
+	planPath := sel.Submodule.PlanPath()
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		return err
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		return err
+	}
+	t := p.Find(sel.Task.ID)
+	if t == nil || t.Status != plan.Done {
+		return nil // only a task that actually reached DONE spawns its successor
+	}
+	vam := t.VerifyAfterMerge()
+	if vam == "" {
+		return nil
+	}
+	succID := mergeVerifySuccessorID(t.ID)
+	if p.Find(succID) != nil {
+		return nil // already spawned (idempotent)
+	}
+	body := []string{
+		fmt.Sprintf("Merge-gated definition-of-done check for %s, spawned by the runner when %s reached DONE.", t.ID, t.ID),
+		fmt.Sprintf("%s carried a Verify-After-Merge command whose live effect only exists after its change merged, so it", t.ID),
+		"could not be verified in the work session. Run the check below: if it PASSES the effect converged and this",
+		"task is done. If it FAILS because the merge has not yet converged, self-defer (`beehive task defer`) and",
+		"re-check; if it FAILS because the change is wrong, that is a real regression to fix or escalate.",
+	}
+	succ, err := plan.NewTask(succID, []string{t.ID}, t.Weight, body)
+	if err != nil {
+		return err
+	}
+	if err := succ.SetCheck(vam); err != nil {
+		return err
+	}
+	if err := p.AddTask(succ); err != nil {
+		return err
+	}
+	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(absRoot, planPath)
+	if err != nil {
+		return err
+	}
+	msg := fmt.Sprintf("plan: spawn merge-verify successor %s for %s\n\nBeehive: %s plan", succID, t.ID, succID)
+	if err := r.Git.CommitPaths(ctx, msg, rel); err != nil && !errors.Is(err, git.ErrNothing) {
+		return err
+	}
+	r.logConcise("[honeybee] spawned merge-verify successor %s for %s (%s)\n", succID, t.ID, sel.Submodule.Name)
+	return nil
 }

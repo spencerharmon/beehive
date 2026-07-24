@@ -511,3 +511,46 @@ func commitsTagValue(commits []string) string {
 	}
 	return strings.Join(commits, ",")
 }
+
+// checkGroundTruth runs the selected task's definition-of-done check ONCE at pass
+// start and renders the result as a brief section, so a task-bearing agent starts
+// from reality (does the effect already hold? is it still broken?) instead of
+// re-deriving state by hand. It is the SAME command (`Check:`) and the SAME
+// execution surface the handoff gate runs on entry to DONE (checkGate) — running
+// it here adds no new environment coupling beyond the gate that already exists.
+// Returns "" when the task carries no check (so the injected brief stays
+// byte-identical to the historical path for every check-less task) or when the
+// check cannot be run (best-effort; the gate, not this hint, is the enforcement).
+func (r *Runner) checkGroundTruth(ctx context.Context, sel *selectt.Selection, hiveAbs string) string {
+	if !hasTask(sel) {
+		return ""
+	}
+	check := sel.Task.Check()
+	if check == "" {
+		return ""
+	}
+	o, err := r.runVerify(ctx, hiveAbs, "sh", "-c", check)
+	if err != nil {
+		// Could not even run the check (infra). Do not fabricate a result; the gate
+		// enforces, this is only a hint. Tell the agent it is unknown.
+		return fmt.Sprintf(
+			"## Ground truth (definition-of-done check)\n"+
+				"The runner tried to run this task's `Check:` at pass start but could not (%v). Treat the "+
+				"definition of done as UNKNOWN and establish it yourself. `Check:` was `%s`.\n\n",
+			err, oneLineCheck(check))
+	}
+	out := strings.TrimRight(o.out, "\n")
+	if len(out) > gateVerifyOutputCap {
+		out = "…(truncated; showing the tail)\n" + out[len(out)-gateVerifyOutputCap:]
+	}
+	status, guidance := "PASSED (exit 0)", "The definition of done ALREADY holds. Do not redo settled work — "+
+		"confirm your change keeps it holding (and does not regress it); this same check gates the task into DONE."
+	if o.exitErr {
+		status, guidance = "FAILED (non-zero exit)", "The definition of done is NOT yet met — this is your target. "+
+			"When your work makes this same check pass, the task is done; the runner re-runs it to gate DONE."
+	}
+	return fmt.Sprintf(
+		"## Ground truth (definition-of-done check, run by the runner at pass start)\n"+
+			"%[1]s %[2]s `Check:` was `%[3]s`; output:\n\n%[4]s\n\n",
+		status, guidance, oneLineCheck(check), out)
+}

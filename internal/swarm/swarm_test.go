@@ -5004,3 +5004,123 @@ func TestWorkSelfDeferPastCapFailsLoud(t *testing.T) {
 		t.Fatalf("error must name the defer cap, got: %v", err)
 	}
 }
+
+// TestPassStartInjectsCheckGroundTruth: when the selected task carries a Check:,
+// the runner runs it at pass start and injects the result into the agent's brief —
+// the PASSED and FAILED cases carry distinct guidance. A task with no check leaves
+// the brief unchanged (covered by every other Run test, whose sel.Task has no Body).
+func TestPassStartInjectsCheckGroundTruth(t *testing.T) {
+	run := func(t *testing.T, fail bool) string {
+		root := t.TempDir()
+		g := gitInit(t, root)
+		repo.Init(root)
+		sm := filepath.Join(root, "submodules", "sm")
+		os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+		repoDir := filepath.Join(sm, "repo")
+		os.MkdirAll(repoDir, 0o755)
+		gitInit(t, repoDir)
+		os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+		git.New(repoDir).Commit(context.Background(), "base")
+		planPath := filepath.Join(sm, "PLAN.md")
+		os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\nCheck: my-ground-check\n"), 0o644)
+		g.Commit(context.Background(), "seed")
+		rp, _ := repo.Open(root)
+		subs, _ := rp.Submodules()
+		// The selected task carries its body (Check:) exactly as selection populates it.
+		sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0],
+			Task: plan.Task{ID: "T1", Status: plan.TODO, Body: []string{"go", "Check: my-ground-check"}}}
+		var firstPrompt string
+		cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
+			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		}}}
+		cl.sess.capture = &firstPrompt
+		gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+			if name == "sh" { // the ground-truth check
+				if len(args) < 2 || args[1] != "my-ground-check" {
+					t.Errorf("unexpected check args: %v", args)
+				}
+				return verifyOutcome{out: "check-output-marker", exitErr: fail}, nil
+			}
+			return verifyOutcome{}, nil
+		}}
+		r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, RunVerify: gr.run}
+		if _, err := r.Run(context.Background(), sel, "sys", "first"); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if !contains(firstPrompt, "Ground truth") || !contains(firstPrompt, "check-output-marker") {
+			t.Fatalf("brief missing injected ground-truth section; got:\n%s", firstPrompt)
+		}
+		return firstPrompt
+	}
+	if fp := run(t, false); !contains(fp, "PASSED") {
+		t.Fatalf("a passing check must inject PASSED guidance; got:\n%s", fp)
+	}
+	if fp := run(t, true); !contains(fp, "FAILED") {
+		t.Fatalf("a failing check must inject FAILED guidance; got:\n%s", fp)
+	}
+}
+
+// TestReviewSpawnsMergeVerifySuccessor: when a review approves a task that carried
+// a `Verify-After-Merge:` command (its live effect only exists after merge), the
+// runner AUTO-spawns a successor CHECK task whose `Check:` IS that command,
+// depending on the now-DONE original and carrying no Verify-After-Merge (so it
+// never recurses). The merge-gated definition of done can never be forgotten.
+func TestReviewSpawnsMergeVerifySuccessor(t *testing.T) {
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\nreview\nVerify-After-Merge: curl -sf https://x/live\n"), 0o644)
+	g.Commit(context.Background(), "seed")
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\nVerify-After-Merge: curl -sf https://x/live\n"), 0o644)
+		commitDocFor(g, "R1")
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
+	res, err := r.Run(context.Background(), sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("review should complete, got %+v", res)
+	}
+	b, _ := os.ReadFile(planPath)
+	p, perr := plan.Parse(string(b))
+	if perr != nil {
+		t.Fatalf("reparse plan: %v", perr)
+	}
+	succ := p.Find("R1-verify-after-merge")
+	if succ == nil {
+		t.Fatalf("successor check task not spawned; plan:\n%s", string(b))
+	}
+	if succ.Status != plan.StatusTODO {
+		t.Fatalf("successor must be TODO, got %s", succ.Status)
+	}
+	if succ.Check() != "curl -sf https://x/live" {
+		t.Fatalf("successor Check must be the Verify-After-Merge command, got %q", succ.Check())
+	}
+	if succ.VerifyAfterMerge() != "" {
+		t.Fatalf("successor must NOT carry Verify-After-Merge (would recurse)")
+	}
+	if len(succ.Deps) != 1 || succ.Deps[0] != "R1" {
+		t.Fatalf("successor must depend on the originating task R1, got %v", succ.Deps)
+	}
+	// Idempotent: the original still has its VAM, and a second spawn is a no-op.
+	absRoot, _ := filepath.Abs(rp.Root)
+	if err := r.spawnMergeVerifySuccessor(context.Background(), sel, absRoot); err != nil {
+		t.Fatalf("second spawn should be a clean no-op: %v", err)
+	}
+	b2, _ := os.ReadFile(planPath)
+	p2, _ := plan.Parse(string(b2))
+	if n := len(p2.Tasks); n != 2 {
+		t.Fatalf("second spawn must not add another successor; got %d tasks", n)
+	}
+}
