@@ -252,16 +252,76 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 			}
 		}
 	}
+
+	// (5) Definition-of-done check. When this handoff ENTERS DONE and the task
+	// declares a `Check:` command, that command IS the machine definition of done:
+	// run it and REFUSE the DONE unless it passes (exit 0). This gates the DONE
+	// *state* regardless of writer (review approve, arbitration, an interrupted-
+	// review finalize) — the enforcement the jellyfin false-DONE lacked
+	// (docs/dod-verification-spec.md). A `check=none` task declared no machine-
+	// checkable DoD (the absence is honest and review-scrutinized) and is not gated
+	// here; an UNDECLARED check is left to `beehive plan lint` (migration-safe: we
+	// gate on a check IF PRESENT, never retro-block a legacy DONE). An infra failure
+	// to RUN the check is fail-closed (block completion).
+	if t.Status == plan.Done && t.Check() != "" {
+		if hint, err := r.checkGate(ctx, t.ID, t.Check(), hiveAbs); err != nil || hint != "" {
+			return hint, err
+		}
+	}
 	return "", nil
 }
 
+// checkGate runs a task's definition-of-done command (its `Check:` body field) as
+// the precondition for entering DONE. The command is a shell string (possibly
+// multi-line), run via `sh -c` in the hive root through the same injectable
+// runVerify seam the rest of the gate uses (tests force outcomes). Exit 0 => the
+// DoD is met and DONE stands (""). Non-zero => the DoD is NOT met: refuse the
+// handoff with a commit-forward prompt carrying the check's output tail (same
+// mechanism as the other gate invariants — the caller keeps the claim and re-runs
+// the gate). A failure to RUN the command at all is an infra error (fail-closed).
+func (r *Runner) checkGate(ctx context.Context, taskID, check, hiveAbs string) (string, error) {
+	o, err := r.runVerify(ctx, hiveAbs, "sh", "-c", check)
+	if err != nil {
+		return "", fmt.Errorf("verify gate: running DoD check for %s: %w", taskID, err)
+	}
+	if o.exitErr {
+		return checkFailPrompt(taskID, check, o.out), nil
+	}
+	return "", nil
+}
+
+// checkFailPrompt renders the commit-forward prompt for a task whose definition-
+// of-done check did not pass at the DONE handoff. The check output is tail-capped
+// so a verbose command cannot blow the turn's token budget.
+func checkFailPrompt(taskID, check, out string) string {
+	out = strings.TrimRight(out, "\n")
+	if len(out) > gateVerifyOutputCap {
+		out = "…(truncated; showing the tail)\n" + out[len(out)-gateVerifyOutputCap:]
+	}
+	return fmt.Sprintf(
+		"Handoff gate FAILED: %[1]s's definition-of-done check did NOT pass, so the task is NOT "+
+			"accepted as done — the `Check:` command IS the machine definition of done and it exited "+
+			"non-zero. Do NOT mark this DONE on a plausible-looking diff: either finish the work so the "+
+			"check passes, or (if the effect only exists after this change is MERGED) leave the task "+
+			"NEEDS-REVIEW and carry the live-effect check on a `Verify-After-Merge:` successor instead of "+
+			"forcing DONE now. Then the gate re-runs automatically (leave the status as-is). `Check:` was "+
+			"`%[2]s`; its output:\n\n%[3]s",
+		taskID, oneLineCheck(check), out)
+}
+
+// oneLineCheck flattens a multi-line check command to a single line for prompt
+// echo (the full command is already in the task's PLAN.md body).
+func oneLineCheck(s string) string { return strings.Join(strings.Fields(s), " ") }
+
 // gatedHandoff reports whether (kind, status) is a terminal handoff the uniform
 // gate covers. NEEDS-HUMAN is deliberately excluded for every kind: an escalation
-// carries its own reason and must never be trapped by the artifact gate.
+// carries its own reason and must never be trapped by the artifact gate. Work is
+// NOT listed for Done: a work pass may never set DONE (workChecklist refuses it),
+// so DONE is reached only via Review/Arbitrate, which carry the check gate below.
 func gatedHandoff(kind selectt.Kind, st plan.Status) bool {
 	switch kind {
 	case selectt.Work:
-		return st == plan.NeedsReview || st == plan.NeedsArb || st == plan.Done
+		return st == plan.NeedsReview || st == plan.NeedsArb
 	case selectt.Review:
 		return st == plan.Done || st == plan.NeedsArb
 	case selectt.Arbitrate:

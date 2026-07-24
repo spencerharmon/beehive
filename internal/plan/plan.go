@@ -36,6 +36,16 @@ import (
 
 const humanReasonPrefix = "Human-needed:"
 
+// checkPrefix / verifyAfterMergePrefix are the body-field labels carrying a task's
+// definition-of-done commands (docs/dod-verification-spec.md). Commands are
+// multi-line and cannot live in the header comment (parsed with strings.Fields),
+// so they are body fields spanning the label line plus following non-blank lines
+// — the same span rule as Human-needed:. `Check:` is the DoD command whose exit 0
+// is "satisfied"; `Verify-After-Merge:` is the DoD command whose effect only
+// exists after the change is merged (its presence marks the task merge-gated).
+const checkPrefix = "Check:"
+const verifyAfterMergePrefix = "Verify-After-Merge:"
+
 // Status is a task state. The machine is:
 //
 //	TODO -> NEEDS-REVIEW -> {DONE | NEEDS-ARBITRATION}
@@ -159,7 +169,16 @@ type Task struct {
 	// Empty on a runner-forced overflow escalation or a legacy task. Serialized as
 	// `category=<value>` in the header comment.
 	HumanCategory Category
-	Body          []string // body lines verbatim, without trailing blank
+	// CheckNone records an explicit, justified declaration that this task has NO
+	// machine-checkable definition of done (mirrors CommitsSet's `commits=none`
+	// forcing function). It makes the ABSENCE of a check a visible, reviewable
+	// decision rather than a silent gap: a task may enter DONE only if its `Check:`
+	// body command passes OR CheckNone is set. Mutually exclusive with a `Check:`
+	// body field (a task carrying both is a parse defect). The justification is the
+	// adjacent body prose (review-enforced). Serialized as `check=none` in the
+	// header comment. See docs/dod-verification-spec.md.
+	CheckNone bool
+	Body      []string // body lines verbatim, without trailing blank
 }
 
 // Plan is a parsed PLAN.md.
@@ -209,6 +228,14 @@ func Parse(s string) (*Plan, error) {
 	}
 	for _, t := range p.Tasks {
 		t.Body = trimTrailingBlank(t.Body)
+	}
+	// DoD schema validation: `check=none` (justified absence) and a `Check:` body
+	// command are mutually exclusive — a task carrying both contradicts itself about
+	// whether it has a machine-checkable definition of done.
+	for _, t := range p.Tasks {
+		if t.CheckNone && t.Check() != "" {
+			return nil, fmt.Errorf("plan: task %s declares both `check=none` and a `Check:` body command — pick one", t.ID)
+		}
 	}
 	p.Header = trimTrailingBlank(p.Header)
 	return p, nil
@@ -268,6 +295,15 @@ func parseHeader(m []string) (*Task, error) {
 			if v != "" && v != "none" {
 				t.Commits = strings.Split(v, ",")
 			}
+		case "check":
+			// The header token only ever carries the justified-absence flag; a
+			// real check COMMAND lives in the `Check:` body field (it has spaces the
+			// Fields-split comment cannot hold). Any value other than `none` is a
+			// malformed plan.
+			if v != "none" {
+				return nil, fmt.Errorf("plan: bad check=%q for %s (the only valid header value is `check=none`; a real check command goes in the `Check:` body field)", v, t.ID)
+			}
+			t.CheckNone = true
 		case "category":
 			// Stored verbatim; validity is enforced at the write/completion
 			// boundary (RequestHuman, the CLI, the runner completion checks), not
@@ -348,6 +384,9 @@ func (t *Task) header() string {
 	if t.HumanCategory != "" {
 		meta += " category=" + string(t.HumanCategory)
 	}
+	if t.CheckNone {
+		meta += " check=none"
+	}
 	return fmt.Sprintf("## %s [%s] <!-- %s -->", t.ID, t.Status, meta)
 }
 
@@ -422,6 +461,86 @@ func (t *Task) clearHumanReason() {
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
+// bodyFieldLabels are the recognized structured body-field prefixes. A field's
+// multi-line span (bodyFieldSpan) stops at the next one so adjacent fields do not
+// bleed into each other (e.g. `Check:` must not absorb a following
+// `Verify-After-Merge:` line).
+var bodyFieldLabels = []string{
+	checkPrefix, verifyAfterMergePrefix, humanReasonPrefix,
+	"Files:", "Doc:", "Accept:", "Review:", "Design:", "Human:",
+}
+
+// startsBodyField reports whether a body line (already trimmed) opens a recognized
+// structured field.
+func startsBodyField(trimmed string) bool {
+	for _, p := range bodyFieldLabels {
+		if strings.HasPrefix(trimmed, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// bodyFieldSpan locates a labeled body field's line range [start, end) in t.Body:
+// the line carrying `prefix` plus every immediately-following non-blank line that
+// does NOT open another recognized field (startsBodyField), stopping at the first
+// blank line, the next field label, or the end of the body. Returns start == -1
+// when no such field exists. Shared by the DoD command accessors (Check,
+// VerifyAfterMerge); a command may span several continuation lines but never
+// swallow a sibling field.
+func (t *Task) bodyFieldSpan(prefix string) (start, end int) {
+	for i, line := range t.Body {
+		if _, ok := strings.CutPrefix(strings.TrimSpace(line), prefix); ok {
+			j := i + 1
+			for j < len(t.Body) {
+				trimmed := strings.TrimSpace(t.Body[j])
+				if trimmed == "" || startsBodyField(trimmed) {
+					break
+				}
+				j++
+			}
+			return i, j
+		}
+	}
+	return -1, -1
+}
+
+// bodyField returns the verbatim content of a labeled body field: the text after
+// `prefix` on its line, joined with any continuation lines by newlines, trimmed.
+// "" when the field is absent.
+func (t *Task) bodyField(prefix string) string {
+	start, end := t.bodyFieldSpan(prefix)
+	if start == -1 {
+		return ""
+	}
+	first := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(t.Body[start]), prefix))
+	if end == start+1 {
+		return first
+	}
+	lines := t.Body[start+1 : end]
+	if first == "" {
+		return strings.Join(lines, "\n")
+	}
+	return strings.Join(append([]string{first}, lines...), "\n")
+}
+
+// Check returns the task's DoD command (the `Check:` body field), or "" if none.
+// Its exit 0 is the machine definition of done, enforced by the runner's handoff
+// gate on entering DONE. See docs/dod-verification-spec.md.
+func (t *Task) Check() string { return t.bodyField(checkPrefix) }
+
+// VerifyAfterMerge returns the task's post-merge DoD command (the
+// `Verify-After-Merge:` body field), or "" if none. Its presence marks the task's
+// effect merge-gated: the live-effect DoD is carried by a runner-spawned successor
+// check task rather than verified in the work session.
+func (t *Task) VerifyAfterMerge() string { return t.bodyField(verifyAfterMergePrefix) }
+
+// CheckDeclared reports whether the task has made an explicit definition-of-done
+// decision: either a real `Check:` command or a justified `check=none`. A task
+// that reaches a state requiring the decision without one is a defect (lint-
+// flagged / gate-refused per surface).
+func (t *Task) CheckDeclared() bool { return t.CheckNone || t.Check() != "" }
+
 // Stamp sets the Beehive-ROI sha, inserting the comment if absent.
 func (p *Plan) Stamp(sha string) {
 	line := "<!-- Beehive-ROI: " + sha + " -->"
@@ -444,4 +563,29 @@ func (p *Plan) Task(id string) *Task {
 		}
 	}
 	return nil
+}
+
+// DanglingDeps returns, per task, the LOCAL dependency ids (same-plan, unqualified
+// — no ":") that name no task in this plan. A dangling dep is never satisfiable:
+// it makes the dependent task permanently "blocked" (Blocked treats an absent dep
+// as unmet) and, worse, lets a work pass fake a legitimate dep-yield against a
+// task that will never exist — the exact defect that wedged
+// flux:phantom-library-bluegreen-repin-gitea-images on the nonexistent
+// jellyfin:jellyfin-image-build. Cross-submodule deps (qualified, "<sm>:<id>")
+// are resolved against the link graph, not here (see the selection graph /
+// `beehive plan lint`). The map is keyed by task id; only tasks WITH a dangling
+// local dep appear. See docs/dod-verification-spec.md.
+func (p *Plan) DanglingDeps() map[string][]string {
+	out := map[string][]string{}
+	for _, t := range p.Tasks {
+		for _, d := range t.Deps {
+			if strings.Contains(d, ":") {
+				continue // cross-submodule: resolved against the link graph elsewhere
+			}
+			if p.Task(d) == nil {
+				out[t.ID] = append(out[t.ID], d)
+			}
+		}
+	}
+	return out
 }

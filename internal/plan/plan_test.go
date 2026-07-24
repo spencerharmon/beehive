@@ -679,3 +679,92 @@ func TestGolden(t *testing.T) {
 		t.Fatalf("golden mismatch:\n%s", got)
 	}
 }
+
+// TestCheckSchemaParseSerialize covers the definition-of-done schema
+// (docs/dod-verification-spec.md): the `Check:` / `Verify-After-Merge:` body
+// commands round-trip verbatim, `check=none` round-trips as the justified-absence
+// flag, and CheckDeclared reflects the decision.
+func TestCheckSchemaParseSerialize(t *testing.T) {
+	src := "## t1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\n" +
+		"Do the thing.\n" +
+		"Check: curl -sf https://x/health\n" +
+		"Verify-After-Merge: kubectl get pods -n ns\n" +
+		"\n" +
+		"## t2 [TODO] <!-- attempts=0 deps= check=none -->\n" +
+		"No machine-checkable DoD because it is a pure doc edit.\n"
+	p, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	t1 := p.Task("t1")
+	if got := t1.Check(); got != "curl -sf https://x/health" {
+		t.Fatalf("t1.Check()=%q", got)
+	}
+	if got := t1.VerifyAfterMerge(); got != "kubectl get pods -n ns" {
+		t.Fatalf("t1.VerifyAfterMerge()=%q", got)
+	}
+	if !t1.CheckDeclared() {
+		t.Fatalf("t1 must be CheckDeclared (has a Check:)")
+	}
+	t2 := p.Task("t2")
+	if !t2.CheckNone || t2.Check() != "" {
+		t.Fatalf("t2 must be check=none with no command: CheckNone=%v Check=%q", t2.CheckNone, t2.Check())
+	}
+	if !t2.CheckDeclared() {
+		t.Fatalf("t2 must be CheckDeclared (check=none is an explicit decision)")
+	}
+	// Round-trip: check=none in header, commands preserved verbatim in body.
+	out := p.String()
+	if !strings.Contains(out, "check=none") {
+		t.Fatalf("serialized plan lost check=none:\n%s", out)
+	}
+	if !strings.Contains(out, "Check: curl -sf https://x/health") ||
+		!strings.Contains(out, "Verify-After-Merge: kubectl get pods -n ns") {
+		t.Fatalf("serialized plan lost the DoD commands:\n%s", out)
+	}
+	if _, err := Parse(out); err != nil {
+		t.Fatalf("re-parse of serialized plan failed: %v", err)
+	}
+}
+
+// TestCheckContradictionRejected: a task carrying BOTH check=none and a `Check:`
+// command contradicts itself about whether it has a definition of done and must
+// fail to parse.
+func TestCheckContradictionRejected(t *testing.T) {
+	src := "## t1 [TODO] <!-- attempts=0 deps= check=none -->\n" +
+		"Check: curl -sf https://x/health\n"
+	if _, err := Parse(src); err == nil {
+		t.Fatalf("a task with both check=none and a Check: command must be a parse error")
+	}
+}
+
+// TestCheckBadHeaderValueRejected: the only valid `check=` header value is `none`;
+// a command never lives in the header comment.
+func TestCheckBadHeaderValueRejected(t *testing.T) {
+	src := "## t1 [TODO] <!-- attempts=0 deps= check=curl -->\n"
+	if _, err := Parse(src); err == nil {
+		t.Fatalf("check=<non-none> in the header must be a parse error")
+	}
+}
+
+// TestDanglingDeps flags a local dependency that names no task in the plan — the
+// class of defect that wedged the jellyfin repin task on a nonexistent id.
+func TestDanglingDeps(t *testing.T) {
+	src := "## a [TODO] <!-- attempts=0 deps=ghost -->\nwork\n" +
+		"## b [TODO] <!-- attempts=0 deps=a -->\nwork\n" +
+		"## c [TODO] <!-- attempts=0 deps=other:x -->\nwork\n"
+	p, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	d := p.DanglingDeps()
+	if got := d["a"]; len(got) != 1 || got[0] != "ghost" {
+		t.Fatalf("a must dangle on 'ghost', got %v", got)
+	}
+	if _, ok := d["b"]; ok {
+		t.Fatalf("b depends on the real task a and must NOT dangle")
+	}
+	if _, ok := d["c"]; ok {
+		t.Fatalf("c's cross-submodule dep is resolved elsewhere, not by DanglingDeps")
+	}
+}

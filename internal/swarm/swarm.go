@@ -2029,17 +2029,23 @@ func (r *Runner) workChecklist(sel *selectt.Selection, branch string) ([]complet
 			docItem,
 		}, nil
 	}
-	// Deliberate-yield completion (cross-dep-autonomy): a work pass that DISCOVERS a
-	// missing prerequisite files it as a real task (in this or a linked submodule)
-	// and links its own task to it via `beehive task block`, which leaves this task
-	// TODO but now BLOCKED by that fresh dependency. The selector only ever
-	// dispatches a work task whose deps are all satisfied, so a work pass observing
-	// its OWN task as TODO-and-blocked can only mean it just added the blocking dep
-	// this session — a legitimate, complete yield (the runner releases the claim;
-	// the selector holds the task until the new dep is DONE). Without this the pass
-	// would spin to the idle-timeout with nothing left to do, misflagged as a
-	// no-progress abort. No doc is required for a yield (the FILED task ships its own
-	// doc; this task's implementation doc comes when it is later re-picked).
+	// Deliberate-yield completion (cross-dep-autonomy / convergence self-defer): a
+	// work pass that DISCOVERS a missing prerequisite files it as a real task (in
+	// this or a linked submodule) and links its own task to it via `beehive task
+	// block`, which leaves this task TODO but now BLOCKED by that fresh dependency;
+	// or a pass whose effect has not yet converged self-defers (TODO + a future
+	// not_before). The selector only ever dispatches a work task whose deps are all
+	// satisfied and whose not_before has elapsed, so a work pass observing its OWN
+	// task as TODO-and-not-ready can only mean it just created that gate this session
+	// — a legitimate, complete yield (the runner releases the claim; the selector
+	// holds the task until the dep is DONE / the not_before elapses). Without this
+	// the pass would spin to the idle-timeout, misflagged as a no-progress abort.
+	//
+	// A yield MUST ship a short change doc explaining WHY it yielded (which dep it
+	// filed / why it deferred) — the same doc bar as any other completion, just
+	// terse. And any blocking dependency MUST exist: taskYieldedBlocked returns an
+	// error (fail-loud, never a silent complete) on a phantom dep, so a work pass can
+	// never wedge its task behind a dependency that will never appear.
 	if t.Status == plan.StatusTODO {
 		yielded, err := r.taskYieldedBlocked(sel, p, t)
 		if err != nil {
@@ -2047,7 +2053,8 @@ func (r *Runner) workChecklist(sel *selectt.Selection, branch string) ([]complet
 		}
 		if yielded {
 			return []completionItem{
-				{"work pass yielded: task left TODO and blocked on a newly-filed dependency", true},
+				{"work pass yielded: task left TODO, held by a real dependency or a future not_before", true},
+				docItem,
 			}, nil
 		}
 	}
@@ -2056,10 +2063,20 @@ func (r *Runner) workChecklist(sel *selectt.Selection, branch string) ([]complet
 			{"NEEDS-HUMAN escalation ready (--category + --reason set)", t.EscalationReady()},
 		}, nil
 	}
-	terminal := t.Status == plan.Done || t.Status == plan.NeedsReview ||
-		t.Status == plan.NeedsArb
+	// A work pass may NEVER set DONE: a task reaches DONE only via review approve
+	// (NEEDS-REVIEW -> DONE) or arbitration. Accepting a work-set DONE is the door
+	// the jellyfin runner-finalize walked through, closing a task while its
+	// definition of done was unmet (docs/dod-verification-spec.md). Refuse it and
+	// tell the agent to hand off for review instead.
+	if t.Status == plan.Done {
+		return []completionItem{
+			{"work pass set DONE, which is FORBIDDEN — a work task reaches DONE only through review; set the status to NEEDS-REVIEW instead", false},
+			docItem,
+		}, nil
+	}
+	terminal := t.Status == plan.NeedsReview || t.Status == plan.NeedsArb
 	return []completionItem{
-		{"terminal STATUS set (NEEDS-REVIEW | DONE | NEEDS-ARBITRATION)", terminal},
+		{"terminal STATUS set (NEEDS-REVIEW | NEEDS-ARBITRATION)", terminal},
 		docItem,
 	}, nil
 }
@@ -2073,27 +2090,57 @@ func (r *Runner) workChecklist(sel *selectt.Selection, branch string) ([]complet
 // graph read/parse error propagates (fail-closed): the pass then does NOT falsely
 // complete on an unverifiable yield.
 func (r *Runner) taskYieldedBlocked(sel *selectt.Selection, p *plan.Plan, t *plan.Task) (bool, error) {
-	if p.Blocked(t) {
-		return true, nil
+	// A phantom dependency (names no real task) is never a legitimate yield: it can
+	// never become DONE, so it would wedge this task forever while masquerading as a
+	// clean dep-yield — the exact defect that stranded
+	// flux:phantom-library-bluegreen-repin-gitea-images on the nonexistent
+	// jellyfin:jellyfin-image-build. Fail LOUD (return an error so the pass does not
+	// falsely complete) rather than accept it. Local (unqualified) deps resolve
+	// against this plan; cross deps against the link graph.
+	var g *selectt.Graph
+	loadGraph := func() (*selectt.Graph, error) {
+		if g == nil {
+			gg, err := selectt.LoadEdges(r.Repo)
+			if err != nil {
+				return nil, err
+			}
+			g = gg
+		}
+		return g, nil
 	}
-	hasCross := false
+	yielded := false
 	for _, d := range t.Deps {
 		if strings.Contains(d, ":") {
-			hasCross = true
-			break
+			gg, err := loadGraph()
+			if err != nil {
+				return false, err
+			}
+			st, exists := gg.TaskStatus(d)
+			if !exists {
+				return false, fmt.Errorf("work pass left task %s TODO blocked on cross-dependency %q, which names no existing task — file the real prerequisite (`beehive task add`) and link it (`beehive task block`); a dangling dependency would wedge this task forever", t.ID, d)
+			}
+			if !gg.CrossDepSatisfied(sel.Submodule.Name, d) {
+				yielded = true // real, existing cross-dep not yet DONE (or link pending)
+			}
+			_ = st
+			continue
+		}
+		dep := p.Task(d)
+		if dep == nil {
+			return false, fmt.Errorf("work pass left task %s TODO blocked on local dependency %q, which names no task in this plan — file the real prerequisite (`beehive task add`) and link it (`beehive task block`); a dangling dependency would wedge this task forever", t.ID, d)
+		}
+		if dep.Status != plan.StatusDone {
+			yielded = true // real, existing local dep not yet DONE
 		}
 	}
-	if !hasCross {
-		return false, nil
+	if yielded {
+		return true, nil
 	}
-	g, err := selectt.LoadEdges(r.Repo)
-	if err != nil {
-		return false, err
-	}
-	for _, d := range t.Deps {
-		if strings.Contains(d, ":") && !g.CrossDepSatisfied(sel.Submodule.Name, d) {
-			return true, nil
-		}
+	// No unmet dependency held it. A future not_before is the other legitimate
+	// self-defer gate (convergence wait): the selector holds a TODO task until its
+	// not_before elapses, exactly like an unmet dep.
+	if !t.NotBefore.IsZero() && t.NotBefore.After(r.now()) {
+		return true, nil
 	}
 	return false, nil
 }

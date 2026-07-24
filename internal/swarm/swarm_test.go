@@ -113,7 +113,7 @@ func TestRunCompletes(t *testing.T) {
 	r := &Runner{Repo: rp, Git: g, Client: mc, MaxTurns: 5, TTL: time.Hour}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}}
 	r.Client = cl
@@ -2049,7 +2049,7 @@ func TestCompletionWaitsForTurnIdle(t *testing.T) {
 
 	sess := &gateSession{started: make(chan struct{}), release: make(chan struct{}), onIdle: func() {
 		// Land the completion artifacts only as the turn settles.
-		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}
 	r := &Runner{Repo: rp, Git: g, Client: &gateClient{sess: sess}, MaxTurns: 3, TTL: time.Hour}
@@ -2373,7 +2373,7 @@ func TestRunPublishFailureBlocksCompletion(t *testing.T) {
 	// Agent drives the task terminal + writes the change doc (completion check passes)…
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}}
 	// …but publishing to main fails once the work is terminal. Gate on [DONE] so the
@@ -2382,7 +2382,7 @@ func TestRunPublishFailureBlocksCompletion(t *testing.T) {
 	r := &Runner{
 		Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour,
 		Publish: func(ctx context.Context) error {
-			if b, _ := os.ReadFile(planPath); strings.Contains(string(b), "[DONE]") {
+			if b, _ := os.ReadFile(planPath); strings.Contains(string(b), "[NEEDS-REVIEW]") {
 				return errors.New("publish boom")
 			}
 			return nil
@@ -2435,13 +2435,13 @@ func TestRunPublishFailureRecordsDurableTranscriptWarning(t *testing.T) {
 
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}}
 	r := &Runner{
 		Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour,
 		Publish: func(ctx context.Context) error {
-			if b, _ := os.ReadFile(planPath); strings.Contains(string(b), "[DONE]") {
+			if b, _ := os.ReadFile(planPath); strings.Contains(string(b), "[NEEDS-REVIEW]") {
 				return errors.New("publish boom")
 			}
 			return nil
@@ -2620,7 +2620,7 @@ func TestRunSuccessfulPublishLeavesNoTranscriptWarning(t *testing.T) {
 
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
@@ -2906,7 +2906,7 @@ func TestWorkSyncsWorktreeBaseToTrackedTip(t *testing.T) {
 			wtBase = b
 		}
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
@@ -2999,7 +2999,7 @@ func TestWorkPinsPointerToTrackedTipDespiteAgentBeeBump(t *testing.T) {
 			return
 		}
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
 		commitDocFor(g, "T1")
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
@@ -4282,35 +4282,29 @@ func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 // gated terminal handoff too (the uniform gate covers Work->{NEEDS-REVIEW,
 // NEEDS-ARBITRATION,DONE}); with a clean worktree, a committed flip, a committed
 // doc, and a matching commits=none tag it completes WITH the gate having run.
-func TestVerifyGateGatesWorkDoneFlip(t *testing.T) {
+// TestWorkDoneFlipRefused: a WORK pass may never set DONE (a work task reaches
+// DONE only through review). A work pass that flips its task straight to DONE is
+// REFUSED — it does not complete — so the runner-finalize-style false-DONE that
+// closed jellyfin:zuul-image-build-publish on an unmet definition of done cannot
+// happen through a work handoff (docs/dod-verification-spec.md).
+func TestWorkDoneFlipRefused(t *testing.T) {
 	ctx := context.Background()
 	g, rp, sm, planPath, _ := gateFixture(t)
 	subs, _ := rp.Submodules()
 	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
 
-	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
-		if o, ok := gateSeamShow("DONE", args); ok {
-			return o, nil
-		}
-		if len(args) > 0 && args[0] == "ls-tree" {
-			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
-		}
-		return verifyOutcome{}, nil // git status: clean
-	}}
 	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
 		os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitDocFor(g, "T1")
 	}}}
-	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, RunVerify: gr.run}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if !res.Completed {
-		t.Fatalf("a direct-to-DONE Work handoff is a gated terminal handoff and must complete with the artifacts present: %+v", res)
-	}
-	if len(gr.calls) == 0 {
-		t.Fatalf("the gate must run for a DONE Work flip")
+	if res.Completed {
+		t.Fatalf("a WORK pass that set DONE must be REFUSED, not completed: %+v", res)
 	}
 }
 
@@ -4448,6 +4442,8 @@ func TestWorkPassYieldsOnFiledBlockingDep(t *testing.T) {
 		os.WriteFile(planPath, []byte(
 			"## T1 [TODO] <!-- attempts=0 deps=T2 -->\n"+
 				"## T2 [TODO] <!-- attempts=0 deps= -->\nnewly filed prerequisite\n"), 0o644)
+		// A yield must ship a short doc explaining why it deferred.
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\nyielded: filed and blocked on T2\n"), 0o644)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -4860,5 +4856,126 @@ func TestVerifyGateLocalSharingAllowsUnpushedCommit(t *testing.T) {
 	}
 	if hint != "" {
 		t.Fatalf("a remote-less local-sharing hive has no origin; a local commit is durable and must pass, got refusal: %q", hint)
+	}
+}
+
+// TestVerifyGateChecksDefinitionOfDone: invariant (5) of the handoff gate — a
+// handoff that ENTERS DONE with a `Check:` command must run that command and
+// REFUSE the DONE unless it exits 0. Driven directly against verifyGate so the
+// branch/stem is controlled. A failing check yields a non-empty refusal prompt;
+// a passing check allows the handoff. See docs/dod-verification-spec.md.
+func TestVerifyGateChecksDefinitionOfDone(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t)
+	_ = sm
+	subs, _ := rp.Submodules()
+	// On-disk plan: a DONE task carrying a real DoD check command.
+	os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\nCheck: my-dod-check\n"), 0o644)
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.NeedsReview}}
+
+	checkFails := true
+	sawCheck := false
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if name == "sh" { // the DoD check: `sh -c <cmd>`
+			sawCheck = true
+			if len(args) < 2 || args[0] != "-c" || args[1] != "my-dod-check" {
+				t.Errorf("check ran with unexpected args: %v", args)
+			}
+			if checkFails {
+				return verifyOutcome{out: "assertion failed: 404", exitErr: true}, nil
+			}
+			return verifyOutcome{out: "ok"}, nil
+		}
+		if o, ok := gateSeamShow("DONE", args); ok { // invariants 1-4 pass
+			return o, nil
+		}
+		if len(args) > 0 && args[0] == "ls-tree" {
+			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
+		}
+		return verifyOutcome{}, nil // git status: clean
+	}}
+	r := &Runner{Repo: rp, Git: g, RunVerify: gr.run}
+	wantRoot, _ := filepath.Abs(rp.Root)
+
+	// Failing check -> the DONE handoff is refused (non-empty prompt).
+	hint, err := r.verifyGate(ctx, sel, "", wantRoot, "bee-T1")
+	if err != nil {
+		t.Fatalf("verifyGate err: %v", err)
+	}
+	if !sawCheck {
+		t.Fatalf("the DoD check command was never run for a DONE handoff carrying a Check:")
+	}
+	if hint == "" {
+		t.Fatalf("a FAILING definition-of-done check must refuse the DONE handoff")
+	}
+
+	// Passing check -> the handoff is allowed (empty prompt).
+	checkFails = false
+	hint, err = r.verifyGate(ctx, sel, "", wantRoot, "bee-T1")
+	if err != nil {
+		t.Fatalf("verifyGate err (pass): %v", err)
+	}
+	if hint != "" {
+		t.Fatalf("a PASSING definition-of-done check must allow the DONE handoff, got refusal: %s", hint)
+	}
+}
+
+// TestVerifyGateCheckNoneNotGated: a task that declared `check=none` has no
+// machine-checkable DoD and is NOT gated by invariant (5) — the DoD command is
+// never run and the handoff is allowed on the other invariants alone.
+func TestVerifyGateCheckNoneNotGated(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t)
+	_ = sm
+	subs, _ := rp.Submodules()
+	os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none check=none -->\npure doc edit\n"), 0o644)
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.NeedsReview}}
+
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if name == "sh" {
+			t.Fatalf("check=none must NOT run any DoD command")
+		}
+		if o, ok := gateSeamShow("DONE", args); ok {
+			return o, nil
+		}
+		if len(args) > 0 && args[0] == "ls-tree" {
+			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
+		}
+		return verifyOutcome{}, nil
+	}}
+	r := &Runner{Repo: rp, Git: g, RunVerify: gr.run}
+	wantRoot, _ := filepath.Abs(rp.Root)
+	hint, err := r.verifyGate(ctx, sel, "", wantRoot, "bee-T1")
+	if err != nil {
+		t.Fatalf("verifyGate err: %v", err)
+	}
+	if hint != "" {
+		t.Fatalf("a check=none DONE handoff must be allowed (no DoD gate), got refusal: %s", hint)
+	}
+}
+
+// TestWorkYieldOnPhantomDepFailsLoud: a work pass that leaves its task TODO
+// blocked on a dependency that names NO existing task must FAIL LOUD (the run
+// errors), never silently "complete" as a yield behind a dep that can never
+// appear — the defect that wedged flux:phantom-library-bluegreen-repin-gitea-
+// images on the nonexistent jellyfin:jellyfin-image-build.
+func TestWorkYieldOnPhantomDepFailsLoud(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t)
+	_ = sm
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		// Leaves T1 TODO blocked on a dep that names no task in the plan.
+		os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps=ghost -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, TTL: time.Hour}
+	_, err := r.Run(ctx, sel, "sys", "first")
+	if err == nil {
+		t.Fatalf("a work pass yielding on a phantom dependency must fail loud, not complete silently")
+	}
+	if !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("the error must name the dangling dependency, got: %v", err)
 	}
 }
