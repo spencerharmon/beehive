@@ -26,6 +26,10 @@ CASES=(
     "MainConvergence|MainConvergence_forcerewind.cfg|fail"
     "SubmodulePointer|SubmodulePointer_fixed.cfg|pass"
     "SubmodulePointer|SubmodulePointer_buggy.cfg|fail"
+    "TaskStatus|TaskStatus_fixed.cfg|pass"
+    "TaskStatus|TaskStatus_buggy.cfg|fail"
+    "ClaimRace|ClaimRace_fixed.cfg|pass"
+    "ClaimRace|ClaimRace_buggy.cfg|fail"
 )
 
 rc=0

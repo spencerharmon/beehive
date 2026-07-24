@@ -49,34 +49,55 @@ action in the model, or has its forbidden action *refused* by a guard actor:
 |---|---|---|---|
 | `StartWork` | action | agent commits + pushes `bee-<taskid>` to submodule origin | — |
 | `AgentBumpsBeeTip` (buggy) | action | the removed "bump the submodule pointer" instruction (pre-`1a9bcea`) | reproduced by `SubmodulePointer_buggy.cfg` |
-| `MergeToTracked` + runner pin | action | `swarm.go:2282 pinPointerToTrackedTip` (sole gitlink writer, at work-start AND completion) | `swarm_test.go TestWorkPinsPointerToTrackedTipDespiteAgentBeeBump` |
-| pin refuses non-durable target | guard | `git.go:352 RemoteContainsCommit` + `git.go:542 BumpGitlink` (refuse bump to a sha not on origin) | `git_test.go:1239 TestRemoteContainsCommit` |
+| `MergeToTracked` + runner pin | action | `swarm.go:2241 pinPointerToTrackedTip` (sole gitlink writer, at work-start AND completion) | `swarm_test.go TestWorkPinsPointerToTrackedTipDespiteAgentBeeBump` |
+| pin refuses non-durable target | guard | `git.go:352 RemoteContainsCommit` + `git.go:542 BumpGitlink` (refuse bump to a sha not on origin); the WORK handoff gate now enforces the same durable-on-origin check via `RemoteContainsCommit` in `verify.go` (`72e2b4a`) | `git_test.go:1239 TestRemoteContainsCommit`, `swarm_test.go TestVerifyGateRefusesLocalOnlyUnpushedCommit` |
 | `ReclaimBranch` GCs bee tip | action | runner branch reclaim after merge | — |
 | `PointerDurable` | invariant | `pinPointerToTrackedTip` + `BumpGitlink` guard; `docs/submodule-pointer-invariant.md` | `SubmodulePointer_buggy.cfg` proves dangling reachable without the fix |
 | `PointerIsTrackedTip` | invariant | `pinPointerToTrackedTip` | `TestWorkPinsPointerToTrackedTipDespiteAgentBeeBump` |
 
-**Not yet modeled here (belongs to Layer 2):** the ambient-pointer false-DONE race
-(`743b1c6`, `bafd386`) — `swarm.go:2566 recordReviewedCommit` and `:2692
-finalizeIfAlreadyMerged` must read the task's OWN `bee-<taskid>` tip, never the
-ambient `HEAD:submodules/<sm>/repo` gitlink. That crosses task-status + review, so
-it is a Layer-2 property (`NoFalseDone`), noted so the gap is explicit rather than
-silently absent.
+**Not yet modeled here (belongs to Layer 2 — and now IS, in `TaskStatus.tla`):**
+the ambient-pointer false-DONE race (`743b1c6`, `bafd386`) — `swarm.go:2525
+recordReviewedCommit` and `:2651 finalizeIfAlreadyMerged` must read the task's OWN
+`bee-<taskid>` tip, never the ambient `HEAD:submodules/<sm>/repo` gitlink. That
+crosses task-status + review, so it is the Layer-2 `NoFalseDone` property.
 
-## Planned layers (roadmap)
+## Layer 2 — `TaskStatus.tla`
 
-### Layer 2 — `TaskLifecycle.tla`
-Status state machine (the exhaustive edge list in `HONEYBEE.md`), claim /
-heartbeat / TTL, selection re-confirm, lost-work self-heal, DONE-gates.
-- `LegalTransitionsOnly` — only the sanctioned edges fire.
-- `AtMostOneLiveClaim`, `NoDuplicateDispatch` — `301964d` (mid-turn heartbeat
-  keepalive + decoupled selection staleness + pre-dispatch re-confirm).
-- `NoFalseDone` — DONE ⇒ the task's own bee-tip is committed, merged into tracked,
-  and reviewed. Covers `fe6da39` (empty bee-branch), `743b1c6`/`bafd386` (ambient
-  false-DONE).
-- liveness `NoStuckDoomedTask` — a NEEDS-REVIEW/ARBITRATION task whose work is gone
-  everywhere eventually returns to TODO. Covers `4fdd953`, `743c46f`.
+Status machine faithful to `internal/plan/state.go` (edges in `state.go:13
+transitions` + the recovery/escalation methods).
 
-### Layer 3 — `EditorSessionNamespace.tla`
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `DoWork` → `HandoffToReview` gate | action + guard | `swarm/verify.go verifyGate` (committed doc `2573066`; durable-on-origin `RemoteContainsCommit` `72e2b4a`; uncommitted-work gate `fe6da39`) | `swarm_test.go TestVerifyGateRefusesLocalOnlyUnpushedCommit`, `TestVerifyGateAllowsPushedCommit` |
+| `HandoffToReview`/`ReviewApprove`/`ReviewReject`/`ArbSideImpl`/`ArbSideReviewer` | actions | `plan/state.go:22 Transition` (edge table `state.go:13`) | `plan` state tests |
+| `ArbSideReviewer` attempts/limit → HUMAN | action | `plan/state.go:85 Reject` | `plan` reject-overflow test |
+| `RecoverLostWork` | action | `plan/state.go:215 RecoverLostWork`; dispatch guards `swarm.go:2788 bounceIfUnreachable`, `:2878 recoverIfLost` | `swarm` recover-lost-work tests |
+| `FinalizeAlreadyMerged` | action | `plan/state.go FinalizeAlreadyMerged`; `swarm.go:2651 finalizeIfAlreadyMerged` (own bee tip, not ambient) | `swarm_test.go TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestry{Remote,LocalSharing}` |
+| `RequestHuman` | action | `plan/state.go RequestHuman` (+ `EscalationReady`) | `plan` human-request test |
+| `LegalTransitionsOnly` | invariant | `plan/state.go:18 CanTransition` (edge table is the single source of truth) | `plan` transition tests |
+| `NoFalseDone` | invariant | `verify.go verifyGate` + `finalizeIfAlreadyMerged`/`recordReviewedCommit` own-tip fix | `TaskStatus_buggy.cfg` proves false-DONE reachable when ungated |
+| `Terminates`, `LostWorkRecovers` | liveness | attempts/limit escalation + `recoverIfLost` dispatch guard | `TaskStatus_fixed.cfg` |
+
+**Modeling note (verified against the code, not assumed):** the operator `Resolve`
+edge `NEEDS-HUMAN → TODO` (`plan/state.go Resolve`) does **not** reset `Attempts`.
+So across resolve/retry cycles the counter is unbounded — `AttemptsBounded` holds
+only for the *autonomous* machine (`NEEDS-HUMAN` terminal, matching the selector's
+own exclusion of `NEEDS-HUMAN` from selection). `TaskStatus.tla` therefore omits
+the `Resolve` action and treats `NEEDS-HUMAN` as terminal; this was surfaced by TLC
+(the fixed cfg failed `AttemptsBounded` until the reopen loop was scoped out).
+
+## Layer 2 — `ClaimRace.tla`
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `Tick` keepalive (fixed) | action | runner mid-turn heartbeat re-stamp; `claim` heartbeat model | `301964d` change |
+| `ClaimFresh` / `ClaimStale` | actions | `claim.Claimer.Claim` (pre-dispatch re-confirm pull + `PreClaimJitter`); selection staleness window `plan.Plan.Candidates(now, ttl)` driven by the Selector `TTL`/`TurnTimeout` (`select/select.go`) | `301964d` change |
+| `Finish` / `LoseRace` | actions | `claim` publish-conflict → `ErrLost` (`claim.go`) | `claim` lost-race tests |
+| `AtMostOneLands` | invariant | the single-owner publish conflict (`claim.go ErrLost`) — the definitive guard | `ClaimRace_buggy.cfg` shows it survives the dispatch bug |
+| `NoDuplicateDispatch` | invariant | mid-turn keepalive + decoupled liveness window (`plan.Plan.Candidates`) + pre-dispatch re-confirm (`301964d`) | `ClaimRace_buggy.cfg` proves duplicate dispatch reachable without them |
+| `EventuallyLanded` | liveness | `claim` + selection fairness | `ClaimRace_fixed.cfg` |
+
+## Planned layer (roadmap)
 The three `edit-*` subsystems sharing `.worktrees/` and the Manager's reclaim/gc
 dance (`internal/editor/editor.go`: `editBranchPrefix = "hive-edit-"` at `:73`,
 `isEditBranch` `:421`, `Reload` `:458`, `Reclaimable` `:634`).
@@ -93,9 +114,9 @@ dance (`internal/editor/editor.go`: `editBranchPrefix = "hive-edit-"` at `:73`,
   uncommitted, may stage a bee-tip gitlink). The specs then prove the
   runner/hook/pin defends the invariant *regardless* — the general form of the
   existing regression tests.
-- **TTL is wall-clock**, abstracted (in Layer 2) to a nondeterministic
-  `DeclareStale` adversary action; this over-approximates timing and so is a safe
-  (never-too-optimistic) model of the claim race.
+- **TTL is wall-clock**, abstracted (in `ClaimRace.tla`) to a logical `clock` with
+  the keepalive tracking it while a claim is dispatched; this over-approximates
+  timing and so is a safe (never-too-optimistic) model of the claim race.
 - **State explosion is the ceiling.** Tiny constants (2 submodules, 2–3
   tasks/artifacts) already surface every catalogued Layer-1 bug; symmetry / small
   bounds keep Layers 2–3 tractable.

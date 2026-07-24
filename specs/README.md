@@ -27,7 +27,7 @@ them apart bounds the state space):
 | Layer | Module(s) | Models | Status |
 |-------|-----------|--------|--------|
 | **1. Shared git refs** | `MainConvergence.tla`, `SubmodulePointer.tla` | `main` fast-forward convergence + submodule gitlink durability/tracked-tip | **done** |
-| **2. Task lifecycle** | `TaskLifecycle.tla` *(planned)* | status state machine + claim/heartbeat/TTL + selection re-confirm + lost-work self-heal + the DONE-gates (incl. ambient-pointer false-DONE) | planned |
+| **2. Task lifecycle** | `TaskStatus.tla`, `ClaimRace.tla` | status state machine + the DONE-gates (incl. false-DONE) + claim/heartbeat/TTL concurrent-dispatch mutual exclusion + lost-work self-heal | **done** |
 | **3. beehived dances** | `EditorSessionNamespace.tla` *(planned)* | the three `edit-*` subsystems sharing `.worktrees/`, the reclaim/gc dance, remote session durability | planned |
 
 ## Layer 1 modules (this delivery)
@@ -64,6 +64,46 @@ Configs:
 - `SubmodulePointer_buggy.cfg` — agent bumps the gitlink to its bee tip; after
   merge + branch reclaim the sha is GC'd. Reproduces the **`1a9bcea` / `35442f4`**
   dangling pointer: `PointerDurable` violated.
+
+## Layer 2 modules (this delivery)
+
+### `TaskStatus.tla`
+The task-lifecycle status state machine (faithful to `internal/plan/state.go`): the
+legal edges, the attempts/limit escalation to `NEEDS-HUMAN`, the runner recovery
+edges (`RecoverLostWork`, `FinalizeAlreadyMerged`), and the honeybee escalation
+edge (`RequestHuman`).
+
+- `LegalTransitionsOnly` — status only ever changes along a sanctioned edge.
+- `NoFalseDone` — a task is `DONE` only when its own work is durable on origin
+  **and** merged into the tracked branch. **Leading safety property.**
+- `AttemptsBounded` — the rework counter never runs past the escalation point.
+- `Terminates` / `LostWorkRecovers` — liveness: the task always reaches `DONE` or
+  `NEEDS-HUMAN`, and lost work never strands (leads back to `TODO`/`NEEDS-HUMAN`).
+
+Configs:
+- `TaskStatus_fixed.cfg` — handoff gate enforced. No error; both liveness
+  properties hold.
+- `TaskStatus_buggy.cfg` — ungated handoff. Reproduces the silent false-DONE
+  family (**`fe6da39` / `2573066` / `72e2b4a` / `743b1c6`**): a task reaches `DONE`
+  on work that is not durable on origin — `NoFalseDone` violated.
+
+### `ClaimRace.tla`
+The commit-race claim protocol between two concurrent passes (faithful to
+`internal/claim` + `internal/swarm` selection/dispatch).
+
+- `AtMostOneLands` — the **correctness backstop**: two sessions never both complete
+  the task (rests on the single-owner publish conflict). Holds in **every** cfg.
+- `NoDuplicateDispatch` — the **efficiency** property the fix adds: two sessions
+  never both get dispatched onto the same live task.
+- `EventuallyLanded` — liveness: the task eventually lands.
+
+Configs:
+- `ClaimRace_fixed.cfg` — mid-turn heartbeat keepalive + decoupled selection
+  staleness. No error.
+- `ClaimRace_buggy.cfg` — no keepalive. Reproduces **`301964d`**: a live owner's
+  heartbeat goes stale to selection and a second session dispatches on top of it —
+  `NoDuplicateDispatch` violated. `AtMostOneLands` still holds (checked here to
+  show the publish-conflict backstop survives the bug).
 
 ## Running
 
