@@ -1419,6 +1419,7 @@ func TestPlanViewPills(t *testing.T) {
 			ID: "imp", Status: StatusTODO, Desc: "implement it",
 			DepStates: []Dep{{Name: "dep-done", Done: true}, {Name: "dep-todo", Done: false}},
 			Session:   "bee-A", Heartbeat: hb, Active: true,
+			Running: true, SessionHref: "/submodule/alpha/session/bee-A",
 			DocHref: "/submodule/alpha/doc/bee-imp.md",
 		},
 		{ID: "rev", Status: StatusReview, Desc: "review me", Session: "bee-B", Heartbeat: hb, Stale: true},
@@ -4551,6 +4552,126 @@ func TestActiveHoneybeesUnifiedAcrossDashboardAndSessions(t *testing.T) {
 		if st.Name == "alpha" && st.ActiveNow != 2 {
 			t.Errorf("stats alpha.ActiveNow = %d, want 2", st.ActiveNow)
 		}
+	}
+}
+
+// TestPlanViewActiveUnified is active-honeybee-plan-view-unify's regression:
+// the plan/task-list view's "running" determination must be the SAME
+// canonical active-honeybee signal every other consumer (dashboard 🐝 counter,
+// /stats ActiveNow, sessions list) already reads — never the plan renderer's
+// own raw claim-freshness-only heuristic. Reuses
+// TestActiveHoneybeesUnifiedAcrossDashboardAndSessions' exact fixture: task a
+// has a FRESH PLAN claim, task b a STALE PLAN claim whose own session stub's
+// branch is also gone, and bee-c is a claimless Bootstrap/Reconcile pass (no
+// PLAN task at all) whose session stub names a STILL-LIVE stream branch. Under
+// today's stale-claim-only plan logic, a's row reads running (fresh claim) and
+// b's reads idle (stale claim) — so this exact assertion would ALREADY pass
+// even with the bug; the case the bug gets wrong is a STALE claim whose own
+// session is still live via the stub-branch fallback, which this test also
+// covers as task d below (mirroring the exact rule sessionLive/activeHoneybees
+// apply: unclaimed/stale falls back to the claimed session's OWN stream branch
+// liveness) — and asserts the plan view, dashboard counter, and sessions list
+// agree on the resulting set {a, c, d}.
+func TestPlanViewActiveUnified(t *testing.T) {
+	s, root := setup(t)
+	now := time.Now().UTC()
+	ttl := time.Hour
+	fresh := now.Add(-5 * time.Minute).Truncate(time.Second).Format(time.RFC3339)
+	stale := now.Add(-90 * time.Minute).Truncate(time.Second).Format(time.RFC3339)
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## a [TODO] <!-- attempts=0 deps= session=bee-a heartbeat="+fresh+" -->\nfresh claim\n\n"+
+			"## b [TODO] <!-- attempts=0 deps= session=bee-b heartbeat="+stale+" -->\nstale claim, dead stub branch\n\n"+
+			"## d [TODO] <!-- attempts=0 deps= session=bee-d heartbeat="+stale+" -->\nstale claim, but session's OWN stub branch still live\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gitAt(t, root, "add", "-A")
+	gitAt(t, root, "commit", "-q", "-m", "seed")
+	// (c)'s and (d)'s ONLY liveness signal: a live stream branch, no fresh
+	// PLAN claim (c has no PLAN task at all; d's PLAN claim is stale).
+	gitAt(t, root, "branch", "bee-c-stream")
+	gitAt(t, root, "branch", "bee-d-stream")
+
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(sessDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("bee-a.md", repo.SessionStub("bee-a-stream-gone"))
+	write("bee-b.md", repo.SessionStub("bee-b-stream-gone"))
+	write("bee-c.md", repo.SessionStub("bee-c-stream"))
+	write("bee-d.md", repo.SessionStub("bee-d-stream"))
+
+	ctx := context.Background()
+	sm, err := s.submodule("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The canonical set itself: exactly {bee-a, bee-c, bee-d}.
+	p, err := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bees := s.activeHoneybees(ctx, sm, p)
+	canonical := map[string]bool{}
+	for _, b := range bees {
+		canonical[b.Session] = true
+	}
+	if want := (map[string]bool{"bee-a": true, "bee-c": true, "bee-d": true}); !reflect.DeepEqual(canonical, want) {
+		t.Fatalf("activeHoneybees session set = %v, want %v", canonical, want)
+	}
+
+	// The plan/task-list view must mark exactly a and d running (c has no
+	// PLAN task, so it cannot appear as a plan row at all) — b must NOT read
+	// running despite carrying a Session, since its claim is stale and its
+	// own stub's branch is gone.
+	body := get(t, s, "/submodule/alpha/plan").Body.String()
+	if !strings.Contains(body, `href="/submodule/alpha/session/bee-a"`) {
+		t.Errorf("plan view: task a missing a working link to its session:\n%s", body)
+	}
+	if !strings.Contains(body, `href="/submodule/alpha/session/bee-d"`) {
+		t.Errorf("plan view: task d (stale claim, live stub branch) must still read running via the canonical fallback:\n%s", body)
+	}
+	if strings.Contains(body, `href="/submodule/alpha/session/bee-b"`) {
+		t.Errorf("plan view: task b (stale claim, dead stub branch) must NOT read running:\n%s", body)
+	}
+
+	// Cross-check against the dashboard counter and sessions list: all three
+	// consumers must agree on the size of the running set (2 tasks are in
+	// PLAN.md as running, but the canonical set adds the claimless bee-c —
+	// so the dashboard/stats total is 3, matching activeHoneybees exactly).
+	views, err := s.subViews(ctx, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alpha subView
+	for _, v := range views {
+		if v.Name == "alpha" {
+			alpha = v
+		}
+	}
+	if alpha.Bees != len(canonical) {
+		t.Errorf("dashboard alpha.Bees = %d, want %d (== the canonical set)", alpha.Bees, len(canonical))
+	}
+	infos := s.sessionInfos(ctx, sm, now, ttl)
+	live := map[string]bool{}
+	for _, in := range infos {
+		live[in.ID] = in.Live
+	}
+	for id := range canonical {
+		if !live[id] {
+			t.Errorf("sessionInfos: %s want Live=true (canonical set member)", id)
+		}
+	}
+	if live["bee-b"] {
+		t.Error("sessionInfos: bee-b want Live=false (stale claim, dead stub branch)")
 	}
 }
 

@@ -61,6 +61,25 @@ type PlanItem struct {
 	DocHref     string    // link to view the change doc (from the commit stamp or the design Doc), "" if unresolved
 	HumanReason string    // explicit NEEDS-HUMAN reason from a body "Human-needed:" line (may span multiple lines)
 	Category    string    // NEEDS-HUMAN escalation category (secret|external-permission|contradiction|architecture), "" if unclassified/runner-forced
+	// Running and SessionHref are active-honeybee-plan-view-unify's row-level
+	// canonical "is this honeybee running right now" signal, filled in by the
+	// plan handler (never projectTask: it needs IO — a sessions/ stub read and
+	// a live-branch check — that the pure projection layer cannot do). Running
+	// is EXACTLY sessionLive(sm, Session, now, ttl) for this task's claimed
+	// Session — the SAME per-session predicate the sessions list/page already
+	// use (active-honeybee-count-unify's canonical union: a fresh PLAN claim,
+	// OR (only when unclaimed/stale) the claimed session's own stream branch
+	// still being live) — never a second, plan-renderer-only heuristic
+	// re-derived from Active/Stale alone. A stale claim whose session stub's
+	// branch is STILL live therefore still reads Running=true here, matching
+	// the sessions page/dashboard counter exactly, where the raw Active field
+	// (claim freshness only) would have wrongly read false. SessionHref links
+	// the row to that session's page (`/submodule/<sm>/session/<Session>`)
+	// whenever Running is true, so a running task in the plan list is a
+	// WORKING LINK to its honeybee — never inert text — matching the
+	// session's own /session/<branch> route (sessionView).
+	Running     bool
+	SessionHref string
 }
 
 // BodyHTML renders the task's full body (Body) as sanitized markdown for the
