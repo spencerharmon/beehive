@@ -74,8 +74,10 @@ transitions` + the recovery/escalation methods).
 | `RecoverLostWork` | action | `plan/state.go:215 RecoverLostWork`; dispatch guards `swarm.go:2788 bounceIfUnreachable`, `:2878 recoverIfLost` | `swarm` recover-lost-work tests |
 | `FinalizeAlreadyMerged` | action | `plan/state.go FinalizeAlreadyMerged`; `swarm.go:2651 finalizeIfAlreadyMerged` (own bee tip, not ambient) | `swarm_test.go TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestry{Remote,LocalSharing}` |
 | `RequestHuman` | action | `plan/state.go:255 RequestHuman` (+ `EscalationReady`) | `plan_test.go TestRequestHuman` |
+| `PassCheck` + DoD gate on DONE-ward edges | action + guard | `swarm/verify.go:266 verifyGate` invariant 5 + `:282 checkGate` (run `Check` via `runVerify`, refuse DONE unless exit 0; `check=none` not gated; fail-closed on infra) (`92d2ed1`) | `swarm_test.go TestVerifyGateChecksDefinitionOfDone`, `TestVerifyGateCheckNoneNotGated` |
+| no `TODO → DONE` (work pass) | guard | `swarm.go:2071 workChecklist` refuses a work-set DONE; `gatedHandoff` drops Work→Done (`92d2ed1`) | `swarm_test.go TestWorkDoneFlipRefused` |
 | `LegalTransitionsOnly` | invariant | `plan/state.go:12 transitions` + `:19 CanTransition` (single source of truth) | `invariant_conformance_test.go TestInvariant_LegalTransitionsOnly` (exhaustive 5×5 matrix, independent of the code map) + `TestInvariant_HumanIsTerminalForAgent` |
-| `NoFalseDone` | invariant | `verify.go verifyGate` + `finalizeIfAlreadyMerged`/`recordReviewedCommit` own-tip fix | `TaskStatus_buggy.cfg` proves false-DONE reachable when ungated |
+| `NoFalseDone` (durable ∧ merged ∧ DoD-check) | invariant | `verify.go verifyGate` (durability + invariant-5 check gate) + `finalizeIfAlreadyMerged`/`recordReviewedCommit` own-tip fix | `TaskStatus_buggy.cfg` (durability defect) + `TaskStatus_buggy_check.cfg` (jellyfin DoD defect) both prove false-DONE reachable when the respective gate is off |
 | `Terminates`, `LostWorkRecovers` | liveness | attempts/limit escalation + `recoverIfLost` dispatch guard | `invariant_conformance_test.go TestInvariant_EscalationTerminates` (deterministic escalation to terminal NEEDS-HUMAN) + `TaskStatus_fixed.cfg` |
 
 **Modeling note (verified against the code, not assumed):** the operator `Resolve`
@@ -96,6 +98,17 @@ the `Resolve` action and treats `NEEDS-HUMAN` as terminal; this was surfaced by 
 | `AtMostOneLands` | invariant | the single-owner publish conflict (`claim.go ErrLost`) — the definitive guard | `ClaimRace_buggy.cfg` shows it survives the dispatch bug |
 | `NoDuplicateDispatch` | invariant | mid-turn keepalive + decoupled liveness window (`plan.Plan.Candidates`) + pre-dispatch re-confirm (`301964d`) | `ClaimRace_buggy.cfg` proves duplicate dispatch reachable without them |
 | `EventuallyLanded` | liveness | `claim` + selection fairness | `ClaimRace_fixed.cfg` |
+
+## Layer 2 — `DependencyReadiness.tla`
+
+Dependency readiness + the dangling-dependency refusal (`92d2ed1`).
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `Yield` (real dep → HELD; phantom → loud escalate) | action + guard | `swarm.go:2092 taskYieldedBlocked` (accept a blocked yield only if every dep is a real task — local via `plan.Blocked`, cross via `selectt.LoadEdges`; fail-loud on a phantom) | `swarm_test.go TestWorkYieldOnPhantomDepFailsLoud` |
+| `DepCompletes` / `Unblock` / `ReadyFromTodo` | actions | selector readiness (`plan.Plan.Candidates` dep gate) | `plan_test.go TestDanglingDeps`; `plan.Plan.DanglingDeps` (`plan.go:578`) |
+| `HeldImpliesRealDep` | invariant | phantom-dep refusal in `taskYieldedBlocked` | `DependencyReadiness_buggy.cfg` proves a phantom dep is silently held without the guard |
+| `EventuallyResolved` | liveness | real dep completes → task proceeds; phantom dep escalates | `DependencyReadiness_fixed.cfg` |
 
 ## Layer 3 (delivered) — `EditorSessionNamespace.tla`
 
@@ -123,9 +136,20 @@ tip" is captured by `Recoverable` counting `localBranch` first.
 
 ## Roadmap
 
-None — Layers 1–3 cover every catalogued bug. Future targets are DEEPENING (not
-new layers): richer multi-task / multi-submodule interaction, and the cross-layer
-composition where a Layer-2 false-DONE would corrupt the Layer-1 gitlink.
+Layers 1–3 cover every catalogued bug, including the DoD-check false-DONE
+(`92d2ed1`) and the dangling-dependency wedge. Two follow-ups track code that is
+*specified but not yet landed* (see `docs/dod-verification-spec.md` Rollout), so
+they are deliberately NOT modeled yet:
+- **`Verify-After-Merge` successor check task** — the merge-gated live-effect DoD
+  carried by a runner-spawned successor task. When it lands, `TaskStatus.tla`
+  gains a successor-check state and `NoFalseDone` extends to the merge-gated
+  effect. (Only the pre-merge `Check` gate is landed and modeled today.)
+- **DoD authoring/teaching layer** — post-select check injection, CLI verbs,
+  generated-prompt edits. Prompt-only; no protocol invariant to model.
+
+Other DEEPENING targets (not new layers): richer multi-task / multi-submodule
+interaction, and the cross-layer composition where a Layer-2 false-DONE would
+corrupt the Layer-1 gitlink.
 
 ## Caveats (how much confidence this actually buys)
 

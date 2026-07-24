@@ -16,6 +16,16 @@
 (*   - 72e2b4a  handoff gate verifies commits are durable on ORIGIN          *)
 (*   - 743b1c6  reviewed commit read from the task's own bee tip, not the     *)
 (*              ambient sibling gitlink (ambient false-DONE)                  *)
+(*   - 92d2ed1  DONE entered on a reviewed commit while the task's declared    *)
+(*              definition-of-done Check command was NOT satisfied            *)
+(*              (jellyfin:zuul-image-build-publish false-DONE)                *)
+(*                                                                         *)
+(* DoD-check gate (verifyGate invariant 5, 92d2ed1): entering DONE by ANY     *)
+(* path -- review approve, arbitration, interrupted-review finalize -- runs   *)
+(* the task's declared `Check:` command and REFUSES the DONE unless it        *)
+(* passes.  A `check=none` task declared a justified absence and is not gated. *)
+(* So NoFalseDone strengthens: durable + merged is necessary but NOT          *)
+(* sufficient; a declared check must also be satisfied.                       *)
 (*                                                                         *)
 (* Liveness: a NEEDS-REVIEW/NEEDS-ARBITRATION task whose work is lost         *)
 (* everywhere eventually returns to TODO or escalates NEEDS-HUMAN -- it       *)
@@ -33,8 +43,9 @@
 EXTENDS Naturals, TLC
 
 CONSTANTS
-    Limit,   \* reject/recover attempts limit; past it a task escalates NEEDS-HUMAN
-    Gated    \* TRUE: the handoff gate requires work durable-on-origin before DONE-ward edges
+    Limit,      \* reject/recover attempts limit; past it a task escalates NEEDS-HUMAN
+    Gated,      \* TRUE: the handoff gate requires work durable-on-origin before DONE-ward edges
+    CheckGated  \* TRUE: entering DONE requires the task's declared DoD Check to pass (verifyGate inv 5)
 
 VARIABLES
     status,       \* one of Statuses
@@ -42,9 +53,12 @@ VARIABLES
     attempts,     \* rework attempts; Reject/Strand/RecoverLostWork bump it (state.go)
     workDurable,  \* the task's own bee work is committed AND durable on the submodule origin
     merged,       \* the task's own bee work has been merged into the tracked branch
-    workLost      \* adversary flag: the durable work was subsequently lost (branch GC'd, publish never landed)
+    workLost,     \* adversary flag: the durable work was subsequently lost (branch GC'd, publish never landed)
+    checkDeclared,\* the task declares a machine-checkable `Check:` DoD command (vs check=none/undeclared)
+    checkPassed   \* the declared Check currently exits 0 (the acceptance bar is actually met)
 
-vars == <<status, prevStatus, attempts, workDurable, merged, workLost>>
+vars == <<status, prevStatus, attempts, workDurable, merged, workLost,
+          checkDeclared, checkPassed>>
 
 Statuses == {"TODO", "REVIEW", "ARB", "DONE", "HUMAN"}
 
@@ -67,6 +81,12 @@ TypeOK ==
     /\ workDurable \in BOOLEAN
     /\ merged \in BOOLEAN
     /\ workLost \in BOOLEAN
+    /\ checkDeclared \in BOOLEAN
+    /\ checkPassed \in BOOLEAN
+
+\* The definition-of-done is satisfied iff no check is declared (check=none: the
+\* absence is honest and review-scrutinized) or the declared check actually passes.
+DodSatisfied == (~checkDeclared) \/ checkPassed
 
 (***************************************************************************)
 (* Safety invariants                                                       *)
@@ -78,9 +98,10 @@ LegalTransitionsOnly ==
     (status /= prevStatus) => (<<prevStatus, status>> \in LegalEdges)
 
 \* A task is DONE only when its own work is real: durable on origin AND merged
-\* into the tracked branch. This is the anti-false-DONE invariant.
+\* into the tracked branch AND (92d2ed1) its declared definition-of-done Check is
+\* satisfied. This is the anti-false-DONE invariant.
 NoFalseDone ==
-    (status = "DONE") => (workDurable /\ merged)
+    (status = "DONE") => (workDurable /\ merged /\ DodSatisfied)
 
 \* The attempts counter never runs away past the escalation point.
 AttemptsBounded == attempts <= Limit + 1
@@ -95,6 +116,8 @@ Init ==
     /\ workDurable = FALSE
     /\ merged = FALSE
     /\ workLost = FALSE
+    /\ checkDeclared \in BOOLEAN   \* explore both a check-declared task and a check=none task
+    /\ checkPassed = FALSE         \* the acceptance bar starts unmet
 
 (***************************************************************************)
 (* Actions. Every action sets prevStatus' = status so the edge just taken   *)
@@ -109,7 +132,19 @@ DoWork ==
     /\ workDurable' = TRUE
     /\ workLost' = FALSE
     /\ prevStatus' = status
-    /\ UNCHANGED <<status, attempts, merged>>
+    /\ UNCHANGED <<status, attempts, merged, checkDeclared, checkPassed>>
+
+\* The agent meets the acceptance bar: it does the real work so the declared DoD
+\* Check command now exits 0. Optional and unforced -- an agent CAN hand off
+\* without meeting it (the jellyfin defect); the check gate is what refuses the
+\* resulting DONE. Enabled while the task is still being worked/reviewed.
+PassCheck ==
+    /\ status \in {"TODO", "REVIEW", "ARB"}
+    /\ checkDeclared
+    /\ ~checkPassed
+    /\ checkPassed' = TRUE
+    /\ prevStatus' = status
+    /\ UNCHANGED <<status, attempts, workDurable, merged, workLost, checkDeclared>>
 
 \* TODO -> NEEDS-REVIEW. The handoff gate: in the fixed protocol the terminal
 \* flip is refused unless the work is durable on origin (verify.go +
@@ -119,34 +154,38 @@ HandoffToReview ==
     /\ (Gated => workDurable)
     /\ status' = "REVIEW"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, merged, workLost>>
+    /\ UNCHANGED <<attempts, workDurable, merged, workLost, checkDeclared, checkPassed>>
 
 \* Review approves: merge the bee tip into the tracked branch, NEEDS-REVIEW -> DONE.
 \* Gated: refuse to approve work that is not durable on origin (no ambient/phantom
-\* false-DONE).
+\* false-DONE). CheckGated (verifyGate inv 5): refuse to approve a declared-check
+\* task whose acceptance bar is not met.
 ReviewApprove ==
     /\ status = "REVIEW"
     /\ (Gated => workDurable)
+    /\ ((CheckGated /\ checkDeclared) => checkPassed)
     /\ merged' = TRUE
     /\ status' = "DONE"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, workLost>>
+    /\ UNCHANGED <<attempts, workDurable, workLost, checkDeclared, checkPassed>>
 
 \* Review rejects: NEEDS-REVIEW -> NEEDS-ARBITRATION (the agent reject edge).
 ReviewReject ==
     /\ status = "REVIEW"
     /\ status' = "ARB"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, merged, workLost>>
+    /\ UNCHANGED <<attempts, workDurable, merged, workLost, checkDeclared, checkPassed>>
 
-\* Arbiter sides with the implementer: merge, NEEDS-ARBITRATION -> DONE.
+\* Arbiter sides with the implementer: merge, NEEDS-ARBITRATION -> DONE. Also
+\* gated on the DoD check (the gate covers DONE entered via arbitration too).
 ArbSideImpl ==
     /\ status = "ARB"
     /\ (Gated => workDurable)
+    /\ ((CheckGated /\ checkDeclared) => checkPassed)
     /\ merged' = TRUE
     /\ status' = "DONE"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, workLost>>
+    /\ UNCHANGED <<attempts, workDurable, workLost, checkDeclared, checkPassed>>
 
 \* Arbiter sides with the reviewer: rework. NEEDS-ARBITRATION -> TODO, attempts++;
 \* once attempts exceed the limit the task escalates NEEDS-HUMAN instead of
@@ -156,7 +195,7 @@ ArbSideReviewer ==
     /\ attempts' = attempts + 1
     /\ status' = IF attempts + 1 > Limit THEN "HUMAN" ELSE "TODO"
     /\ prevStatus' = status
-    /\ UNCHANGED <<workDurable, merged, workLost>>
+    /\ UNCHANGED <<workDurable, merged, workLost, checkDeclared, checkPassed>>
 
 \* Adversary: the durable work is subsequently lost -- the bee branch was reclaimed
 \* / GC'd and the publish never landed, so what looked reviewable now points at a
@@ -168,7 +207,7 @@ LoseWork ==
     /\ workDurable' = FALSE
     /\ workLost' = TRUE
     /\ prevStatus' = status
-    /\ UNCHANGED <<status, attempts, merged>>
+    /\ UNCHANGED <<status, attempts, merged, checkDeclared, checkPassed>>
 
 \* Runner recovers a task whose work is unrecoverable everywhere: reset to TODO
 \* (attempts++, past limit -> NEEDS-HUMAN). Valid from REVIEW or ARB (state.go
@@ -181,25 +220,28 @@ RecoverLostWork ==
     /\ status' = IF attempts + 1 > Limit THEN "HUMAN" ELSE "TODO"
     /\ workLost' = FALSE
     /\ prevStatus' = status
-    /\ UNCHANGED <<workDurable, merged>>
+    /\ UNCHANGED <<workDurable, merged, checkDeclared, checkPassed>>
 
 \* Runner completes interrupted review bookkeeping: the bee work is already merged
 \* into tracked main, so finalize NEEDS-REVIEW/ARB -> DONE without a new session.
-\* Requires merged, so it never manufactures a false DONE.
+\* Requires merged, so the work is real; and (verifyGate inv 5) the DoD check must
+\* be satisfied -- the interrupted-review finalize is exactly the path the jellyfin
+\* false-DONE walked through, so it is gated on the check too.
 FinalizeAlreadyMerged ==
     /\ status \in {"REVIEW", "ARB"}
     /\ merged
     /\ workDurable
+    /\ ((CheckGated /\ checkDeclared) => checkPassed)
     /\ status' = "DONE"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, merged, workLost>>
+    /\ UNCHANGED <<attempts, workDurable, merged, workLost, checkDeclared, checkPassed>>
 
 \* Honeybee escalates a concrete blocker: any non-DONE working status -> NEEDS-HUMAN.
 RequestHuman ==
     /\ status \in {"TODO", "REVIEW", "ARB"}
     /\ status' = "HUMAN"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, merged, workLost>>
+    /\ UNCHANGED <<attempts, workDurable, merged, workLost, checkDeclared, checkPassed>>
 
 \* NOTE: the operator Resolve edge NEEDS-HUMAN -> TODO (state.go Resolve) is a
 \* legal edge (kept in LegalEdges) but is deliberately NOT an action here: it is
@@ -217,6 +259,7 @@ Done ==
 
 Next ==
     \/ DoWork
+    \/ PassCheck
     \/ HandoffToReview
     \/ ReviewApprove
     \/ ReviewReject
@@ -243,6 +286,7 @@ LostWorkRecovers ==
 
 Fairness ==
     /\ WF_vars(DoWork)
+    /\ WF_vars(PassCheck)
     /\ WF_vars(HandoffToReview)
     /\ WF_vars(ReviewApprove)
     /\ WF_vars(ArbSideImpl)

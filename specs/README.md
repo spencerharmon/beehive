@@ -27,7 +27,7 @@ them apart bounds the state space):
 | Layer | Module(s) | Models | Status |
 |-------|-----------|--------|--------|
 | **1. Shared git refs** | `MainConvergence.tla`, `SubmodulePointer.tla` | `main` fast-forward convergence + submodule gitlink durability/tracked-tip | **done** |
-| **2. Task lifecycle** | `TaskStatus.tla`, `ClaimRace.tla` | status state machine + the DONE-gates (incl. false-DONE) + claim/heartbeat/TTL concurrent-dispatch mutual exclusion + lost-work self-heal | **done** |
+| **2. Task lifecycle** | `TaskStatus.tla`, `ClaimRace.tla`, `DependencyReadiness.tla` | status state machine + the DONE-gates (durability + definition-of-done check) + claim/heartbeat/TTL concurrent-dispatch mutual exclusion + lost-work self-heal + dangling-dependency refusal | **done** |
 | **3. beehived dances** | `EditorSessionNamespace.tla` *(planned)* | the three `edit-*` subsystems sharing `.worktrees/`, the reclaim/gc dance, remote session durability | planned |
 
 ## Layer 1 modules (this delivery)
@@ -75,17 +75,40 @@ edge (`RequestHuman`).
 
 - `LegalTransitionsOnly` — status only ever changes along a sanctioned edge.
 - `NoFalseDone` — a task is `DONE` only when its own work is durable on origin
-  **and** merged into the tracked branch. **Leading safety property.**
+  **and** merged into the tracked branch **and** its declared definition-of-done
+  `Check` is satisfied (`92d2ed1`). **Leading safety property.**
 - `AttemptsBounded` — the rework counter never runs past the escalation point.
 - `Terminates` / `LostWorkRecovers` — liveness: the task always reaches `DONE` or
   `NEEDS-HUMAN`, and lost work never strands (leads back to `TODO`/`NEEDS-HUMAN`).
 
 Configs:
-- `TaskStatus_fixed.cfg` — handoff gate enforced. No error; both liveness
-  properties hold.
+- `TaskStatus_fixed.cfg` — both DONE gates (durable-on-origin AND DoD check)
+  enforced. No error; both liveness properties hold.
 - `TaskStatus_buggy.cfg` — ungated handoff. Reproduces the silent false-DONE
   family (**`fe6da39` / `2573066` / `72e2b4a` / `743b1c6`**): a task reaches `DONE`
   on work that is not durable on origin — `NoFalseDone` violated.
+- `TaskStatus_buggy_check.cfg` — durability gate on, DoD-check gate **off**
+  (pre-**`92d2ed1`**): a task reaches `DONE` on real, durable, merged work whose
+  declared acceptance `Check` is **not** satisfied — the
+  `jellyfin:zuul-image-build-publish` false-DONE (reviewed config commit, image
+  never pullable) — `NoFalseDone` violated.
+
+### `DependencyReadiness.tla`
+Dependency readiness + the dangling-dependency refusal (`92d2ed1`, faithful to
+`internal/swarm/swarm.go taskYieldedBlocked`). A work pass may yield its task TODO
+held on a blocking dep, but only if the dep is a **real, existing task**.
+
+- `HeldImpliesRealDep` — a held (accepted-yield) task always has a real dep; a
+  phantom dep is never silently held.
+- `EventuallyResolved` — liveness: the task never wedges forever (real dep →
+  `DONE`; phantom dep → escalated `NEEDS-HUMAN`).
+
+Configs:
+- `DependencyReadiness_fixed.cfg` — phantom-dep refusal on. No error.
+- `DependencyReadiness_buggy.cfg` — any blocked yield accepted (pre-**`92d2ed1`**):
+  a task yielded on a phantom dep is silently held forever —
+  `flux:phantom-…-repin` wedged on the nonexistent `jellyfin:jellyfin-image-build`
+  — `HeldImpliesRealDep` (and `EventuallyResolved`) violated.
 
 ### `ClaimRace.tla`
 The commit-race claim protocol between two concurrent passes (faithful to
