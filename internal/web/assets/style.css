@@ -790,9 +790,40 @@ section { margin: var(--space-5) 0; }
   padding: var(--space-3);
   box-shadow: var(--shadow);
 }
-.editor-grid .chat { flex: 1; min-width: 18rem; max-height: 80vh; overflow: auto; }
-.editor-grid .diffpane { flex: 1.6; min-width: 24rem; display: flex; flex-direction: column; }
+/* chat-editor-draggable-divider: the chat pane's width is now a flex-BASIS
+ * driven by a CSS custom property (--editor-chat-width, a percentage) instead
+ * of a fixed flex-grow ratio, so the .editor-divider script below can resize it
+ * live without touching layout math elsewhere. The property lives on
+ * <html>/<body> (set from localStorage on load — see layout.html "footer"),
+ * never on a node inside .editor-grid itself, because editor_panel.html is
+ * re-rendered by every htmx poll/morph: a value stored on a morphed node would
+ * be clobbered the moment the busy-poll ticks. The 38% fallback preserves the
+ * original 1:1.6 (chat:diffpane) ratio when no preference has been saved yet. */
+.editor-grid .chat { flex: 0 1 var(--editor-chat-width, 38%); min-width: 18rem; max-height: 80vh; overflow: auto; }
+.editor-grid .diffpane { flex: 1 1 auto; min-width: 24rem; display: flex; flex-direction: column; }
 .editor-grid .diffpane pre.diff { flex: 1; }
+/* Draggable/click-adjustable splitter between the chat and diff panes. A
+ * pointer drag (see layout.html "footer" script) or the arrow/Home/End keys
+ * (while focused) adjust --editor-chat-width; a double-click/double-tap or
+ * Enter resets it to the default ratio. align-self:stretch fills the grid's
+ * height so the whole vertical seam is grabbable, not just the divider's own
+ * (unset) content height. */
+.editor-divider {
+  flex: 0 0 auto;
+  align-self: stretch;
+  width: 0.4rem;
+  margin: 0 calc(-1 * var(--space-4) / 2 + 0.2rem);
+  border-radius: var(--radius-sm);
+  background: var(--border);
+  cursor: col-resize;
+  touch-action: none;
+}
+.editor-divider:hover,
+.editor-divider:focus-visible,
+.editor-divider.dragging {
+  background: var(--accent);
+  outline: none;
+}
 .msg {
   padding: var(--space-2) var(--space-3);
   margin: var(--space-2) 0;
@@ -972,7 +1003,10 @@ pre.diff .ln.del::before { content: "-"; color: var(--danger); text-decoration: 
 /* Narrow screens: stack the editor panes --------------------------------- */
 @media (max-width: 48rem) {
   .editor-grid { flex-direction: column; }
-  .editor-grid .chat, .editor-grid .diffpane { min-width: 0; width: 100%; }
+  .editor-grid .chat, .editor-grid .diffpane { min-width: 0; width: 100%; flex-basis: auto; }
+  /* Stacked layout has no horizontal seam to drag; the divider would just be a
+     confusing full-width bar, so it drops out entirely (chat-editor-draggable-divider). */
+  .editor-divider { display: none; }
 }
 
 /* Rendered markdown (editor-markdown-render) ------------------------------

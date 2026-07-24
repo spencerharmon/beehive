@@ -186,4 +186,98 @@
   });
 })();
 </script>
+<script>
+/* editor-divider-drag (chat-editor-draggable-divider): a draggable + keyboard/
+ * click-adjustable splitter between the AI editor's chat and diff panes
+ * (.editor-grid > .chat / .editor-divider / .diffpane — editor_panel.html).
+ * The width preference lives as a CSS custom property, --editor-chat-width
+ * (a percentage), set on <html> rather than anywhere inside .editor-grid:
+ * editor_panel.html is re-rendered by the busy-poll's htmx morph swap every
+ * 1.5s while the agent is working, so a value stored on a morphed node would
+ * be silently reset mid-drag or right after it. <html> sits outside that
+ * subtree and is never touched by the morph, so the preference survives every
+ * poll tick and, via localStorage, page reloads too. Event-delegated (like the
+ * scripts above) so it works on the FIRST editor-grid the page ever gets and
+ * on every one a later htmx navigation swaps in. Single-binary embed, no
+ * external libraries (no CDN/SPA/framework), per repo/docs/… conventions. */
+(function () {
+  var PROP = '--editor-chat-width';
+  var KEY = 'beehive-editor-chat-width';
+  var MIN_PCT = 15, MAX_PCT = 80, STEP_PCT = 3;
+  var root = document.documentElement;
+
+  function clamp(pct) { return Math.max(MIN_PCT, Math.min(MAX_PCT, pct)); }
+  function apply(pct) { root.style.setProperty(PROP, clamp(pct) + '%'); }
+  function reset() {
+    root.style.removeProperty(PROP);
+    try { localStorage.removeItem(KEY); } catch (e) { /* storage unavailable */ }
+  }
+  function persist(pct) {
+    apply(pct);
+    try { localStorage.setItem(KEY, String(clamp(pct))); } catch (e) { /* storage unavailable */ }
+  }
+
+  // Restore any saved width immediately so the very first paint (even before
+  // htmx has fetched the editor panel) already reflects it.
+  (function restore() {
+    var saved;
+    try { saved = localStorage.getItem(KEY); } catch (e) { saved = null; }
+    var pct = saved ? parseFloat(saved) : NaN;
+    if (!isNaN(pct)) apply(pct);
+  })();
+
+  function gridOf(divider) { return divider.closest('.editor-grid'); }
+  function pctFromClientX(divider, clientX) {
+    var grid = gridOf(divider);
+    if (!grid) return null;
+    var rect = grid.getBoundingClientRect();
+    if (rect.width <= 0) return null;
+    return ((clientX - rect.left) / rect.width) * 100;
+  }
+
+  var dragging = null; // the divider currently captured, or null
+
+  document.addEventListener('pointerdown', function (e) {
+    var el = e.target.closest && e.target.closest('.editor-divider');
+    if (!el) return;
+    dragging = el;
+    el.classList.add('dragging');
+    el.setPointerCapture && el.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  document.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    var pct = pctFromClientX(dragging, e.clientX);
+    if (pct !== null) persist(pct);
+  });
+  function endDrag(e) {
+    if (!dragging) return;
+    dragging.classList.remove('dragging');
+    dragging.releasePointerCapture && e && e.pointerId != null && dragging.releasePointerCapture(e.pointerId);
+    dragging = null;
+  }
+  document.addEventListener('pointerup', endDrag);
+  document.addEventListener('pointercancel', endDrag);
+
+  // Click/keyboard adjustment: the divider is a focusable role="separator", so
+  // arrow keys (or Home/End for the extremes) work as a non-drag alternative,
+  // and Enter/double-click resets to the default ratio.
+  document.addEventListener('keydown', function (e) {
+    var el = e.target.closest && e.target.closest('.editor-divider');
+    if (!el) return;
+    var cur = parseFloat(getComputedStyle(root).getPropertyValue(PROP)) ||
+      parseFloat(getComputedStyle(el.closest('.editor-grid').querySelector('.chat')).flexBasis) || 38;
+    if (e.key === 'ArrowLeft') { persist(cur - STEP_PCT); e.preventDefault(); }
+    else if (e.key === 'ArrowRight') { persist(cur + STEP_PCT); e.preventDefault(); }
+    else if (e.key === 'Home') { persist(MIN_PCT); e.preventDefault(); }
+    else if (e.key === 'End') { persist(MAX_PCT); e.preventDefault(); }
+    else if (e.key === 'Enter') { reset(); e.preventDefault(); }
+  });
+  document.addEventListener('dblclick', function (e) {
+    var el = e.target.closest && e.target.closest('.editor-divider');
+    if (!el) return;
+    reset();
+  });
+})();
+</script>
 </body></html>{{end}}
