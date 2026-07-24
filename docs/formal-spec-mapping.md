@@ -70,13 +70,13 @@ transitions` + the recovery/escalation methods).
 |---|---|---|---|
 | `DoWork` → `HandoffToReview` gate | action + guard | `swarm/verify.go verifyGate` (committed doc `2573066`; durable-on-origin `RemoteContainsCommit` `72e2b4a`; uncommitted-work gate `fe6da39`) | `swarm_test.go TestVerifyGateRefusesLocalOnlyUnpushedCommit`, `TestVerifyGateAllowsPushedCommit` |
 | `HandoffToReview`/`ReviewApprove`/`ReviewReject`/`ArbSideImpl`/`ArbSideReviewer` | actions | `plan/state.go:22 Transition` (edge table `state.go:13`) | `plan` state tests |
-| `ArbSideReviewer` attempts/limit → HUMAN | action | `plan/state.go:85 Reject` | `plan` reject-overflow test |
+| `ArbSideReviewer` attempts/limit → HUMAN | action | `plan/state.go:85 Reject` | `plan_test.go TestRejectAttempts`; `invariant_conformance_test.go TestInvariant_EscalationTerminates` |
 | `RecoverLostWork` | action | `plan/state.go:215 RecoverLostWork`; dispatch guards `swarm.go:2788 bounceIfUnreachable`, `:2878 recoverIfLost` | `swarm` recover-lost-work tests |
 | `FinalizeAlreadyMerged` | action | `plan/state.go FinalizeAlreadyMerged`; `swarm.go:2651 finalizeIfAlreadyMerged` (own bee tip, not ambient) | `swarm_test.go TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestry{Remote,LocalSharing}` |
-| `RequestHuman` | action | `plan/state.go RequestHuman` (+ `EscalationReady`) | `plan` human-request test |
-| `LegalTransitionsOnly` | invariant | `plan/state.go:18 CanTransition` (edge table is the single source of truth) | `plan` transition tests |
+| `RequestHuman` | action | `plan/state.go:255 RequestHuman` (+ `EscalationReady`) | `plan_test.go TestRequestHuman` |
+| `LegalTransitionsOnly` | invariant | `plan/state.go:12 transitions` + `:19 CanTransition` (single source of truth) | `invariant_conformance_test.go TestInvariant_LegalTransitionsOnly` (exhaustive 5×5 matrix, independent of the code map) + `TestInvariant_HumanIsTerminalForAgent` |
 | `NoFalseDone` | invariant | `verify.go verifyGate` + `finalizeIfAlreadyMerged`/`recordReviewedCommit` own-tip fix | `TaskStatus_buggy.cfg` proves false-DONE reachable when ungated |
-| `Terminates`, `LostWorkRecovers` | liveness | attempts/limit escalation + `recoverIfLost` dispatch guard | `TaskStatus_fixed.cfg` |
+| `Terminates`, `LostWorkRecovers` | liveness | attempts/limit escalation + `recoverIfLost` dispatch guard | `invariant_conformance_test.go TestInvariant_EscalationTerminates` (deterministic escalation to terminal NEEDS-HUMAN) + `TaskStatus_fixed.cfg` |
 
 **Modeling note (verified against the code, not assumed):** the operator `Resolve`
 edge `NEEDS-HUMAN → TODO` (`plan/state.go Resolve`) does **not** reset `Attempts`.
