@@ -1,0 +1,22 @@
+{{/* plan-items-body (active-state-live-poll): the plan view's live region — the
+   task table whose per-row status/claim/running state changes as the swarm works.
+   Split out of plan_items.html so it can be polled on its own: the page shell
+   wraps a #plan-items div (data-scroll-preserve + hx-ext="morph") that hx-gets
+   /submodule/{name}/plan/body on `load, every 2s` and morph-swaps this fragment
+   in place, and the /plan/body handler serves it through renderConditional so an
+   unchanged table 304s (no re-swap, no viewport jump) instead of re-sending. The
+   full-page plan_items.html invokes this same define, so the table markup (and
+   the tests that assert it) render identically whether polled or served whole. */}}
+{{define "plan-items-body"}}<div class="table-scroll">
+<table>
+<tr><th scope="col">id</th><th scope="col">status</th><th scope="col">desc</th><th scope="col">deps</th><th scope="col">claim</th><th scope="col">change doc</th></tr>
+{{range .Plan.Items}}<tr id="task-{{.ID}}">
+<td><a href="#task-{{.ID}}"><code>{{.ID}}</code></a></td>
+<td><span class="{{.StatusClass}}{{if .Running}} active{{end}}">{{.Status}}</span>{{if .Running}} <a href="{{.SessionHref}}">running</a>{{end}}</td>
+<td>{{if .NotBeforeLabel}}<div class="muted">not before {{.NotBeforeLabel}}</div>{{end}}{{.Desc}}{{if .Body}}<details><summary class="muted">expand</summary><div class="markdown">{{.BodyHTML}}</div></details>{{end}}</td>
+<td>{{range .DepStates}}<span class="badge{{if .Done}} live{{end}}" title="{{if .Done}}satisfied (DONE){{else}}pending{{end}}">{{.Name}}</span> {{else}}<span class="muted">&mdash;</span>{{end}}</td>
+<td>{{if .ClaimState}}<span class="badge{{if .Active}} live{{end}}">{{.ClaimState}}</span> <code>{{.Session}}</code> <span class="ago">{{.HeartbeatLabel}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+<td>{{if .DocHref}}<a href="{{.DocHref}}?from=plan">change doc</a>{{else if .Doc}}<span class="muted">{{.Doc}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
+</tr>{{end}}
+</table>
+</div>{{end}}

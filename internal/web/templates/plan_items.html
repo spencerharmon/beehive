@@ -2,18 +2,19 @@
 {{template "breadcrumb" .Crumbs}}
 <h1>{{.Name}} plan</h1>
 <p class="muted">ROI stamp: <code>{{.Plan.ROIStamp}}</code></p>
-<div class="table-scroll">
-<table>
-<tr><th scope="col">id</th><th scope="col">status</th><th scope="col">desc</th><th scope="col">deps</th><th scope="col">claim</th><th scope="col">change doc</th></tr>
-{{range .Plan.Items}}<tr id="task-{{.ID}}">
-<td><a href="#task-{{.ID}}"><code>{{.ID}}</code></a></td>
-<td><span class="{{.StatusClass}}{{if .Running}} active{{end}}">{{.Status}}</span>{{if .Running}} <a href="{{.SessionHref}}">running</a>{{end}}</td>
-<td>{{if .NotBeforeLabel}}<div class="muted">not before {{.NotBeforeLabel}}</div>{{end}}{{.Desc}}{{if .Body}}<details><summary class="muted">expand</summary><div class="markdown">{{.BodyHTML}}</div></details>{{end}}</td>
-<td>{{range .DepStates}}<span class="badge{{if .Done}} live{{end}}" title="{{if .Done}}satisfied (DONE){{else}}pending{{end}}">{{.Name}}</span> {{else}}<span class="muted">&mdash;</span>{{end}}</td>
-<td>{{if .ClaimState}}<span class="badge{{if .Active}} live{{end}}">{{.ClaimState}}</span> <code>{{.Session}}</code> <span class="ago">{{.HeartbeatLabel}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
-<td>{{if .DocHref}}<a href="{{.DocHref}}?from=plan">change doc</a>{{else if .Doc}}<span class="muted">{{.Doc}}</span>{{else}}<span class="muted">&mdash;</span>{{end}}</td>
-</tr>{{end}}
-</table>
+{{/* active-state-live-poll: the task table auto-refreshes so a status/claim/
+   running change appears without a manual reload. #plan-items polls
+   /submodule/{name}/plan/body (renderConditional → etag/304 no-swap when
+   unchanged) and morph-swaps in place; data-scroll-preserve + the layout's
+   window-scroll restore keep the viewport from jumping on a tick. */}}
+<div id="plan-items"
+     role="region" aria-live="polite" aria-label="plan tasks"
+     data-scroll-preserve
+     hx-ext="morph"
+     hx-get="/submodule/{{.Name}}/plan/body"
+     hx-trigger="load, every 2s"
+     hx-swap="morph:innerHTML">
+{{template "plan-items-body" .}}
 </div>
 <form method="post" action="/submodule/{{.Name}}/plan/delete"
       onsubmit="return confirm('Delete PLAN.md for {{.Name}}? The next honeybee will rebootstrap the plan from ROI.md. In-flight task state is discarded.');">
