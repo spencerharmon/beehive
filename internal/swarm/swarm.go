@@ -2138,8 +2138,13 @@ func (r *Runner) taskYieldedBlocked(sel *selectt.Selection, p *plan.Plan, t *pla
 	}
 	// No unmet dependency held it. A future not_before is the other legitimate
 	// self-defer gate (convergence wait): the selector holds a TODO task until its
-	// not_before elapses, exactly like an unmet dep.
+	// not_before elapses, exactly like an unmet dep — but the wait is BOUNDED. Past
+	// MaxDefers the effect is treated as non-converging and the pass must fail loud
+	// so the next pass escalates to NEEDS-HUMAN instead of deferring forever.
 	if !t.NotBefore.IsZero() && t.NotBefore.After(r.now()) {
+		if t.Defers > plan.MaxDefers {
+			return false, fmt.Errorf("work pass self-deferred task %s past the defer cap (deferred %d times, max %d): its effect has not converged — escalate to NEEDS-HUMAN (`beehive task human`) with the concrete blocker instead of deferring again", t.ID, t.Defers, plan.MaxDefers)
+		}
 		return true, nil
 	}
 	return false, nil

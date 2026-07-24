@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/plan"
 )
@@ -121,4 +122,125 @@ func TestTaskBlockRejectsMissingTarget(t *testing.T) {
 			t.Fatal("task block on a non-existent dep task must error")
 		}
 	})
+}
+
+// task add --check attaches a machine definition of done that round-trips into
+// PLAN.md as a Check: body field.
+func TestTaskAddWithCheck(t *testing.T) {
+	root, _ := newHive(t)
+	writeFileMW(t, root, "submodules/flux/PLAN.md", todoPlan)
+	commitPush(t, root, "seed flux plan")
+	inDir(t, root, func() {
+		c := taskAddCmd()
+		c.SetArgs([]string{"flux", "dod-job",
+			"--body", "Ship the thing.",
+			"--doc", "# dod-job\ndesign\n",
+			"--check", "curl -sf https://x/health"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("task add --check: %v", err)
+		}
+	})
+	p := reparsePlan(t, root, "submodules/flux/PLAN.md")
+	nt := p.Find("dod-job")
+	if nt == nil || nt.Check() != "curl -sf https://x/health" {
+		t.Fatalf("check not attached: %+v", nt)
+	}
+	if !nt.CheckDeclared() {
+		t.Fatal("task must be CheckDeclared")
+	}
+}
+
+// task add --check-none records a justified absence; --check-none with --check is
+// rejected.
+func TestTaskAddCheckNone(t *testing.T) {
+	root, _ := newHive(t)
+	writeFileMW(t, root, "submodules/flux/PLAN.md", todoPlan)
+	commitPush(t, root, "seed flux plan")
+	inDir(t, root, func() {
+		c := taskAddCmd()
+		c.SetArgs([]string{"flux", "doc-only", "--body", "pure doc edit, no DoD",
+			"--doc", "# d\nx\n", "--check-none"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("task add --check-none: %v", err)
+		}
+	})
+	p := reparsePlan(t, root, "submodules/flux/PLAN.md")
+	if nt := p.Find("doc-only"); nt == nil || !nt.CheckNone {
+		t.Fatalf("check=none not recorded: %+v", nt)
+	}
+	inDir(t, root, func() {
+		c := taskAddCmd()
+		c.SetArgs([]string{"flux", "contradiction", "--body", "x", "--doc", "# d\nx\n",
+			"--check", "true", "--check-none"})
+		if err := c.Execute(); err == nil {
+			t.Fatal("--check with --check-none must be rejected")
+		}
+	})
+}
+
+// task defer sets not_before in the future, increments the defer counter, and
+// releases the claim.
+func TestTaskDefer(t *testing.T) {
+	root, origin := newHive(t)
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## conv [TODO] <!-- attempts=0 deps= session=s1 heartbeat=2026-07-01T00:00:00Z -->\nwait for convergence.\n")
+	commitPush(t, root, "seed flux plan")
+	peer := seedRemoteAhead(t, origin)
+	inDir(t, root, func() {
+		c := taskDeferCmd()
+		c.SetArgs([]string{"flux", "conv", "--until", "30m", "--reason", "gitops not reconciled yet"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("task defer: %v", err)
+		}
+	})
+	assertHealedAndPushed(t, root, origin, peer, "plan: defer conv")
+	nt := reparsePlan(t, root, "submodules/flux/PLAN.md").Find("conv")
+	if nt == nil || nt.NotBefore.IsZero() || !nt.NotBefore.After(time.Now()) {
+		t.Fatalf("not_before not set in the future: %+v", nt)
+	}
+	if nt.Defers != 1 {
+		t.Fatalf("defer counter = %d, want 1", nt.Defers)
+	}
+	if nt.Session != "" || !nt.Heartbeat.IsZero() {
+		t.Fatalf("claim not released: %+v", nt)
+	}
+}
+
+// task check runs a task's Check: command and reflects its exit status.
+func TestTaskCheckRunsCommand(t *testing.T) {
+	root, _ := newHive(t)
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## ok [TODO] <!-- attempts=0 deps= -->\nx\nCheck: true\n\n## bad [TODO] <!-- attempts=0 deps= -->\nx\nCheck: false\n\n## none [TODO] <!-- attempts=0 deps= check=none -->\nx\n")
+	commitPush(t, root, "seed flux plan")
+	inDir(t, root, func() {
+		if err := runTaskCheck(t, "flux", "ok"); err != nil {
+			t.Fatalf("check ok must pass: %v", err)
+		}
+		if err := runTaskCheck(t, "flux", "bad"); err == nil {
+			t.Fatal("check bad must fail")
+		}
+		if err := runTaskCheck(t, "flux", "none"); err == nil {
+			t.Fatal("check on a check=none task must error (nothing to run)")
+		}
+	})
+}
+
+func runTaskCheck(t *testing.T, sm, id string) error {
+	t.Helper()
+	c := taskCheckCmd()
+	c.SetArgs([]string{sm, id})
+	return c.Execute()
+}
+
+func reparsePlan(t *testing.T, root, rel string) *plan.Plan {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(root, rel))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("reparse %s: %v", rel, err)
+	}
+	return p
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // idRe validates a task id / a dep's task part: the token that appears after
@@ -94,6 +95,59 @@ func (t *Task) AddDep(dep string) (bool, error) {
 	}
 	t.Deps = append(t.Deps, dep)
 	return true, nil
+}
+
+// SetCheck appends a `Check:` body field carrying the task's definition-of-done
+// command (its exit 0 is the machine DoD the runner's handoff gate enforces on
+// entering DONE). Errors if the task already declared `check=none` (mutually
+// exclusive) or already carries a Check. Used by `beehive task add --check`.
+func (t *Task) SetCheck(cmd string) error {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return fmt.Errorf("plan: empty check command")
+	}
+	if t.CheckNone {
+		return fmt.Errorf("plan: task %s cannot carry both a Check and check=none", t.ID)
+	}
+	if s, _ := t.bodyFieldSpan(checkPrefix); s != -1 {
+		return fmt.Errorf("plan: task %s already has a Check", t.ID)
+	}
+	t.Body = append(t.Body, checkPrefix+" "+cmd)
+	return nil
+}
+
+// SetVerifyAfterMerge appends a `Verify-After-Merge:` body field carrying the
+// task's post-merge DoD command. Its presence marks the task's effect merge-gated
+// (verified by a runner-spawned successor check task, not in the work session).
+// Used by `beehive task add --verify-after-merge`.
+func (t *Task) SetVerifyAfterMerge(cmd string) error {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return fmt.Errorf("plan: empty verify-after-merge command")
+	}
+	if s, _ := t.bodyFieldSpan(verifyAfterMergePrefix); s != -1 {
+		return fmt.Errorf("plan: task %s already has a Verify-After-Merge", t.ID)
+	}
+	t.Body = append(t.Body, verifyAfterMergePrefix+" "+cmd)
+	return nil
+}
+
+// Defer records a convergence-wait self-defer: it sets not_before to until (the
+// wall-clock the task becomes selectable again) and increments the defer counter
+// that MaxDefers bounds. It is the mutation behind `beehive task defer` and the
+// runner's own re-check scheduling: "did the work, the world has not converged,
+// re-check after `until`." Errors on a zero/past `until` (a defer must move the
+// gate into the future). The task stays TODO; the caller releases its claim.
+func (t *Task) Defer(until, now time.Time) error {
+	if until.IsZero() || !until.After(now) {
+		return fmt.Errorf("plan: defer until %s is not in the future (now %s)", until.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+	}
+	if t.Status != StatusTODO {
+		return fmt.Errorf("plan: only a TODO task may be deferred; %s is %s", t.ID, t.Status)
+	}
+	t.NotBefore = until
+	t.Defers++
+	return nil
 }
 
 // Blocked reports whether a TODO task is currently held OUT of selection by an

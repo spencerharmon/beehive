@@ -178,8 +178,22 @@ type Task struct {
 	// adjacent body prose (review-enforced). Serialized as `check=none` in the
 	// header comment. See docs/dod-verification-spec.md.
 	CheckNone bool
-	Body      []string // body lines verbatim, without trailing blank
+	// Defers counts how many times this task has been self-deferred (TODO->TODO
+	// with a bumped not_before) — the convergence-wait bound. Each `beehive task
+	// defer` / runner self-defer increments it; past MaxDefers the wait is treated
+	// as non-converging and must escalate to NEEDS-HUMAN rather than defer again, so
+	// a task whose effect never settles cannot spin forever. Serialized as
+	// `defers=N` in the header comment (omitted when zero).
+	Defers int
+	Body   []string // body lines verbatim, without trailing blank
 }
+
+// MaxDefers bounds the convergence-wait self-defer loop: a task deferred more than
+// this many times is treated as non-converging and must escalate to NEEDS-HUMAN
+// instead of deferring again (docs/dod-verification-spec.md). Chosen generously so
+// legitimate slow reconciles (GitOps, image builds, cache TTLs) finish well within
+// it while a genuinely stuck wait still terminates.
+const MaxDefers = 12
 
 // Plan is a parsed PLAN.md.
 type Plan struct {
@@ -304,6 +318,12 @@ func parseHeader(m []string) (*Task, error) {
 				return nil, fmt.Errorf("plan: bad check=%q for %s (the only valid header value is `check=none`; a real check command goes in the `Check:` body field)", v, t.ID)
 			}
 			t.CheckNone = true
+		case "defers":
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("plan: bad defers %q for %s", v, t.ID)
+			}
+			t.Defers = n
 		case "category":
 			// Stored verbatim; validity is enforced at the write/completion
 			// boundary (RequestHuman, the CLI, the runner completion checks), not
@@ -386,6 +406,9 @@ func (t *Task) header() string {
 	}
 	if t.CheckNone {
 		meta += " check=none"
+	}
+	if t.Defers > 0 {
+		meta += fmt.Sprintf(" defers=%d", t.Defers)
 	}
 	return fmt.Sprintf("## %s [%s] <!-- %s -->", t.ID, t.Status, meta)
 }

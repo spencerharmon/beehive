@@ -768,3 +768,67 @@ func TestDanglingDeps(t *testing.T) {
 		t.Fatalf("c's cross-submodule dep is resolved elsewhere, not by DanglingDeps")
 	}
 }
+
+// TestDeferRoundTrip: Defer sets a future not_before, increments the bounded
+// counter, and both survive serialize->parse; a zero/past target and a non-TODO
+// task are rejected.
+func TestDeferRoundTrip(t *testing.T) {
+	now := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	tk, err := NewTask("t1", nil, 1, []string{"body"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := now.Add(30 * time.Minute)
+	if err := tk.Defer(until, now); err != nil {
+		t.Fatalf("defer: %v", err)
+	}
+	if tk.Defers != 1 || !tk.NotBefore.Equal(until) {
+		t.Fatalf("defer state wrong: defers=%d notBefore=%s", tk.Defers, tk.NotBefore)
+	}
+	if err := tk.Defer(now.Add(-time.Minute), now); err == nil {
+		t.Fatal("a past defer target must be rejected")
+	}
+	p := &Plan{Tasks: []*Task{tk}}
+	rp, err := Parse(p.String())
+	if err != nil {
+		t.Fatalf("reparse: %v", err)
+	}
+	got := rp.Task("t1")
+	if got.Defers != 1 || !got.NotBefore.Equal(until) {
+		t.Fatalf("defers/not_before lost in round-trip: %+v", got)
+	}
+	// A non-TODO task cannot be deferred.
+	got.Status = NeedsReview
+	if err := got.Defer(until, now); err == nil {
+		t.Fatal("deferring a non-TODO task must be rejected")
+	}
+}
+
+// TestSetCheckMutualExclusion: SetCheck refuses a check=none task and refuses a
+// second check; SetVerifyAfterMerge refuses a duplicate.
+func TestSetCheckMutualExclusion(t *testing.T) {
+	tk, _ := NewTask("t1", nil, 1, []string{"body"})
+	if err := tk.SetCheck("a"); err != nil {
+		t.Fatalf("first SetCheck: %v", err)
+	}
+	if err := tk.SetCheck("b"); err == nil {
+		t.Fatal("a second SetCheck must be rejected")
+	}
+	if tk.Check() != "a" {
+		t.Fatalf("check clobbered: %q", tk.Check())
+	}
+	none, _ := NewTask("t2", nil, 1, []string{"body"})
+	none.CheckNone = true
+	if err := none.SetCheck("x"); err == nil {
+		t.Fatal("SetCheck on a check=none task must be rejected")
+	}
+	if err := tk.SetVerifyAfterMerge("v"); err != nil {
+		t.Fatalf("SetVerifyAfterMerge: %v", err)
+	}
+	if err := tk.SetVerifyAfterMerge("v2"); err == nil {
+		t.Fatal("a second SetVerifyAfterMerge must be rejected")
+	}
+	if tk.Check() != "a" || tk.VerifyAfterMerge() != "v" {
+		t.Fatalf("fields wrong after both set: check=%q vam=%q", tk.Check(), tk.VerifyAfterMerge())
+	}
+}

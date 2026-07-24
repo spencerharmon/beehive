@@ -132,14 +132,44 @@ or a near-duplicate on origin as a reason to stop, re-plan, force-push, or escal
 ## Status transitions (exhaustive)
 You perform the status edit; the runner manages session/heartbeat and the merge to main. The only
 legal edges, each owned by exactly one kind:
-- `TODO → NEEDS-REVIEW` — work finished, awaits review.
-- `NEEDS-REVIEW → DONE` — review approved.
+- `TODO → NEEDS-REVIEW` — work finished, awaits review. **This is the ONLY forward terminal a WORK pass
+  may set. `TODO → DONE` is FORBIDDEN — a work pass may never mark its own task DONE** (that is self-
+  approval, and it is the exact door the jellyfin false-DONE walked through). DONE is entered only by a
+  reviewer/arbiter, below.
+- `TODO → TODO` (self-defer) — the work is applied but the world has not CONVERGED yet (a running effect
+  you cannot yet observe live). Leave the task TODO with a future `not_before` and a SHORT change doc
+  saying why; the selector re-dispatches it after `not_before`. Use `beehive task defer <sm> <id> --until
+  <t> --reason ...`. Bounded: past the defer cap it must escalate to NEEDS-HUMAN, not defer again. (This
+  is the passive-convergence case only — see "Deployed ≠ loaded": if a bounded ACTION of yours produces
+  the effect, do it now, do not defer.)
+- `NEEDS-REVIEW → DONE` — review approved. **Gated on the task's definition of done:** the runner runs the
+  task's `Check:` command when it enters DONE and REFUSES the flip unless it exits 0 (or the task declared
+  `check=none`). See "Definition of done" below.
 - `NEEDS-REVIEW → NEEDS-ARBITRATION` — review rejected.
-- `NEEDS-ARBITRATION → DONE` — arbiter sided with the implementer.
+- `NEEDS-ARBITRATION → DONE` — arbiter sided with the implementer (same DONE check gate applies).
 - `NEEDS-ARBITRATION → TODO` — arbiter sided with the reviewer; rework.
 - any working status `→ NEEDS-HUMAN` — a concrete operator blocker, set only via `beehive task human`
   (never hand-write the status; it requires a `--category` + `--reason`, see Steps §4). Exact string `NEEDS-HUMAN`.
 A reconcile pass rewrites `PLAN.md` wholesale rather than moving one task; see its section.
+
+## Definition of done (the `Check:` contract)
+Every task carries a machine-checkable definition of done, so "DONE" means reality agrees — not that a
+plausible diff merged. It is a task-body field, and the runner ENFORCES it (prompts only remind):
+- **`Check:` <command>** — the DoD. Its exit 0 IS "done." The runner runs it on entry to DONE and refuses
+  DONE if it fails. Write a check that asserts the REAL effect (curl the endpoint and grep the expected
+  body, `kubectl rollout status`, pull the image by digest) — never one that passes on a 404 or greps the
+  wrong string. Run it yourself any time with `beehive task check <sm> <id>`.
+- **`Verify-After-Merge:` <command>** — a DoD whose effect only exists AFTER the merge (GitOps and
+  anything the reviewer lands). You cannot run it in-session (the merge does not exist yet at
+  NEEDS-REVIEW); its live effect is verified by a SEPARATE successor CHECK task — a normal task carrying
+  this command as its `Check:`, filed against the merged result and gated to run post-merge. Use
+  `Verify-After-Merge:` to record that merge-gated DoD on the originating task.
+- **`check=none`** (header token) — an explicit, justified declaration that the task has NO machine check
+  (a pure doc/refactor with no observable effect). Justify it in the body prose; a reviewer judges the
+  justification. It is mutually exclusive with `Check:`. Silent absence is a defect `beehive plan lint`
+  flags — declare one or the other.
+When you FILE a task (`beehive task add`), give it its check: `--check '<cmd>'`,
+`--verify-after-merge '<cmd>'`, or `--check-none`.
 
 ## Reconcile task
 `ROI.md` changed since `PLAN.md`'s `<!-- Beehive-ROI: <sha> -->` stamp. Your Context carries the diff
@@ -148,6 +178,12 @@ range.
   while in flight → `NEEDS-REVIEW` with a doc, not a silent delete.
 - Add design docs for new tasks, tag dependencies, and reweight tasks if the priority order moved
   (`beehive help` for the weighting scale).
+- **Give every task a definition of done.** Lower the ROI's success criteria into each task's machine
+  check: a `Check:` command that asserts the task's real effect (`--check` on `beehive task add`), a
+  `Verify-After-Merge:` for a merge-gated effect, or an explicit `check=none` for a task with no
+  observable effect (a pure doc/refactor) justified in its body. You TRANSLATE the operator's stated
+  success criteria into an executable check — you do not invent a definition of done the ROI never asked
+  for. Run `beehive plan lint <sm>` after: it reports tasks left without a check so coverage is visible.
 - **Cross-submodule needs — author the real task in the OTHER submodule, never a placeholder.** If new
   intent means a task here needs work owned by another submodule, do NOT fake it with a local
   bare/sentinel dep. Create that work as a real task in the other submodule's `PLAN.md` (with its design
@@ -182,7 +218,9 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
      cross-submodule one; the command registers the authorizing submodule link if missing and REJECTS a
      dep that would form a wait cycle) and releases your claim.
   That leaves your task `TODO`-and-blocked: the selector holds it until the prerequisite is DONE, and
-  your pass COMPLETES as a clean yield (no doc needed for the yield — the FILED task carries its own).
+  your pass COMPLETES as a clean yield. **Write a SHORT change doc for the yield** (its exact path, as
+  below) saying which prerequisite you filed and why you yielded — the runner requires the doc on a yield
+  just like any other completion; the FILED task carries its OWN separate doc.
   Only escalate `contradiction` when two intents genuinely OPPOSE and you cannot tell which is
   authoritative — never merely because a prerequisite is absent.
 - **A dependency looks `DONE` but its effect is absent → read it, then defer OR file — never escalate.**
@@ -251,7 +289,8 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
 - **Every terminal handoff runs the SAME deterministic protocol gate — Work, Review, and Arbitrate
   alike.** Before the runner accepts your flip as done (Work→{NEEDS-REVIEW,NEEDS-ARBITRATION,DONE},
   Review→{DONE,NEEDS-ARBITRATION}, Arbitrate→{DONE,TODO}; a `NEEDS-HUMAN` escalation is never gated) it
-  verifies FOUR committed-artifact invariants, all protocol (never correctness):
+  verifies FIVE invariants — four committed-artifact (protocol, never correctness) plus the definition-of-
+  done check:
   1. **Clean submodule checkout** — `git status --porcelain` in the checkout you touched (your code
      worktree for Work; `submodules/<sm>/repo` for a Review/Arbitrate that merged a bee-branch) is empty.
      Any uncommitted change (modified OR untracked) means work you never committed, which the merge drops.
@@ -270,6 +309,12 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
      code and push `bee-<taskid>` to the submodule origin — THEN record its sha(s) in the tag and commit
      the PLAN flip + doc. A tag naming a commit that does not exist (a phantom/bad-object stamp) is
      REFUSED with the requirement to create the commit or correct the tag.
+  5. **Definition-of-done check PASSES (on entry to DONE only)** — when the accepted flip ENTERS DONE
+     (`NEEDS-REVIEW→DONE`, `NEEDS-ARBITRATION→DONE`), the runner runs the task's `Check:` command and
+     REFUSES the DONE unless it exits 0. A task that declared `check=none` is exempt (the absence was
+     justified). A check that cannot even be run (infra failure) fails closed. This is why a reviewer
+     must actually RUN the check before approving (see Review task): approving a check that passes on a
+     404 is the empty-checksum disease one layer down.
   Any failing invariant REFUSES the handoff and hands you back the ONE thing to fix, same session — leave
   the status as-is and commit forward. "I wrote the files" is not "I committed the files": a task is not
   done until the code diff is a real pushed commit, and the PLAN flip + doc (with a truthful `commits=`
@@ -292,7 +337,11 @@ the runner already verified reachability before dispatching you.
 - APPROVE only when the change doc CARRIES the evidence: an automated regression test (command +
   passing result) for any behavioral change, and a live-effect confirmation for a deploy/service/
   migration task. No evidence in the doc ⇒ you cannot verify "done" ⇒ REJECT (do not approve on a
-  plausible-looking diff). When satisfied, merge `bee-<taskid>` into the submodule's tracked branch on
+  plausible-looking diff). **RUN the task's definition-of-done check yourself** — `beehive task check
+  <sm> <taskid>` — and confirm it both PASSES and asserts the REAL effect (not a check that passes on a
+  404, greps the wrong string, or hits the wrong host); a weak or lying check is a rejection just like a
+  missing one, and an unjustified `check=none` on a task that HAS an observable effect is a rejection.
+  When satisfied, merge `bee-<taskid>` into the submodule's tracked branch on
   its origin, `NEEDS-REVIEW → DONE`, unlock dependents. Commit. Do NOT touch the submodule pointer — the
   runner pins it to the tracked-branch tip.
 - REJECT: `NEEDS-REVIEW → NEEDS-ARBITRATION` plus a rejection doc at
@@ -317,8 +366,9 @@ Done when the task leaves `NEEDS-ARBITRATION`.
 3. **Dependents.** On any `→ DONE`, unlock linked dependents (same plan or a linked submodule).
 4. **Plan/doc/infra.** Ensure the change doc exists at its exact path and `PLAN.md`, `ARTIFACTS.md`,
    `INFRASTRUCTURE.md` are current. After editing a `PLAN.md`, confirm it still parses with
-   `beehive plan validate <sm>` (parses + round-trips the whole plan) — do NOT hunt for a
-   `plan check`/`plan lint`/`task list` subcommand (they do not exist). **Human escalation is a
+   `beehive plan validate <sm>` (parses + round-trips the whole plan) and check DoD/dep hygiene with
+   `beehive plan lint <sm>` (reports tasks missing a check, dangling deps, defer-cap breaches) — do NOT
+   hunt for a `plan check`/`task list` subcommand (those do not exist). **Human escalation is a
    narrow channel, NOT a work queue for the operator** — it is only for what the swarm genuinely
    cannot do for itself. Before escalating, apply the boundary gate: **if some action within your
    authority (in-cluster kubectl, restarting/scaling a workload, clearing a cache, a reversible

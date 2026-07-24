@@ -16,7 +16,85 @@ func planCmd() *cobra.Command {
 	c := &cobra.Command{Use: "plan", Short: "manage PLAN.md"}
 	c.AddCommand(planArchiveCmd())
 	c.AddCommand(planValidateCmd())
+	c.AddCommand(planLintCmd())
 	return c
+}
+
+// planLintCmd reports definition-of-done and dependency hygiene for a submodule's
+// PLAN.md: open (non-DONE) tasks that declared neither a Check nor check=none;
+// dangling local dependencies (a dep naming no task in the plan — the class that
+// wedged the jellyfin repin task); and self-defer counters at or past the
+// MaxDefers bound. It is the deterministic replacement for a "periodic efficacy-
+// evaluation pass": coverage and rot are a command away, not a swarm session.
+// Read-only. Exits non-zero when any issue is found so a hook / CI can gate on it.
+// See docs/dod-verification-spec.md.
+func planLintCmd() *cobra.Command {
+	var strict bool
+	cmd := &cobra.Command{
+		Use:   "lint <submodule>",
+		Short: "report missing DoD checks, dangling deps, and defer-cap breaches in a PLAN.md",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			subName, err := taskSubmoduleName(args[0])
+			if err != nil {
+				return err
+			}
+			planRel := filepath.Join("submodules", subName, repo.PlanFile)
+			b, err := os.ReadFile(filepath.Join(root, planRel))
+			if err != nil {
+				return err
+			}
+			p, err := plan.Parse(string(b))
+			if err != nil {
+				return fmt.Errorf("plan lint: %s does NOT parse: %w", planRel, err)
+			}
+			var issues []string
+			// Dangling local deps — always an error (any writer).
+			for id, deps := range p.DanglingDeps() {
+				issues = append(issues, fmt.Sprintf("task %s: dangling dependency %s (names no task in this plan)", id, strings.Join(deps, ",")))
+			}
+			// Defer-cap breaches — a non-converging wait that should have escalated.
+			for _, t := range p.Tasks {
+				if t.Defers > plan.MaxDefers {
+					issues = append(issues, fmt.Sprintf("task %s: deferred %d times (max %d) — escalate to NEEDS-HUMAN, do not defer again", t.ID, t.Defers, plan.MaxDefers))
+				}
+			}
+			// Missing DoD declaration on open tasks. Grandfather DONE history (do not
+			// retro-gate). This is the backlog the migration surfaces as coverage climbs;
+			// a warning by default, an error only with --strict.
+			var missing []string
+			for _, t := range p.Tasks {
+				if t.Status == plan.Done {
+					continue
+				}
+				if !t.CheckDeclared() {
+					missing = append(missing, t.ID)
+				}
+			}
+			if len(missing) > 0 {
+				msg := fmt.Sprintf("%d open task(s) declare neither a Check: nor check=none: %s", len(missing), strings.Join(missing, ", "))
+				if strict {
+					issues = append(issues, msg)
+				} else {
+					fmt.Fprintf(os.Stderr, "beehive: WARNING %s\n", msg)
+				}
+			}
+			if len(issues) > 0 {
+				for _, is := range issues {
+					fmt.Fprintf(os.Stderr, "beehive: %s: %s\n", planRel, is)
+				}
+				return fmt.Errorf("plan lint: %d issue(s) in %s", len(issues), planRel)
+			}
+			fmt.Printf("beehive: %s DoD/dep hygiene OK\n", planRel)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&strict, "strict", false, "treat open tasks missing a DoD declaration as errors (default: warn)")
+	return cmd
 }
 
 // planValidateCmd parses a submodule's PLAN.md and reports whether it is

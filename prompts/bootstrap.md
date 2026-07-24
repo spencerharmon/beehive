@@ -12,6 +12,11 @@ Submodule has ROI.md, no PLAN.md. Bootstrap PLAN.md from intent.
   PLAN.md (with its design doc under that submodule's docs/), register the link
   (`beehive submodule link <this> <other>`), and depend on it as `deps=<other-sm>:<taskid>`.
 - Status each new task TODO. Add a terse design doc per non-trivial task under docs/.
+- **Give every task a definition of done.** Lower the ROI's success criteria into a machine check per
+  task: `beehive task add <sm> <id> --check '<cmd>'` (exit 0 asserts the task's REAL effect),
+  `--verify-after-merge '<cmd>'` for a merge-gated effect, or `--check-none` (justified in the body) for
+  a task with no observable effect. The runner GATES DONE on it. Run `beehive plan lint <sm>` to confirm
+  coverage. Translate the operator's stated criteria; do not invent a DoD the ROI never asked for.
 - **Weight each task on a logarithmic (base-2) priority scale (see "Weighting").**
 
 ## Weighting (logarithmic, base-2)

@@ -1,6 +1,6 @@
 # Definition-of-Done verification: the check contract
 
-Status: **specified; implementation in progress** (see "Rollout" for what has landed).
+Status: **specified; core landed** (see "Rollout" for what has landed vs planned).
 
 ## Motivation
 
@@ -111,6 +111,7 @@ gate-refused, per surface).
 2. **Post-select context injection** *(planned)*: the runner runs the task's
    `Check` once at pass start and injects the result (exit + output tail) into the
    agent brief, so the agent starts from ground truth instead of re-deriving state.
+   *(Env-coupled — see "Environment coupling"; deferred with the sandbox decision.)*
 3. **DONE gate** (in `verifyGate`, invariant 5): when the accepted terminal
    handoff **enters DONE**, the runner runs `Check` via the `runVerify` seam. Pass
    (exit 0) → DONE stands. Non-zero → the handoff is refused and the agent gets a
@@ -129,13 +130,18 @@ gate-refused, per surface).
      blocking dep is a **real, existing** task that is simply not-yet-DONE; a
      phantom dep makes the yield invalid and the pass fails loudly rather than
      silently spinning to idle-timeout.
-6. **Self-defer** *(planned)*: `taskYieldedBlocked` also accepts "TODO gated by a
-   future `not_before`" as a legitimate yield (bounded by a defer count / max
-   convergence window → NEEDS-HUMAN past the bound). The `beehive task defer` verb
-   is its sanctioned atomic form.
-7. **Successor spawn** *(planned)*: on merge of a task carrying `Verify-After-
-   Merge`, the runner creates the successor check task (deterministic; the
-   honeybee never has to remember to file its own DoD).
+6. **Self-defer**: `taskYieldedBlocked` accepts "TODO gated by a future
+   `not_before`" as a legitimate yield, bounded by a defer count (`defers=N`
+   header token) against `plan.MaxDefers` — past the bound the yield fails loudly so
+   the next pass escalates to NEEDS-HUMAN rather than deferring forever. The
+   `beehive task defer` verb is its sanctioned atomic form.
+7. **Successor spawn** *(planned; authorship pending operator decision)*: a task
+   carrying `Verify-After-Merge` has a merge-gated DoD verified by a separate
+   successor CHECK task (a normal task whose `Check:` is that command, gated
+   post-merge). Whether the runner AUTO-spawns it at merge (preferred — cannot be
+   forgotten) or the approving reviewer/reconcile FILES it (`beehive task add
+   --check`, works today) is the open decision below; until it is ruled, the field
+   RECORDS the merge-gated DoD and a successor check task is filed explicitly.
 
 ## Merge ordering and blue/green
 
@@ -156,16 +162,21 @@ that check — promotes it. Any strategy with a staging surface generalizes the
 same way; without one, the check is a post-cutover gate whose failure branch is a
 rollback task.
 
-## CLI surface *(planned)*
+## CLI surface
 
-- `beehive task add --check '<cmd>' [--verify-after-merge '<cmd>'] [--not-before <t>]`
+*(Landed)*
+
+- `beehive task add --check '<cmd>' [--verify-after-merge '<cmd>'] [--check-none] [--not-before <t>]`
+  — attach a definition of done (or a justified absence) when filing a task.
 - `beehive task defer <sm> <id> --until <t> [--reason ...]` — the sanctioned
-  atomic self-defer transition.
-- `beehive task check <sm> <id>` — run a task's check ad hoc (author/debug; let a
-  reviewer run it without a full pass).
-- `beehive plan lint <sm>` — report tasks missing a check where `check=none` is
-  not declared, dangling deps, and stale `not_before` / defer-cap breaches. The
-  deterministic replacement for "a periodic efficacy-evaluation pass".
+  atomic convergence-wait self-defer (sets `not_before`, increments the bounded
+  `defers` counter, releases the claim). `<t>` is RFC3339 or a duration (`30m`, `2h`).
+- `beehive task check <sm> <id>` — run a task's `Check:` ad hoc (author/debug; let a
+  reviewer run it without a full pass). Read-only; exits non-zero on failure.
+- `beehive plan lint <sm>` — report tasks missing a check where `check=none` is not
+  declared (warn; `--strict` to error), dangling local deps (error), and defer-cap
+  breaches (error). The deterministic replacement for a "periodic efficacy-
+  evaluation pass".
 
 ## Review contract
 
@@ -197,14 +208,31 @@ history). A reconcile pass backfills `Check:` / `check=none` onto open tasks;
 ## Rollout
 
 - **Landed:** the state-transition model above; schema fields (`Check`,
-  `VerifyAfterMerge`, `CheckNone`) with parse/serialize/validate; disallow
-  `TODO → DONE`; the DONE check gate in `verifyGate`; dangling-dep refusal
-  (`Plan.DanglingDeps` + yield-completion existence check); doc-required-on-yield.
+  `VerifyAfterMerge`, `CheckNone`, `defers`) with parse/serialize/validate;
+  disallow `TODO → DONE`; the DONE check gate in `verifyGate`; dangling-dep refusal
+  (`Plan.DanglingDeps` + yield-completion existence check); doc-required-on-yield;
+  `not_before` self-defer acceptance in the yield branch + defer-cap (`MaxDefers`);
+  the CLI verbs (`task add --check/--verify-after-merge/--check-none/--not-before`,
+  `task defer`, `task check`, `plan lint`); the generated-prompt edits
+  (HONEYBEE / review / reconcile / bootstrap) that teach the contract.
 - **Planned (sequenced follow-ups, tracked in PLAN.md):** post-select check
-  context injection; `not_before` self-defer acceptance in the yield branch +
-  defer-cap; successor check-task spawn on merge; CLI verbs (`--check`,
-  `--verify-after-merge`, `defer`, `check`, `plan lint`); the generated-prompt
-  edits (HONEYBEE / review / bootstrap / reconcile) that teach the contract.
+  context injection (env-coupled, deferred with the sandbox decision); runner
+  AUTO-spawn of the `Verify-After-Merge` successor check task (vs the
+  file-it-explicitly path that works today) — pending the authorship decision below.
+
+## Open decisions (operator to rule)
+
+- **Successor authorship** — runner AUTO-spawns the `Verify-After-Merge` successor
+  check task at merge (deterministic, cannot be forgotten, but couples the merge
+  path to plan mutation) vs the approving reviewer/reconcile FILES it (`beehive
+  task add --check`, simpler, works today, relies on the agent). Lean: runner-auto.
+- **Review-ran-check as a hard completion predicate** — make "the reviewer recorded
+  the check's live result in the review doc" a runner-checked review-completion
+  predicate, so a reviewer cannot approve a check they never executed.
+- **Probe sandbox** — which read-only verbs + which credentials a `Check:` may use
+  when the runner runs it against the live environment (the DONE gate and the
+  planned pass-start injection both execute task-authored commands). Lives with
+  LOCALS/ROI per install.
 
 ## Enforcement-point map (keep current)
 
@@ -216,3 +244,6 @@ history). A reconcile pass backfills `Check:` / `check=none` onto open tasks;
 | no dangling dep (yield) | yield-completion | `taskYieldedBlocked` |
 | yield ships a doc | completion predicate | `workChecklist` |
 | check / verify_after_merge / check=none schema | parse / serialize | `internal/plan/plan.go` |
+| convergence-wait self-defer + bound | yield-completion + counter | `taskYieldedBlocked`, `plan.MaxDefers`, `Task.Defer` |
+| DoD/dep hygiene surfaced deterministically | CLI | `beehive plan lint` (`cmd/beehive/cmd_plan.go`) |
+| author a task's DoD | CLI | `beehive task add --check/--verify-after-merge/--check-none`, `beehive task defer`, `beehive task check` (`cmd/beehive/cmd_task.go`) |

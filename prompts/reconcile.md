@@ -8,6 +8,13 @@ You are given the diff of ROI.md from the last-reconciled commit to HEAD (ROI.md
 - Read the diff. Update PLAN.md: add/modify/remove/retire tasks so the plan matches new intent.
 - Preserve in-flight task status; retiring a task in flight -> NEEDS-REVIEW with a doc, not silent delete.
 - Add design docs for new tasks. Tag dependencies. Rightsize for one context window.
+- **Give every task a definition of done.** Lower the ROI's success criteria into each task's machine
+  check: `beehive task add <sm> <id> --check '<cmd>'` (a command whose exit 0 asserts the task's REAL
+  effect — curl+grep the endpoint, `kubectl rollout status`, pull the image by digest),
+  `--verify-after-merge '<cmd>'` for an effect that only exists after merge, or `--check-none` (justified
+  in the body) for a task with no observable effect. The runner GATES DONE on this check. Translate the
+  operator's stated criteria into an executable check; do not invent a DoD the ROI never asked for. Run
+  `beehive plan lint <sm>` to see which tasks still lack one.
 - Cross-submodule dependencies are REAL tasks, never placeholders:
   - A dep is LOCAL (bare id -> a task in THIS PLAN.md) or CROSS-SUBMODULE (qualified `<other-sm>:<taskid>`,
     authorized by a registered link, satisfied only when that task is DONE). A bare dep naming no local

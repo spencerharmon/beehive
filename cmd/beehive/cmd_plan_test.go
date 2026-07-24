@@ -179,3 +179,53 @@ func TestPlanValidateCommand(t *testing.T) {
 		t.Fatalf("validate malformed plan: got nil error, want a parse failure")
 	}
 }
+
+// plan lint fails on a dangling local dep and on a defer-cap breach, warns (does
+// not fail) on open tasks missing a DoD declaration by default, and errors on
+// them with --strict.
+func TestPlanLint(t *testing.T) {
+	root, _ := newHive(t)
+	// Clean plan: a task with a Check and one with check=none — no issues.
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## a [TODO] <!-- attempts=0 deps= -->\nx\nCheck: true\n\n## b [DONE] <!-- attempts=0 deps= check=none -->\nx\n")
+	commitPush(t, root, "seed clean plan")
+	inDir(t, root, func() {
+		if err := runPlanLint(t, "flux", false); err != nil {
+			t.Fatalf("clean plan must lint OK: %v", err)
+		}
+	})
+
+	// Dangling dep + defer-cap breach → hard errors regardless of --strict.
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## a [TODO] <!-- attempts=0 deps=ghost -->\nx\nCheck: true\n\n## b [TODO] <!-- attempts=0 deps= defers=99 -->\nx\nCheck: true\n")
+	commitPush(t, root, "seed broken plan")
+	inDir(t, root, func() {
+		if err := runPlanLint(t, "flux", false); err == nil {
+			t.Fatal("dangling dep + defer-cap breach must fail lint")
+		}
+	})
+
+	// Open task missing a DoD declaration: warn by default, error with --strict.
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## a [TODO] <!-- attempts=0 deps= -->\nno check declared\n")
+	commitPush(t, root, "seed undeclared plan")
+	inDir(t, root, func() {
+		if err := runPlanLint(t, "flux", false); err != nil {
+			t.Fatalf("missing DoD must only WARN by default: %v", err)
+		}
+		if err := runPlanLint(t, "flux", true); err == nil {
+			t.Fatal("missing DoD must ERROR with --strict")
+		}
+	})
+}
+
+func runPlanLint(t *testing.T, sm string, strict bool) error {
+	t.Helper()
+	c := planLintCmd()
+	args := []string{sm}
+	if strict {
+		args = append(args, "--strict")
+	}
+	c.SetArgs(args)
+	return c.Execute()
+}

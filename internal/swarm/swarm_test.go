@@ -4979,3 +4979,28 @@ func TestWorkYieldOnPhantomDepFailsLoud(t *testing.T) {
 		t.Fatalf("the error must name the dangling dependency, got: %v", err)
 	}
 }
+
+// TestWorkSelfDeferPastCapFailsLoud: a convergence-wait self-defer is bounded — a
+// work pass that leaves its task TODO with a future not_before but a defer counter
+// past plan.MaxDefers must FAIL LOUD (escalate to NEEDS-HUMAN), not silently yield
+// forever. Below the cap the same shape is a legitimate yield.
+func TestWorkSelfDeferPastCapFailsLoud(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t)
+	_ = sm
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= not_before="+future+" defers=99 -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, TTL: time.Hour}
+	_, err := r.Run(ctx, sel, "sys", "first")
+	if err == nil {
+		t.Fatalf("a self-defer past the defer cap must fail loud, not yield")
+	}
+	if !strings.Contains(err.Error(), "defer cap") {
+		t.Fatalf("error must name the defer cap, got: %v", err)
+	}
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -21,6 +22,8 @@ func taskCmd() *cobra.Command {
 	c.AddCommand(taskHumanCmd())
 	c.AddCommand(taskAddCmd())
 	c.AddCommand(taskBlockCmd())
+	c.AddCommand(taskCheckCmd())
+	c.AddCommand(taskDeferCmd())
 	return c
 }
 
@@ -146,6 +149,8 @@ func humanReason(reason, reasonFile string) (string, error) {
 // its own task at the new one with `beehive task block`.
 func taskAddCmd() *cobra.Command {
 	var body, bodyFile, doc, docFile, deps string
+	var check, verifyAfterMerge, notBefore string
+	var checkNone bool
 	var weight int
 	cmd := &cobra.Command{
 		Use:   "add <submodule> <task-id>",
@@ -199,6 +204,33 @@ func taskAddCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Definition-of-done: attach the machine check(s) or the justified
+			// absence. A live-effect task must carry a Check (or Verify-After-Merge)
+			// or an explicit check=none with an honest reason in the body; the runner
+			// gates DONE on it (docs/dod-verification-spec.md).
+			if checkNone {
+				if check != "" || verifyAfterMerge != "" {
+					return fmt.Errorf("--check-none is mutually exclusive with --check/--verify-after-merge")
+				}
+				t.CheckNone = true
+			}
+			if check != "" {
+				if err := t.SetCheck(check); err != nil {
+					return err
+				}
+			}
+			if verifyAfterMerge != "" {
+				if err := t.SetVerifyAfterMerge(verifyAfterMerge); err != nil {
+					return err
+				}
+			}
+			if notBefore != "" {
+				nb, err := parseUntil(notBefore, time.Now().UTC())
+				if err != nil {
+					return fmt.Errorf("--not-before: %w", err)
+				}
+				t.NotBefore = nb
+			}
 			if err := p.AddTask(t); err != nil {
 				return err
 			}
@@ -229,6 +261,10 @@ func taskAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&doc, "doc", "", "design doc content (required)")
 	cmd.Flags().StringVar(&docFile, "doc-file", "", "read design doc content from file (required)")
 	cmd.Flags().StringVar(&deps, "deps", "", "comma-separated deps for the NEW task (bare id or <submodule>:<taskid>)")
+	cmd.Flags().StringVar(&check, "check", "", "definition-of-done command (its exit 0 is the machine DoD the runner gates DONE on)")
+	cmd.Flags().StringVar(&verifyAfterMerge, "verify-after-merge", "", "post-merge DoD command (effect exists only after merge; verified by a separate successor check task)")
+	cmd.Flags().BoolVar(&checkNone, "check-none", false, "declare this task has NO machine-checkable DoD (justify in --body); mutually exclusive with --check")
+	cmd.Flags().StringVar(&notBefore, "not-before", "", "hold the task out of selection until this time (RFC3339 or a duration like 30m/2h from now)")
 	cmd.Flags().IntVar(&weight, "weight", 1, "selection weight (default 1)")
 	return cmd
 }
@@ -367,4 +403,158 @@ func linesOf(s string) []string {
 		return nil
 	}
 	return strings.Split(s, "\n")
+}
+
+// taskCheckCmd runs a task's definition-of-done command (`Check:`) ad hoc and
+// reports its exit status — the same command the runner's handoff gate runs when
+// the task enters DONE. It lets an author debug a check and lets a reviewer run
+// the check without driving a whole pass (the review contract requires the
+// reviewer to actually execute the check, not merely confirm a Check: line
+// exists — docs/dod-verification-spec.md). Read-only: it never writes or commits.
+// Exits non-zero when the check fails or the task declares check=none.
+func taskCheckCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "check <submodule> <task-id>",
+		Short: "run a task's Check: command ad hoc and report its exit status",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			subName, err := taskSubmoduleName(args[0])
+			if err != nil {
+				return err
+			}
+			planRel := filepath.Join("submodules", subName, repo.PlanFile)
+			b, err := os.ReadFile(filepath.Join(root, planRel))
+			if err != nil {
+				return err
+			}
+			p, err := plan.Parse(string(b))
+			if err != nil {
+				return err
+			}
+			t := p.Find(args[1])
+			if t == nil {
+				return fmt.Errorf("task %q not found in %s", args[1], planRel)
+			}
+			if t.CheckNone {
+				return fmt.Errorf("task %s declares check=none — it has no machine-checkable definition of done to run", t.ID)
+			}
+			check := t.Check()
+			if check == "" {
+				return fmt.Errorf("task %s has no Check: command (and did not declare check=none)", t.ID)
+			}
+			// Run in the submodule's repo checkout, the natural cwd for a check that
+			// inspects the change (build artifacts, rendered manifests, endpoints).
+			runDir := filepath.Join(root, "submodules", subName, "repo")
+			if _, statErr := os.Stat(runDir); statErr != nil {
+				runDir = root
+			}
+			ex := exec.CommandContext(cmd.Context(), "sh", "-c", check)
+			ex.Dir = runDir
+			ex.Stdout = os.Stdout
+			ex.Stderr = os.Stderr
+			fmt.Fprintf(os.Stderr, "beehive: running check for %s:%s in %s\n  %s\n", subName, t.ID, runDir, check)
+			if err := ex.Run(); err != nil {
+				return fmt.Errorf("check FAILED for %s:%s: %w", subName, t.ID, err)
+			}
+			fmt.Fprintf(os.Stderr, "beehive: check PASSED for %s:%s\n", subName, t.ID)
+			return nil
+		},
+	}
+	return cmd
+}
+
+// taskDeferCmd records a convergence-wait self-defer on a TODO task: it sets
+// not_before to --until, increments the bounded defer counter, and releases the
+// claim so the selector holds the task until then. It is the sanctioned atomic
+// form of the TODO->TODO self-defer transition ("did the work, the world has not
+// converged, re-check after T") — bounded by plan.MaxDefers so a non-converging
+// wait escalates to NEEDS-HUMAN rather than spinning forever. Authors the PLAN.md
+// commit directly on primary main, so it syncs the hive remote before and
+// publishes after, exactly like `task human`/`task block`.
+func taskDeferCmd() *cobra.Command {
+	var until, reason string
+	cmd := &cobra.Command{
+		Use:   "defer <submodule> <task-id> --until <time>",
+		Short: "self-defer a TODO task until --until (convergence wait); releases its claim",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			rootGit := git.New(root)
+			remote, _ := rootGit.Remote(cmd.Context())
+			if err := rootGit.SyncMainFromRemote(cmd.Context(), remote); err != nil {
+				return err
+			}
+			subName, err := taskSubmoduleName(args[0])
+			if err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			if strings.TrimSpace(until) == "" {
+				return fmt.Errorf("--until is required (RFC3339 or a duration like 30m/2h from now)")
+			}
+			nb, err := parseUntil(until, now)
+			if err != nil {
+				return fmt.Errorf("--until: %w", err)
+			}
+			planRel := filepath.Join("submodules", subName, repo.PlanFile)
+			planPath := filepath.Join(root, planRel)
+			b, err := os.ReadFile(planPath)
+			if err != nil {
+				return err
+			}
+			p, err := plan.Parse(string(b))
+			if err != nil {
+				return err
+			}
+			t := p.Find(args[1])
+			if t == nil {
+				return fmt.Errorf("task %q not found in %s", args[1], planRel)
+			}
+			if err := t.Defer(nb, now); err != nil {
+				return err
+			}
+			// Release the claim so the runner reselects once not_before elapses.
+			t.Session = ""
+			t.Heartbeat = time.Time{}
+			if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+				return err
+			}
+			msg := fmt.Sprintf("plan: defer %s until %s (defer %d/%d)\n\nBeehive: %s plan", t.ID, nb.Format(time.RFC3339), t.Defers, plan.MaxDefers, t.ID)
+			if r := strings.Join(strings.Fields(reason), " "); r != "" {
+				msg += "\nReason: " + r
+			}
+			if err := rootGit.CommitPaths(cmd.Context(), msg, planRel); err != nil && err != git.ErrNothing {
+				return err
+			}
+			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
+				return err
+			}
+			fmt.Printf("%s %s deferred until %s (defer %d/%d)\n", subName, t.ID, nb.Format(time.RFC3339), t.Defers, plan.MaxDefers)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&until, "until", "", "when the task becomes selectable again (RFC3339 or a duration like 30m/2h from now)")
+	cmd.Flags().StringVar(&reason, "reason", "", "why the task is being deferred (recorded in the commit)")
+	return cmd
+}
+
+// parseUntil resolves a not_before / defer target given either an absolute
+// RFC3339 timestamp or a relative Go duration (e.g. "30m", "2h") added to now.
+// The result is always UTC.
+func parseUntil(s string, now time.Time) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if d, err := time.ParseDuration(s); err == nil {
+		return now.Add(d).UTC(), nil
+	}
+	if ts, err := time.Parse(time.RFC3339, s); err == nil {
+		return ts.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("%q is neither an RFC3339 time nor a duration (e.g. 30m, 2h)", s)
 }
