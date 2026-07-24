@@ -20,19 +20,19 @@
     {{if .SkillsDrift}}<span class="muted small skills-drift" title="managed skills/*.md that differ from or are missing versus the binary's embedded default">{{len .SkillsDrift}} skill(s) drifted: {{range $i, $s := .SkillsDrift}}{{if $i}}, {{end}}{{$s}}{{end}}</span>{{end}}
   </form>
 </nav>
-<div class="cards">
-{{range .Subs}}<div class="card{{if .Working}} active{{end}}">
-  <h3><a href="/submodule/{{.Name}}">{{.Name}}</a></h3>
-  <div class="card-meta">
-    <span class="badge{{if eq .State "active"}} live{{end}}" title="swarm status">{{.State}}</span>
-    {{if .Env}}<a class="badge {{.EnvClass}}" title="active deploy env — manage this submodule's blue/green" href="/submodule/{{.Name}}/env">{{.Env}}</a>{{end}}
-    <span class="badge bees{{if .Working}} bees-live{{end}}" title="honeybees actively working this submodule right now (fresh PLAN-task claims + live claimless reconcile/bootstrap sessions)" aria-label="{{.Bees}} honeybees active"><span aria-hidden="true">🐝</span> {{.Bees}}</span>
-    <span class="badge" title="tasks not DONE">pending {{.Pending}}</span>
-    {{if .Human}}<a class="badge human" href="/human" title="tasks needing a human">needs-human {{.Human}}</a>{{end}}
-  </div>
-  <p class="muted small card-stamp">stamp: <code{{if .Stamp}} title="{{.Stamp}}"{{end}}>{{if .Stamp}}{{.Stamp}}{{else}}&mdash;{{end}}</code></p>
-  <div class="card-links"><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">commits</a> · <a href="/submodule/{{.Name}}/docs">docs</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <span class="roi-links">roi <a href="/roi/{{.Name}}">view</a> / <a href="/edit?path=submodules/{{.Name}}/ROI.md">edit</a></span></div>
-</div>{{else}}<p>no submodules</p>{{end}}
+{{/* active-state-live-poll: the submodule cards auto-refresh so the 🐝 honeybee
+   counter and active overlay track the swarm without a manual reload.
+   #dashboard-cards polls /dashboard/body (renderConditional → etag/304 no-swap
+   when unchanged) and morph-swaps in place; data-scroll-preserve + the layout's
+   window-scroll restore keep the viewport from jumping on a tick. */}}
+<div class="cards" id="dashboard-cards"
+     role="region" aria-live="polite" aria-label="submodule status"
+     data-scroll-preserve
+     hx-ext="morph"
+     hx-get="/dashboard/body"
+     hx-trigger="load, every 2s"
+     hx-swap="morph:innerHTML">
+{{template "dashboard-cards" .}}
 </div>
 <div class="cards">{{template "hygiene-widget" .Hygiene}}</div>
 <form method="post" action="/submodule/add">

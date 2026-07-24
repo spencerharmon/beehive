@@ -318,6 +318,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	b := s.bind
 	mux.HandleFunc("GET /{$}", b((*Server).dashboard))
+	mux.HandleFunc("GET /dashboard/body", b((*Server).dashboardBody))
 	mux.HandleFunc("GET /bootstrap", b((*Server).bootstrapAgent))
 	mux.HandleFunc("GET /stats", b((*Server).stats))
 	mux.HandleFunc("GET /submodule/{name}", b((*Server).explorer))
@@ -326,6 +327,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /submodule/{name}/doc/{file...}", b((*Server).doc))
 	mux.HandleFunc("GET /submodule/{name}/docs", b((*Server).docExplorer))
 	mux.HandleFunc("GET /submodule/{name}/plan", b((*Server).plan))
+	mux.HandleFunc("GET /submodule/{name}/plan/body", b((*Server).planBody))
 	mux.HandleFunc("POST /submodule/{name}/plan/delete", b((*Server).planDelete))
 	mux.HandleFunc("GET /submodule/{name}/sessions", b((*Server).sessionsList))
 	mux.HandleFunc("GET /submodule/{name}/sessions/body", b((*Server).sessionsListBody))
@@ -602,6 +604,22 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	// {{if .Title}} falls back to the bare site name — the one page that
 	// demonstrates the fallback rather than composing one via pageTitle.
 	s.render(w, "dashboard.html", map[string]interface{}{"Subs": views, "Hygiene": hyg, "Bootstrap": s.bootstrapState(), "RootFiles": rootFiles, "RootFilesDrift": rootFilesDrift(rootFiles), "SkillsDrift": skillsDrift, "InstructionDrift": instructionDrift, "Nav": "dashboard"})
+}
+
+// dashboardBody serves just the submodule cards (the "dashboard-cards" fragment)
+// for the auto-refresh poll wired in dashboard.html (active-state-live-poll): the
+// 🐝 honeybee counter and active overlay track the canonical active-honeybee set
+// live, so a honeybee picking up or finishing work appears without a manual
+// reload. Only the cards (subViews) are re-derived here — the instruction-file
+// index, hygiene widget, and add-submodule form are static shell that stays put
+// through renderConditional's etag/304 no-swap when the card set is unchanged.
+func (s *Server) dashboardBody(w http.ResponseWriter, r *http.Request) {
+	views, err := s.subViews(r.Context(), time.Now(), s.ttl())
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.renderConditional(w, r, "dashboard-cards", map[string]interface{}{"Subs": views})
 }
 
 // subViews builds the dashboard card data for every submodule: State
@@ -1003,12 +1021,44 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	ctx := r.Context()
-	now, ttl := time.Now(), s.ttl()
-	p, err := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	p, err := s.planViewData(r.Context(), sm)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
+	}
+	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p, "Title": pageTitle("plan", sm.Name), "Crumbs": planCrumbs(sm.Name)})
+}
+
+// planBody serves just the plan task table (the "plan-items-body" fragment) for
+// the auto-refresh poll wired in plan_items.html (active-state-live-poll). Like
+// the sessions-list body it goes through renderConditional so an unchanged table
+// answers a repeat poll with a 304/empty body (no re-swap, no viewport jump)
+// instead of re-sending the whole table every tick. It re-derives the SAME live
+// per-row running/claim state and doc links as the full page (planViewData), so
+// a status/claim change the swarm made is reflected without a manual reload.
+func (s *Server) planBody(w http.ResponseWriter, r *http.Request) {
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	p, err := s.planViewData(r.Context(), sm)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.renderConditional(w, r, "plan-items-body", map[string]interface{}{"Name": sm.Name, "Plan": p})
+}
+
+// planViewData builds the plan view's live task list for a submodule: the
+// unified PLAN parse plus the per-row running/claim state and resolved doc links
+// the plan_items table renders. Shared by the full page (plan) and the poll
+// fragment (planBody) so both always agree on the live state.
+func (s *Server) planViewData(ctx context.Context, sm repo.Submodule) (Plan, error) {
+	now, ttl := time.Now(), s.ttl()
+	p, err := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	if err != nil {
+		return Plan{}, err
 	}
 	// active-honeybee-plan-view-unify: a task's "running" row state is the
 	// SAME canonical per-session predicate sessionLive/sessionInfos already
@@ -1044,7 +1094,7 @@ func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
 			p.Items[i].DocHref = resolveDocHref(sm, p.Items[i].Doc)
 		}
 	}
-	s.render(w, "plan_items.html", map[string]interface{}{"Name": sm.Name, "Plan": p, "Title": pageTitle("plan", sm.Name), "Crumbs": planCrumbs(sm.Name)})
+	return p, nil
 }
 
 // planDelete removes a submodule's PLAN.md and publishes the deletion, so the

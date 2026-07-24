@@ -1,0 +1,21 @@
+{{/* dashboard-cards (active-state-live-poll): the dashboard's live region — the
+   per-submodule cards whose 🐝 honeybee counter and active overlay change as the
+   swarm picks up and finishes work. Split out of dashboard.html so it can be
+   polled on its own: the page wraps a #dashboard-cards div (data-scroll-preserve
+   + hx-ext="morph") that hx-gets /dashboard/body on `load, every 2s` and
+   morph-swaps this fragment in place, and the /dashboard/body handler serves it
+   through renderConditional so an unchanged card set 304s (no re-swap, no
+   viewport jump) instead of re-sending. dashboard.html invokes this same define,
+   so the card markup renders identically whether polled or served whole. */}}
+{{define "dashboard-cards"}}{{range .Subs}}<div class="card{{if .Working}} active{{end}}">
+  <h3><a href="/submodule/{{.Name}}">{{.Name}}</a></h3>
+  <div class="card-meta">
+    <span class="badge{{if eq .State "active"}} live{{end}}" title="swarm status">{{.State}}</span>
+    {{if .Env}}<a class="badge {{.EnvClass}}" title="active deploy env — manage this submodule's blue/green" href="/submodule/{{.Name}}/env">{{.Env}}</a>{{end}}
+    <span class="badge bees{{if .Working}} bees-live{{end}}" title="honeybees actively working this submodule right now (fresh PLAN-task claims + live claimless reconcile/bootstrap sessions)" aria-label="{{.Bees}} honeybees active"><span aria-hidden="true">🐝</span> {{.Bees}}</span>
+    <span class="badge" title="tasks not DONE">pending {{.Pending}}</span>
+    {{if .Human}}<a class="badge human" href="/human" title="tasks needing a human">needs-human {{.Human}}</a>{{end}}
+  </div>
+  <p class="muted small card-stamp">stamp: <code{{if .Stamp}} title="{{.Stamp}}"{{end}}>{{if .Stamp}}{{.Stamp}}{{else}}&mdash;{{end}}</code></p>
+  <div class="card-links"><a href="/submodule/{{.Name}}/plan">plan</a> · <a href="/submodule/{{.Name}}/branches">commits</a> · <a href="/submodule/{{.Name}}/docs">docs</a> · <a href="/submodule/{{.Name}}/sessions">sessions</a> · <span class="roi-links">roi <a href="/roi/{{.Name}}">view</a> / <a href="/edit?path=submodules/{{.Name}}/ROI.md">edit</a></span></div>
+</div>{{else}}<p>no submodules</p>{{end}}{{end}}

@@ -7947,3 +7947,74 @@ func TestEditorFullWidthPanelLayout(t *testing.T) {
 		t.Fatalf("style.css must keep the editor-grid narrow-viewport stack breakpoint:\n%s", css)
 	}
 }
+
+// TestActiveStateLivePoll locks active-state-live-poll: the three surfaces that
+// carry live active-honeybee state — the plan task table, the sessions list, and
+// the dashboard 🐝 bee-counter cards — each auto-refresh via an htmx poll trigger
+// (an `every` on a stable target) whose fragment endpoint short-circuits an
+// unchanged tick to a 304/empty body through renderConditional, so a change in
+// the canonical active set appears without a manual browser reload and an idle
+// steady state does not re-transfer the whole fragment. The poll wrappers carry
+// data-scroll-preserve + hx-swap="morph:innerHTML" so a tick patches the DOM in
+// place (reusing poll-scroll-preserve/session-poll-dom-morph) and never jumps the
+// viewport. DOM scroll itself is not Go-unit-testable; the manual scroll check is
+// in the change doc.
+func TestActiveStateLivePoll(t *testing.T) {
+	s, _ := setup(t)
+
+	// Each of the three live surfaces must render a poll trigger on a stable,
+	// morph-swapped, scroll-preserved target pointing at its fragment endpoint.
+	surfaces := []struct {
+		name, page, target, endpoint string
+	}{
+		{"plan view", "/submodule/alpha/plan", `id="plan-items"`, "/submodule/alpha/plan/body"},
+		{"sessions list", "/submodule/alpha/sessions", `id="session-list"`, "/submodule/alpha/sessions/body"},
+		{"dashboard bee-counter", "/", `id="dashboard-cards"`, "/dashboard/body"},
+	}
+	for _, sf := range surfaces {
+		w := get(t, s, sf.page)
+		if w.Code != 200 {
+			t.Fatalf("%s: GET %s status = %d, want 200", sf.name, sf.page, w.Code)
+		}
+		body := w.Body.String()
+		for _, want := range []string{
+			sf.target,                   // a stable poll target id
+			`hx-get="` + sf.endpoint,    // polls its fragment endpoint (may carry a query)
+			"every 2s",                  // a periodic refresh trigger
+			`hx-swap="morph:innerHTML"`, // in-place morph (no scroll reset)
+			"data-scroll-preserve",      // reuses poll-scroll-preserve
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s (%s): missing poll wiring %q:\n%s", sf.name, sf.page, want, body)
+			}
+		}
+	}
+
+	// Each fragment endpoint sets a strong ETag on its 200 and answers a repeat
+	// poll carrying that validator with a 304 + empty body (the no-swap
+	// short-circuit that stops re-sending an unchanged fragment every tick).
+	for _, endpoint := range []string{"/submodule/alpha/plan/body", "/dashboard/body"} {
+		first := get(t, s, endpoint)
+		if first.Code != 200 {
+			t.Fatalf("%s: first GET status = %d, want 200 (body: %s)", endpoint, first.Code, first.Body)
+		}
+		etag := first.Header().Get("ETag")
+		if etag == "" {
+			t.Fatalf("%s: first GET carries no ETag (renderConditional not wired)", endpoint)
+		}
+		if first.Body.Len() == 0 {
+			t.Fatalf("%s: first GET has an empty body", endpoint)
+		}
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", endpoint, nil)
+		req.Header.Set("If-None-Match", etag)
+		s.Routes().ServeHTTP(w, req)
+		if w.Code != http.StatusNotModified {
+			t.Fatalf("%s: repeat GET with matching If-None-Match status = %d, want 304", endpoint, w.Code)
+		}
+		if w.Body.Len() != 0 {
+			t.Errorf("%s: 304 response carries a non-empty body: %q", endpoint, w.Body.String())
+		}
+	}
+}
