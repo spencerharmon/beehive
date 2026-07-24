@@ -4,6 +4,13 @@
     {{if .Busy}}<div class="msg agent busy"><span class="who">agent</span> <span class="spinner">editing…</span></div>{{end}}
     {{if .Error}}<div class="msg err">⚠️ {{.Error}}</div>{{end}}
   </div>
+  {{/* chat-editor-draggable-divider: a keyboard- and pointer-operable splitter.
+     Drag support is wired by the delegated editor-divider-drag script
+     (layout.html "footer"), which reads/writes --editor-chat-width on <html>
+     (not on this node — see the CSS comment above .editor-divider — since this
+     whole panel is morphed on every busy poll). role=separator + the arrow/
+     Home/End keys make it click/keyboard-adjustable too, not drag-only. */}}
+  <div class="editor-divider" role="separator" aria-orientation="vertical" aria-label="Resize chat and diff panels" tabindex="0" title="Drag, or use arrow keys, to resize (double-click/Enter to reset)"></div>
   <div class="diffpane">
     <div class="statusbar">
       {{if .Live}}<span class="state live">State: live</span>{{else}}<span class="state dirty">State: dirty</span>{{end}}

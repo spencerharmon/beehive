@@ -7947,3 +7947,67 @@ func TestEditorFullWidthPanelLayout(t *testing.T) {
 		t.Fatalf("style.css must keep the editor-grid narrow-viewport stack breakpoint:\n%s", css)
 	}
 }
+
+// chat-editor-draggable-divider: the divider between the chat and diff panes
+// must be present, draggable (pointer events wired), and click/keyboard-
+// adjustable (role=separator + tabindex so arrow keys work), and it must drop
+// out at the narrow-viewport stack breakpoint where there is no horizontal
+// seam left to drag.
+func TestEditorDraggableDivider(t *testing.T) {
+	s, _ := setup(t)
+
+	panel := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"})
+	for _, want := range []string{
+		`class="editor-divider"`,
+		`role="separator"`,
+		`aria-orientation="vertical"`,
+		`tabindex="0"`,
+	} {
+		if !strings.Contains(panel, want) {
+			t.Fatalf("editor_panel.html missing draggable-divider attribute %q:\n%s", want, panel)
+		}
+	}
+	// The divider must sit between the two panes in document order so it is a
+	// flex sibling of both (grabbable seam between them, not floating outside
+	// the grid).
+	chatIdx := strings.Index(panel, `id="editor-chat"`)
+	dividerIdx := strings.Index(panel, `class="editor-divider"`)
+	diffIdx := strings.Index(panel, `id="editor-diff"`)
+	if !(chatIdx >= 0 && dividerIdx > chatIdx && diffIdx > dividerIdx) {
+		t.Fatalf("editor-divider must render between #editor-chat and #editor-diff:\n%s", panel)
+	}
+
+	// CSS: the chat pane's width is driven by a CSS custom property so a JS
+	// drag can resize it without fighting the busy-poll morph, and the
+	// divider is hidden again at the narrow-viewport stack breakpoint.
+	css := get(t, s, "/assets/style.css").Body.String()
+	for _, want := range []string{
+		"--editor-chat-width",
+		".editor-divider {",
+		"cursor: col-resize;",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("style.css missing draggable-divider rule %q:\n%s", want, css)
+		}
+	}
+	narrow := css[strings.Index(css, "@media (max-width: 48rem)"):]
+	if !strings.Contains(narrow, ".editor-divider { display: none; }") {
+		t.Fatalf("style.css must hide .editor-divider in the narrow-viewport stack:\n%s", narrow)
+	}
+
+	// JS: the drag/keyboard/reset wiring is embedded in the shared layout
+	// script (no external file, no SPA/CDN — single-binary embed). Comment
+	// text is stripped from <script> blocks by html/template's contextual
+	// escaper, so assert on actual code tokens rather than the comment name.
+	page := get(t, s, "/").Body.String()
+	for _, want := range []string{
+		"pointerdown",
+		"beehive-editor-chat-width",
+		"ArrowLeft",
+		"ArrowRight",
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("layout script missing draggable-divider wiring %q", want)
+		}
+	}
+}
