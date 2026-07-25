@@ -7,6 +7,7 @@
 package editor
 
 import (
+	"fmt"
 	"html/template"
 	"strings"
 )
@@ -136,8 +137,48 @@ func charDiff(old, new string) (oldHTML, newHTML template.HTML) {
 
 // DiffRow is one rendered line of the unified diff view.
 type DiffRow struct {
-	Kind string        // eq | add | del
-	HTML template.HTML // escaped content, intra-line changes span-wrapped
+	Kind   string        // eq | add | del
+	HTML   template.HTML // escaped content, intra-line changes span-wrapped
+	Anchor string        // stable DOM id (diff-jump-to-changes-overlay), set by
+	// AssignHunkAnchors on the FIRST row of a change hunk; "" for every other
+	// row (context rows and every row after a hunk's first).
+}
+
+// DiffHunk is one contiguous run of changed (add/del) rows within a rendered
+// diff — a "change" the jump-to-changes overlay lets the reader jump straight
+// to, modeled on the session view's turn TOC (session-transcript-rendered-
+// toc). Anchor matches the DOM id AssignHunkAnchors stamped onto the hunk's
+// first row.
+type DiffHunk struct {
+	Index  int    // 1-based position among this diff's hunks
+	Anchor string // DOM id of the hunk's first row, e.g. "hunk-1"
+}
+
+// AssignHunkAnchors scans rows for contiguous runs of non-"eq" rows (a hunk —
+// one or more adjacent add/del lines) and stamps a stable id (prefix + the
+// hunk's 1-based index) onto the FIRST row of each run, in place. It returns
+// the ordered hunk list the jump-to-changes overlay renders as its link
+// list — one entry per hunk, in file order. Rows with no changes at all
+// return nil (no overlay to show). Call once per rendered diff; for a multi-
+// file diff give each file's rows a distinct prefix (RenderMultiFileDiff does
+// this) so anchors never collide across files on the same page.
+func AssignHunkAnchors(rows []DiffRow, prefix string) []DiffHunk {
+	var hunks []DiffHunk
+	inHunk := false
+	for i := range rows {
+		if rows[i].Kind == "eq" {
+			inHunk = false
+			continue
+		}
+		if !inHunk {
+			idx := len(hunks) + 1
+			anchor := fmt.Sprintf("%s%d", prefix, idx)
+			rows[i].Anchor = anchor
+			hunks = append(hunks, DiffHunk{Index: idx, Anchor: anchor})
+			inHunk = true
+		}
+	}
+	return hunks
 }
 
 // RenderDiff produces a unified-diff rendering of the change from old to new:
@@ -179,13 +220,13 @@ func RenderDiffHTML(old, new string, oldHTML, newHTML []template.HTML) []DiffRow
 		op := ops[k]
 		if highlighted {
 			if h, ok := lineHTML(op.ai, op.bi); ok {
-				rows = append(rows, DiffRow{diffRowKind(op.kind), h})
+				rows = append(rows, DiffRow{Kind: diffRowKind(op.kind), HTML: h})
 				continue
 			}
 		}
 		switch op.kind {
 		case 'e':
-			rows = append(rows, DiffRow{"eq", template.HTML(template.HTMLEscapeString(op.text))})
+			rows = append(rows, DiffRow{Kind: "eq", HTML: template.HTML(template.HTMLEscapeString(op.text))})
 		case '-':
 			// Gather the contiguous delete run and any insert run that follows it;
 			// pair them index-wise for column-level highlighting (a "replace").
@@ -205,17 +246,17 @@ func RenderDiffHTML(old, new string, oldHTML, newHTML []template.HTML) []DiffRow
 			}
 			for p := 0; p < paired; p++ {
 				oh, nh := charDiff(dels[p], adds[p])
-				rows = append(rows, DiffRow{"del", oh})
-				rows = append(rows, DiffRow{"add", nh})
+				rows = append(rows, DiffRow{Kind: "del", HTML: oh})
+				rows = append(rows, DiffRow{Kind: "add", HTML: nh})
 			}
 			for p := paired; p < len(dels); p++ {
-				rows = append(rows, DiffRow{"del", template.HTML(template.HTMLEscapeString(dels[p]))})
+				rows = append(rows, DiffRow{Kind: "del", HTML: template.HTML(template.HTMLEscapeString(dels[p]))})
 			}
 			for p := paired; p < len(adds); p++ {
-				rows = append(rows, DiffRow{"add", template.HTML(template.HTMLEscapeString(adds[p]))})
+				rows = append(rows, DiffRow{Kind: "add", HTML: template.HTML(template.HTMLEscapeString(adds[p]))})
 			}
 		case '+':
-			rows = append(rows, DiffRow{"add", template.HTML(template.HTMLEscapeString(op.text))})
+			rows = append(rows, DiffRow{Kind: "add", HTML: template.HTML(template.HTMLEscapeString(op.text))})
 		}
 	}
 	return rows
@@ -241,8 +282,9 @@ type FileChange struct {
 // one merged blob — and expanding or collapsing one file never affects another
 // (each box is a self-contained node with its own rows).
 type FileDiffBox struct {
-	Path string
-	Rows []DiffRow
+	Path  string
+	Rows  []DiffRow
+	Hunks []DiffHunk // this file's own hunks (diff-jump-to-changes-overlay), anchors unique across the whole multi-file diff
 }
 
 // RenderMultiFileDiff groups a multi-file edit into one independently rendered
@@ -253,15 +295,22 @@ type FileDiffBox struct {
 // boxes" UI relies on. A FileChange with an empty Path is skipped (there is no
 // box to key), so a caller that over-allocates its slice never emits a
 // phantom box.
+// Each box's hunks are anchored with a per-file-position prefix
+// ("file-<i>-hunk-<n>") so the jump-to-changes overlay (diff-jump-to-changes-
+// overlay) can link into any file's any hunk without anchor collisions across
+// the whole multi-file diff.
 func RenderMultiFileDiff(changes []FileChange) []FileDiffBox {
 	boxes := make([]FileDiffBox, 0, len(changes))
 	for _, c := range changes {
 		if c.Path == "" {
 			continue
 		}
+		rows := RenderDiffHTML(c.Old, c.New, c.OldHTML, c.NewHTML)
+		hunks := AssignHunkAnchors(rows, fmt.Sprintf("file-%d-hunk-", len(boxes)))
 		boxes = append(boxes, FileDiffBox{
-			Path: c.Path,
-			Rows: RenderDiffHTML(c.Old, c.New, c.OldHTML, c.NewHTML),
+			Path:  c.Path,
+			Rows:  rows,
+			Hunks: hunks,
 		})
 	}
 	return boxes

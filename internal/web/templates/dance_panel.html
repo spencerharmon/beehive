@@ -20,6 +20,7 @@
 </div>
 {{if $.Diffs}}
 <div class="diff-boxes">
+{{template "diff-jump-overlay-multi" $.Diffs}}
 {{range $.Diffs}}{{template "diff-file-box" .}}{{end}}
 </div>
 {{end}}

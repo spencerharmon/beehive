@@ -900,6 +900,56 @@ pre.diff .ln::before {
 pre.diff .ln.add::before { content: "+"; color: var(--success); }
 pre.diff .ln.del::before { content: "-"; color: var(--danger); text-decoration: none; }
 
+/* Jump-to-changes overlay (diff-jump-to-changes-overlay): a per-diff/per-
+ * multi-file TOC listing every hunk with a jump-to link, plus prev/next
+ * buttons — modeled on .session-toc above, reusing the same toc-jump/
+ * toc-num building blocks. Rendered as a collapsible <details> sitting above
+ * its diff (editor_panel.html's single diff pane, commit_view.html's commit
+ * diff, and the multi-file diff-boxes in dance_panel.html/
+ * human_resolve_panel.html), wired by the delegated diff-jump-nav script
+ * (layout.html "footer"). */
+.diff-toc {
+  margin-bottom: var(--space-2);
+  background: var(--surface);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  font-size: var(--text-xs);
+}
+.diff-toc > summary {
+  cursor: pointer;
+  padding: var(--space-2) var(--space-3);
+  font-weight: 600;
+  list-style-position: inside;
+}
+.diff-toc-jumps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding: 0 var(--space-3) var(--space-2);
+}
+.diff-toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 var(--space-2);
+  border-top: var(--border-width) solid var(--border);
+  max-height: 12rem;
+  overflow: auto;
+}
+.diff-toc-list li { margin: 0; }
+.diff-toc-list a {
+  display: block;
+  padding: var(--space-1) var(--space-3);
+  color: var(--text);
+  text-decoration: none;
+}
+.diff-toc-list a:hover { background: var(--surface-2); }
+.diff-toc-file {
+  display: inline-block;
+  margin-right: var(--space-1);
+  color: var(--text-muted);
+  font-family: var(--font-mono, monospace);
+}
+
 /* Syntax highlighting (chat-editor-snappy-polish) ------------------------- *
  * internal/web/highlight.go buckets every chroma token into this small,
  * curated class set (see tokenClass) instead of emitting one of chroma's ~90

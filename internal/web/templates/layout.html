@@ -280,4 +280,49 @@
   });
 })();
 </script>
+<script>
+/* diff-jump-nav (diff-jump-to-changes-overlay): wires the jump-to-changes
+ * overlay's per-hunk links ([data-diff-anchor]) and prev/next buttons
+ * ([data-diff-jump]) rendered by diff_box.html's "diff-jump-overlay" /
+ * "diff-jump-overlay-multi" templates — one overlay per diff pane
+ * (editor_panel.html's single-file diff, commit_view.html's commit diff, and
+ * the multi-file diff-boxes in dance_panel.html/human_resolve_panel.html).
+ * Event-delegated off the document (like session-toc-nav above) so it covers
+ * every overlay currently on the page AND any htmx/morph swap brings in
+ * later — the editor's busy-poll re-renders editor_panel.html every 1.5s, so
+ * a directly-bound listener would go stale. scrollIntoView (rather than
+ * session-toc-nav's manual container-scrollTop math) is used here since a
+ * diff's changed rows are marked with a plain span id, not a section wrapped
+ * in one dedicated scroll container per page — the browser already resolves
+ * the nearest scrollable ancestor (the pre.diff / the page) correctly for
+ * `block: "center"`. No external libraries (single-binary embed, no CDN). */
+(function () {
+  function hunkAnchors() {
+    return Array.prototype.slice.call(document.querySelectorAll('[data-diff-anchor]'));
+  }
+  function jumpTo(el) {
+    if (!el) return;
+    var target = document.getElementById(el.getAttribute('data-diff-anchor'));
+    if (target) target.scrollIntoView({ block: 'center' });
+  }
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    var a = t.closest('[data-diff-anchor]');
+    if (a) { e.preventDefault(); jumpTo(a); return; }
+    var b = t.closest('[data-diff-jump]');
+    if (b) {
+      e.preventDefault();
+      var anchors = hunkAnchors();
+      if (!anchors.length) return;
+      var dir = b.getAttribute('data-diff-jump') === 'next' ? 1 : -1;
+      var cur = anchors.indexOf(document.activeElement && document.activeElement.closest ? document.activeElement.closest('[data-diff-anchor]') : null);
+      var next = cur === -1 ? (dir > 0 ? 0 : anchors.length - 1) : (cur + dir + anchors.length) % anchors.length;
+      var el = anchors[next];
+      jumpTo(el);
+      if (el && el.focus) el.focus({ preventScroll: true });
+    }
+  });
+})();
+</script>
 </body></html>{{end}}

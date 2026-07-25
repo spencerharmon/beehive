@@ -117,11 +117,18 @@ func (s *Server) panelData(ctx context.Context, sess *editor.Session) map[string
 	base, proposed, _ := sess.Diff(ctx)
 	state := sess.State(ctx)
 	log := sess.Log()
+	// diff-jump-to-changes-overlay: stamp anchors on the rendered rows and hand
+	// the ordered hunk list to editor_panel.html's overlay (modeled on the
+	// session view's TOC/jump overlay — session-transcript-rendered-toc) so a
+	// large single-file diff is quick to navigate instead of hand-scrolled.
+	rows := editor.RenderDiff(base, proposed)
+	hunks := editor.AssignHunkAnchors(rows, "hunk-")
 	return map[string]interface{}{
 		"ID":         sess.ID,
 		"File":       sess.File,
 		"Log":        log,
-		"Rows":       editor.RenderDiff(base, proposed),
+		"Rows":       rows,
+		"Hunks":      hunks,
 		"State":      state,
 		"Live":       state == "live",
 		"Merged":     state == "live" && len(log) > 0,
