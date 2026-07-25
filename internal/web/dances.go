@@ -643,7 +643,20 @@ func (p dancePanel) withPlan(plan dancePlan) dancePanel {
 	changes := make([]editor.FileChange, 0, len(plan.Diffs))
 	for _, d := range plan.Diffs {
 		if d.changed() {
-			changes = append(changes, editor.FileChange{Path: d.Path, Old: d.Before, New: d.After})
+			// chat-diff-syntax-highlight-bug: precompute per-line
+			// syntax-highlighted HTML for BOTH sides so the chat-diff panel
+			// renders proper language/token/diff markup instead of plain text.
+			// lexer is chosen from the file path; an unknown type yields a nil
+			// lexer and highlightLines returns nil, so RenderMultiFileDiff falls
+			// back to the plain char-diff exactly as before.
+			lexer := lexerFor(d.Path)
+			changes = append(changes, editor.FileChange{
+				Path:    d.Path,
+				Old:     d.Before,
+				New:     d.After,
+				OldHTML: highlightLines(d.Before, lexer),
+				NewHTML: highlightLines(d.After, lexer),
+			})
 		}
 	}
 	p.Diffs = editor.RenderMultiFileDiff(changes)

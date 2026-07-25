@@ -297,3 +297,33 @@ func TestSkillRepairPlanFixesCorruptStamp(t *testing.T) {
 		t.Fatalf("body corrupted: %v", tk.Body)
 	}
 }
+
+// TestWithPlanSyntaxHighlightsChatDiff is the regression test for
+// chat-diff-syntax-highlight-bug: withPlan (the chat-diff panel view model) must
+// feed precomputed syntax-highlighted per-line HTML into the rendered diff so a
+// changed file previews with real language/token markup, not plain escaped text.
+// Before the fix withPlan built editor.FileChange without OldHTML/NewHTML, so the
+// rendered rows carried no highlight spans and this assertion fails.
+func TestWithPlanSyntaxHighlightsChatDiff(t *testing.T) {
+	before := "package main\n\nfunc main() {}\n"
+	after := "package main\n\nfunc main() { println(\"hi\") }\n"
+	plan := dancePlan{
+		Diffs: []*danceDiff{{Path: "main.go", Before: before, After: after}},
+	}
+	panel := dancePanel{}.withPlan(plan)
+	if len(panel.Diffs) != 1 {
+		t.Fatalf("want 1 file diff box, got %d", len(panel.Diffs))
+	}
+	var joined strings.Builder
+	for _, row := range panel.Diffs[0].Rows {
+		joined.WriteString(string(row.HTML))
+		joined.WriteString("\n")
+	}
+	out := joined.String()
+	if !strings.Contains(out, `class="hl-kw"`) {
+		t.Errorf("chat-diff rows are not syntax-highlighted (no keyword span); got:\n%s", out)
+	}
+	if !strings.Contains(out, `class="hl-str"`) {
+		t.Errorf("chat-diff rows missing string highlight span; got:\n%s", out)
+	}
+}
