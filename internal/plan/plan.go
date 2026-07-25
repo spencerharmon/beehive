@@ -454,18 +454,57 @@ func (t *Task) HumanReason() string {
 }
 
 func (t *Task) setHumanReason(reason string) {
-	reason = oneLine(reason)
-	field := humanReasonPrefix + " " + reason
+	lines := reasonLines(reason)
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	field := append([]string{humanReasonPrefix + " " + lines[0]}, lines[1:]...)
 	if start, end := t.humanReasonSpan(); start != -1 {
 		rest := append([]string{}, t.Body[end:]...)
-		t.Body = append(t.Body[:start:start], field)
+		t.Body = append(t.Body[:start:start], field...)
 		t.Body = append(t.Body, rest...)
 		return
 	}
 	if len(t.Body) > 0 && strings.TrimSpace(t.Body[len(t.Body)-1]) != "" {
 		t.Body = append(t.Body, "")
 	}
-	t.Body = append(t.Body, field)
+	t.Body = append(t.Body, field...)
+}
+
+// reasonLines normalizes a NEEDS-HUMAN reason into the trimmed, non-blank lines
+// setHumanReason stores as the "Human-needed:" field's span (needs-human-
+// standard-escalation-format): the standard action-first template (summary,
+// numbered Steps, Links, Technical detail — see HONEYBEE.md's escalation
+// guidance) is authored as real newline-separated markdown, so a reason arriving
+// with embedded "\n"s (a --reason string, a --reason-file, or a body edited
+// directly in PLAN.md) must PRESERVE that line structure rather than being
+// flattened to one line — otherwise the heading/numbered-list/link structure the
+// /human view renders as markdown could never survive the round trip. Each line
+// is still whitespace-normalized (strings.Fields+Join) so stray tabs/runs of
+// spaces within a line don't corrupt markdown syntax, and blank lines are
+// dropped so humanReasonSpan's "stop at the first blank line" rule never
+// truncates the structured reason early.
+// NormalizeReasonText applies reasonLines' per-line whitespace normalization
+// and blank-line dropping to a raw multi-line reason string and rejoins it with
+// "\n". Exported so a caller outside this package (the CLI's `beehive task
+// human --reason`/`--reason-file`) can normalize/validate a reason using the
+// EXACT rule setHumanReason applies when it is actually stored — preserving the
+// standard template's line structure (summary / Steps / Links / Technical
+// detail) — without reaching into the plan package's body-field encoding.
+func NormalizeReasonText(s string) string {
+	return strings.Join(reasonLines(s), "\n")
+}
+
+func reasonLines(s string) []string {
+	var out []string
+	for _, ln := range strings.Split(s, "\n") {
+		ln = oneLine(ln)
+		if ln == "" {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return out
 }
 
 // clearHumanReason drops the Human-needed body field — including any

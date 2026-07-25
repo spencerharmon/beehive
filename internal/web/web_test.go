@@ -977,6 +977,57 @@ func TestHumanViewRendersStructuredReasonMarkdown(t *testing.T) {
 	}
 }
 
+// TestNeedsHumanReasonMarkdownRender is needs-human-standard-escalation-format's
+// acceptance test: a NEEDS-HUMAN reason authored in the standard action-first
+// template (a one-line summary, a numbered "Steps" list, a "Links" section with
+// a real URL, and a "Technical detail" summary last) renders as REAL HTML — a
+// heading, an `<ol>`/`<li>` numbered list, and a clickable `<a href>` — on BOTH
+// the global `/human` queue and the per-task `/human/<sub>/<id>` resolve page,
+// never as literal markdown syntax or one unbroken text blob.
+func TestNeedsHumanReasonMarkdownRender(t *testing.T) {
+	s, root := editorFixtureClient(t, &fakeAgentClient{reply: "ok"})
+	reason := strings.Join([]string{
+		"Human-needed: Deploy API token missing; only an operator can supply a credential.",
+		"### Steps",
+		"1. Open the Secrets panel and add `deploy_api_token`.",
+		"2. Then click Mark resolved below to reopen the task.",
+		"### Links",
+		"[dashboard](https://dash.example.com/tasks/needs-token)",
+		"### Technical detail",
+		"The deploy client returned 401 on every attempt; no token is configured for this environment.",
+	}, "\n")
+	write(t, filepath.Join(root, "submodules/alpha/PLAN.md"), "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+		"## needs-token [NEEDS-HUMAN] <!-- attempts=4 deps= category=secret -->\nblocked\n"+
+		reason+"\n")
+	if err := git.New(root).Commit(context.Background(), "seed structured needs-human reason"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, url := range []string{"/human", "/human/alpha/needs-token"} {
+		w := get(t, s, url)
+		if w.Code != 200 {
+			t.Fatalf("%s -> %d: %s", url, w.Code, w.Body)
+		}
+		body := w.Body.String()
+		for _, want := range []string{
+			"<h3>Steps</h3>",
+			"<ol>",
+			"<li>Open the Secrets panel",
+			"<li>Then click Mark resolved",
+			"<h3>Links</h3>",
+			`<a href="https://dash.example.com/tasks/needs-token">dashboard</a>`,
+			"<h3>Technical detail</h3>",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("%s rendered reason missing %q:\n%s", url, want, body)
+			}
+		}
+		if strings.Contains(body, "### Steps") || strings.Contains(body, "1. Open the Secrets panel and add") && strings.Contains(body, "<pre>") {
+			t.Fatalf("%s rendered raw markdown syntax instead of real markup:\n%s", url, body)
+		}
+	}
+}
+
 // TestParsePlanRealFormat is the core of web-plan-parser-unify: the web parser is
 // now a thin adapter over internal/plan, so a REAL H2-header PLAN.md (the format
 // the runner actually writes, with session/heartbeat claim metadata) parses —
