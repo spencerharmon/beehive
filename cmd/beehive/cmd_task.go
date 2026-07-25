@@ -129,6 +129,17 @@ func taskSubmoduleName(s string) (string, error) {
 	return s, nil
 }
 
+// humanReason resolves the --reason/--reason-file flags to the reason text
+// RequestHuman records. needs-human-standard-escalation-format: the standard
+// action-first template (a one-line summary, then Steps/Links/Technical detail
+// as their own markdown lines — see HONEYBEE.md's escalation guidance) is
+// authored with real embedded newlines, so this PRESERVES line breaks rather
+// than collapsing the whole reason to one line (that used to flatten a
+// multi-line --reason into an unreadable run-on sentence, and made the
+// structured template impossible to write via the CLI at all). Each line is
+// still whitespace-normalized (internal runs of spaces/tabs collapsed) via
+// plan.NormalizeReasonLine, and blank lines are dropped. A reason that is
+// entirely blank (or becomes empty after normalization) is still rejected.
 func humanReason(reason, reasonFile string) (string, error) {
 	if reason != "" && reasonFile != "" {
 		return "", fmt.Errorf("use --reason or --reason-file, not both")
@@ -140,7 +151,7 @@ func humanReason(reason, reasonFile string) (string, error) {
 		}
 		reason = string(b)
 	}
-	reason = strings.Join(strings.Fields(reason), " ")
+	reason = plan.NormalizeReasonText(reason)
 	if reason == "" {
 		return "", fmt.Errorf("--reason or --reason-file is required")
 	}

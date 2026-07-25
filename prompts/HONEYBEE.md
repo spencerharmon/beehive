@@ -407,10 +407,30 @@ Done when the task leaves `NEEDS-ARBITRATION`.
      schema, public API, an architecture fork). Reason = the options + each one's user-visible
      consequence. (An internal choice with no user-visible difference ≠ architecture — pick the
      cleaner one, note the tradeoff.)
-   The `--reason` must LEAD with the operator-facing ask and stay short — the investigation narrative
-   and evidence belong in the change doc, not the escalation. The runner will NOT let the pass end on
-   a NEEDS-HUMAN with a blank reason or a missing/invalid `--category`.
-5. **ROI.** You never touched `ROI.md`. Confirm.
+    The `--reason` must LEAD with the operator-facing ask and stay short — the investigation narrative
+    and evidence belong in the change doc, not the escalation. The runner will NOT let the pass end on
+    a NEEDS-HUMAN with a blank reason or a missing/invalid `--category`.
+
+    **Standard escalation format (needs-human-standard-escalation-format) — write every `--reason` in
+    this FIXED, ACTION-FIRST template, in order, so the operator can act from the top alone without
+    wading through investigation prose:**
+    1. **Summary** — one line: what is blocked and why a human (not the swarm) must clear it.
+    2. **Steps** — a numbered, do-this-then-that list of the EXACT actions the operator must take
+       (`1. …`, `2. …`): a concrete action, the literal command to run, or the exact setting to change.
+       Write it so the operator can act from this list alone.
+    3. **Links** — every URL the operator needs, as real markdown links (`[label](https://…)`): the
+       PLAN task / session, an external console, the credential/secret store location. Omit the
+       section only when there is truly no link to give.
+    4. **Technical detail** — LAST, short: the relevant facts for context (what was tried, what failed)
+       — never the investigation narrative up front, and never a stream-of-consciousness dump.
+    The reason is real markdown, authored with embedded newlines (`--reason $'Summary…\n1. step one\n2.
+    step two\nLinks: [dashboard](https://…)\nTechnical detail: …'` or `--reason-file`) — the CLI
+    preserves line breaks exactly (it no longer flattens a multi-line reason to one run-on sentence),
+    and the beehived `/human` and per-task resolve views render it as real markdown (heading/numbered
+    list/link markup), never literal text. A short, one-line reason (no Steps/Links needed) is still
+    fine — the template's sections are additive structure for a substantial blocker, not mandatory
+    boilerplate for a trivial one.
+ 5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills
 The hive `skills/` directory holds standard procedures as separate files, read LAZILY — never up front.

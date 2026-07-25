@@ -7,7 +7,8 @@
   <h2>Blocker</h2>
   <p><span class="{{.Item.CategoryClass}}">{{.Item.CategoryLabel}}</span></p>
   {{if .Item.Ask}}<p><strong>{{.Item.Ask}}</strong></p>{{end}}
-  <p><strong>Why the swarm needs you:</strong> {{if .Item.HumanReason}}{{.Item.HumanReason}}{{else}}<span class="muted">(no explicit reason recorded)</span>{{end}}</p>
+  <p><strong>Why the swarm needs you:</strong></p>
+  {{if .Item.HumanReason}}<div class="markdown">{{.Item.HumanReasonHTML}}</div>{{else}}<p><span class="muted">(no explicit reason recorded)</span></p>{{end}}
   <p><strong>Task:</strong> {{.Item.Desc}}</p>
   {{if .Item.DepStates}}<p><strong>Dependents wait on this.</strong> Deps:
     {{range .Item.DepStates}}<span class="dep {{if .Done}}done{{else}}pending{{end}}">{{.Name}}</span> {{end}}</p>{{end}}
