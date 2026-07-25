@@ -9,7 +9,49 @@
      but collapsible per-file on demand. */}}
 {{define "diff-file-box"}}<details class="diffbox" open>
   <summary class="diffbox-path"><code>{{.Path}}</code></summary>
-  <pre class="diff" data-scroll-preserve>{{range .Rows}}<span class="ln {{.Kind}}">{{.HTML}}</span>
+  <pre class="diff" data-scroll-preserve>{{range .Rows}}<span class="ln {{.Kind}}"{{if .Anchor}} id="{{.Anchor}}"{{end}}>{{.HTML}}</span>
 {{else}}<span class="muted">no line changes</span>{{end}}</pre>
 </details>
 {{end}}
+
+{{/* diff-jump-overlay (diff-jump-to-changes-overlay): a table-of-contents
+     overlay for a SINGLE rendered diff — modeled on the session view's turn
+     TOC/jump overlay (session_body.html, session-transcript-rendered-toc) —
+     that lists every hunk (change) in the diff and lets the reader jump
+     straight to it instead of hand-scrolling a large diff. Data is a
+     []editor.DiffHunk (editor.AssignHunkAnchors's return value). Jump links
+     ([data-diff-anchor]) and the prev/next buttons ([data-diff-jump]) are
+     wired by the delegated diff-jump-nav script (layout.html "footer"), which
+     scrolls the nearest scrollable diff container into view — never the
+     window — exactly like session-toc-nav does for the transcript pane.
+     Renders nothing for a diff with no hunks (e.g. an unchanged file). */}}
+{{define "diff-jump-overlay"}}{{if .}}<details class="diff-toc" open>
+  <summary>Changes · {{len .}} hunk{{if ne (len .) 1}}s{{end}}</summary>
+  <div class="diff-toc-jumps">
+    <button type="button" class="toc-jump" data-diff-jump="prev" title="previous change">&#9650; change</button>
+    <button type="button" class="toc-jump" data-diff-jump="next" title="next change">&#9660; change</button>
+  </div>
+  <ol class="diff-toc-list">
+    {{range .}}<li><a href="#{{.Anchor}}" data-diff-anchor="{{.Anchor}}"><span class="toc-num">{{.Index}}</span> change {{.Index}}</a></li>
+    {{end}}
+  </ol>
+</details>{{end}}{{end}}
+
+{{/* diff-jump-overlay-multi (diff-jump-to-changes-overlay): the same overlay,
+     but spanning a MULTI-file diff's changed files and their hunks — so
+     navigating a large multi-file edit is as quick as a single file. Data is
+     a []editor.FileDiffBox (editor.RenderMultiFileDiff's return value); each
+     box's own .Hunks were anchored with a file-unique prefix, so one overlay
+     list can safely link into any file's any hunk. Groups entries under each
+     file's path, matching the per-file diffbox layout below it. */}}
+{{define "diff-jump-overlay-multi"}}{{$entries := 0}}{{range .}}{{range .Hunks}}{{$entries = 1}}{{end}}{{end}}{{if $entries}}<details class="diff-toc" open>
+  <summary>Changes across {{len .}} file{{if ne (len .) 1}}s{{end}}</summary>
+  <div class="diff-toc-jumps">
+    <button type="button" class="toc-jump" data-diff-jump="prev" title="previous change">&#9650; change</button>
+    <button type="button" class="toc-jump" data-diff-jump="next" title="next change">&#9660; change</button>
+  </div>
+  <ol class="diff-toc-list">
+    {{range $box := .}}{{range $box.Hunks}}<li><a href="#{{.Anchor}}" data-diff-anchor="{{.Anchor}}"><span class="diff-toc-file">{{$box.Path}}</span> change {{.Index}}</a></li>
+    {{end}}{{end}}
+  </ol>
+</details>{{end}}{{end}}

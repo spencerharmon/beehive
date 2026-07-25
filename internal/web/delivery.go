@@ -254,6 +254,9 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 	after, _ := s.git.Show(r.Context(), full, planPath)
 	lexer := lexerFor(planPath)
 	rows := editor.RenderDiffHTML(before, after, highlightLines(before, lexer), highlightLines(after, lexer))
+	// diff-jump-to-changes-overlay: same jump overlay as the chat-diff editor
+	// pane, so a large PLAN.md commit diff is quick to navigate too.
+	hunks := editor.AssignHunkAnchors(rows, "hunk-")
 	shortSHA := full[:min(12, len(full))]
 	s.render(w, "commit_view.html", map[string]interface{}{
 		"Name":    sm.Name,
@@ -262,6 +265,7 @@ func (s *Server) commitView(w http.ResponseWriter, r *http.Request) {
 		"Date":    f[1],
 		"Subject": f[2],
 		"Rows":    rows,
+		"Hunks":   hunks,
 		"Title":   pageTitle("commit", shortSHA, sm.Name),
 		"Crumbs":  commitCrumbs(sm.Name, shortSHA),
 	})
