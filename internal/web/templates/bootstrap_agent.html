@@ -1,14 +1,17 @@
 <div class="bootstrap-agent">
   {{/* edit-session-consolidation: the setup agent is an editor.Session now, so it
      shares the coordination editor's panel + routes (/editor/{id}/*). The panel
-     re-arms its own poll only while a turn is in flight; an idle chat stops
-     polling. The agent edits LOCALS.md directly and the operator reviews the diff
-     and clicks Merge in the panel — nothing is written to main until then. */}}
+     auto-refreshes from this persistent shell node on a self-sustaining timer
+     (load, every 1.5s) and morph-swaps in place, so a landing reply/diff appears
+     without a manual refresh (chat-diff-poll-update-integration); an idle tick is
+     a cheap ETag 304 (no swap). The agent edits LOCALS.md directly and the
+     operator reviews the diff and clicks Merge — nothing is written to main until
+     then. */}}
   <div id="editor"
        role="status" aria-live="polite"
        hx-ext="morph"
        hx-get="/editor/{{.ID}}/panel"
-       hx-trigger="load"
+       hx-trigger="load, every 1500ms"
        hx-swap="morph:innerHTML">
     {{template "skeleton-transcript"}}
   </div>

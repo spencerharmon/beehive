@@ -336,27 +336,27 @@ func TestBootstrapAgentHandlerUnbootstrapped(t *testing.T) {
 }
 
 // TestBootstrapAgentPanelPollsRepeatedly is the chat-editor-snappy-polish
-// regression lock, adapted for bootstrap-chat-poll-backoff's idle backoff: a
-// slow/working turn started via the form must keep refreshing the panel (not
-// leave the human staring at a stale render — the "bare spinner" the ROI names),
-// while an IDLE chat no longer polls an unchanging fragment every 1.5s forever.
-// So the shell fetches the panel ONCE on load and chatedit_panel.html re-arms the
-// poll only while a turn is in flight (.Busy), exactly mirroring editor.html /
-// editor_panel.html's own idle backoff. See TestPollBackoffWhenEndedOrIdle for
-// the full cadence contract this closes the last polled surface of.
+// regression lock, updated for chat-diff-poll-update-integration: a slow/working
+// turn started via the form must keep refreshing the panel (not leave the human
+// staring at a stale render — the "bare spinner" the ROI names) AND, crucially, a
+// reply/diff that lands must appear WITHOUT a manual refresh. The refresh is now
+// driven by the PERSISTENT shell node (bootstrap_agent.html: hx-trigger="load,
+// every 1500ms"), not a body-embedded self-poll (which idiomorph preserved and a
+// 304-unchanged tick dropped, killing the loop). The panel body carries no poller
+// in any state. See TestPollBackoffWhenEndedOrIdle for the full cadence contract.
 func TestBootstrapAgentPanelPollsRepeatedly(t *testing.T) {
 	s, _ := editorFixture(t, "")
-	// The shell polls the panel once on load — no forever interval on idle.
+	// The shell auto-refreshes the panel on a self-sustaining timer, so a landing
+	// reply/diff appears without a manual reload; an idle tick is a cheap 304.
 	body := get(t, s, "/bootstrap").Body.String()
-	if !strings.Contains(body, `hx-trigger="load"`) || strings.Contains(body, "every 1500ms") {
-		t.Fatalf("#editor must fetch once on load, not poll on an interval:\n%s", body)
+	if !strings.Contains(body, `hx-trigger="load, every 1500ms"`) {
+		t.Fatalf("#editor must auto-refresh on a self-sustaining timer so updates appear without a manual refresh:\n%s", body)
 	}
-	// A working turn keeps refreshing: the busy panel re-arms a hidden 1.5s poll
-	// targeting #editor, so the loop continues until the turn settles and the final
-	// reply lands (the snappy-polish guarantee, now scoped to .Busy).
+	// The panel body drives NO poll of its own now (a body-embedded self-poll was
+	// the exact node a 304/morph tick dropped) — the shell owns the cadence.
 	busy := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "c1", "Busy": true})
-	if !strings.Contains(busy, `hx-trigger="load delay:1500ms"`) || !strings.Contains(busy, `hx-target="#editor"`) {
-		t.Fatalf("a busy editor panel must re-arm the poll so a working turn keeps refreshing:\n%s", busy)
+	if strings.Contains(busy, "hx-trigger") {
+		t.Fatalf("editor_panel must carry NO poller — the persistent shell drives the poll:\n%s", busy)
 	}
 }
 

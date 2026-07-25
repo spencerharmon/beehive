@@ -2,16 +2,22 @@
 {{template "breadcrumb" .Crumbs}}
 <h1>edit · {{.File}}</h1>
 <p>chatting with the AI editor on its own branch. Changes are not live until merged.</p>
-{{/* Poll only while a turn is in flight: the shell fetches the panel ONCE on
-   load, and editor_panel.html re-arms this poll (a hidden load-delay fetch) only
-   while .Busy. An idle editor (agent waiting for the next message) therefore
-   stops polling instead of re-rendering an unchanged diff every 1.5s; sending a
-   message makes the panel Busy again, which restarts the poll. */}}
+{{/* chat-diff-poll-update-integration: poll from THIS persistent shell node on a
+   self-sustaining timer (load, every 1.5s) — the same proven pattern the
+   dashboard/plan/sessions panes use — and morph-swap the panel in place. The
+   #editor node itself is never swapped (only its innerHTML is), so the recurring
+   trigger keeps firing regardless of what a tick returns. That is the fix for the
+   "diff never updates until a manual refresh" bug: the OLD design re-armed the
+   poll from a hidden node INSIDE the swapped body, which idiomorph preserves
+   (never re-firing its load) and which a 304-unchanged tick drops entirely (empty
+   body), so polling died on the first idle/unchanged tick and a landing reply was
+   never fetched. An idle tick is now just a cheap ETag 304 (no swap, no viewport
+   jump — poll-scroll-preserve), exactly like every other polled pane. */}}
 <div id="editor"
      role="status" aria-live="polite"
      hx-ext="morph"
      hx-get="/editor/{{.ID}}/panel"
-     hx-trigger="load"
+     hx-trigger="load, every 1500ms"
      hx-swap="morph:innerHTML">
   {{template "skeleton-transcript"}}
 </div>

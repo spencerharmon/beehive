@@ -436,13 +436,14 @@ func TestPollPaneLoadingSkeletons(t *testing.T) {
 //     an ENDED session (durable final transcript, no stream) fetches once on
 //     load and then STOPS, so a left-open tab no longer polls identical bytes
 //     every 2s forever. The poll target and swap are unchanged in both states.
-//  2. editor.html polls the panel once on load and editor_panel.html re-arms the
-//     poll ONLY while a turn is in flight (.Busy) — an idle editor stops.
+//  2. editor.html auto-refreshes the panel from its PERSISTENT shell node on a
+//     self-sustaining timer (load, every 1.5s) so a landing reply/diff appears
+//     without a manual refresh (chat-diff-poll-update-integration); the panel body
+//     carries no poller. An idle tick is a cheap 304 (no swap).
 //  3. human_resolve.html / human_resolve_panel.html apply the same idle backoff
 //     to the resolution agent.
-//  4. bootstrap_agent.html / chatedit_panel.html apply it to the setup wizard's
-//     chat panel — the last polled surface poll-backoff-trigger-landing's scope
-//     missed (it named only the editor/human-resolve/session-view panels).
+//  4. bootstrap_agent.html shares the editor panel and auto-refreshes it from the
+//     shell on the same self-sustaining timer.
 func TestPollBackoffWhenEndedOrIdle(t *testing.T) {
 	s, _ := setup(t)
 
@@ -465,18 +466,23 @@ func TestPollBackoffWhenEndedOrIdle(t *testing.T) {
 		}
 	}
 
-	// (2) editor: the shell polls once; the panel self-perpetuates only while Busy.
+	// (2) editor: the PERSISTENT shell auto-refreshes the panel on a self-sustaining
+	// timer (chat-diff-poll-update-integration) so a landing reply/diff appears
+	// without a manual refresh; the panel body carries NO poller in any state (a
+	// body-embedded self-poll was preserved-not-refired by idiomorph and dropped by
+	// a 304-unchanged tick, which killed the loop until a manual reload). An idle
+	// tick is just a cheap ETag 304 — no swap, no viewport jump.
 	eShell := renderTmpl(t, s, "editor.html", map[string]interface{}{"ID": "e1", "File": "ROI.md"})
-	if !strings.Contains(eShell, `hx-trigger="load"`) || strings.Contains(eShell, "every") {
-		t.Errorf("editor.html shell must poll once on load, not on an interval:\n%s", eShell)
+	if !strings.Contains(eShell, `hx-trigger="load, every 1500ms"`) {
+		t.Errorf("editor.html shell must auto-refresh the panel on a self-sustaining timer:\n%s", eShell)
 	}
 	eIdle := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Busy": false})
 	if strings.Contains(eIdle, "hx-trigger") {
-		t.Errorf("idle editor_panel must carry NO poller (nothing to watch):\n%s", eIdle)
+		t.Errorf("idle editor_panel must carry NO poller (the shell drives the poll):\n%s", eIdle)
 	}
 	eBusy := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Busy": true})
-	if !strings.Contains(eBusy, `hx-trigger="load delay:1500ms"`) || !strings.Contains(eBusy, `hx-target="#editor"`) {
-		t.Errorf("busy editor_panel must re-arm the poll while a turn is in flight:\n%s", eBusy)
+	if strings.Contains(eBusy, "hx-trigger") {
+		t.Errorf("busy editor_panel must carry NO poller (the shell drives the poll):\n%s", eBusy)
 	}
 
 	// (3) human_resolve: the same idle/busy backoff for the resolution agent.
@@ -494,21 +500,21 @@ func TestPollBackoffWhenEndedOrIdle(t *testing.T) {
 	}
 
 	// (4) bootstrap chat (setup wizard): the setup agent is now an editor.Session
-	// (edit-session-consolidation), so bootstrap_agent.html polls editor_panel.html
-	// once on load and the panel re-arms the poll ONLY while a turn is in flight
-	// (.Busy) — an idle setup chat stops. Same idle-backoff contract as the
-	// coordination editor it now shares.
+	// (edit-session-consolidation), so bootstrap_agent.html shares the coordination
+	// editor's panel and, like it, auto-refreshes from the PERSISTENT shell node on
+	// a self-sustaining timer (chat-diff-poll-update-integration). The panel body
+	// carries no poller in any state.
 	bShell := renderTmpl(t, s, "bootstrap_agent.html", map[string]interface{}{"ID": "c1"})
-	if !strings.Contains(bShell, `hx-trigger="load"`) || strings.Contains(bShell, "every") {
-		t.Errorf("bootstrap_agent.html shell must poll the editor panel once on load, not on an interval:\n%s", bShell)
+	if !strings.Contains(bShell, `hx-trigger="load, every 1500ms"`) {
+		t.Errorf("bootstrap_agent.html shell must auto-refresh the panel on a self-sustaining timer:\n%s", bShell)
 	}
 	bIdle := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "c1", "Busy": false})
 	if strings.Contains(bIdle, "hx-trigger") {
-		t.Errorf("idle editor_panel must carry NO poller (nothing to watch):\n%s", bIdle)
+		t.Errorf("idle editor_panel must carry NO poller (the shell drives the poll):\n%s", bIdle)
 	}
 	bBusy := renderTmpl(t, s, "editor_panel.html", map[string]interface{}{"ID": "c1", "Busy": true})
-	if !strings.Contains(bBusy, `hx-trigger="load delay:1500ms"`) || !strings.Contains(bBusy, `hx-target="#editor"`) {
-		t.Errorf("busy editor_panel must re-arm the poll while a turn is in flight:\n%s", bBusy)
+	if strings.Contains(bBusy, "hx-trigger") {
+		t.Errorf("busy editor_panel must carry NO poller (the shell drives the poll):\n%s", bBusy)
 	}
 }
 
@@ -7865,7 +7871,11 @@ func TestPollPanesMorphSwap(t *testing.T) {
 
 // TestBusyPanelPollMorphs locks that the self-perpetuating in-flight poll (the
 // hidden load-delay node re-armed while .Busy) also morphs, so a live turn's
-// repeated re-fetch patches the panel in place rather than rebuilding it.
+// repeated re-fetch patches the panel in place rather than rebuilding it. The
+// editor/bootstrap panel no longer carries its own poll node (chat-diff-poll-
+// update-integration moved the poll to the persistent shell, which already
+// morph-swaps — see TestPollBackoffWhenEndedOrIdle); the human-resolve panel
+// still self-perpetuates while busy and must morph.
 func TestBusyPanelPollMorphs(t *testing.T) {
 	s, _ := setup(t)
 	for _, c := range []struct {
@@ -7873,7 +7883,6 @@ func TestBusyPanelPollMorphs(t *testing.T) {
 		tmpl string
 		data interface{}
 	}{
-		{"editor_panel", "editor_panel.html", map[string]interface{}{"ID": "e1", "File": "ROI.md", "Busy": true}},
 		{"human_resolve_panel", "human_resolve_panel.html", map[string]interface{}{"Sub": "alpha", "TaskID": "t1", "SessID": "s1", "Busy": true}},
 	} {
 		out := renderTmpl(t, s, c.tmpl, c.data)
