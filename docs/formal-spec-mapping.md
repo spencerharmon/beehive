@@ -134,6 +134,73 @@ is what `NoForeignReclaim` catches; the same namespace scoping fixes both.
 `recoverMissingWorktree`'s "prefer the surviving local ref over an older remote
 tip" is captured by `Recoverable` counting `localBranch` first.
 
+## Adjacent-path audit — the handoff terminal-leak shape
+
+`TaskStatus.tla`'s `NoDoclessTerminal` (cfgs `TaskStatus_leak_{buggy,fixed}.cfg`)
+models ONE leak: the per-turn `internal/claim` `Heartbeat` republishes PLAN.md's
+on-disk status to `main` unconditionally, so when the runner PINS an unearned
+terminal (`NEEDS-REVIEW`/`DONE`) in place on a gate-fail, later heartbeats leak a
+**forward terminal status ahead of its change doc**. The terminal-leak blocker's
+"audit every adjacent path with the same ordering shape" clause requires proving
+that shape exists *nowhere else*. Two shapes are candidates:
+
+- **(a) commit-PLAN-then-publish independent of the backing artifact** — any
+  `internal/claim` verb doing `CommitPaths(planRel())` + `Publish`;
+- **(b) reset/clean a git working tree** — could a heal drop a not-yet-published
+  artifact?
+
+The leak's *essential precondition* is a **forward** terminal (`NEEDS-REVIEW` or
+`DONE`) published while its change doc is NOT yet durable on `main`. A path is
+CLEARED when it either never publishes a forward terminal, or only publishes one
+whose doc is already proven durable. Verdicts below; every path was evaluated and
+**all are cleared** — no adjacent path reproduces the leak, so no new buggy/fixed
+cfg is warranted (the one real instance is already covered by
+`TaskStatus_leak_*.cfg`).
+
+### Shape (a) — `internal/claim` verbs (`CommitPaths(planRel())` + publish)
+
+| Verb (`internal/claim/claim.go`) | Status effect | Publishes? | Verdict | Why cleared |
+|---|---|---|---|---|
+| `Heartbeat` (:182) | re-stamp, status unchanged | yes | **the leak itself** | Republishes on-disk status unconditionally — the exact vehicle; MODELED by `NoDoclessTerminal` + revert-over-pin fix (`TaskStatus_leak_*.cfg`). Not a *new* gap. |
+| `Release` (:227) | clears claim only, status unchanged | yes | cleared | Never sets a terminal; only unclaims whatever phase the agent already committed. No status moves ahead of any artifact. |
+| `Reject` (:266) | `NEEDS-REVIEW → NEEDS-ARBITRATION`/`TODO` | no (commit only) | cleared | Moves BACKWARD to rework/dispute; the leak needs a FORWARD terminal. `NEEDS-ARBITRATION`/`TODO` are not in the terminal set and carry no forward-doc obligation. Doesn't publish (piggybacks `finish()`). |
+| `Strand` (:295) | `NEEDS-REVIEW → TODO`/`NEEDS-HUMAN` | no (commit only) | cleared | Backward demotion of an unreachable-commit task — the OPPOSITE of leaking a terminal (it REMOVES an unearned `NEEDS-REVIEW`). No publish. |
+| `BounceUnreachable` (:324) | `NEEDS-REVIEW → NEEDS-ARBITRATION` | yes | cleared | Deterministic dispute escalation; `NEEDS-ARBITRATION` is a rework status, not a doc-bearing forward terminal. The implementer doc that reached `NEEDS-REVIEW` is already durable; the arbiter reads it. |
+| `RecoverLostWork` (:359) | `→ TODO`/`NEEDS-HUMAN` | yes | cleared | Backward recovery of confirmed-lost work; no forward terminal. |
+| `RecordReviewCommit` (:394) | sets `review=<sha>` stamp, status unchanged | yes | cleared | Records the agent's ALREADY-pushed bee tip as PLAN metadata; the sha IS its own backing artifact (durability re-checked by the verify gate). No status flip at all. |
+| `FinalizeAlreadyMerged` (:435) | `→ DONE` | yes | cleared | The one forward-to-terminal publish, but GATED on the recorded pointer being a proven ANCESTOR of tracked `main` (the merge is durable) — and the work-pass doc that drove the task to `NEEDS-REVIEW` is already on `main` (the handoff gate required it). This is exactly `NoFalseDone`'s (durable ∧ merged) conjunct, already modeled in `TaskStatus.tla`. |
+| `ClaimLock`/`ReleaseLock` (:506/:546) | lock-file only, no task status | yes | cleared | Operates on `.bee-lock-<name>`, never a task status or a change doc. Out of the terminal-leak shape entirely. |
+
+Summary: only `Heartbeat` publishes a status that can be a leaked forward
+terminal, and it is precisely what `TaskStatus_leak_*.cfg` reproduces and the
+revert-over-pin + runner-owned-doc-synthesis fix closes. Every other verb is
+either backward-only (rework/recovery), status-neutral (Release, RecordReviewCommit,
+locks), or a durability-gated finalize (`FinalizeAlreadyMerged`, covered by
+`NoFalseDone`).
+
+### Shape (b) — git working-tree resets / config revert
+
+| Path (`internal/…`) | What it resets | Verdict | Why cleared |
+|---|---|---|---|
+| `git.go:824 healLocalMain` | `reset --hard HEAD` + `submodule update --force` + `clean -ffd`, scoped to the MAIN worktree and `submodules/<name>/repo` projections | cleared | Discards only UNCOMMITTED drift in the projection; NEVER touches the agent's `submodules/<name>/worktrees/bee-*` worktree where a not-yet-published artifact lives as a real COMMIT. By definition a `reset --hard HEAD` drops nothing committed, so it cannot drop a durable artifact. |
+| `git.go:907 EnsureCleanCheckout` | delegates to `healLocalMain` when the tree is dirty | cleared | Same scoping/argument as `healLocalMain`; heals the shared checkout to a pure HEAD projection before any tokens are spent, never the bee worktree. |
+| `git.go:682 PublishToMain` / `:1004 UpdateLocalMain` dirty-tree heal | `reset --hard` on the main worktree before the push | cleared | The commits being published already exist on the source branch; the heal only clears drift that would block `updateInstead`. No artifact is uncommitted at this point. |
+| `swarm.go:1147 RestoreConfig` (→ `git.go:228 RestoreRemotes`) | git-config `remote.*` sections only | cleared | Touches NO working tree and NO tracked artifact — it rewrites remote config keys and publishes nothing. Structurally outside both shapes; cannot leak a status or drop a doc. |
+| `swarm.go:2459 landSourceBranch` / `:2486 demoteUnpushed` (conflict/land path) | no tree reset; on push-failure demotes via `claim.Strand` + publish | cleared | Pushes the source branch; on failure the correction is BACKWARD (`NEEDS-REVIEW → TODO`/`NEEDS-HUMAN`), i.e. it REMOVES an unearned terminal at an unreachable commit — the inverse of the leak. No reset drops an artifact. |
+
+Conclusion: no working-tree reset can drop a durable (committed) artifact — every
+reset is scoped to a HEAD projection and drops only uncommitted drift — and the
+config revert touches no tree at all. No shape-(b) gap.
+
+### Audit outcome
+
+Every adjacent path enumerated by the blocker is **cleared**; the sole real
+instance of the terminal-leak ordering shape is the handoff/`Heartbeat` pin path,
+already covered by `TaskStatus.tla`'s `NoDoclessTerminal` invariant and its
+`TaskStatus_leak_{buggy,fixed}.cfg`. No new buggy+fixed cfg was added because the
+audit found no uncovered gap — `run-tlc.sh` is unchanged and all 18 cases still
+behave as declared.
+
 ## Roadmap
 
 Layers 1–3 cover every catalogued bug, including the DoD-check false-DONE
