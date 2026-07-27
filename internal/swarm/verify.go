@@ -376,6 +376,20 @@ func checkFailPrompt(taskID, check, out string) string {
 // echo (the full command is already in the task's PLAN.md body).
 func oneLineCheck(s string) string { return strings.Join(strings.Fields(s), " ") }
 
+// revertedFlipPrompt renders the commit-forward prompt for a REVERT-OVER-PIN: the
+// agent's premature terminal flip failed the handoff gate (hint names the one
+// unmet requirement) and the runner has ALREADY reverted the on-disk status back
+// to working so the next heartbeat never republishes the rejected terminal value
+// un-gated. Tells the agent both facts explicitly, so it fixes the gap and
+// re-requests the flip instead of assuming its status write already stuck.
+func revertedFlipPrompt(hint string, working plan.Status) string {
+	return fmt.Sprintf(
+		"%s\n\nNote: your premature status flip was NOT accepted and has been REVERTED — PLAN.md now reads "+
+			"%s again (this is expected; the flip is a REQUEST the runner adjudicates, never a fact). Fix the "+
+			"gap above, then re-flip the status yourself; the gate re-runs on the next completion check.",
+		hint, working)
+}
+
 // gatedHandoff reports whether (kind, status) is a terminal handoff the uniform
 // gate covers. NEEDS-HUMAN is deliberately excluded for every kind: an escalation
 // carries its own reason and must never be trapped by the artifact gate. Work is

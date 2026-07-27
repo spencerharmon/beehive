@@ -4052,8 +4052,8 @@ func TestWorkCompletionKeepsUnmergedSourceBranch(t *testing.T) {
 		_ = git.New(wtDir).Commit(ctx, "feat: in-flight work")
 		// ...then complete the Work handoff: change doc + NEEDS-REVIEW.
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-		commitReviewDoc(g)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitReviewDoc(g)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -4127,8 +4127,8 @@ func TestWorkCompletionDemotesWhenSourceBranchCannotLand(t *testing.T) {
 		os.WriteFile(filepath.Join(wtDir, "feature.txt"), []byte("work\n"), 0o644)
 		_ = git.New(wtDir).Commit(ctx, "feat: work")
 		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-		commitReviewDoc(g)
 		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+		commitReviewDoc(g)
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, RejectLimit: 3}
 	res, err := r.Run(ctx, sel, "sys", "first")
@@ -4354,6 +4354,66 @@ func TestVerifyGateDirtyTreeBlocksThenFixForwardCompletes(t *testing.T) {
 	}
 }
 
+// TestRevertOverPin: a Work pass repeatedly flips its task to NEEDS-REVIEW with
+// an uncommitted change (the handoff gate keeps rejecting it) — the historical
+// pin-to-terminal bug pinned sel.Task.Status to NEEDS-REVIEW so every later
+// heartbeat kept republishing that ungated terminal status to main. The fix,
+// revert-over-pin, instead reverts the ON-DISK PLAN.md status back to the pass's
+// captured working status (TODO here) and COMMITS that reversion, so the task
+// never sits on disk (or reaches main) at an unearned terminal value between
+// turns. Assert: the handoff never completes, the on-disk status reads TODO
+// (not NEEDS-REVIEW) once the run gives up, and the hive history records the
+// revert as a real commit (never a silent in-memory-only pin).
+func TestRevertOverPin(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Work, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.TODO}}
+
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if name == "git" {
+			return verifyOutcome{out: " M infrastructure/zuul/config-repo.yaml"}, nil // always dirty
+		}
+		return verifyOutcome{}, nil
+	}}
+	cl := &mockClient{sess: &mockSession{onTurn: func(turn int) {
+		os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
+		os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+	}}}
+	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 3, TTL: time.Hour, RunVerify: gr.run}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.Completed {
+		t.Fatalf("a persistently rejected flip must never complete: %+v", res)
+	}
+
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("T1")
+	if tk == nil {
+		t.Fatal("T1 vanished from PLAN.md")
+	}
+	if tk.Status != plan.TODO {
+		t.Fatalf("revert-over-pin must restore the working status (TODO) on disk after a rejected flip, got %s", tk.Status)
+	}
+
+	out, err := g.Run(ctx, "log", "--format=%s")
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	if !strings.Contains(out, "revert T1 NEEDS-REVIEW -> TODO") {
+		t.Fatalf("expected a committed revert-over-pin message in hive history, got:\n%s", out)
+	}
+}
+
 // TestVerifyGateDirtyTreeNeverCompletes: while the code worktree stays dirty the
 // handoff never completes (the task is left GC-marked for retry, never a phantom
 // done that ships none of its code).
@@ -4553,8 +4613,8 @@ func TestPredicateHardStopCancelsTurnMidStream(t *testing.T) {
 	sess := &predicateHardStopSession{
 		deliver: func() {
 			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-			commitReviewDoc(g)
 			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+			commitReviewDoc(g)
 		},
 		secondCallRan: secondCallRan,
 	}

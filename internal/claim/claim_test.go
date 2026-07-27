@@ -93,6 +93,51 @@ func TestHeartbeatResolved(t *testing.T) {
 	}
 }
 
+// TestHeartbeatNeverPublishesUngatedTerminal proves the handoff-terminal-leak-fix
+// invariant directly on the heartbeat/publish path: when the on-disk status has
+// moved to a terminal value the caller's `from` does not name (exactly what an
+// agent's own premature/un-gated flip looks like — the runner has not yet run its
+// handoff gate over it), Heartbeat must NEVER commit or publish that terminal
+// status. It reports ErrResolved and makes NO git commit at all (not merely "no
+// publish" — a local commit here would still leave a terminal write in this
+// session's history for a later heartbeat/publish to carry forward un-gated).
+func TestHeartbeatNeverPublishesUngatedTerminal(t *testing.T) {
+	c, ctx := setup(t)
+	if err := c.Claim(ctx, "T1", time.Now().UTC()); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	published := false
+	c.Publish = func(context.Context) error { published = true; return nil }
+
+	head := func() string {
+		out, err := c.Git.Run(ctx, "rev-parse", "HEAD")
+		if err != nil {
+			t.Fatalf("rev-parse HEAD: %v", err)
+		}
+		return strings.TrimSpace(out)
+	}
+	// Simulate an agent that flipped the on-disk status to NEEDS-REVIEW itself
+	// (the historical pin-to-terminal shape) WITHOUT the runner's handoff gate
+	// ever having approved it. The pass's own working status (captured at pass
+	// start, per revert-over-pin) is still TODO, so the caller heartbeats with
+	// from=TODO.
+	writePlan(t, c, ctx, "## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= -->\ndo it\n")
+	afterAgentWrite := head()
+
+	for i := 0; i < 3; i++ { // every subsequent tick must keep refusing, not just the first
+		err := c.Heartbeat(ctx, "T1", plan.TODO, time.Now().UTC())
+		if !errors.Is(err, ErrResolved) {
+			t.Fatalf("tick %d: want ErrResolved (never publish an ungated terminal), got %v", i, err)
+		}
+	}
+	if published {
+		t.Fatal("Heartbeat published the un-gated NEEDS-REVIEW status; it must never publish a status the caller's `from` does not name")
+	}
+	if head() != afterAgentWrite {
+		t.Fatalf("Heartbeat made its own commit over the un-gated terminal flip (HEAD moved %s -> %s); it must make NO commit at all when the on-disk status mismatches `from`", afterAgentWrite, head())
+	}
+}
+
 // TestHeartbeatLost: while we were away a live foreign session took the task;
 // the next heartbeat detects it and returns ErrLost.
 func TestHeartbeatLost(t *testing.T) {
