@@ -1204,6 +1204,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					// detected at top-of-turn heartbeat rather than post-turn): if the
 					// committed artifacts are incomplete, feed the agent the one failing
 					// requirement and keep working (commit forward) instead of finalizing.
+					if berr := r.autoBookkeep(ctx, sel, wtAbs, absRoot, res.Branch); berr != nil {
+						if ferr := finish(""); ferr != nil {
+							return res, errors.Join(berr, ferr)
+						}
+						return res, berr
+					}
 					if hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch); gerr != nil {
 						if ferr := finish(""); ferr != nil {
 							return res, errors.Join(gerr, ferr)
@@ -1398,6 +1404,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// NEEDS-REVIEW flip, and a clean tree all return "" and leave completion
 		// unchanged; an infra failure to run the check is fail-closed (blocks it).
 		if done {
+			if berr := r.autoBookkeep(ctx, sel, wtAbs, absRoot, res.Branch); berr != nil {
+				if ferr := finish(""); ferr != nil {
+					return res, errors.Join(berr, ferr)
+				}
+				return res, berr
+			}
 			hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch)
 			if gerr != nil {
 				if ferr := finish(""); ferr != nil {
