@@ -430,6 +430,25 @@ Done when the task leaves `NEEDS-ARBITRATION`.
     list/link markup), never literal text. A short, one-line reason (no Steps/Links needed) is still
     fine — the template's sections are additive structure for a substantial blocker, not mandatory
     boilerplate for a trivial one.
+
+    **When the Steps are mechanically executable, ship a script, not prose
+    (needs-human-executable-artifact).** If the operator-facing Steps are a fixed sequence of
+    concrete commands (host-root ops, a data migration, a cutover, a multi-step provisioning run),
+    the swarm's job is NOT to transcribe them into the `--reason` — it is to AUTHOR a single,
+    reviewable, executable artifact (a `set -euo pipefail` script / a rendered manifest) that the
+    operator reviews once and runs, and reduce the escalation Steps to "review then run this
+    artifact." The artifact carries the precision the human cannot be asked to reconstruct: EVERY
+    value the swarm cannot know from inside the sandbox (a host path, a device, a color, a service
+    name, a credential location) is a DOCUMENTED OPTION/flag with a sane default, never a blank the
+    operator must infer; every destructive step is gated behind a typed confirmation and supports a
+    dry run; every phase fails loudly with no silent partial. If the artifact must exist on `main`
+    before the human step can reference it, SPLIT the work: a normal mergeable **part (a)** task
+    authors + reviews + merges the script/tooling, and the **part (b)** NEEDS-HUMAN escalation
+    (hard-dep on part (a) DONE) is only "review then run `path/to/script …`". Vague imperative prose
+    that could have been a script IS a shortcut — the same class as a placeholder value: it pushes
+    the swarm's unfinished work onto the operator and invites a mis-execution the script would have
+    prevented. The `--category` is still whichever of the four applies (usually
+    `external-permission`); this rule governs the SHAPE of what you hand over, not the gate.
  5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills
