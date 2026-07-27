@@ -449,6 +449,16 @@ Done when the task leaves `NEEDS-ARBITRATION`.
     the swarm's unfinished work onto the operator and invites a mis-execution the script would have
     prevented. The `--category` is still whichever of the four applies (usually
     `external-permission`); this rule governs the SHAPE of what you hand over, not the gate.
+
+    **State the EXACT command, not "run the script."** The escalation Steps must give the operator
+    the LITERAL invocation to paste — binary/script path plus every flag filled with the REAL value
+    this migration needs (`sudo ./scripts/foo.sh quiesce --gostream-state /var/gostream`), in run
+    order, one line per command. Never `run the script with the appropriate flags`, never a
+    `<placeholder>` the operator must resolve: if a value is knowable from the target's state, put it
+    in; if it is genuinely operator-only (a path only they can confirm), name the ONE thing to fill
+    and where to get it. "Review then run this artifact" means the review is of a command they can
+    already see in full — an escalation that makes the operator reconstruct the command line is the
+    same vague-prose shortcut this rule forbids.
  5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills
