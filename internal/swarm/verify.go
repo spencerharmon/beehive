@@ -12,6 +12,7 @@ import (
 
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
+	"github.com/spencerharmon/beehive/internal/repo"
 	selectt "github.com/spencerharmon/beehive/internal/select"
 )
 
@@ -388,6 +389,195 @@ func revertedFlipPrompt(hint string, working plan.Status) string {
 			"%s again (this is expected; the flip is a REQUEST the runner adjudicates, never a fact). Fix the "+
 			"gap above, then re-flip the status yourself; the gate re-runs on the next completion check.",
 		hint, working)
+}
+
+// autoBookkeep is runner-owned mechanical completion bookkeeping (the follow-up
+// scoped out of handoff-terminal-leak-fix's change doc): when a Work pass has
+// already produced real substance — a change doc on disk, real commits in its
+// code worktree — but left one or more purely MECHANICAL artifacts unfinished
+// (the doc uncommitted, or the `commits=`/`Beehive-Commits` tag missing), the
+// runner completes that bookkeeping itself instead of bouncing the agent back
+// for busywork it can derive deterministically. It runs immediately BEFORE the
+// handoff gate at every completion check, so a pass that is otherwise done needs
+// no extra turn merely to satisfy the gate's own artifact invariants.
+//
+// It NEVER invents substance: a task whose change doc does not exist on disk at
+// all is left untouched (the gate's docUncommittedFailPrompt still correctly
+// asks the agent to write one), and it never rewrites the doc's prose — only its
+// first-line Beehive-Commits header, and only when that header is absent or
+// disagrees with the actual commits= tag. The submodule commit+push itself
+// remains the agent's (landSourceBranch already owns pushing the branch once the
+// task is accepted; this function only reconciles the BOOKKEEPING artifacts that
+// describe commits already made). Scoped to Work with a code worktree — Review
+// and Arbitrate author their OWN terminal merge as their defining act, a
+// different shape not covered here (mirrors the explicit boundary
+// handoff-terminal-leak-fix's change doc drew around this exact follow-up).
+// Best-effort throughout: any failure to even read/parse the plan or doc is a
+// silent no-op (the gate itself still runs and reports the real, unmasked
+// problem); only a failure to WRITE an update this function decided to make is
+// returned as an error (fail loud on a decided write, never as a phantom-fix).
+func (r *Runner) autoBookkeep(ctx context.Context, sel *selectt.Selection, wtAbs, hiveAbs, branch string) error {
+	if sel.Kind != selectt.Work || wtAbs == "" {
+		return nil
+	}
+	planPath := sel.Submodule.PlanPath()
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		return nil
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		return nil
+	}
+	t := p.Find(sel.Task.ID)
+	if t == nil || !gatedHandoff(selectt.Work, t.Status) {
+		return nil // nothing to bookkeep unless the agent already flipped terminal
+	}
+
+	// Discover the change doc this task already carries on disk, if any — the
+	// one substantive artifact this function refuses to fabricate.
+	docDir := filepath.Join(sel.Submodule.Path, "docs")
+	stem := branch + "-" + sel.Task.ID
+	var docName string
+	if ents, derr := os.ReadDir(docDir); derr == nil {
+		for _, e := range ents {
+			if !e.IsDir() && pathHasPrefix(e.Name(), stem) {
+				docName = e.Name()
+				break
+			}
+		}
+	}
+	if docName == "" {
+		return nil // no doc on disk at all — nothing to bookkeep, the gate asks for one
+	}
+	docFSPath := filepath.Join(docDir, docName)
+	docRel := path.Join("submodules", sel.Submodule.Name, "docs", docName)
+	planRel := path.Join("submodules", sel.Submodule.Name, repoPlanFile)
+
+	docBytes, err := os.ReadFile(docFSPath)
+	if err != nil {
+		return nil
+	}
+	doc := string(docBytes)
+
+	// Cheap bail-out FIRST, before any git call: if the plan already carries a
+	// commits= tag AND the doc's header already agrees with it, there is nothing
+	// this function owns to fix — never touch git for an already-consistent task.
+	docShas, docHasHeader := parseDocCommits(doc)
+	if t.CommitsSet && docHasHeader && sameCommitSet(docShas, t.Commits) {
+		return nil
+	}
+
+	// Discover the real submodule commits this session produced (reachable from
+	// the code worktree HEAD but not the tracked-branch tip). Best-effort: any
+	// git failure just yields an empty set (never fabricated). Skipped when the
+	// plan already carries a definitive commits= tag — that declared set is
+	// authoritative and is only ever mirrored into the doc, never overridden.
+	commits := t.Commits
+	if !t.CommitsSet {
+		commits = r.discoverSessionCommits(ctx, wtAbs, sel.Submodule)
+	}
+
+	changed := false
+	if !t.CommitsSet {
+		t.Commits = commits
+		t.CommitsSet = true
+		changed = true
+	}
+	docWritten := false
+	if !docHasHeader || !sameCommitSet(docShas, t.Commits) {
+		newDoc := setDocCommitsHeader(doc, t.Commits)
+		if newDoc != doc {
+			if err := os.WriteFile(docFSPath, []byte(newDoc), 0o644); err != nil {
+				return fmt.Errorf("auto-bookkeep: writing doc %s: %w", docFSPath, err)
+			}
+			docWritten = true
+		}
+	}
+	if changed {
+		if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+			return fmt.Errorf("auto-bookkeep: writing %s: %w", planPath, err)
+		}
+	}
+	if !changed && !docWritten {
+		return nil // already consistent — nothing this function owns needs fixing
+	}
+
+	// Commit whichever of PLAN.md/the doc are still dirty in the hive worktree —
+	// the agent may have left one, both, or neither uncommitted.
+	status, err := r.runVerify(ctx, hiveAbs, "git", "status", "--porcelain", "--", planRel, docRel)
+	if err != nil {
+		return fmt.Errorf("auto-bookkeep: git status: %w", err)
+	}
+	if status.exitErr || strings.TrimSpace(status.out) == "" {
+		return nil // clean already — nothing left to commit
+	}
+	msg := fmt.Sprintf(
+		"beehive: runner-owned bookkeeping for %s (doc + commits tag)\n\nBeehive: %s %s",
+		sel.Task.ID, sel.Task.ID, docRel)
+	if err := r.Git.CommitPaths(ctx, msg, planRel, docRel); err != nil && !errors.Is(err, git.ErrNothing) {
+		return fmt.Errorf("auto-bookkeep: committing %s: %w", sel.Task.ID, err)
+	}
+	return nil
+}
+
+// discoverSessionCommits reports the submodule commits reachable from the code
+// worktree's HEAD but not from the tracked branch's tip — the real commits THIS
+// session made, derived the exact same way the handoff gate's own durability
+// check reasons about reachability. Best-effort: any git failure (an unreadable
+// ref, an unconfigured remote, a repo that never diverged) yields an empty slice
+// rather than propagating, since this is a bookkeeping convenience, never the
+// gate of record.
+func (r *Runner) discoverSessionCommits(ctx context.Context, wtAbs string, sub repo.Submodule) []string {
+	sg := git.New(wtAbs)
+	trackedBranch := r.trackedBranch(ctx, sub.Path)
+	ref := trackedBranch
+	if rem, err := sg.Remote(ctx); err == nil && rem != "" {
+		if ferr := sg.Fetch(ctx, rem, trackedBranch); ferr == nil {
+			ref = rem + "/" + trackedBranch
+		}
+	}
+	out, err := sg.Run(ctx, "rev-list", ref+".."+"HEAD")
+	if err != nil {
+		return nil
+	}
+	var shas []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			shas = append(shas, line)
+		}
+	}
+	return shas
+}
+
+// setDocCommitsHeader rewrites (or inserts) doc's first-line
+// `<!-- Beehive-Commits: ... -->` header to name exactly commits, leaving every
+// other line untouched — the ONLY prose this function ever writes, and only when
+// the header is absent or disagrees with the commits= tag it mirrors.
+func setDocCommitsHeader(doc string, commits []string) string {
+	header := fmt.Sprintf("<!-- Beehive-Commits: %s -->", commitsTagValue(commits))
+	lines := strings.SplitN(doc, "\n", 2)
+	first := strings.TrimSpace(lines[0])
+	rest := ""
+	if len(lines) > 1 {
+		rest = lines[1]
+	}
+	if strings.Contains(first, "Beehive-Commits:") {
+		if first == header {
+			return doc
+		}
+		if rest == "" {
+			return header
+		}
+		return header + "\n" + rest
+	}
+	if rest == "" && len(lines) == 1 {
+		if strings.TrimSpace(doc) == "" {
+			return header + "\n"
+		}
+		return header + "\n" + doc
+	}
+	return header + "\n" + doc
 }
 
 // gatedHandoff reports whether (kind, status) is a terminal handoff the uniform
