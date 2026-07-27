@@ -27,7 +27,7 @@ them apart bounds the state space):
 | Layer | Module(s) | Models | Status |
 |-------|-----------|--------|--------|
 | **1. Shared git refs** | `MainConvergence.tla`, `SubmodulePointer.tla` | `main` fast-forward convergence + submodule gitlink durability/tracked-tip | **done** |
-| **2. Task lifecycle** | `TaskStatus.tla`, `ClaimRace.tla`, `DependencyReadiness.tla` | status state machine + the DONE-gates (durability + definition-of-done check) + claim/heartbeat/TTL concurrent-dispatch mutual exclusion + lost-work self-heal + dangling-dependency refusal | **done** |
+| **2. Task lifecycle** | `TaskStatus.tla`, `ClaimRace.tla`, `DependencyReadiness.tla` | status state machine + the DONE-gates (durability + definition-of-done check) + on-disk-vs-published status/change-doc handoff-terminal-leak gating + claim/heartbeat/TTL concurrent-dispatch mutual exclusion + lost-work self-heal + dangling-dependency refusal | **done** |
 | **3. beehived dances** | `EditorSessionNamespace.tla` *(planned)* | the three `edit-*` subsystems sharing `.worktrees/`, the reclaim/gc dance, remote session durability | planned |
 
 ## Layer 1 modules (this delivery)
@@ -92,6 +92,47 @@ Configs:
   declared acceptance `Check` is **not** satisfied — the
   `jellyfin:zuul-image-build-publish` false-DONE (reviewed config commit, image
   never pullable) — `NoFalseDone` violated.
+
+**The handoff-terminal-leak** (2026-07-26 session mining, 31/68 gate-hitting
+passes deadlocked to `MaxTurns`): `status` above is the AGENT-WRITTEN on-disk
+status only (the worktree's `PLAN.md`); it is not what the selector/peers
+observe. `published` is the separate status the runner's per-turn heartbeat
+(`internal/claim` `Heartbeat` -> `CommitPaths(planRel())` -> `Publish`) actually
+carries onto `main`, **every turn, independent of the handoff gate and of
+whether the change doc exists anywhere**. `docWritten`/`docOnMain` model the
+change-doc artifact the same way `workDurable`/`merged` model the code commit.
+`CONSTANT RevertOverPin` selects the fix (`TRUE`: on gate-fail the runner
+reverts the on-disk status back to its pre-handoff value instead of pinning it,
+*and* the heartbeat's publish of a terminal status is itself gated on the
+backing artifacts being present — "runner-owned doc/commit synthesis") vs the
+pre-fix bug (`FALSE`: pin-to-terminal, `swarm.go` ~1205/~1401, plus an
+unconditional heartbeat publish).
+
+- `NoFalseHandoff` — a `published` `NEEDS-REVIEW` always has its change doc
+  durably recorded on `main` too (extends the anti-false-DONE contract to the
+  handoff itself, phrased on the sticky `docOnMain` latch so an adversarial
+  `LoseWork` after a legitimate handoff doesn't retroactively violate it).
+- `NoDoclessTerminal` — no terminal `published` status (`NEEDS-REVIEW` or
+  `DONE`) ever reaches `main` without its change doc also being on `main`. This
+  is the exact shape of the two real false-DONE leaks found in the
+  2026-07-26 session mining: `beehive:active-state-live-poll` and
+  `chris-agent:spec-lifecycle-state-machine` reached `DONE` on `main` with **no
+  change doc**.
+- `PublishConverges` — liveness: `published` eventually catches up with an
+  earned on-disk terminal, so the revert loop (`GateCheck` reverting a pinned,
+  unearned terminal) never livelocks — a task whose substance never actually
+  appears still terminates (`DONE`-with-substance or `NEEDS-HUMAN` past
+  `Limit`), it never spins forever re-flipping.
+
+Configs:
+- `TaskStatus_leak_fixed.cfg` — `RevertOverPin = TRUE` (durability + DoD-check
+  gates also on). No error; `NoFalseHandoff`/`NoDoclessTerminal` and all prior
+  invariants hold, and `PublishConverges` holds alongside `Terminates` /
+  `LostWorkRecovers`.
+- `TaskStatus_leak_buggy.cfg` — `RevertOverPin = FALSE` (durability + DoD-check
+  gates left **on**, isolating the leak from the older false-DONE defects
+  above): a terminal status reaches `published` with no change doc ever
+  recorded on `main` — `NoDoclessTerminal` violated, with trace.
 
 ### `DependencyReadiness.tla`
 Dependency readiness + the dangling-dependency refusal (`92d2ed1`, faithful to
