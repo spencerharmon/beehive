@@ -287,8 +287,8 @@ func TestLeanContextWrapsFollowUpTurn(t *testing.T) {
 	cl := &mockClient{sess: &mockSession{all: &sent, onTurn: func(turn int) {
 		if turn == 2 {
 			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-			commitReviewDoc(g)
 			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+			commitReviewDoc(g)
 		}
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour, LeanContext: true}
@@ -323,8 +323,8 @@ func TestLeanContextOffIsInert(t *testing.T) {
 	cl := &mockClient{sess: &mockSession{all: &sent, onTurn: func(turn int) {
 		if turn == 2 {
 			os.WriteFile(filepath.Join(sm, "docs", "bee-T1-T1.md"), []byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
-			commitReviewDoc(g)
 			os.WriteFile(planPath, []byte("## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\ngo\n"), 0o644)
+			commitReviewDoc(g)
 		}
 	}}}
 	r := &Runner{Repo: rp, Git: g, Client: cl, MaxTurns: 5, TTL: time.Hour} // LeanContext: false

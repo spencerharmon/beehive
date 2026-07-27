@@ -575,6 +575,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if err != nil {
 		return res, err
 	}
+	// workingStatus is THIS pass's non-terminal status as selected — TODO (Work),
+	// NEEDS-REVIEW (Review), or NEEDS-ARBITRATION (Arbitrate) — captured ONCE here,
+	// at pass start, before anything can mutate it. It is the revert-over-pin
+	// target: when the handoff gate rejects a premature terminal flip, the on-disk
+	// status is reverted to EXACTLY this captured value (never re-read from the
+	// now-errant plan, which could itself already be corrupted/mid-flip) so the
+	// heartbeat/publish path always carries a legitimate, non-terminal status.
+	workingStatus := sel.Task.Status
 
 	// Self-heal before doing anything else: drop any orphan code-worktree gitlink a
 	// prior pass leaked into the beehive index (a committed submodules/<sm>/
@@ -1202,10 +1210,18 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						}
 						return res, gerr
 					} else if hint != "" {
-						if st, serr := r.taskStatus(sel); serr == nil {
-							sel.Task.Status = st
+						// REVERT-OVER-PIN: the on-disk terminal flip was rejected — revert it
+						// to the pass's captured working status (never pin sel.Task.Status to
+						// the rejected terminal value) so the heartbeat/publish path carries
+						// only the legitimate non-terminal status. Tell the agent both facts.
+						if rerr := r.revertGatedFlip(ctx, sel, absRoot, workingStatus); rerr != nil {
+							if ferr := finish(""); ferr != nil {
+								return res, errors.Join(rerr, ferr)
+							}
+							return res, rerr
 						}
-						prompt = hint
+						sel.Task.Status = workingStatus
+						prompt = revertedFlipPrompt(hint, workingStatus)
 						continue
 					}
 					// Publish first; only release + report complete if main advanced.
@@ -1391,15 +1407,20 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			}
 			if hint != "" {
 				done = false
-				gateHint = hint
-				// Pin to the terminal status the agent actually left (NEEDS-REVIEW /
-				// NEEDS-ARBITRATION / DONE / TODO by kind), NOT a hardcoded one, so the
-				// next turn's heartbeat re-stamps that status (keeping the claim fresh)
-				// instead of tripping ErrResolved on a mismatch. Falls back to the
-				// selection's prior status if the plan can't be re-read.
-				if st, serr := r.taskStatus(sel); serr == nil {
-					sel.Task.Status = st
+				// REVERT-OVER-PIN: revert the on-disk status to the pass's captured
+				// working status (never pin sel.Task.Status to the rejected terminal
+				// value) so the heartbeat/publish path never carries an un-gated
+				// terminal status. gateHint tells the agent BOTH the gate result and
+				// that its premature flip was reverted, so it re-requests once the
+				// substance exists instead of thrashing.
+				if rerr := r.revertGatedFlip(ctx, sel, absRoot, workingStatus); rerr != nil {
+					if ferr := finish(""); ferr != nil {
+						return res, errors.Join(rerr, ferr)
+					}
+					return res, rerr
 				}
+				sel.Task.Status = workingStatus
+				gateHint = revertedFlipPrompt(hint, workingStatus)
 			}
 		}
 		// Claim-ttl-wallcap race guard (session-audit-013 F1): the heartbeat above
@@ -3100,6 +3121,54 @@ func (r *Runner) deleteSourceBranch(ctx context.Context, sub repo.Submodule, bra
 	// The remote branch is gone; drop any lingering local ref so it does not accrue.
 	_ = sg.DeleteBranch(ctx, branch)
 	return ""
+}
+
+// revertGatedFlip implements REVERT-OVER-PIN: when the handoff gate rejects a
+// premature terminal flip (NEEDS-REVIEW/NEEDS-ARBITRATION/DONE/TODO the agent
+// wrote on disk without earning it), the on-disk PLAN.md status is reverted to
+// `working` — the pass's non-terminal status CAPTURED AT PASS START, never
+// re-read from the now-errant plan — and that reversion is committed so the next
+// heartbeat publishes the legitimate working status instead of re-publishing the
+// rejected terminal one. This replaces the historical pin-to-terminal approach
+// (setting sel.Task.Status to the terminal value so Heartbeat's `from` matched
+// and kept republishing it un-gated): a REQUEST the gate rejects must never reach
+// `main` as if it were a fact. Idempotent (a no-op commit if the disk already
+// reads `working`, e.g. a peer/prior turn already reverted it); a read/parse
+// failure or a task that vanished under us is reported so the caller fails
+// closed rather than silently leaving a terminal status in place.
+func (r *Runner) revertGatedFlip(ctx context.Context, sel *selectt.Selection, absRoot string, working plan.Status) error {
+	planPath := sel.Submodule.PlanPath()
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		return fmt.Errorf("revert gated flip: reading %s: %w", planPath, err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		return fmt.Errorf("revert gated flip: parsing %s: %w", planPath, err)
+	}
+	t := p.Find(sel.Task.ID)
+	if t == nil {
+		return fmt.Errorf("revert gated flip: task %q absent from %s", sel.Task.ID, planPath)
+	}
+	if t.Status == working {
+		return nil // already reverted (idempotent)
+	}
+	rejected := t.Status
+	t.Status = working
+	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+		return fmt.Errorf("revert gated flip: writing %s: %w", planPath, err)
+	}
+	rel, err := filepath.Rel(absRoot, planPath)
+	if err != nil {
+		return fmt.Errorf("revert gated flip: resolving relative path: %w", err)
+	}
+	msg := fmt.Sprintf(
+		"plan: revert %s %s -> %s (handoff gate rejected)\n\nBeehive: %s plan",
+		sel.Task.ID, rejected, working, sel.Task.ID)
+	if err := r.Git.CommitPaths(ctx, msg, rel); err != nil && !errors.Is(err, git.ErrNothing) {
+		return fmt.Errorf("revert gated flip: committing %s: %w", rel, err)
+	}
+	return nil
 }
 
 // taskStatus reads the selected task's current status from the (published)
