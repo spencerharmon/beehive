@@ -468,6 +468,15 @@ Done when the task leaves `NEEDS-ARBITRATION`.
     gates are un-skippable even under a `--yes`/non-interactive flag. Offer the individual steps as
     an advanced escape hatch for retry/inspection, but the DEFAULT the escalation names is the single
     run-it-all command.
+
+    **Bake known values as defaults; the example command carries only what the swarm genuinely
+    cannot know.** If you know a value (a path, a namespace, a service name discoverable from the
+    target's state), it is a DEFAULT inside the artifact — not a flag the operator must supply. A
+    flag whose value equals its default is noise: it is one more field for the operator to fumble and
+    it implies a choice that does not exist. The ideal example command is zero-flag (`sudo ./run.sh
+    migrate`); a flag appears in the example ONLY for a value the operator alone holds. Validate the
+    baked defaults up front (assert each path/resource exists before mutating) so a wrong default
+    fails loudly and immediately instead of silently doing the wrong thing.
  5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills
