@@ -459,6 +459,15 @@ Done when the task leaves `NEEDS-ARBITRATION`.
     and where to get it. "Review then run this artifact" means the review is of a command they can
     already see in full — an escalation that makes the operator reconstruct the command line is the
     same vague-prose shortcut this rule forbids.
+
+    **ONE command, not a checklist of them.** If the artifact has multiple steps, it runs them
+    itself in order from a single entrypoint — do NOT hand the operator N commands to paste in
+    sequence (that is just prose steps wearing a monospace font). The one command stops ONLY at the
+    genuine human-decision gates the swarm cannot make (judge private/opaque data, confirm a
+    user-visible cutover is healthy); everything mechanical between gates is automatic, and those
+    gates are un-skippable even under a `--yes`/non-interactive flag. Offer the individual steps as
+    an advanced escape hatch for retry/inspection, but the DEFAULT the escalation names is the single
+    run-it-all command.
  5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills
