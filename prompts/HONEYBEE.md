@@ -477,6 +477,19 @@ Done when the task leaves `NEEDS-ARBITRATION`.
     migrate`); a flag appears in the example ONLY for a value the operator alone holds. Validate the
     baked defaults up front (assert each path/resource exists before mutating) so a wrong default
     fails loudly and immediately instead of silently doing the wrong thing.
+
+    **Bake a default ONLY for a value you can actually validate; a value you CANNOT validate stays a
+    surfaced flag — never a fabricated default.** The two rules above (zero-flag, validate up front)
+    are the SAME rule: you may only hide a value you have verified. If the value lives outside your
+    sandbox — a path on the operator's host, a network resource you cannot reach, an install-specific
+    location — you have NOT verified it, so guessing a default and hiding it is a placeholder
+    shortcut: a hidden wrong guess is strictly worse than a flag, because it silently mis-runs or
+    hard-blocks on a value the operator never saw. Instead: (a) if the artifact can discover the
+    real value at run time on the target (query the running unit, the API, the cluster), do that and
+    fall back to a flag; (b) else expose it as a flag — required, or defaulted only to a genuine,
+    documented CONVENTION (a package default), never to an invented path. Verify the guess against
+    the source of truth before baking it: e.g. a state-file location is whatever the program's own
+    code/config says it is, not where it "should" live.
  5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills
