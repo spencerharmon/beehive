@@ -490,6 +490,15 @@ Done when the task leaves `NEEDS-ARBITRATION`.
     documented CONVENTION (a package default), never to an invented path. Verify the guess against
     the source of truth before baking it: e.g. a state-file location is whatever the program's own
     code/config says it is, not where it "should" live.
+
+    **When the operator hands off a bulk capture, consume it whole — do not re-fixate on individual
+    files inside it.** If the operator has already recursively copied a directory tree (a state dir,
+    a data dir), the artifact copies/mounts that tree verbatim and lets the downstream consumer take
+    what it needs; it must NOT single out one file by an exact name/path, assert that file, or
+    reconstruct a sub-layout the operator already provided. Singling out a file is both fragile (an
+    exact path you probably have wrong) and unsafe (you drop its siblings — e.g. a SQLite `-wal`/
+    `-shm` alongside the `.db`, losing the newest writes). Recursively capturing the parent is
+    simpler AND more correct. Trust the operator's completed handoff over your model of its internals.
  5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills
