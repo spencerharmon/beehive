@@ -511,6 +511,15 @@ Done when the task leaves `NEEDS-ARBITRATION`.
     one-shot job, skip-if-present, `rsync` not blind copy) without hand-surgery between attempts. An
     artifact that only works on a pristine first run, or that a background reconciler can silently
     revert, is not done.
+
+    **When an artifact copies a directory tree, know what is UNDER that tree.** A source dir can
+    contain nested/virtual mounts (FUSE, bind, network) that are NOT the data you mean to copy and
+    can be orders of magnitude larger — recursing into them fills the disk with real bytes and
+    detonates the operation. Copy with the mount-boundary respected (`rsync --one-file-system`,
+    `find -xdev`, `tar --one-file-system`), and guard capacity up front: measure the REAL source
+    size (`du -sx`, mounts excluded) against free space on the destination filesystem and refuse
+    before the first byte if it will not fit. Staging onto the same disk duplicates the data — count
+    that. A copy that assumes a directory is only what you think it is will eventually eat the host.
  5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills
