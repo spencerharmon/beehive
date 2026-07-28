@@ -499,6 +499,18 @@ Done when the task leaves `NEEDS-ARBITRATION`.
     exact path you probably have wrong) and unsafe (you drop its siblings — e.g. a SQLite `-wal`/
     `-shm` alongside the `.db`, losing the newest writes). Recursively capturing the parent is
     simpler AND more correct. Trust the operator's completed handoff over your model of its internals.
+
+    **A runnable artifact must own the whole operation it triggers — including quiescing anything that
+    fights it, and being safely re-runnable.** If the artifact mutates state that a controller
+    continuously reconciles (a GitOps operator, an autoscaler, an operator/CRD), it must suspend that
+    controller for the duration and restore it after — discovering the controller's identity from the
+    live objects, not a hardcoded name — or the controller races the artifact and undoes/corrupts the
+    change mid-flight. On failure, leave the system in the SAFE half-state (quiesced, not half-
+    started over inconsistent data) and say so, rather than blindly restoring. And make every step
+    idempotent: a failed run must be fixable and re-run from the top (delete-and-recreate the
+    one-shot job, skip-if-present, `rsync` not blind copy) without hand-surgery between attempts. An
+    artifact that only works on a pristine first run, or that a background reconciler can silently
+    revert, is not done.
  5. **ROI.** You never touched `ROI.md`. Confirm.
 
 ## Skills
