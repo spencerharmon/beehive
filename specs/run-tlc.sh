@@ -24,6 +24,8 @@ CASES=(
     "MainConvergence|MainConvergence_fixed.cfg|pass"
     "MainConvergence|MainConvergence_buggy.cfg|fail"
     "MainConvergence|MainConvergence_forcerewind.cfg|fail"
+    "MainConvergence|MainConvergence_stagedheal_fixed.cfg|pass"
+    "MainConvergence|MainConvergence_stagedheal_buggy.cfg|fail"
     "SubmodulePointer|SubmodulePointer_fixed.cfg|pass"
     "SubmodulePointer|SubmodulePointer_buggy.cfg|fail"
     "TaskStatus|TaskStatus_fixed.cfg|pass"

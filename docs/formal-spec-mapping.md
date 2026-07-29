@@ -39,8 +39,12 @@ action in the model, or has its forbidden action *refused* by a guard actor:
 | `PullMainFFOnly` | action | `sessions.go:764 pullMain` → `git.go:276 Pull` (`git pull --ff-only`) | `git_test.go TestPullFFOnlyDivergence` (ff-only cannot cross a fork) |
 | `PushPrimary` | action | `git.go:777 PublishPrimaryMain` (non-ff push refused, never force) | `git_test.go:1188` |
 | `ExternalForceRewind` | action | refused by `config/hook.go:153 preReceiveHook` (`refs/heads/main`, `hook.go:189`) | end-to-end regression in the `f8e7828` change |
+| `MutatePrimaryTree` | action | staging a write into the live primary working tree before it is committed: `git.go` `submodule add` / `CommitPaths` index+worktree write, an operator edit (StagedAtomic=TRUE fuses stage+convergent-publish; FALSE leaves it uncommitted) | `MainConvergence_stagedheal_buggy.cfg` reproduces the uncommitted window |
+| `CommitStaged` | action | the commit that promotes a staged primary-tree write into committed local history (`git.go` `CommitPaths` commit step) | `MainConvergence_stagedheal_fixed.cfg` |
+| `HealResetHard` | action | `main.go`/`internal/swarm` preflight dirty-tree heal — `healLocalMain` `git reset --hard HEAD` (see `docs/sharing-modes.md` reset-dirty-with-WARNING guard) | `MainConvergence_stagedheal_buggy.cfg` proves it eats an uncommitted staged write |
 | `Reconcilable` | invariant | the whole convergence protocol; `docs/main-convergence-protocol.md` "two anchors that must stay reconcilable" | `MainConvergence_buggy.cfg` proves the fork is reachable without the fix |
 | `NoSilentLoss` | invariant | pre-receive guard (`hook.go`) + `SyncMainFromRemote` merge | `MainConvergence_forcerewind.cfg` proves loss reachable without the guard |
+| `NoStagedLoss` | invariant | the reset-dirty-tree heal may only discard content some writer will re-stage — a begun primary-tree write MUST be committed (atomically, or authored in a worktree the heal never touches) before the heal runs; the 2026-07-29 `submodule add` orphan-gitlink loss is a begun write eaten uncommitted | `MainConvergence_stagedheal_buggy.cfg` reproduces the loss (MutatePrimaryTree→HealResetHard); `MainConvergence_stagedheal_fixed.cfg` (StagedAtomic) passes |
 | `EventuallyConverged` | liveness | `PublishToMain` + `UpdateLocalMain` at every publish site (honeybee/editor/resolve) | `MainConvergence_fixed.cfg` |
 
 ## Layer 1 — `SubmodulePointer.tla`
