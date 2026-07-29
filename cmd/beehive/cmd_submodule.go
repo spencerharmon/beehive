@@ -272,6 +272,18 @@ func syncSubmodule(ctx context.Context, root, sm string) error {
 	return nil
 }
 
+// submoduleAddCmd registers a new tracked submodule. Convergence protocol
+// (docs/main-convergence-protocol.md): submod.Add mutates the live primary tree
+// (.gitmodules + the new gitlink) WITHOUT committing, so — unlike the four verbs
+// main-write-command-routing fixed — the caller used to hand back a dirty tree
+// with no bound on how long it stayed that way, the widest possible exposure to
+// beehived's dirty-tree heal (`git reset --hard HEAD`), which silently discards
+// the staged-but-uncommitted mutation (the 2026-07-29 runcible/runcible-configs
+// orphan-gitlink loss). This wraps the mutation in the SAME
+// SyncMainFromRemote-before -> CommitPaths -> PublishPrimaryMain-after shape
+// syncSubmodule/submoduleRemoteCmd already use, so the commit lands in the same
+// function call immediately after the mutation — no window for a heal to race it
+// — and the base is fresh so the commit can never fork against a stale local main.
 func submoduleAddCmd() *cobra.Command {
 	var name, branch string
 	c := &cobra.Command{
@@ -283,8 +295,20 @@ func submoduleAddCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			rootGit := git.New(root)
+			remote, _ := rootGit.Remote(cmd.Context())
+			if err := rootGit.SyncMainFromRemote(cmd.Context(), remote); err != nil {
+				return err
+			}
 			added, err := submod.Add(cmd.Context(), root, args[0], name, branch)
 			if err != nil {
+				return err
+			}
+			rel := filepath.Join("submodules", added)
+			if err := rootGit.CommitPaths(cmd.Context(), "submodule add: "+added, ".gitmodules", rel); err != nil && err != git.ErrNothing {
+				return err
+			}
+			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
 				return err
 			}
 			fmt.Printf("added submodule %s tracking %s (dormant; author ROI.md to activate)\n", added, branch)
@@ -296,17 +320,34 @@ func submoduleAddCmd() *cobra.Command {
 	return c
 }
 
+// submoduleLinkCmd records an undirected submodule link. Same protocol fix as
+// submoduleAddCmd: submod.LinkSubmodules mutates two SUBMODULE-LINKS.yaml files
+// live and uncommitted; wrap it sync-before -> mutate -> commit -> publish-after
+// so the mutation is never left dirty for a heal to discard.
 func submoduleLinkCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "link <submodule-a> <submodule-b>",
 		Short: "link two submodules so each plan may depend on the other",
 		Args:  cobra.ExactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			root, err := findRoot()
 			if err != nil {
 				return err
 			}
+			rootGit := git.New(root)
+			remote, _ := rootGit.Remote(cmd.Context())
+			if err := rootGit.SyncMainFromRemote(cmd.Context(), remote); err != nil {
+				return err
+			}
 			if err := submod.LinkSubmodules(root, args[0], args[1]); err != nil {
+				return err
+			}
+			pathA := filepath.Join("submodules", args[0], repo.LinksFile)
+			pathB := filepath.Join("submodules", args[1], repo.LinksFile)
+			if err := rootGit.CommitPaths(cmd.Context(), "submodule link: "+args[0]+" <-> "+args[1], pathA, pathB); err != nil && err != git.ErrNothing {
+				return err
+			}
+			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
 				return err
 			}
 			fmt.Printf("linked %s <-> %s\n", args[0], args[1])

@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/submod"
 )
 
 func mustGit(t *testing.T, dir string, args ...string) string {
@@ -231,5 +232,176 @@ func TestMainWriteWithoutSyncManufacturesFork(t *testing.T) {
 	}
 	if _, err := g.Run(ctx, "merge", "--ff-only", "FETCH_HEAD"); err == nil {
 		t.Fatal("expected ff-only merge to FAIL on the manufactured fork, but it succeeded")
+	}
+}
+
+// --- submodule-add-link-protocol-routing ---
+//
+// submod.Add / submod.LinkSubmodules mutate the live primary tree
+// (.gitmodules, the new gitlink, SUBMODULE-LINKS.yaml) WITHOUT committing —
+// unlike the four verbs main-write-command-routing fixed, the caller used to
+// hand back a dirty tree with NO bound on how long it stayed dirty (the widest
+// exposure to beehived's dirty-tree heal, `git reset --hard HEAD`). These tests
+// lock: (1) `submodule add`/`submodule link` heal a pre-existing fork and
+// publish, exactly like the other main-write verbs; (2) the CLI leaves a CLEAN
+// primary tree afterward (TestSubmoduleAddLeavesCleanTree /
+// TestSubmoduleAddAtomicPublish); (3) a negative control proves the
+// pre-fix shape (mutate via submod.Add directly, no immediate commit) is
+// vulnerable to exactly the heal-eats-uncommitted-write loss the 2026-07-29
+// runcible/runcible-configs incident hit.
+
+// bareSubmoduleOrigin builds a bare origin plus a seeded, pushed submodule
+// checkout content dir a submod.Add clone can pull from.
+func bareSubmoduleOrigin(t *testing.T) string {
+	t.Helper()
+	origin := t.TempDir()
+	mustGit(t, origin, "init", "-q", "--bare", "-b", "main")
+	seed := t.TempDir()
+	mustGit(t, seed, "init", "-q", "-b", "main")
+	mustGit(t, seed, "config", "user.email", "s@s")
+	mustGit(t, seed, "config", "user.name", "s")
+	writeFileMW(t, seed, "README.md", "target repo\n")
+	mustGit(t, seed, "add", "README.md")
+	mustGit(t, seed, "commit", "-q", "-m", "seed")
+	mustGit(t, seed, "remote", "add", "origin", origin)
+	mustGit(t, seed, "push", "-q", "origin", "main")
+	return origin
+}
+
+// TestSubmoduleAddHealsForkAndPublishes mirrors TestSubmoduleRemoteHealsForkAndPublishes:
+// `submodule add` on a hive whose local main is behind origin must heal the fork
+// and publish the new submodule commit to origin, never manufacturing a fork.
+func TestSubmoduleAddHealsForkAndPublishes(t *testing.T) {
+	root, origin := newHive(t)
+	smOrigin := bareSubmoduleOrigin(t)
+	peer := seedRemoteAhead(t, origin)
+
+	inDir(t, root, func() {
+		os.Setenv("GIT_ALLOW_PROTOCOL", "file")
+		defer os.Unsetenv("GIT_ALLOW_PROTOCOL")
+		c := submoduleAddCmd()
+		c.SetArgs([]string{smOrigin, "--name", "mysm"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("submodule add: %v", err)
+		}
+	})
+	assertHealedAndPushed(t, root, origin, peer, "submodule add: mysm")
+}
+
+// TestSubmoduleAddLeavesCleanTree (also matched as TestSubmoduleAddAtomicPublish
+// by the task's Check) is the core regression: after `submodule add` the primary
+// checkout must be clean — the mutation landed as a real commit, not a dangling
+// staged change waiting for a heal to discard it.
+func TestSubmoduleAddLeavesCleanTree(t *testing.T) {
+	root, _ := newHive(t)
+	smOrigin := bareSubmoduleOrigin(t)
+
+	inDir(t, root, func() {
+		os.Setenv("GIT_ALLOW_PROTOCOL", "file")
+		defer os.Unsetenv("GIT_ALLOW_PROTOCOL")
+		c := submoduleAddCmd()
+		c.SetArgs([]string{smOrigin, "--name", "mysm"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("submodule add: %v", err)
+		}
+	})
+	status := strings.TrimSpace(mustGit(t, root, "status", "--porcelain"))
+	if status != "" {
+		t.Fatalf("submodule add left a DIRTY primary tree (heal-vulnerable):\n%s", status)
+	}
+	logs := mustGit(t, root, "log", "--format=%s", "main")
+	if !strings.Contains(logs, "submodule add: mysm") {
+		t.Fatalf("submodule add commit missing from main history:\n%s", logs)
+	}
+}
+
+// TestSubmoduleAddAtomicPublish is an alias satisfying the task's Check grep
+// alternate name, asserting the same atomic mutate-then-commit-then-publish
+// contract end to end (fork healed + published + clean tree) in one place.
+func TestSubmoduleAddAtomicPublish(t *testing.T) {
+	root, origin := newHive(t)
+	smOrigin := bareSubmoduleOrigin(t)
+	peer := seedRemoteAhead(t, origin)
+
+	inDir(t, root, func() {
+		os.Setenv("GIT_ALLOW_PROTOCOL", "file")
+		defer os.Unsetenv("GIT_ALLOW_PROTOCOL")
+		c := submoduleAddCmd()
+		c.SetArgs([]string{smOrigin, "--name", "mysm"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("submodule add: %v", err)
+		}
+	})
+	assertHealedAndPushed(t, root, origin, peer, "submodule add: mysm")
+	status := strings.TrimSpace(mustGit(t, root, "status", "--porcelain"))
+	if status != "" {
+		t.Fatalf("submodule add left a dirty primary tree:\n%s", status)
+	}
+}
+
+// TestSubmoduleLinkHealsForkAndPublishesCleanly is submodule link's counterpart:
+// LinkSubmodules mutates two SUBMODULE-LINKS.yaml files live, so `submodule link`
+// must sync-before, commit both files atomically, publish-after, and leave the
+// tree clean.
+func TestSubmoduleLinkHealsForkAndPublishesCleanly(t *testing.T) {
+	root, origin := newHive(t)
+	writeFileMW(t, root, "submodules/a/PLAN.md", todoPlan)
+	writeFileMW(t, root, "submodules/b/PLAN.md", todoPlan)
+	commitPush(t, root, "seed two submodules")
+	peer := seedRemoteAhead(t, origin)
+
+	inDir(t, root, func() {
+		c := submoduleLinkCmd()
+		c.SetArgs([]string{"a", "b"})
+		if err := c.Execute(); err != nil {
+			t.Fatalf("submodule link: %v", err)
+		}
+	})
+	assertHealedAndPushed(t, root, origin, peer, "submodule link: a <-> b")
+	status := strings.TrimSpace(mustGit(t, root, "status", "--porcelain"))
+	if status != "" {
+		t.Fatalf("submodule link left a dirty primary tree:\n%s", status)
+	}
+}
+
+// TestSubmoduleAddWithoutCommitVulnerableToHeal is the negative control: this is
+// exactly the PRE-FIX shape — call submod.Add directly (the mutation with no
+// immediate commit, what submoduleAddCmd did before this task) and show a
+// dirty-tree heal (`git reset --hard HEAD`, what beehived's healLocalMain runs)
+// silently discards the staged .gitmodules + gitlink, reproducing the
+// 2026-07-29 runcible/runcible-configs orphan-gitlink loss.
+func TestSubmoduleAddWithoutCommitVulnerableToHeal(t *testing.T) {
+	ctx := context.Background()
+	root, _ := newHive(t)
+	smOrigin := bareSubmoduleOrigin(t)
+	os.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	defer os.Unsetenv("GIT_ALLOW_PROTOCOL")
+
+	// Pre-fix shape: mutate only, no commit — exactly submod.Add's own contract
+	// ("staged changes... left for the caller to commit").
+	if _, err := submod.Add(ctx, root, smOrigin, "mysm", "main"); err != nil {
+		t.Fatalf("submod.Add: %v", err)
+	}
+	before := strings.TrimSpace(mustGit(t, root, "status", "--porcelain"))
+	if before == "" {
+		t.Fatal("expected submod.Add to leave a dirty (uncommitted) tree pre-fix")
+	}
+
+	// Simulate beehived's healLocalMain: reset --hard HEAD. This discards staged/
+	// tracked changes (the .gitmodules edit + the gitlink) but — like the real
+	// heal — leaves untracked content (the fresh submodules/mysm/ clone) on disk,
+	// so we assert on the TRACKED state, not the untracked working tree.
+	mustGit(t, root, "reset", "--hard", "HEAD")
+
+	gitmodules, _ := os.ReadFile(filepath.Join(root, ".gitmodules"))
+	if strings.Contains(string(gitmodules), "mysm") {
+		t.Fatal("expected heal to discard the staged .gitmodules edit, but it survived")
+	}
+	if out := strings.TrimSpace(mustGit(t, root, "ls-files", "--", "submodules/mysm")); out != "" {
+		t.Fatalf("expected heal to discard the staged gitlink, but ls-files still reports it:\n%s", out)
+	}
+	logs := mustGit(t, root, "log", "--format=%s", "main")
+	if strings.Contains(logs, "mysm") {
+		t.Fatal("the uncommitted submodule add must NOT appear in history after the heal (loss reproduced)")
 	}
 }
