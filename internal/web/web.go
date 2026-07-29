@@ -1223,9 +1223,30 @@ func (s *Server) roiPost(w http.ResponseWriter, r *http.Request) {
 // publish -> redirect shape. A missing/empty url or bad name is a client error;
 // an unknown submodule is a 404. On success it redirects back to the submodule's
 // ROI editor so the form re-renders prefilled with the new url.
+// submoduleRemote repoints an existing submodule's tracked remote URL through the
+// shared submod.SetRemoteURL (rewrite .gitmodules + `git submodule sync`), then
+// commits the .gitmodules change via publishMain (whose `git add -A` picks up the
+// unstaged rewrite). It is the per-submodule "change remote" action that sits
+// beside the ROI editor, mirroring submoduleAdd's shared-lib -> error-switch ->
+// publish -> redirect shape. A missing/empty url or bad name is a client error;
+// an unknown submodule is a 404. On success it redirects back to the submodule's
+// ROI editor so the form re-renders prefilled with the new url.
+// Convergence protocol audit (submodule-add-link-protocol-routing): this handler
+// mutated .gitmodules live, uncommitted, and WITHOUT gitMu held — the same
+// exposure submoduleAdd/submoduleLink had — so it is folded in here with the same
+// sync-before / gitMu-held-across-mutate+publish treatment.
 func (s *Server) submoduleRemote(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if _, err := submod.SetRemoteURL(r.Context(), s.repo.Root, name, r.FormValue("url")); err != nil {
+	ctx := r.Context()
+	s.gitMu.Lock()
+	defer s.gitMu.Unlock()
+	if remote, rerr := s.git.Remote(ctx); rerr == nil {
+		if err := s.git.SyncMainFromRemote(ctx, remote); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	}
+	if _, err := submod.SetRemoteURL(ctx, s.repo.Root, name, r.FormValue("url")); err != nil {
 		switch {
 		case errors.Is(err, submod.ErrURLRequired), errors.Is(err, submod.ErrInvalidName):
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1236,7 +1257,7 @@ func (s *Server) submoduleRemote(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if err := s.publishMain(r.Context(), "frontend: set remote "+name); err != nil {
+	if err := s.publishMainLocked(ctx, "frontend: set remote "+name); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -1386,9 +1407,23 @@ func (s *Server) trackedBranch(ctx context.Context, sm repo.Submodule) string {
 // the new .gitmodules + gitlink. The old handler just os.MkdirAll'd an inert dir
 // with no repo/ and no tracking. The clone needs network/creds and can be slow,
 // so it is bounded by submoduleAddTimeout and errors are surfaced to the user.
+// Convergence protocol (docs/main-convergence-protocol.md): submod.Add mutates
+// the primary checkout live and uncommitted, so — mirroring the CLI's
+// submoduleAddCmd fix — this syncs the local main up to the remote BEFORE
+// mutating (never authoring the follow-up commit against a stale base) and holds
+// gitMu across the mutate+publish so no other frontend write or the follow-remote
+// pull can interleave a heal between the mutation and the commit.
 func (s *Server) submoduleAdd(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), submoduleAddTimeout)
 	defer cancel()
+	s.gitMu.Lock()
+	defer s.gitMu.Unlock()
+	if remote, rerr := s.git.Remote(ctx); rerr == nil {
+		if err := s.git.SyncMainFromRemote(ctx, remote); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	}
 	added, err := submod.Add(ctx, s.repo.Root, r.FormValue("url"), r.FormValue("name"), r.FormValue("branch"))
 	if err != nil {
 		switch {
@@ -1401,7 +1436,7 @@ func (s *Server) submoduleAdd(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if err := s.publishMain(r.Context(), "frontend: add submodule "+added); err != nil {
+	if err := s.publishMainLocked(ctx, "frontend: add submodule "+added); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -1425,8 +1460,24 @@ func (s *Server) submoduleLinksGet(w http.ResponseWriter, r *http.Request) {
 // schema (submod.AddDep) and commits valid, sorted YAML — replacing the old raw
 // `from: [to]` append that was neither schema-valid nor cycle-checked. A cycle,
 // self-dependency, or empty edge is a client error rejected without writing.
+// submoduleLink records a from->to dependency through the cycle-checked links
+// schema (submod.AddDep) and commits valid, sorted YAML — replacing the old raw
+// `from: [to]` append that was neither schema-valid nor cycle-checked. A cycle,
+// self-dependency, or empty edge is a client error rejected without writing.
+// Convergence protocol (docs/main-convergence-protocol.md): mirrors submoduleAdd
+// — sync local main up to the remote BEFORE mutating SUBMODULE-LINKS.yaml, and
+// hold gitMu across mutate+publish so nothing can heal-race the uncommitted edit.
 func (s *Server) submoduleLink(w http.ResponseWriter, r *http.Request) {
 	from, to := r.FormValue("from"), r.FormValue("to")
+	ctx := r.Context()
+	s.gitMu.Lock()
+	defer s.gitMu.Unlock()
+	if remote, rerr := s.git.Remote(ctx); rerr == nil {
+		if err := s.git.SyncMainFromRemote(ctx, remote); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	}
 	if err := submod.AddDep(s.repo.Root, from, to); err != nil {
 		switch {
 		case errors.Is(err, submod.ErrInvalidDep):
@@ -1438,7 +1489,7 @@ func (s *Server) submoduleLink(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if err := s.publishMain(r.Context(), "frontend: link "+from+" -> "+to); err != nil {
+	if err := s.publishMainLocked(ctx, "frontend: link "+from+" -> "+to); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}

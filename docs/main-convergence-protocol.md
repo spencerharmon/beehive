@@ -104,10 +104,41 @@ advance local main after a remote push.
 
 - `submodule sync` — **fixed** (sync-before-author + publish-after).
 - `PublishToMain` callers (honeybee/editor/resolve) — **advance local main**.
-- `submodule remote`, `plan`, `task`, `instruction update` — still commit on the
-  primary without `SyncMainFromRemote`/`PublishPrimaryMain`. Tracked by the
-  follow-up task to route every write step through a protocol-carrying `beehive`
-  command. Until then, do not run them while local `main` may lag a remote push.
+- `submodule remote`, `plan`, `task`, `instruction update` — **fixed**
+  (`main-write-command-routing`): sync-before-author + publish-after, locked by
+  `cmd/beehive/cmd_mainwrite_test.go`.
+- `submodule add`, `submodule link` (CLI verbs `submoduleAddCmd`/
+  `submoduleLinkCmd`, plus the `internal/web` handlers `submoduleAdd`/
+  `submoduleLink`/`submoduleRemote` that call the same `internal/submod`
+  helpers) — **fixed** (`submodule-add-link-protocol-routing`). Unlike the four
+  verbs above, `submod.Add`/`submod.LinkSubmodules`/`submod.SetRemoteURL` do not
+  commit at all — they hand the caller a staged-but-uncommitted mutation
+  (`.gitmodules`, the new gitlink, `SUBMODULE-LINKS.yaml`) with no bound on how
+  long it stays dirty, the widest exposure to beehived's dirty-tree heal
+  (`git reset --hard HEAD`). Both CLI verbs now wrap the mutation
+  `SyncMainFromRemote` (before) -> mutate -> `CommitPaths` ->
+  `PublishPrimaryMain` (after) in the same function call, so the commit lands
+  immediately after the mutation with no window for a heal to race it. The web
+  handlers hold `gitMu` across the same sync -> mutate -> `publishMainLocked`
+  sequence so no concurrent frontend write or the follow-remote pull can
+  interleave a heal either. Locked by
+  `cmd/beehive/cmd_mainwrite_test.go` (`TestSubmoduleAddHealsForkAndPublishes`,
+  `TestSubmoduleAddLeavesCleanTree`, `TestSubmoduleAddAtomicPublish`,
+  `TestSubmoduleLinkHealsForkAndPublishesCleanly`, and the negative control
+  `TestSubmoduleAddWithoutCommitVulnerableToHeal` reproducing the pre-fix
+  heal-eats-uncommitted-write loss) and `internal/web` request tests
+  (`TestSubmoduleAdd`, `TestSubmoduleLink`, `TestSubmoduleRemote`).
+- Remaining primary-tree-mutating web handlers audited during this pass
+  (`roiPost`, `secretsPost`, `planDelete`, `mergePost`, `instructionUpdate`):
+  each writes its file(s) then commits+pushes through `publishMain`/
+  `publishMainLocked` under `gitMu` in the SAME handler invocation (no
+  intervening request can interleave), so the staged-then-committed window is
+  bounded to one request instead of left open indefinitely like `submodule
+  add`/`link` were — these are considered CLEARED, not requiring the
+  sync-before treatment on top (they already run under the lock and commit
+  same-call; a future pass may still add `SyncMainFromRemote` before their own
+  mutation for full fork-safety symmetry with the CLI verbs, but they are not
+  exposed to the unbounded-dirty-tree heal-loss shape this task closes).
 
 Locked by `internal/git/git_test.go`:
 `TestSyncMainFromRemoteHealsFork`, `TestSyncMainFromRemoteNoRemoteIsNoop`,
