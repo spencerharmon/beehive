@@ -53,6 +53,9 @@ CASES=(
     "CrossLayer|CrossLayer_fixed.cfg|pass"
     "CrossLayer|CrossLayer_buggy.cfg|fail"
     "CrossLayer|CrossLayer_buggy_check.cfg|fail"
+    "PlanConvergence|PlanConvergence_fixed.cfg|pass"
+    "PlanConvergence|PlanConvergence_stale_overwrite_buggy.cfg|fail"
+    "PlanConvergence|PlanConvergence_dedup_buggy.cfg|fail"
 )
 
 rc=0

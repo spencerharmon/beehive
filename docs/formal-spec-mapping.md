@@ -139,6 +139,40 @@ OK   TaskStatus_resolveloop_buggy.cfg (expected fail)
 | `NoDuplicateDispatch` | invariant | mid-turn keepalive + decoupled liveness window (`plan.Plan.Candidates`) + pre-dispatch re-confirm (`301964d`) | `ClaimRace_buggy.cfg` proves duplicate dispatch reachable without them |
 | `EventuallyLanded` | liveness | `claim` + selection fairness | `ClaimRace_fixed.cfg` |
 
+## Layer 2 — `PlanConvergence.tla`
+
+The reconcile-vs-status-flip merge race on structured PLAN.md CONTENT (as opposed
+to `MainConvergence.tla`'s raw `main` ref, or `TaskStatus.tla`'s single-task legal
+edges): a reconcile pass rewrites PLAN.md wholesale from ROI.md while work/review
+passes concurrently flip individual task STATUS fields and an operator/maintenance
+pass leans a DONE task's narrative (`ArchiveDone`). `DedupGuard` models the
+already-implemented reconcile-dedup-skip mitigation (`swarm.go` ~:604
+`Runner.reconciled`); `ThreeWayMerge` models whether the reconcile publish is a
+true per-field git merge (only ever changes lines its own ROI delta owns) vs a
+buggy whole-file overwrite from a (possibly stale) snapshot.
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `WorkFlip` | action | a work/review pass's single-task PLAN.md status edit landing on `main` independent of any reconcile fold (`internal/plan` `Transition` + the runner's publish path) | `plan` state tests (Layer 2a `TaskStatus.tla`) |
+| `ArchiveLean` | action | `internal/plan/archive.go:42 ArchiveDone` — leans a DONE task's narrative out of its PLAN.md body, invoked from `cmd/beehive/cmd_plan.go:199` | `plan/archive_test.go` (round-trip / idempotence of `ArchiveDone`) |
+| `ReconcileSnapshot` | action | `swarm.go` reconcile pass reading `PLAN.md` after `refreshMain` (pull) at pass start | `swarm_test.go` reconcile-pass tests |
+| `ReconcilePublish` (dedup-skip branch) | action + guard | `swarm.go:604 Runner.reconciled` — re-pulls main and prefix-compares the FRESH `Beehive-ROI` stamp against ROI head immediately before publishing; short-circuits (no session, no publish) when already applied | `swarm_test.go` tests covering the reconcile pre-check pull + `reconciled()` short-circuit |
+| `ReconcilePublish` (fold branch) | action | the reconcile fold's actual `git`-level publish of the rewritten `PLAN.md` — a real git 3-way text merge is per-line, so a reconcile diff and a concurrent status-flip diff on distinct lines merge without conflict; `ThreeWayMerge = FALSE` models the counterfactual of a publish that instead force-writes the ENTIRE file from the reconcile session's own (possibly stale) snapshot | none yet — no Go conformance test asserts the reconcile publish path preserves concurrently-landed fields on a real 3-way merge; **gap**, see below |
+| `NoLostStatus` | invariant | relies on git's line-based 3-way merge never being replaced by a whole-file overwrite in the reconcile publish path | `PlanConvergence_stale_overwrite_buggy.cfg` proves a committed status transition can be silently reverted without it |
+| `NoResurrect` | invariant | relies on the same line-based merge preserving an `ArchiveDone` lean against a concurrent, stale-based reconcile rewrite | `PlanConvergence_stale_overwrite_buggy.cfg` proves an archived task can resurrect without it |
+| `NoRedundantReconcile` | invariant | `swarm.go:604 Runner.reconciled` dedup-skip guard | `PlanConvergence_dedup_buggy.cfg` proves a superseded reconcile session redundantly re-publishes (the "zero-progress reconcile pass" defect) without the guard |
+
+**Conformance gap (honest, not closed by this task):** the reconcile publish path's
+reliance on git's line-based 3-way merge (rather than any explicit whole-file
+overwrite) has not been asserted by a targeted Go regression test that lands a
+concurrent status flip and a reconcile fold against the same base and checks the
+merged result preserves both. `ThreeWayMerge = FALSE` in this spec is therefore a
+reproduce-then-lock counterfactual for a defect class the current code likely
+avoids structurally (real `git merge` is always line-based, there is no whole-file
+overwrite in the reconcile publish call path as read) rather than a defect
+observed in production. Filing and closing that test is future work; this task's
+Accept bar is the spec + the invariants + the wiring, per its Check command.
+
 ## Layer 2 — `DependencyReadiness.tla`
 
 The N-task dependency graph with cross-submodule links (`internal/links/links.go`,
