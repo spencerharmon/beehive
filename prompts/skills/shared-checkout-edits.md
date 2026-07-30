@@ -27,9 +27,11 @@ protocol.
 1. Cut a target-repo worktree off the synced tracked tip:
    ```
    beehive submodule worktree add <submodule> <branch>
-   # -> submodules/<submodule>/worktrees/<branch>/
+   # -> .submodule-worktrees/<submodule>/<branch>/ (printed by the command)
    ```
-2. Edit and **commit inside that worktree**. Never touch `submodules/<submodule>/repo/`.
+2. Edit and **commit inside that worktree** — use `beehive submodule git` (e.g. `beehive submodule git
+   add -A`, `beehive submodule git commit -m ...`) so git runs against that worktree by absolute path,
+   never `cd`+git. Never touch `submodules/<submodule>/repo/`.
 3. Land the commit on the submodule's tracked branch — the beehive pointer follows
    it: `git push origin HEAD:<tracked-branch>` from the worktree (or a PR that
    merges). The self-hosting beehive submodule tracks `origin/main`.

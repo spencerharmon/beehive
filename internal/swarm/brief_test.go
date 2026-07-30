@@ -79,7 +79,7 @@ func TestWorkBriefInjected(t *testing.T) {
 	wants := []string{
 		"# Task brief (precomputed by the runner",
 		"Branch: bee-T1",
-		"submodules/sm/worktrees/bee-T1",
+		".submodule-worktrees/sm/bee-T1",
 		"Submodule pointer (the worktree branched from this commit): " + originTip,
 		"Tracked tip (origin/main): " + originTip,
 		"REQUIRED change-doc path (write it EXACTLY here): submodules/sm/docs/bee-T1-T1.md",

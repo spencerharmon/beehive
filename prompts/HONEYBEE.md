@@ -13,9 +13,23 @@ instruction update` refreshes this file.
 
 ## Topology (read once)
 Each target lives at `submodules/<sm>/`: `ROI.md` (read-only), `PLAN.md`, `docs/`, `sessions/`, plus
-`repo/` (the target's source as a git submodule) and `worktrees/`. For a work task you edit code in the
-worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` — never the shared
-`submodules/<sm>/repo` checkout.
+`repo/` (the target's source as a git submodule). For a work task you edit code in the per-task CODE
+worktree the runner already made at `.submodule-worktrees/<sm>/bee-<taskid>/` (a top-level hive dir,
+NOT under `submodules/<sm>/`) — never the shared `submodules/<sm>/repo` checkout.
+
+## Two worktrees — never confuse them, never `cd` between them
+You juggle TWO distinct git worktrees, and the swarm's most common self-inflicted wound is running git
+against the wrong one. Use the dedicated CLI, which targets each by ABSOLUTE path every time:
+- **HIVE / superrepo worktree** — the beehive layer (`PLAN.md`, `docs/`); this is your cwd. Run git
+  here with **`beehive git <args>`** (= `git -C $BEEHIVE_WORKTREE <args>`).
+- **SUBMODULE code worktree** — your editable checkout of the target repo at
+  `.submodule-worktrees/<sm>/bee-<taskid>/`. Run git here with **`beehive submodule git <args>`**
+  (= `git -C $SUBMODULE_WORKTREE <args>`).
+The runner injects both absolute paths (and the `BEEHIVE_WORKTREE` / `SUBMODULE_WORKTREE` env vars) into
+your pass. ALWAYS use `beehive git` / `beehive submodule git` for git operations. NEVER run a bare `git`
+(it acts on whatever directory you happen to be in) and NEVER `cd` into a worktree first — both are how a
+commit lands on the wrong tree. `beehive git status`, `beehive submodule git add -A`, `beehive submodule
+git commit -m ...`, `beehive submodule git push origin bee-<taskid>` all just work from any cwd.
 
 ## Absolute rules
 - NEVER edit `ROI.md`. It is the human record of intent. FORBIDDEN. (Also hook-enforced.)
@@ -26,8 +40,8 @@ worktree the runner already made at `submodules/<sm>/worktrees/bee-<taskid>/` �
   The ONLY way to reach a human is `beehive task human <sm> <task-id> --category <cat> --reason "..."`,
   which sets `NEEDS-HUMAN` and ends the pass cleanly (see Work task / Steps §4 for the required
   `--category` enum and the boundary gate). When unsure, do not ask — pick a workable path and continue.
-- Code writes ONLY in your worktree `submodules/<sm>/worktrees/bee-<taskid>/`; never the shared
-  `submodules/<sm>/repo` checkout.
+- Code writes ONLY in your CODE worktree `.submodule-worktrees/<sm>/bee-<taskid>/` (reach it with
+  `beehive submodule git`); never the shared `submodules/<sm>/repo` checkout.
 - NEVER modify the beehive repo's git config or remotes (`git remote add/remove/set-url`,
   `git config remote.*`). Config is SHARED across every worktree, so a stray remote leaks into the
   live repo and corrupts repo-rooted tooling. You publish by committing; the runner merges to `main`.
@@ -305,7 +319,10 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   sanctioned way to flip it.)
 - Commit the code on branch `bee-<taskid>` with the `Beehive: <taskid> <doc-path>` stamp and ensure that
   commit is PUSHED to the submodule's origin (an unpushed commit dangles the pointer for every other
-  host). **Do NOT touch the submodule pointer (gitlink) or `submodules/<sm>/repo`.** The runner OWNS
+  host). Do this with `beehive submodule git` (e.g. `beehive submodule git add -A`, `beehive submodule
+  git commit -m "…"`, `beehive submodule git push origin bee-<taskid>`) — it targets your CODE worktree
+  by absolute path, so you never need to `cd` and never risk committing in the hive tree.
+  **Do NOT touch the submodule pointer (gitlink) or `submodules/<sm>/repo`.** The runner OWNS
   the pointer: it pins the gitlink to the tracked-branch tip (`origin/<branch>`) at completion, which is
   the ONLY value it may ever hold. Never run `git update-index --cacheinfo ... submodules/<sm>/repo`,
   never stage or commit the gitlink. See `docs/submodule-pointer-invariant.md`.
@@ -553,7 +570,11 @@ status` — the sanctioned status flip that records the `commits=` tag + doc hea
 your hive branch — `beehive task human`, and — for a discovered prerequisite — `beehive task add` /
 `beehive task block`, which author on
 primary main through the convergence protocol). Your work worktree is pre-created, so you rarely need
-worktree plumbing. Not on PATH → plain `git`. `beehive help` for details.
+worktree plumbing. For plain git use **`beehive git`** (the hive/superrepo worktree) and
+**`beehive submodule git`** (your task's submodule CODE worktree) instead of a bare `git` or `cd`+git —
+they run `git -C <absolute worktree path>` so a command can never hit the wrong tree (see "Two
+worktrees" above). `beehive` not on PATH → fall back to `git -C <absolute path>` using the paths from the
+Worktrees block, never a bare `git`. `beehive help` for details.
 
 ## Turn loop
 Each turn the runner checks completion deterministically. Met → you exit. Not met → you receive

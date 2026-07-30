@@ -490,7 +490,8 @@ func conflictResolutionPrompt(conflicts []string) string {
 }
 
 // sweepOrphanWorktreeGitlinks removes any orphan gitlink that a prior pass leaked
-// under submodules/<sm>/worktrees/ from this honeybee's beehive index and
+// under a per-task code-worktree path (.submodule-worktrees/<sm>/<branch>, or the
+// legacy submodules/<sm>/worktrees/<branch>) from this honeybee's beehive index and
 // publishes the removal to main, so a committed code-worktree (a gitlink with no
 // .gitmodules entry that wedges `git submodule update`) self-heals on the next
 // pass instead of festering until an operator runs cleanup. It is a strict
@@ -585,8 +586,8 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	workingStatus := sel.Task.Status
 
 	// Self-heal before doing anything else: drop any orphan code-worktree gitlink a
-	// prior pass leaked into the beehive index (a committed submodules/<sm>/
-	// worktrees/<branch> gitlink with no .gitmodules entry wedges `git submodule
+	// prior pass leaked into the beehive index (a committed code-worktree gitlink
+	// with no .gitmodules entry wedges `git submodule
 	// update`). This runs before this pass creates its OWN code worktree, so the
 	// index is a clean projection of main and the removal commit records nothing
 	// but the orphan drop. Non-fatal: a transient failure must not kill a healthy
@@ -858,8 +859,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"Beehive layer: write submodules/%[1]s/PLAN.md ONLY to flip this task's status, and "+
 				"submodules/%[1]s/docs/ for the change doc. Your task is provided below — do NOT open PLAN.md or "+
 				"ROI.md for task context.\n"+
-				"Code worktree (already created and checked out for you): submodules/%[1]s/worktrees/%[2]s/ "+
-				"on branch %[2]s. Edit the submodule's CODE there; never write submodules/%[1]s/repo (the shared checkout).\n"+
+				"Code worktree (already created and checked out for you): .submodule-worktrees/%[1]s/%[2]s/ "+
+				"on branch %[2]s (absolute path in the Worktrees block below). Edit the submodule's CODE there "+
+				"via `beehive submodule git`; never write submodules/%[1]s/repo (the shared checkout).\n"+
 				"%[4]s"+
 				"REQUIRED change doc path: submodules/%[1]s/docs/%[2]s-%[3]s.md (the beehive layer — NOT inside the code "+
 				"worktree). The runner's completion check looks for it exactly there; a doc elsewhere reads as 'not done'.\n"+
@@ -911,6 +913,23 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	if hasTask(sel) {
 		preamble += buildEnvPreamble(r.BuildEnv)
 	}
+	// Worktree context: name the TWO worktrees this pass juggles by absolute path —
+	// the HIVE/superrepo worktree (the beehive layer: PLAN.md, docs/) and, for a
+	// task-bearing kind, the SUBMODULE code checkout — and tell the agent to reach
+	// each through `beehive git` / `beehive submodule git` instead of a bare git or a
+	// `cd`. submoduleWt is the code worktree for Work and the shared repo checkout
+	// (which Review/Arbitrate merge into) otherwise; empty for Bootstrap/Reconcile.
+	submoduleWt := ""
+	switch sel.Kind {
+	case selectt.Work:
+		submoduleWt = wtAbs
+	case selectt.Review, selectt.Arbitrate:
+		submoduleWt = sel.Submodule.RepoDir()
+		if !filepath.IsAbs(submoduleWt) {
+			submoduleWt = filepath.Join(absRoot, submoduleWt)
+		}
+	}
+	preamble += worktreeContextPreamble(absRoot, submoduleWt)
 	// Precomputed task brief (Work only): hand the agent the worktree/branch/pointer
 	// the setup already resolved, the deterministic doc-path/commit-stamp, and head
 	// excerpts of its own files — so it skips discovery plumbing and a whole-tree scan.
@@ -958,6 +977,16 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// stated preamble line, above, is the lever for opencode's sibling bash tool —
 	// see buildenv.go). No-op when BuildEnv is empty.
 	r.exportBuildEnv()
+	// Thread the pass's worktree paths to the agent's `beehive git` /
+	// `beehive submodule git` invocations: export them into this process env AND
+	// write the per-pass repo.WorktreeEnvFile at the hive root (the reliable channel,
+	// since opencode's sibling shell does not inherit this env). Best-effort — a
+	// write failure must not kill a healthy pass; the commands still fall back to
+	// findRoot()/sole-worktree derivation.
+	r.exportWorktreeEnv(absRoot, submoduleWt)
+	if err := writeWorktreeEnvFile(absRoot, submoduleWt); err != nil && r.Debug != nil {
+		fmt.Fprintf(r.Debug, "[honeybee] write worktree env file: %v\n", err)
+	}
 	sess, err := r.Client.Open(ctx, absRoot, system)
 	if err != nil {
 		return res, fmt.Errorf("open session: %w", err)

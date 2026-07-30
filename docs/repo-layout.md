@@ -14,12 +14,17 @@ SUBMODULE-LINKS.yaml      cross-submodule dependency graph (optional)
 submodules/
   web-frontend/
     repo/                 the submodule checkout (managed by scripted submodule update)
-    worktrees/            per-branch honeybee worktrees (isolated writes)
     docs/                 change docs, named <branch>-<taskid>
     ROI.md                record of intent — human-owned, honeybees never write
     PLAN.md               tasks; carries <!-- Beehive-ROI: <sha> --> stamp
     INFRASTRUCTURE.md
     ARTIFACTS.md
+.submodule-worktrees/
+  web-frontend/
+    <branch>/             per-task honeybee CODE worktrees (isolated writes; gitignored,
+                          disposable). Reached via `beehive submodule git`; kept OUT of
+                          submodules/<name>/ so a code worktree is never confused with the
+                          beehive layer.
     SECRETS.yaml.gpg      per-submodule secrets (optional)
     SUBMODULE-LINKS.yaml
 ```

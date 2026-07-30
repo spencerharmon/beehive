@@ -39,7 +39,8 @@ your manual edit is just one more participant in that protocol. Three cases:
 - **Submodule CODE** — `submodules/<sm>/repo/` contents, including the self-hosting
   `beehive` submodule itself:
   `beehive submodule worktree add <sm> <branch>`; edit + commit inside
-  `submodules/<sm>/worktrees/<branch>/` (never `submodules/<sm>/repo/`); land it on
+  `.submodule-worktrees/<sm>/<branch>/` (the path the command prints; never
+  `submodules/<sm>/repo/`); land it on
   the tracked branch (`git push origin HEAD:main`); then
   `beehive submodule sync <sm>` and `beehive submodule worktree rm <sm> <branch>`.
 - **Beehive-layer / superproject files** — `INFRASTRUCTURE.md`, `SUBMODULE-LINKS.yaml`,
@@ -98,8 +99,10 @@ exact complement. Each pass, the runner automatically:
   stale claim as the GC signal. The agent never writes session/heartbeat and changes
   only the task STATUS.
 - **Creates the code worktree** (work kind) at
-  `submodules/<sm>/worktrees/bee-<taskid>/` off the submodule tip before turn 1. The
-  agent edits there and never runs worktree/submodule plumbing or writes
+  `.submodule-worktrees/<sm>/bee-<taskid>/` (a top-level hive dir, off the submodule
+  tip) before turn 1, and exports its absolute path as `SUBMODULE_WORKTREE` (the hive
+  worktree is `BEEHIVE_WORKTREE`). The agent edits there — reaching it with `beehive
+  submodule git` — and never runs worktree/submodule plumbing or writes
   `submodules/<sm>/repo`.
 - **Checks out the cross-dep sibling submodules** a work task names in `deps=<sm>:<id>`
   into the pass worktree at their tracked gitlink, so the agent can READ its
@@ -169,6 +172,9 @@ Repo root (beehive-managed defaults unless noted):
   `BOOTSTRAP.md` walks you through creating it.
 - `INFRASTRUCTURE.md` — repo-wide infrastructure notes. Per-repo content.
 - `.gitmodules`, `SUBMODULE-LINKS.yaml` — submodule registry and cross-links.
+- `.submodule-worktrees/` — hive-root dir holding every submodule's per-task CODE worktrees
+  (`.submodule-worktrees/<sm>/<branch>/`), kept out of `submodules/<sm>/` so a code worktree is never
+  confused with the beehive layer. Gitignored, disposable; reached via `beehive submodule git`.
 
 Per submodule (`submodules/<name>/`):
 
@@ -184,7 +190,6 @@ Per submodule (`submodules/<name>/`):
 - `docs/` — one terse, LLM-targeted change doc per task (`<branch>-<taskid>.md`).
 - `sessions/` — recorded honeybee transcripts (one `.md` per session branch).
 - `repo/` — the target's actual source, tracked as a git submodule (gitlink).
-- `worktrees/` — per-task code worktrees the runner creates and tears down.
 - Optional: `INFRASTRUCTURE.md`, `ARTIFACTS.md`, `RULES.md`, `AGENTS.md` (a
   submodule-local rules overlay). Render whether or not present; absent ones are
   created on first edit.

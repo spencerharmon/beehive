@@ -611,7 +611,7 @@ func TestWorkPreambleHasDocPath(t *testing.T) {
 	if !contains(firstPrompt, "submodules/sm/docs/bee-T1-T1.md") {
 		t.Fatalf("preamble missing exact doc path; got:\n%s", firstPrompt)
 	}
-	if !contains(firstPrompt, "submodules/sm/worktrees/bee-T1") {
+	if !contains(firstPrompt, ".submodule-worktrees/sm/bee-T1") {
 		t.Fatalf("preamble missing code worktree path; got:\n%s", firstPrompt)
 	}
 }
@@ -4190,7 +4190,7 @@ func gateFixture(t *testing.T) (g *git.Repo, rp *repo.Repo, sm, planPath, wtDir 
 	os.WriteFile(planPath, []byte("## T1 [TODO] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z -->\ngo\n"), 0o644)
 	g.Commit(ctx, "seed")
 	rp, _ = repo.Open(root)
-	wtDir = filepath.Join(sm, "worktrees", "bee-T1")
+	wtDir = repo.SubmoduleWorktreePath(root, "sm", "bee-T1")
 	return
 }
 
@@ -4824,7 +4824,7 @@ func durabilityFixture(t *testing.T, withRemote, push bool) (r *Runner, sel *sel
 		}
 	}
 	// The code worktree the Work pass authored in, carrying one bee-T1 commit.
-	wtDir = filepath.Join(sm, "worktrees", "bee-T1")
+	wtDir = repo.SubmoduleWorktreePath(root, "sm", "bee-T1")
 	if _, err := rg.Run(ctx, "worktree", "add", "-q", "-b", "bee-T1", wtDir); err != nil {
 		t.Fatalf("worktree add: %v", err)
 	}

@@ -3,8 +3,11 @@ package swarm
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/spencerharmon/beehive/internal/repo"
 )
 
 // The host build/test environment (static link + tmp/cache redirected off a
@@ -88,4 +91,52 @@ func sortedKeys(env map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// exportWorktreeEnv sets BEEHIVE_WORKTREE (and SUBMODULE_WORKTREE when non-empty)
+// in the honeybee process env, so any beehive subprocess the honeybee itself
+// spawns sees them. The agent's opencode shell does NOT inherit this (sibling
+// process), which is why worktreeContextPreamble states the paths and
+// writeWorktreeEnvFile persists them for the CLI to read. It sets the real env
+// directly (NOT via the BuildEnv ExportEnv seam, which is scoped to BuildEnv), so
+// it is independent of BuildEnv configuration.
+func (r *Runner) exportWorktreeEnv(beehiveWt, submoduleWt string) {
+	_ = os.Setenv("BEEHIVE_WORKTREE", beehiveWt)
+	if submoduleWt != "" {
+		_ = os.Setenv("SUBMODULE_WORKTREE", submoduleWt)
+	}
+}
+
+// writeWorktreeEnvFile records the pass's worktree paths as KEY=VALUE lines in
+// repo.WorktreeEnvFile at the hive worktree root. `beehive git` /
+// `beehive submodule git` read it when the env var is absent (the reliable channel
+// past opencode's process boundary). SUBMODULE_WORKTREE is omitted when empty
+// (Bootstrap/Reconcile touch no submodule checkout).
+func writeWorktreeEnvFile(beehiveWt, submoduleWt string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "BEEHIVE_WORKTREE=%s\n", beehiveWt)
+	if submoduleWt != "" {
+		fmt.Fprintf(&b, "SUBMODULE_WORKTREE=%s\n", submoduleWt)
+	}
+	return os.WriteFile(filepath.Join(beehiveWt, repo.WorktreeEnvFile), []byte(b.String()), 0o644)
+}
+
+// worktreeContextPreamble names the two worktrees this pass juggles by absolute
+// path and directs the agent to reach each through the dedicated CLI instead of a
+// bare git or a `cd` — the disambiguation that stops an agent editing/committing
+// against the wrong tree. submoduleWt == "" (Bootstrap/Reconcile) drops the
+// submodule line and the whole block is beehive-layer only.
+func worktreeContextPreamble(beehiveWt, submoduleWt string) string {
+	var b strings.Builder
+	b.WriteString("# Worktrees (two distinct trees — never confuse them; never `cd` between them)\n")
+	fmt.Fprintf(&b, "- HIVE / superrepo worktree (the beehive layer: PLAN.md, docs/): %s\n", beehiveWt)
+	b.WriteString("  Run git here with `beehive git <args>` (= `git -C $BEEHIVE_WORKTREE <args>`).\n")
+	if submoduleWt != "" {
+		fmt.Fprintf(&b, "- SUBMODULE code worktree (edit the target repo's CODE here): %s\n", submoduleWt)
+		b.WriteString("  Run git here with `beehive submodule git <args>` (= `git -C $SUBMODULE_WORKTREE <args>`).\n")
+	}
+	b.WriteString("ALWAYS use `beehive git` / `beehive submodule git` for git operations instead of a bare `git` " +
+		"(which acts on whatever cwd you happen to be in) or `cd`+git. They target the correct worktree by " +
+		"absolute path every time, so you can never commit to the wrong tree.\n\n")
+	return b.String()
 }

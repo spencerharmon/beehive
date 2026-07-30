@@ -135,7 +135,10 @@ Core files:
 - `sessions/` — honeybee transcripts.
 - `docs/` — task change records.
 - `repo/` — target source git submodule.
-- `worktrees/` — isolated task worktrees.
+
+Per-task honeybee CODE worktrees live at the hive root under `.submodule-worktrees/<submodule>/<branch>/`
+(gitignored, disposable), not under `submodules/`. Run git against them with `beehive submodule git`
+(the hive/superrepo worktree is `beehive git`) so a command never hits the wrong tree.
 
 ## Common CLI commands
 

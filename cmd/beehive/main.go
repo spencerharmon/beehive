@@ -25,6 +25,7 @@ func main() {
 		submoduleCmd(),
 		secretCmd(),
 		worktreeCmd(),
+		gitCmd(),
 		editCmd(),
 		taskCmd(),
 		planCmd(),

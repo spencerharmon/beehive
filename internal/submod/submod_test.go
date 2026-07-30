@@ -76,8 +76,11 @@ func TestAddCreatesTrackedSubmodule(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "submodules", "myrepo", "repo", "f.txt")); err != nil {
 		t.Fatalf("submodule not checked out: %v", err)
 	}
-	if fi, err := os.Stat(filepath.Join(root, "submodules", "myrepo", "worktrees")); err != nil || !fi.IsDir() {
-		t.Fatalf("worktrees dir missing: %v", err)
+	// Per-task code worktrees no longer live under submodules/<name>/worktrees —
+	// they are created on demand at <root>/.submodule-worktrees/<name>/<branch>, so
+	// `submodule add` must NOT create the legacy dir.
+	if _, err := os.Stat(filepath.Join(root, "submodules", "myrepo", "worktrees")); !os.IsNotExist(err) {
+		t.Fatalf("legacy worktrees dir should not be created (relocated to .submodule-worktrees): err=%v", err)
 	}
 }
 

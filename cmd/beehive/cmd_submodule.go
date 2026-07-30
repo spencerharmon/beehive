@@ -34,7 +34,7 @@ func findRoot() (string, error) {
 func submoduleCmd() *cobra.Command {
 	c := &cobra.Command{Use: "submodule", Short: "manage beehive submodules"}
 	c.AddCommand(submoduleAddCmd(), submoduleLinkCmd(), submodulePlanCmd(),
-		submoduleWorktreeCmd(), submoduleSyncCmd(), submoduleRemoteCmd(),
+		submoduleWorktreeCmd(), gitSubmoduleCmd(), submoduleSyncCmd(), submoduleRemoteCmd(),
 		submodulePointerBumpCmd())
 	return c
 }
@@ -141,8 +141,9 @@ func submoduleRemoteCmd() *cobra.Command {
 }
 
 // submoduleWorktreeCmd manages worktrees of a submodule's target repo, where a
-// honeybee's code edits for a task live (submodules/<sm>/worktrees/<branch>),
-// kept separate from the beehive-layer worktrees.
+// honeybee's code edits for a task live (<root>/.submodule-worktrees/<sm>/<branch>),
+// kept OUT of the beehive-layer submodules/<sm>/ tree so a code worktree is never
+// confused with the submodule's coordination files.
 func submoduleWorktreeCmd() *cobra.Command {
 	c := &cobra.Command{Use: "worktree", Short: "manage submodule target-repo worktrees"}
 	repoDir := func(root, sm string) string { return filepath.Join(root, "submodules", sm, "repo") }
@@ -159,11 +160,12 @@ func submoduleWorktreeCmd() *cobra.Command {
 			if err := syncSubmodule(cmd.Context(), root, a[0]); err != nil {
 				return err
 			}
+			wt := repo.SubmoduleWorktreePath(root, a[0], a[1])
 			g := git.New(repoDir(root, a[0]))
-			if err := g.WorktreeAdd(cmd.Context(), filepath.Join("..", "worktrees", a[1]), a[1], "HEAD"); err != nil {
+			if err := g.WorktreeAdd(cmd.Context(), wt, a[1], "HEAD"); err != nil {
 				return err
 			}
-			fmt.Println(filepath.Join("submodules", a[0], "worktrees", a[1]))
+			fmt.Println(wt)
 			return nil
 		},
 	})
@@ -177,7 +179,7 @@ func submoduleWorktreeCmd() *cobra.Command {
 				return err
 			}
 			g := git.New(repoDir(root, a[0]))
-			if err := g.WorktreeRemove(cmd.Context(), filepath.Join("..", "worktrees", a[1])); err != nil {
+			if err := g.WorktreeRemove(cmd.Context(), repo.SubmoduleWorktreePath(root, a[0], a[1])); err != nil {
 				return err
 			}
 			_, _ = g.Run(cmd.Context(), "branch", "-D", a[1])

@@ -80,9 +80,10 @@ func Add(ctx context.Context, root, url, name, branch string) (string, error) {
 	if _, err := os.Stat(filepath.Join(subdir, "repo")); err == nil {
 		return "", fmt.Errorf("%w: %q", ErrExists, name)
 	}
-	// Create the beehive worktrees dir up front (the submodule layer lives
-	// alongside repo/); `git submodule add` fills in repo/ itself.
-	if err := os.MkdirAll(filepath.Join(subdir, "worktrees"), 0o755); err != nil {
+	// Ensure the submodule layer dir exists; `git submodule add` fills in repo/
+	// itself. Per-task CODE worktrees no longer live here — they are created on
+	// demand under <root>/.submodule-worktrees/<name>/ (see repo.WorktreesDir).
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
 		return "", err
 	}
 	rel := filepath.Join("submodules", name, "repo")

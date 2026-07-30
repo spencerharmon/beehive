@@ -96,9 +96,45 @@ type Submodule struct {
 func (s Submodule) RepoDir() string { return filepath.Join(s.Path, "repo") }
 
 // PlanPath, ROIPath, WorktreesDir locate coordination files.
-func (s Submodule) PlanPath() string     { return filepath.Join(s.Path, PlanFile) }
-func (s Submodule) ROIPath() string      { return filepath.Join(s.Path, ROIFile) }
-func (s Submodule) WorktreesDir() string { return filepath.Join(s.Path, "worktrees") }
+func (s Submodule) PlanPath() string { return filepath.Join(s.Path, PlanFile) }
+func (s Submodule) ROIPath() string  { return filepath.Join(s.Path, ROIFile) }
+
+// SubmoduleWorktreesDirName is the hive-root directory that holds EVERY
+// submodule's per-task CODE worktrees, deliberately OUTSIDE the beehive-layer
+// submodules/<name>/ tree. Keeping code worktrees at
+// <root>/.submodule-worktrees/<name>/<branch> (rather than the old
+// submodules/<name>/worktrees/<branch>) means a honeybee never confuses its
+// disposable code worktree with the submodule's coordination files (PLAN.md,
+// docs/, repo/) that live under submodules/<name>/. See docs/repo-layout.md.
+const SubmoduleWorktreesDirName = ".submodule-worktrees"
+
+// WorktreeEnvFile is a per-pass KEY=VALUE file the runner writes at the hive
+// worktree root recording BEEHIVE_WORKTREE and SUBMODULE_WORKTREE (the absolute
+// worktree paths for the current pass). It is the reliable channel the
+// `beehive git` / `beehive submodule git` commands read those paths from when the
+// agent's shell did not inherit the env vars (opencode runs the agent's shell in
+// a separate process that does not inherit the runner's env). Gitignored;
+// disposable with the pass worktree.
+const WorktreeEnvFile = ".beehive-worktrees"
+
+// hiveRoot returns the beehive repo root this submodule lives under, derived from
+// Path (which Submodules() builds as <root>/submodules/<name>).
+func (s Submodule) hiveRoot() string { return filepath.Dir(filepath.Dir(s.Path)) }
+
+// WorktreesDir is the parent dir for this submodule's per-task CODE worktrees:
+// <root>/.submodule-worktrees/<name>. A worktree for one task is a <branch> dir
+// under it.
+func (s Submodule) WorktreesDir() string {
+	return filepath.Join(s.hiveRoot(), SubmoduleWorktreesDirName, s.Name)
+}
+
+// SubmoduleWorktreePath is the absolute path of one submodule code worktree,
+// <root>/.submodule-worktrees/<submodule>/<branch> — the single source of truth
+// the runner and the `beehive submodule worktree`/`beehive submodule git` CLI
+// share so the layout can never drift between them.
+func SubmoduleWorktreePath(root, submodule, branch string) string {
+	return filepath.Join(root, SubmoduleWorktreesDirName, submodule, branch)
+}
 
 // SessionsDir holds recorded honeybee session transcripts (one .md per branch).
 func (s Submodule) SessionsDir() string { return filepath.Join(s.Path, "sessions") }

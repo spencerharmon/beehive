@@ -2,4 +2,6 @@
 *.test
 /.cave/
 /.worktrees/
+/.submodule-worktrees/
+/.beehive-worktrees
 /AGENTS.md

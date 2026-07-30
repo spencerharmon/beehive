@@ -125,12 +125,13 @@ func (r *Repo) RemoveCached(ctx context.Context, paths ...string) error {
 }
 
 // OrphanWorktreeGitlinks returns the tracked gitlink paths (index mode 160000)
-// that live under submodules/<sm>/worktrees/ and are NOT declared submodules in
-// .gitmodules — i.e. honeybee code-worktrees that leaked into the beehive index
-// as orphan gitlinks. Such an entry has no submodule URL and wedges
-// `git submodule update`, so the runner sweeps it. Declared submodules (real
-// gitlinks) and any gitlink outside a worktrees/ path are deliberately excluded,
-// so the sweep can only ever remove a leaked worktree, never a real submodule.
+// that live under a per-task code-worktree path (see isWorktreeGitlinkPath) and
+// are NOT declared submodules in .gitmodules — i.e. honeybee code-worktrees that
+// leaked into the beehive index as orphan gitlinks. Such an entry has no submodule
+// URL and wedges `git submodule update`, so the runner sweeps it. Declared
+// submodules (real gitlinks) and any gitlink outside a code-worktree path are
+// deliberately excluded, so the sweep can only ever remove a leaked worktree,
+// never a real submodule.
 func (r *Repo) OrphanWorktreeGitlinks(ctx context.Context) ([]string, error) {
 	out, err := r.Run(ctx, "ls-files", "-s")
 	if err != nil {
@@ -166,12 +167,19 @@ func (r *Repo) OrphanWorktreeGitlinks(ctx context.Context) ([]string, error) {
 	return orphans, nil
 }
 
-// isWorktreeGitlinkPath reports whether p is a per-task code-worktree path of the
-// form submodules/<sm>/worktrees/<...> — the only shape the orphan-gitlink sweep
-// will remove. It intentionally does NOT match submodules/<sm>/repo (a real
+// isWorktreeGitlinkPath reports whether p is a per-task code-worktree path — the
+// only shape the orphan-gitlink sweep will remove. It matches BOTH the current
+// layout `.submodule-worktrees/<sm>/<branch>[/...]` and the legacy
+// `submodules/<sm>/worktrees/<...>` layout (so a leak left by an older binary
+// still self-heals). It intentionally does NOT match submodules/<sm>/repo (a real
 // submodule checkout) or any other layout.
 func isWorktreeGitlinkPath(p string) bool {
 	parts := strings.Split(p, "/")
+	// Current layout: .submodule-worktrees/<sm>/<branch>[/...]
+	if len(parts) >= 3 && parts[0] == ".submodule-worktrees" {
+		return true
+	}
+	// Legacy layout: submodules/<sm>/worktrees/<...>
 	return len(parts) >= 4 && parts[0] == "submodules" && parts[2] == "worktrees"
 }
 
