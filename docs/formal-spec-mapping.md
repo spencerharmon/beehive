@@ -78,6 +78,7 @@ transitions` + the recovery/escalation methods).
 | `RecoverLostWork` | action | `plan/state.go:215 RecoverLostWork`; dispatch guards `swarm.go:2788 bounceIfUnreachable`, `:2878 recoverIfLost` | `swarm` recover-lost-work tests |
 | `FinalizeAlreadyMerged` | action | `plan/state.go FinalizeAlreadyMerged`; `swarm.go:2651 finalizeIfAlreadyMerged` (own bee tip, not ambient) | `swarm_test.go TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestry{Remote,LocalSharing}` |
 | `RequestHuman` | action | `plan/state.go:255 RequestHuman` (+ `EscalationReady`) | `plan_test.go TestRequestHuman` |
+| `Resolve` (operator reopen `NEEDS-HUMAN → TODO`) + `ResetAttemptsOnResolve` fix contract | action + guard | `plan/state.go:294 Resolve` — **GAP: does NOT reset `t.Attempts`** (sets Status=TODO/clears claim only) | `TaskStatus_resolveloop_buggy.cfg` reproduces `AttemptsBounded` violated (escalate→resolve→escalate grows the counter unbounded); `TaskStatus_resolveloop_fixed.cfg` passes with attempts reset per reopen |
 | `PassCheck` + DoD gate on DONE-ward edges | action + guard | `swarm/verify.go:266 verifyGate` invariant 5 + `:282 checkGate` (run `Check` via `runVerify`, refuse DONE unless exit 0; `check=none` not gated; fail-closed on infra) (`92d2ed1`) | `swarm_test.go TestVerifyGateChecksDefinitionOfDone`, `TestVerifyGateCheckNoneNotGated` |
 | no `TODO → DONE` (work pass) | guard | `swarm.go:2071 workChecklist` refuses a work-set DONE; `gatedHandoff` drops Work→Done (`92d2ed1`) | `swarm_test.go TestWorkDoneFlipRefused` |
 | `LegalTransitionsOnly` | invariant | `plan/state.go:12 transitions` + `:19 CanTransition` (single source of truth) | `invariant_conformance_test.go TestInvariant_LegalTransitionsOnly` (exhaustive 5×5 matrix, independent of the code map) + `TestInvariant_HumanIsTerminalForAgent` |
@@ -85,12 +86,47 @@ transitions` + the recovery/escalation methods).
 | `Terminates`, `LostWorkRecovers` | liveness | attempts/limit escalation + `recoverIfLost` dispatch guard | `invariant_conformance_test.go TestInvariant_EscalationTerminates` (deterministic escalation to terminal NEEDS-HUMAN) + `TaskStatus_fixed.cfg` |
 
 **Modeling note (verified against the code, not assumed):** the operator `Resolve`
-edge `NEEDS-HUMAN → TODO` (`plan/state.go Resolve`) does **not** reset `Attempts`.
-So across resolve/retry cycles the counter is unbounded — `AttemptsBounded` holds
-only for the *autonomous* machine (`NEEDS-HUMAN` terminal, matching the selector's
-own exclusion of `NEEDS-HUMAN` from selection). `TaskStatus.tla` therefore omits
-the `Resolve` action and treats `NEEDS-HUMAN` as terminal; this was surfaced by TLC
-(the fixed cfg failed `AttemptsBounded` until the reopen loop was scoped out).
+edge `NEEDS-HUMAN → TODO` (`plan/state.go:294 Resolve`) does **not** reset `Attempts`
+— it sets `Status = TODO` and clears the claim only. Previously `TaskStatus.tla`
+*scoped this edge out* and treated `NEEDS-HUMAN` as terminal, on the reasoning that
+the reopen loop is out-of-band; the cost was that the diagnosed unbounded-attempts
+bug was invisible to the model. It is now modeled explicitly as a reproduce-then-lock
+counterexample (mirroring the handoff-terminal-leak `_leak_*.cfg` pattern):
+
+- `Resolve` action, guarded by `CONSTANT ModelResolve` (the other cfgs keep
+  `ModelResolve = FALSE`, so `NEEDS-HUMAN` stays terminal and their behaviour is
+  byte-identical to before — the existing 12 TaskStatus cases are unchanged).
+- `CONSTANT ResetAttemptsOnResolve` pins the fix contract: `FALSE` = `state.go`
+  Resolve *as written* (no reset) → `AttemptsBounded` violated with a counterexample
+  trace (`TaskStatus_resolveloop_buggy.cfg`); `TRUE` = Resolve resets `attempts` to 0
+  per operator reopen → `AttemptsBounded` holds and the task still terminates
+  (`TaskStatus_resolveloop_fixed.cfg`).
+
+**Fix contract (what the Go `Resolve` must satisfy before operator reopen is wired
+into the autonomous loop):** either `Resolve` resets `t.Attempts = 0` (a fresh rework
+budget per reopen — the modeled fix), or attempts become per-cycle so a reopen starts
+a new budget. Until then `plan/state.go:294 Resolve` is a **known conformance gap**:
+the fixed cfg models a `Resolve` the code does not yet implement. The buggy cfg is the
+faithful model of today's code.
+
+Counterexample trace (`TaskStatus_resolveloop_buggy.cfg`, `Limit = 1`):
+
+```
+State 1  <Init>          attempts = 0  status = "TODO"
+State 4  ReviewApprove   attempts = 0  status = "DONE"
+State 5  GateCheck       attempts = 1  status = "REVIEW"   (unearned terminal reverted, attempts++)
+State 6  GateCheck       attempts = 2  status = "HUMAN"    (past Limit → escalate)
+State 7  Resolve         attempts = 2  status = "TODO"     (operator reopen — attempts NOT reset)
+State 8  HandoffToReview attempts = 2  status = "REVIEW"
+State 9  GateCheck       attempts = 3  status = "HUMAN"    → AttemptsBounded (attempts ≤ Limit+1 = 2) VIOLATED
+```
+
+Run-tlc.sh output (both new cases, wired into the CASES list):
+
+```
+OK   TaskStatus_resolveloop_fixed.cfg (expected pass)
+OK   TaskStatus_resolveloop_buggy.cfg (expected fail)
+```
 
 ## Layer 2 — `ClaimRace.tla`
 

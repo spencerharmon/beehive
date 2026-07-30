@@ -33,6 +33,8 @@ CASES=(
     "TaskStatus|TaskStatus_buggy_check.cfg|fail"
     "TaskStatus|TaskStatus_leak_fixed.cfg|pass"
     "TaskStatus|TaskStatus_leak_buggy.cfg|fail"
+    "TaskStatus|TaskStatus_resolveloop_fixed.cfg|pass"
+    "TaskStatus|TaskStatus_resolveloop_buggy.cfg|fail"
     "DependencyReadiness|DependencyReadiness_fixed.cfg|pass"
     "DependencyReadiness|DependencyReadiness_buggy.cfg|fail"
     "ClaimRace|ClaimRace_fixed.cfg|pass"
