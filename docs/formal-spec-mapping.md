@@ -183,6 +183,24 @@ and an INFINITE lost-work loop when the pass misreads the vanished branch.
 | `NoOrphanWrite` | invariant | the presence re-check (`taskRemoved`) before any status write lands | `TaskRemovalRace_orphan_buggy.cfg` proves an orphan write reachable without it |
 | `VanishedPassTerminates` | liveness | clean vanished-exit + durable-record finalize guards | `TaskRemovalRace_loop_buggy.cfg` proves the non-terminating loop reachable without them |
 
+## Layer 2 — `ClaimGC.tla`
+
+The heartbeat-vs-TTL claim-GC TIMING invariant `ClaimRace.tla` leaves over-approximated
+(its `Fixed` toggle just decides whether a dispatched owner's heartbeat tracks the clock
+at all): this module pins the actual PARAMETER-ORDERING the two mechanisms rest on — the
+runner's mid-turn keepalive period `K` vs. selection's claim-GC threshold `TTL` — the
+honeybee-claim analogue of the editor's `LiveGuard` guarantee.
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `K` (keepalive period) | constant | `swarm.Runner`'s mid-turn heartbeat re-stamp, fired roughly every `TTL/3` for the whole duration of a live turn | `internal/select/select.go` (`"heartbeat re-stamp every ~TTL/3"` comment) |
+| `TTL` (GC reclaim threshold) | constant | the claim-GC staleness window a claim's heartbeat is compared against | `internal/config/config.go TTLMinutes`, `plan.Plan.Candidates(now, ttl)` |
+| `Tick` | action | one logical tick: while live, the keepalive restamps (`age` resets to 0) whenever `age` would reach `K`; while dead, `age` grows unboundedly (capped at `MaxAge` for a finite state space) | `select/select.go` keepalive loop |
+| `Die` | action | the owning pass's turn ends / the process dies — no further keepalive restamps | a crash, OOM-kill, wall-clock/idle-timeout abort, or worktree teardown mid-turn |
+| `GC` | action | selection's claim-GC reclaiming a claim whose heartbeat has gone stale past `TTL` | `plan.Plan.Candidates(now, ttl)` |
+| `NoLiveReclaim` | invariant | a live pass's claim is never reclaimed out from under it when `K < TTL` | `ClaimGC_buggy.cfg` (`K >= TTL`) reproduces a live claim getting reclaimed |
+| `EventuallyReclaimDead` | liveness | a dead pass's claim is always eventually reclaimed — no permanent wedge | `ClaimGC_fixed.cfg` |
+
 ## Layer 2 — `PlanConvergence.tla`
 
 The reconcile-vs-status-flip merge race on structured PLAN.md CONTENT (as opposed

@@ -40,6 +40,8 @@ CASES=(
     "DependencyReadiness|DependencyReadiness_cycle_buggy.cfg|fail"
     "ClaimRace|ClaimRace_fixed.cfg|pass"
     "ClaimRace|ClaimRace_buggy.cfg|fail"
+    "ClaimGC|ClaimGC_fixed.cfg|pass"
+    "ClaimGC|ClaimGC_buggy.cfg|fail"
     "EditorSessionNamespace|EditorSessionNamespace_fixed.cfg|pass"
     "EditorSessionNamespace|EditorSessionNamespace_buggy_namespace.cfg|fail"
     "EditorSessionNamespace|EditorSessionNamespace_buggy_liveguard.cfg|fail"
