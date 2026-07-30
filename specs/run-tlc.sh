@@ -26,6 +26,14 @@ CASES=(
     "MainConvergence|MainConvergence_forcerewind.cfg|fail"
     "MainConvergence|MainConvergence_stagedheal_fixed.cfg|pass"
     "MainConvergence|MainConvergence_stagedheal_buggy.cfg|fail"
+    # MainConvergence conflict sub-model: swarm.go resolveConflict hands the
+    # agent conflicted files; a gitlink (mode 160000) conflict cannot be
+    # auto-merged. Fixed resolves to the UNION within the runner's attempt cap;
+    # the buggy cfgs reproduce a non-terminating resolution loop and a byzantine
+    # dropped-side merge (conflict).
+    "MainConvergence|MainConvergence_conflict_fixed.cfg|pass"
+    "MainConvergence|MainConvergence_conflictloop_buggy.cfg|fail"
+    "MainConvergence|MainConvergence_conflictloss_buggy.cfg|fail"
     "SubmodulePointer|SubmodulePointer_fixed.cfg|pass"
     "SubmodulePointer|SubmodulePointer_buggy.cfg|fail"
     "TaskStatus|TaskStatus_fixed.cfg|pass"
@@ -70,9 +78,16 @@ CASES=(
 )
 
 rc=0
+i=0
 for c in "${CASES[@]}"; do
     IFS='|' read -r mod cfg expect <<< "$c"
-    out="$(cd "$HERE" && java -cp "$JAR" tlc2.TLC -config "$cfg" "$mod.tla" 2>&1)"
+    # Unique metadir per run: TLC otherwise names its states dir from the current
+    # time and back-to-back sub-second runs collide ("writes its files to a
+    # directory whose name is generated from the current time").
+    i=$((i + 1))
+    md="$(mktemp -d "${TMPDIR:-/tmp}/tlc-states.XXXXXX")"
+    out="$(cd "$HERE" && java -cp "$JAR" tlc2.TLC -metadir "$md" -config "$cfg" "$mod.tla" 2>&1)"
+    rm -rf "$md"
     if echo "$out" | grep -q "No error has been found"; then
         got=pass
     elif echo "$out" | grep -qE "is violated|Temporal properties were violated"; then

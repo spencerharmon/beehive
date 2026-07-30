@@ -50,9 +50,24 @@ CONSTANTS
     Artifacts,        \* finite set of authorable work items (opaque commit contents)
     Fixed,            \* TRUE: hive writers SyncMainFromRemote/merge before authoring
     PreReceiveGuard,  \* TRUE: server refuses non-fast-forward rewrites of refs/heads/main
-    StagedAtomic      \* TRUE: primary-tree mutation is committed atomically (or in a
+    StagedAtomic,     \* TRUE: primary-tree mutation is committed atomically (or in a
                       \*   worktree the heal never touches) so no begun write is left
                       \*   staged-but-uncommitted for HealResetHard to discard.
+    ConflictModel,    \* TRUE: check the MERGE-CONFLICT-RESOLUTION protocol
+                      \*   (resolveConflict / gitlink-160000 conflict) instead of the
+                      \*   fast-forward convergence protocol above. The two sub-models
+                      \*   share the mainLocal/mainRemote/authored anchors but exercise
+                      \*   a disjoint action set, selected by Next.
+    ConflictHonest,   \* TRUE: the agent resolves a conflict to the UNION of both
+                      \*   sides and the runner BOUNDS the resolution loop, so it
+                      \*   terminates and loses nothing. FALSE: a byzantine agent (or
+                      \*   an unresolvable mode-160000 gitlink conflict it "resolves"
+                      \*   by picking one side) may either loop without making progress
+                      \*   (non-terminating) or commit a merge that silently drops a
+                      \*   side.
+    MaxResolveAttempts \* the runner's cap on conflict-resolution attempts. The fixed
+                      \*   protocol always resolves within it; the buggy loop exceeds
+                      \*   it, which ConflictTerminates catches as a safety violation.
 
 VARIABLES
     mainLocal,        \* contents of local primary main (beehived's COMMITTED tree)
@@ -60,10 +75,18 @@ VARIABLES
     authored,         \* every artifact any writer ever committed (conserved quantity)
     mainStaged,       \* staged-but-uncommitted view of the local primary working tree
                       \*   (always a superset of mainLocal until a heal resets it)
-    begun             \* every artifact some local writer has STAGED into the primary
+    begun,            \* every artifact some local writer has STAGED into the primary
                       \*   tree (begun authoring); it must never vanish uncommitted.
+    \* --- conflict-resolution sub-model (meaningful only when ConflictModel) ---
+    inConflict,       \* a merge raised a conflict awaiting agent resolution
+    resolveAttempts,  \* number of resolution attempts so far (termination measure)
+    mustSurvive,      \* the UNION of both conflicting sides, captured when the
+                      \*   conflict is raised; a correct merge must preserve all of it
+    mergedTree,       \* the tree the agent has resolved the conflict to
+    mergeDone         \* the conflicted merge has been resolved AND published
 
-vars == <<mainLocal, mainRemote, authored, mainStaged, begun>>
+vars == <<mainLocal, mainRemote, authored, mainStaged, begun,
+          inConflict, resolveAttempts, mustSurvive, mergedTree, mergeDone>>
 
 TypeOK ==
     /\ mainLocal  \subseteq Artifacts
@@ -71,6 +94,11 @@ TypeOK ==
     /\ authored   \subseteq Artifacts
     /\ mainStaged \subseteq Artifacts
     /\ begun      \subseteq Artifacts
+    /\ inConflict \in BOOLEAN
+    /\ resolveAttempts \in Nat
+    /\ mustSurvive \subseteq Artifacts
+    /\ mergedTree \subseteq Artifacts
+    /\ mergeDone  \in BOOLEAN
 
 \* A ref only ever fast-forwards: it may advance to a superset of its contents.
 FastForward(old, new) == old \subseteq new
@@ -99,6 +127,30 @@ NoSilentLoss == authored \subseteq (mainLocal \cup mainRemote)
 NoStagedLoss == begun \subseteq (mainStaged \cup mainLocal \cup mainRemote)
 
 (***************************************************************************)
+(* Conflict-resolution safety invariants (ConflictModel).                  *)
+(*                                                                         *)
+(* internal/swarm/swarm.go resolveConflict hands the agent the conflicted  *)
+(* files; a gitlink (mode 160000) conflict "cannot be resolved by editing" *)
+(* -- so the failure class is (a) a NON-TERMINATING resolution loop (the    *)
+(* agent never converges the conflict) or (b) a byzantine agent that        *)
+(* commits a resolution SILENTLY DROPPING one side's artifacts.  These two  *)
+(* invariants lock out exactly those two failure classes.                  *)
+(***************************************************************************)
+
+\* (a) Termination: the runner bounds the conflict-resolution loop, so the
+\* number of resolution attempts never exceeds the cap. A model that lets the
+\* agent re-attempt without progress blows past MaxResolveAttempts -- the
+\* non-terminating conflict loop, caught as a finite safety counterexample.
+ConflictTerminates == resolveAttempts <= MaxResolveAttempts
+
+\* (b) No silent loss at MERGE granularity (the NoSilentLoss guarantee for a
+\* conflicted merge): once a conflicted merge is published, the resolved tree
+\* must be a SUPERSET of the union of BOTH conflicting sides -- never a subset
+\* that dropped one side. A byzantine "pick one side" resolution of an
+\* unresolvable gitlink conflict violates this with a dropped-side trace.
+NoMergeLoss == mergeDone => (mustSurvive \subseteq mergedTree)
+
+(***************************************************************************)
 (* Init                                                                    *)
 (***************************************************************************)
 Init ==
@@ -107,6 +159,11 @@ Init ==
     /\ authored   = {}
     /\ mainStaged = {}
     /\ begun      = {}
+    /\ inConflict = FALSE
+    /\ resolveAttempts = 0
+    /\ mustSurvive = {}
+    /\ mergedTree = {}
+    /\ mergeDone  = FALSE
 
 (***************************************************************************)
 (* Actions                                                                 *)
@@ -223,16 +280,94 @@ Done ==
     /\ mainStaged = mainLocal
     /\ UNCHANGED vars
 
+(***************************************************************************)
+(* Conflict-resolution actions (ConflictModel).                            *)
+(***************************************************************************)
+
+\* The conflict-model variable group, so the fast-forward sub-model's actions
+\* can leave the conflict state untouched in a single UNCHANGED clause.
+convVars == <<inConflict, resolveAttempts, mustSurvive, mergedTree, mergeDone>>
+
+\* Two hosts published incomparable forks of main; merging them raises a
+\* conflict (e.g. a mode-160000 gitlink conflict git cannot auto-merge). The
+\* union of both sides is what a correct resolution MUST preserve.
+RaiseConflict ==
+    /\ ~inConflict /\ ~mergeDone /\ mustSurvive = {}
+    /\ LET la == CHOOSE x \in Artifacts : TRUE
+           rb == CHOOSE x \in Artifacts : x /= la
+       IN /\ mainLocal'   = {la}
+          /\ mainRemote'  = {rb}
+          /\ authored'    = {la, rb}
+          /\ mustSurvive' = {la, rb}
+    /\ inConflict' = TRUE
+    /\ UNCHANGED <<mainStaged, begun, resolveAttempts, mergedTree, mergeDone>>
+
+\* The runner hands the agent the conflicted files (swarm.go resolveConflict).
+\* Honest: the agent makes PROGRESS -- resolves to the full union and clears
+\* the conflict. Byzantine: no progress -- it re-attempts the same conflict
+\* without converging (the non-terminating loop). Each attempt is counted; the
+\* guard caps the explored depth at one past the bound so the loop's violation
+\* of ConflictTerminates is a finite counterexample.
+ResolveConflict ==
+    /\ inConflict /\ ~mergeDone
+    /\ resolveAttempts <= MaxResolveAttempts
+    /\ resolveAttempts' = resolveAttempts + 1
+    /\ IF ConflictHonest
+         THEN /\ mergedTree' = mustSurvive
+              /\ inConflict' = FALSE
+         ELSE /\ mergedTree' = mergedTree
+              /\ inConflict' = TRUE
+    /\ UNCHANGED <<mainLocal, mainRemote, authored, mainStaged, begun,
+                   mustSurvive, mergeDone>>
+
+\* Publish an HONEST resolution: the merged (union) tree lands on both anchors.
+PublishMerged ==
+    /\ ConflictHonest
+    /\ ~inConflict /\ ~mergeDone /\ mustSurvive /= {}
+    /\ mainLocal'  = mergedTree
+    /\ mainRemote' = mergedTree
+    /\ mergeDone'  = TRUE
+    /\ UNCHANGED <<authored, mainStaged, begun,
+                   inConflict, resolveAttempts, mustSurvive, mergedTree>>
+
+\* Byzantine publish: the agent "resolves" the unresolvable gitlink conflict by
+\* keeping ONE side and dropping the other, then commits it to both anchors.
+\* mustSurvive is no longer a subset of the merged tree -> NoMergeLoss fires.
+PublishMergedLossy ==
+    /\ ~ConflictHonest
+    /\ inConflict /\ ~mergeDone
+    /\ \E drop \in mustSurvive :
+         LET keep == mustSurvive \ {drop} IN
+         /\ mergedTree' = keep
+         /\ mainLocal'  = keep
+         /\ mainRemote' = keep
+    /\ inConflict' = FALSE
+    /\ mergeDone'  = TRUE
+    /\ resolveAttempts' = resolveAttempts + 1
+    /\ UNCHANGED <<authored, mainStaged, begun, mustSurvive>>
+
+\* Terminal stutter once the conflicted merge is published, so a fully-resolved
+\* run is not reported as a deadlock.
+ConflictDone ==
+    /\ mergeDone
+    /\ UNCHANGED vars
+
 Next ==
-    \/ ExternalPush
-    \/ (IF Fixed THEN PublishConverging ELSE PublishDirectStale)
-    \/ PullMainFFOnly
-    \/ PushPrimary
-    \/ ExternalForceRewind
-    \/ MutatePrimaryTree
-    \/ CommitStaged
-    \/ HealResetHard
-    \/ Done
+    IF ConflictModel
+      THEN \/ RaiseConflict
+           \/ ResolveConflict
+           \/ PublishMerged
+           \/ PublishMergedLossy
+           \/ ConflictDone
+      ELSE \/ (ExternalPush /\ UNCHANGED convVars)
+           \/ ((IF Fixed THEN PublishConverging ELSE PublishDirectStale) /\ UNCHANGED convVars)
+           \/ (PullMainFFOnly /\ UNCHANGED convVars)
+           \/ (PushPrimary /\ UNCHANGED convVars)
+           \/ (ExternalForceRewind /\ UNCHANGED convVars)
+           \/ (MutatePrimaryTree /\ UNCHANGED convVars)
+           \/ (CommitStaged /\ UNCHANGED convVars)
+           \/ (HealResetHard /\ UNCHANGED convVars)
+           \/ Done
 
 (***************************************************************************)
 (* Liveness: every writer's work eventually reaches BOTH anchors.          *)
@@ -242,10 +377,10 @@ Converged == mainLocal = mainRemote
 EventuallyConverged == <>[](authored = Artifacts /\ Converged)
 
 Fairness ==
-    /\ WF_vars(PublishConverging)
-    /\ WF_vars(PullMainFFOnly)
-    /\ WF_vars(PushPrimary)
-    /\ WF_vars(CommitStaged)
+    /\ WF_vars(PublishConverging /\ UNCHANGED convVars)
+    /\ WF_vars(PullMainFFOnly /\ UNCHANGED convVars)
+    /\ WF_vars(PushPrimary /\ UNCHANGED convVars)
+    /\ WF_vars(CommitStaged /\ UNCHANGED convVars)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 =============================================================================
