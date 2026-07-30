@@ -58,6 +58,8 @@ CASES=(
     "PlanConvergence|PlanConvergence_dedup_buggy.cfg|fail"
     "DeferBound|DeferBound_fixed.cfg|pass"
     "DeferBound|DeferBound_buggy.cfg|fail"
+    "BootstrapRace|BootstrapRace_fixed.cfg|pass"
+    "BootstrapRace|BootstrapRace_buggy.cfg|fail"
 )
 
 rc=0
