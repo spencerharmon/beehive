@@ -122,6 +122,30 @@ into each cfg via `<-` because TLC cfgs cannot express `<<>>` tuple literals.
 | `CycleNeverHeld` | invariant | cyclic-task exclusion → escalation rather than silent hold (`graphGate` + `InCycle`) | `DependencyReadiness_cycle_buggy.cfg` proves a cycle is silently held without `CycleGuard` |
 | `EventuallyResolved` | liveness | real dep completes → DONE; phantom or cycle → NEEDS-HUMAN | `DependencyReadiness_fixed.cfg` |
 
+## Layer 2 — `Selection.tla`
+
+The deterministic task-selection layer (`internal/select/select.go` `Select` +
+`weightedOrder` + `pickTask`, and the `not_before` wall-clock gate
+`plan.Task.NotBeforeReached` / `plan.Plan.Candidates`). It extends the selection
+dimension `ClaimRace.tla` touches from the claim side, covering the selector's two
+OTHER obligations, each a distinct failure class: STARVATION (a continuously-ready
+task never selected — a liveness failure the weighted-random-over-positive-weights
+guarantee forbids) and PREMATURE DISPATCH (a future-`not_before` task selected before
+its gate — a safety failure). Toggled by `FairSelect` (per-task selection fairness =
+positive weight, on vs off) and `GateHonored` (honor `not_before` vs ignore it).
+`clock` is a logical wall clock; `Release` models the selection-claim TTL requeuing a
+task into the continuous work stream (the ready pool over which no-starvation must
+hold). Scenario `Tasks`/`NotBefore` are `<-`-substituted (`Tasks3`, `NBNone`/`NBGate`)
+since cfgs cannot express function literals.
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `Select(t)` (weighted-random over ready candidates; gate-honoring) | action + guard | `select/select.go Select` + `weightedOrder` + `pickTask` over `plan.Plan.Candidates`; the gate clause `t.NotBeforeReached(now)` (`plan/compat.go:42`) | `select` `TestSelect*`; `plan_test.go TestNotBeforeReached` |
+| `Ready(t)` (not_before reached) | operator | `plan.Task.NotBeforeReached` (`plan/state.go:75`); `Candidates` main-tier gate (`plan/compat.go:42`) | `plan_test.go TestNotBeforeReached` |
+| `Release(t)` (claim TTL requeue) | action | `plan.Task.Active`/`Stale` staleness window driving `Candidates(now, ttl)`; `plan.Task.Release` | `plan_test.go` claim/TTL tests |
+| `NoPrematureDispatch` | invariant | `Candidates` holds a TODO task out of the main tier until `NotBeforeReached(now)` | `Selection_premature_buggy.cfg` proves early dispatch reachable when the gate is ignored (`GateHonored=FALSE`) |
+| `EventuallySelected` / `NoStarvation` | liveness | weighted-random with positive weight for every ready candidate (`weightedOrder`/`pickTask`) — every ready task eventually selected | `Selection_fixed.cfg` (holds); `Selection_starvation_buggy.cfg` reproduces the starvation lasso when fairness is dropped (`FairSelect=FALSE`) |
+
 ## Layer 3 (delivered) — `EditorSessionNamespace.tla`
 
 The beehived chat-diff editor Manager reclaim/gc dance (faithful to

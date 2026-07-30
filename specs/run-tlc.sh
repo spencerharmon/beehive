@@ -42,6 +42,9 @@ CASES=(
     "EditorSessionNamespace|EditorSessionNamespace_buggy_namespace.cfg|fail"
     "EditorSessionNamespace|EditorSessionNamespace_buggy_liveguard.cfg|fail"
     "EditorSessionNamespace|EditorSessionNamespace_buggy_remote.cfg|fail"
+    "Selection|Selection_fixed.cfg|pass"
+    "Selection|Selection_starvation_buggy.cfg|fail"
+    "Selection|Selection_premature_buggy.cfg|fail"
 )
 
 rc=0
@@ -50,7 +53,7 @@ for c in "${CASES[@]}"; do
     out="$(cd "$HERE" && java -cp "$JAR" tlc2.TLC -config "$cfg" "$mod.tla" 2>&1)"
     if echo "$out" | grep -q "No error has been found"; then
         got=pass
-    elif echo "$out" | grep -q "is violated"; then
+    elif echo "$out" | grep -qE "is violated|Temporal properties were violated"; then
         got=fail
     else
         got=error
