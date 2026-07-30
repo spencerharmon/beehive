@@ -56,6 +56,8 @@ CASES=(
     "PlanConvergence|PlanConvergence_fixed.cfg|pass"
     "PlanConvergence|PlanConvergence_stale_overwrite_buggy.cfg|fail"
     "PlanConvergence|PlanConvergence_dedup_buggy.cfg|fail"
+    "BootstrapRace|BootstrapRace_fixed.cfg|pass"
+    "BootstrapRace|BootstrapRace_buggy.cfg|fail"
 )
 
 rc=0

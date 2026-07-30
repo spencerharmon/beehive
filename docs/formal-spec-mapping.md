@@ -65,6 +65,33 @@ recordReviewedCommit` and `:2651 finalizeIfAlreadyMerged` must read the task's O
 `bee-<taskid>` tip, never the ambient `HEAD:submodules/<sm>/repo` gitlink. That
 crosses task-status + review, so it is the Layer-2 `NoFalseDone` property.
 
+## Layer 1 — `BootstrapRace.tla`
+
+Two concurrent bootstrap passes, each observing "no `PLAN.md` exists" for the same
+submodule, each attempting to create + publish the plan's first version. Unlike the
+other Layer 1 modules, this one is **spec-first and optional** — the Go level
+already gates this race today (`TestRunBootstrapGatesOnUnpublishedPlan`), so this
+module documents an already-defended candidate rather than closing an observed
+bug. `Gated` toggles the fixed protocol (re-check the fresh "plan exists" state
+immediately before publish; first-publish-wins) vs the buggy counterfactual (a
+session publishes unconditionally from its stale "no plan yet" snapshot).
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `Observe` | action | the selector's "no `PLAN.md` → pick bootstrap kind" check (`swarm.go` task selection) reading main at pass start | `swarm_test.go` bootstrap-selection tests |
+| `Build` | action | the bootstrap agent turn loop writing `PLAN.md` into its private worktree, uncommitted until publish | `TestRunBootstrapGatesOnUnpublishedPlan` (the local write, deliberately never committed) |
+| `Publish` (gated branch) | action + guard | the publish-time gate on the unpublished-plan check — a bootstrap pass's local completion check must observe its OWN commit landed, not merely the on-disk file, so a stale second session's publish attempt is refused / no-ops | `TestRunBootstrapGatesOnUnpublishedPlan` — asserts the run is NOT reported `Completed` and the task is left for GC/re-drive when the write is never committed |
+| `Publish` (ungated/buggy branch) | action | the counterfactual of no re-check: a session publishes unconditionally from its stale snapshot | reproduced by `BootstrapRace_buggy.cfg` only — no such code path exists today |
+| `SinglePlanCreated` | invariant | the "gates on unpublished plan" check keeping a second, stale session's publish from ever landing a redundant plan | `BootstrapRace_buggy.cfg` proves two publishes can land without the gate |
+| `SecondBootstrapNoOps` | invariant | first-publish-wins semantics — a losing session's publish never overwrites the winner's recorded plan | `BootstrapRace_buggy.cfg` proves the second session's publish can clobber the first session's recorded owner without the gate |
+
+**Conformance note:** `TestRunBootstrapGatesOnUnpublishedPlan` covers the single-
+session shape (one bootstrap pass whose write never lands a commit is gated); no
+Go regression test yet exercises the TWO-session race this module models end to
+end. Per the task card, this is acceptable — land only if a concrete bootstrap
+race is ever actually observed in the wild; until then it stays a documented,
+already-gated candidate.
+
 ## Layer 2 — `TaskStatus.tla`
 
 Status machine faithful to `internal/plan/state.go` (edges in `state.go:13
