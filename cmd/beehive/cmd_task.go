@@ -23,6 +23,7 @@ import (
 func taskCmd() *cobra.Command {
 	c := &cobra.Command{Use: "task", Short: "manage PLAN.md tasks"}
 	c.AddCommand(taskHumanCmd())
+	c.AddCommand(taskStatusCmd())
 	c.AddCommand(taskAddCmd())
 	c.AddCommand(taskBlockCmd())
 	c.AddCommand(taskCheckCmd())
@@ -158,7 +159,140 @@ func humanReason(reason, reasonFile string) (string, error) {
 	return reason, nil
 }
 
-// taskAddCmd files a brand-new TODO task (with its design doc) into a
+// taskStatusCmd is the deterministic honeybee handoff: it flips a PLAN.md task's
+// STATUS along a legal state-machine edge, records the session's submodule commits
+// as the `commits=` tag, mirrors that same set into the change doc's first-line
+// `<!-- Beehive-Commits: ... -->` header, and commits BOTH to the local hive branch
+// — the exact committed-artifact set the runner's handoff gate enforces, produced
+// atomically instead of by hand-editing PLAN.md (the error-prone path this command
+// replaces).
+//
+// Unlike the operator verbs (task human/defer/block/reopen), this NEVER syncs or
+// publishes to primary main: a honeybee is forbidden from touching remotes, and the
+// runner owns the merge of the hive branch to main. It only edits + commits in the
+// pass's cwd (the beehive repo root the runner handed the honeybee), exactly like
+// the runner's own autoBookkeep. The transition itself is validated by the plan
+// state machine (Task.Transition), so an illegal edge — e.g. a work pass trying
+// TODO -> DONE (self-approval) — is refused here, deterministically.
+func taskStatusCmd() *cobra.Command {
+	var commitsCSV, docFlag string
+	var commitsNone, noCommit bool
+	cmd := &cobra.Command{
+		Use:   "status <submodule> <task-id> <new-status>",
+		Short: "flip a task's PLAN.md status (deterministic honeybee handoff: validates the edge, records commits=, mirrors the doc's Beehive-Commits header, commits both locally)",
+		Long: "Flip a PLAN.md task's status along a legal edge (TODO->NEEDS-REVIEW, " +
+			"NEEDS-REVIEW->{DONE,NEEDS-ARBITRATION}, NEEDS-ARBITRATION->{DONE,TODO}). Records the " +
+			"submodule commits this session produced as the `commits=` tag and mirrors the SAME set into " +
+			"the change doc's first-line `<!-- Beehive-Commits: ... -->` header, then commits PLAN.md + the " +
+			"doc to the local hive branch. It does NOT push or publish — the runner merges the hive branch " +
+			"to main. Escalation to NEEDS-HUMAN is `beehive task human`; a TODO self-defer is `beehive task defer`.",
+		Args: cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			subArg, id, rawStatus := args[0], args[1], args[2]
+			to := plan.Status(strings.TrimSpace(rawStatus))
+			switch to {
+			case plan.StatusReview, plan.StatusDone, plan.StatusArb, plan.StatusTODO:
+				// legal honeybee handoff targets; the state machine below enforces the edge
+			case plan.StatusHuman:
+				return fmt.Errorf("use `beehive task human %s %s --category <cat> --reason \"...\"` to escalate to %s", subArg, id, plan.StatusHuman)
+			default:
+				return fmt.Errorf("invalid target status %q; one of %s, %s, %s, %s", rawStatus,
+					plan.StatusReview, plan.StatusArb, plan.StatusDone, plan.StatusTODO)
+			}
+			// commits designation is MANDATORY: every terminal handoff must record the
+			// submodule commits this session produced (or commits=none), and the runner's
+			// gate refuses a flip that lacks it. Require exactly one of --commits/--commits-none
+			// so the tag can never be silently omitted.
+			if commitsNone == (strings.TrimSpace(commitsCSV) != "") {
+				return fmt.Errorf("exactly one of --commits <sha>[,<sha>...] or --commits-none is required " +
+					"(records the commits= tag the handoff gate enforces)")
+			}
+			var commits []string
+			if !commitsNone {
+				for _, s := range strings.Split(commitsCSV, ",") {
+					if s = strings.TrimSpace(s); s != "" {
+						commits = append(commits, s)
+					}
+				}
+				if len(commits) == 0 {
+					return fmt.Errorf("--commits was empty; pass the real submodule sha(s) or use --commits-none")
+				}
+			}
+			root, err := findRoot()
+			if err != nil {
+				return err
+			}
+			subName, err := taskSubmoduleName(subArg)
+			if err != nil {
+				return err
+			}
+			planRel := filepath.Join("submodules", subName, repo.PlanFile)
+			planPath := filepath.Join(root, planRel)
+			b, err := os.ReadFile(planPath)
+			if err != nil {
+				return err
+			}
+			p, err := plan.Parse(string(b))
+			if err != nil {
+				return err
+			}
+			t := p.Find(id)
+			if t == nil {
+				return fmt.Errorf("task %q not found in %s", id, planRel)
+			}
+			from := t.Status
+			if err := t.Transition(to, time.Now().UTC()); err != nil {
+				return err
+			}
+			t.Commits = commits
+			t.CommitsSet = true
+			// Mirror the commits set into the change doc's Beehive-Commits header so the
+			// PLAN tag and the doc agree (the gate refuses a mismatch). Default doc path is
+			// the standard bee-<id>-<id>.md change doc; --doc overrides for a non-standard
+			// branch name.
+			docRel := strings.TrimSpace(docFlag)
+			if docRel == "" {
+				docRel = filepath.Join("submodules", subName, "docs", "bee-"+id+"-"+id+".md")
+			}
+			docPath := filepath.Join(root, docRel)
+			docBytes, derr := os.ReadFile(docPath)
+			if derr != nil {
+				return fmt.Errorf("change doc %s must exist before the status flip "+
+					"(the handoff gate requires it committed with a matching Beehive-Commits header) "+
+					"— write it first, or pass --doc <path>: %w", docRel, derr)
+			}
+			newDoc := plan.SetDocCommitsHeader(string(docBytes), commits)
+			if newDoc != string(docBytes) {
+				if err := os.WriteFile(docPath, []byte(newDoc), 0o644); err != nil {
+					return err
+				}
+			}
+			if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+				return err
+			}
+			tag := plan.CommitsTagValue(commits)
+			if noCommit {
+				fmt.Printf("%s %s: %s -> %s (commits=%s); PLAN.md + %s written, NOT committed (--no-commit)\n",
+					subName, id, from, to, tag, docRel)
+				return nil
+			}
+			// Local commit ONLY — no primary-main sync/publish. The runner merges the hive
+			// branch to main; a honeybee never touches remotes.
+			msg := fmt.Sprintf("plan: %s %s -> %s\n\nBeehive: %s %s", id, from, to, id, docRel)
+			if err := git.New(root).CommitPaths(cmd.Context(), msg, planRel, docRel); err != nil && err != git.ErrNothing {
+				return err
+			}
+			fmt.Printf("%s %s: %s -> %s (commits=%s), committed to the local hive branch\n", subName, id, from, to, tag)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&commitsCSV, "commits", "", "comma-separated submodule sha(s) this session produced (the commits= tag)")
+	cmd.Flags().BoolVar(&commitsNone, "commits-none", false, "declare this session made NO submodule commit (commits=none)")
+	cmd.Flags().StringVar(&docFlag, "doc", "", "change-doc path to mirror the Beehive-Commits header into (default submodules/<sm>/docs/bee-<id>-<id>.md)")
+	cmd.Flags().BoolVar(&noCommit, "no-commit", false, "write PLAN.md + doc but do not git-commit them (you commit yourself)")
+	return cmd
+}
+
 // submodule's PLAN.md through the primary-main convergence protocol — the
 // first-class way a WORK pass that discovers a missing prerequisite creates the
 // real task for it instead of faking a dangling dep or farming it out to a human.

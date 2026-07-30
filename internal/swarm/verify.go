@@ -550,34 +550,11 @@ func (r *Runner) discoverSessionCommits(ctx context.Context, wtAbs string, sub r
 	return shas
 }
 
-// setDocCommitsHeader rewrites (or inserts) doc's first-line
-// `<!-- Beehive-Commits: ... -->` header to name exactly commits, leaving every
-// other line untouched — the ONLY prose this function ever writes, and only when
-// the header is absent or disagrees with the commits= tag it mirrors.
+// setDocCommitsHeader delegates to plan.SetDocCommitsHeader — the single source of
+// truth for the doc's Beehive-Commits header format, shared with the honeybee-
+// facing `beehive task status` producer so the two can never drift.
 func setDocCommitsHeader(doc string, commits []string) string {
-	header := fmt.Sprintf("<!-- Beehive-Commits: %s -->", commitsTagValue(commits))
-	lines := strings.SplitN(doc, "\n", 2)
-	first := strings.TrimSpace(lines[0])
-	rest := ""
-	if len(lines) > 1 {
-		rest = lines[1]
-	}
-	if strings.Contains(first, "Beehive-Commits:") {
-		if first == header {
-			return doc
-		}
-		if rest == "" {
-			return header
-		}
-		return header + "\n" + rest
-	}
-	if rest == "" && len(lines) == 1 {
-		if strings.TrimSpace(doc) == "" {
-			return header + "\n"
-		}
-		return header + "\n" + doc
-	}
-	return header + "\n" + doc
+	return plan.SetDocCommitsHeader(doc, commits)
 }
 
 // gatedHandoff reports whether (kind, status) is a terminal handoff the uniform
@@ -614,54 +591,14 @@ func (r *Runner) gateCleanCheckout(ctx context.Context, dir string) (string, err
 	return "", nil
 }
 
-// parseDocCommits extracts the `<!-- Beehive-Commits: <sha>,<sha> | none -->`
-// header from a change doc. Returns the sha list (empty for `none`) and whether
-// a well-formed header was found at all.
+// parseDocCommits delegates to plan.ParseDocCommits (single source of truth).
 func parseDocCommits(doc string) ([]string, bool) {
-	for _, line := range strings.Split(doc, "\n") {
-		line = strings.TrimSpace(line)
-		_, rest, ok := strings.Cut(line, "Beehive-Commits:")
-		if !ok {
-			continue
-		}
-		rest, _, ok = strings.Cut(rest, "-->")
-		if !ok {
-			continue
-		}
-		rest = strings.TrimSpace(rest)
-		if rest == "" || rest == "none" {
-			return nil, true
-		}
-		var shas []string
-		for _, s := range strings.Split(rest, ",") {
-			if s = strings.TrimSpace(s); s != "" {
-				shas = append(shas, s)
-			}
-		}
-		return shas, true
-	}
-	return nil, false
+	return plan.ParseDocCommits(doc)
 }
 
-// sameCommitSet reports whether a and b hold the same set of commit shas
-// (order-insensitive).
+// sameCommitSet delegates to plan.SameCommitSet (single source of truth).
 func sameCommitSet(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	seen := make(map[string]int, len(a))
-	for _, s := range a {
-		seen[s]++
-	}
-	for _, s := range b {
-		seen[s]--
-	}
-	for _, n := range seen {
-		if n != 0 {
-			return false
-		}
-	}
-	return true
+	return plan.SameCommitSet(a, b)
 }
 
 // gateVerifyOutputCap bounds how much command output rides back in the
@@ -770,13 +707,9 @@ func commitsUnreachableFailPrompt(sm, sha string, commits []string) string {
 		sm, sha, commitsTagValue(commits))
 }
 
-// commitsTagValue renders a sha list the way the `commits=` tag serializes it (or
-// "none" for an empty set), for use in gate prompts.
+// commitsTagValue delegates to plan.CommitsTagValue (single source of truth).
 func commitsTagValue(commits []string) string {
-	if len(commits) == 0 {
-		return "none"
-	}
-	return strings.Join(commits, ",")
+	return plan.CommitsTagValue(commits)
 }
 
 // checkGroundTruth runs the selected task's definition-of-done check ONCE at pass

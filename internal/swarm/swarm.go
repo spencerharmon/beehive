@@ -790,10 +790,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"(with its `Review:` note) is provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
 				"Implementer's work is on branch bee-%[2]s in submodules/%[1]s/repo — inspect read-only via git "+
 				"(fetch from origin if the branch is absent locally). Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md.\n"+
-				"APPROVE -> merge bee-%[2]s into the submodule's tracked branch on its origin + PLAN.md task DONE + "+
-				"unlock dependents. Do NOT touch the submodule pointer (gitlink) yourself — the runner pins it to the "+
+				"APPROVE -> merge bee-%[2]s into the submodule's tracked branch on its origin, then `beehive task "+
+				"status %[1]s %[2]s DONE --commits <merge-sha>` (flips PLAN.md + records the commits tag/doc header + "+
+				"commits both; unlocks dependents). Do NOT touch the submodule pointer (gitlink) yourself — the runner pins it to the "+
 				"tracked-branch tip; that is the ONLY value it may ever hold (see docs/submodule-pointer-invariant.md). "+
-				"REJECT -> PLAN.md task NEEDS-ARBITRATION + rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
+				"REJECT -> `beehive task status %[1]s %[2]s NEEDS-ARBITRATION --commits-none` + rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
 				"HANDOFF GATE (same for every terminal flip): before your flip is accepted the runner requires a CLEAN "+
 				"submodules/%[1]s/repo checkout, your PLAN.md flip COMMITTED, the change doc "+
 				"submodules/%[1]s/docs/bee-%[2]s-%[2]s.md COMMITTED with a first-line `<!-- Beehive-Commits: <sha>,<sha> -->` "+
@@ -811,10 +812,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
 				"Implementer branch bee-%[2]s in submodules/%[1]s/repo; change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
 				"reviewer rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
-				"SIDE WITH IMPLEMENTER -> merge bee-%[2]s into the submodule's tracked branch on its origin + PLAN.md DONE "+
-				"+ unlock dependents. Do NOT touch the submodule pointer (gitlink) yourself — the runner pins it to the "+
+				"SIDE WITH IMPLEMENTER -> merge bee-%[2]s into the submodule's tracked branch on its origin, then "+
+				"`beehive task status %[1]s %[2]s DONE --commits <merge-sha>` (unlocks dependents). Do NOT touch the submodule pointer (gitlink) yourself — the runner pins it to the "+
 				"tracked-branch tip (see docs/submodule-pointer-invariant.md). "+
-				"SIDE WITH REVIEWER -> PLAN.md TODO with the binding rationale; if a concrete operator blocker is exposed, "+
+				"SIDE WITH REVIEWER -> `beehive task status %[1]s %[2]s TODO --commits-none` with the binding rationale; if a concrete operator blocker is exposed, "+
 				"run beehive task human %[1]s %[2]s --reason \"<specific blocker>\".\n"+
 				"HANDOFF GATE (same for every terminal flip): before your flip is accepted the runner requires a CLEAN "+
 				"submodules/%[1]s/repo checkout, your PLAN.md flip COMMITTED, the change doc "+
@@ -840,15 +841,17 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if !r.LeanInject {
 			onComplete = fmt.Sprintf(
 				"On completion of a Work task: commit the code on branch %[1]s with a `Beehive: %[2]s <doc-path>` stamp "+
-					"and push that commit to the submodule's origin FIRST; then record its sha(s) as a `commits=<sha>[,<sha>]` "+
-					"tag on the PLAN.md task header (or `commits=none` if this task changed no submodule code) AND as the "+
-					"change doc's first-line `<!-- Beehive-Commits: <sha>,<sha> -->` header (same set), flip PLAN.md -> "+
-					"NEEDS-REVIEW, and COMMIT the PLAN flip + doc together. The runner's handoff gate refuses the flip unless "+
-					"your code worktree is clean, the flip and doc are COMMITTED, and every commit named in the tag actually "+
-					"exists — so do the submodule commit+push BEFORE recording the tag. "+
+					"and push that commit to the submodule's origin FIRST; then run `beehive task status %[3]s %[2]s "+
+					"NEEDS-REVIEW --commits <sha>[,<sha>]` (or `--commits-none` if this task changed no submodule code). "+
+					"That ONE command flips PLAN.md, writes the `commits=` tag AND the change doc's first-line "+
+					"`<!-- Beehive-Commits: <sha>,<sha> -->` header from the same set, and commits the PLAN flip + doc "+
+					"together on your hive branch (write the doc's prose first). The runner's handoff gate refuses the "+
+					"flip unless your code worktree is clean, the flip and doc are COMMITTED, and every commit named in "+
+					"the tag actually exists — so do the submodule commit+push BEFORE `beehive task status`. Never "+
+					"hand-edit the PLAN.md status. "+
 					"Do NOT bump or otherwise write the submodule pointer (gitlink) — the runner owns it and pins it to the "+
 					"tracked-branch tip; a bee-branch tip must NEVER be recorded (see docs/submodule-pointer-invariant.md).\n",
-				res.Branch, taskID(sel))
+				res.Branch, taskID(sel), smName)
 		}
 		preamble = fmt.Sprintf(
 			"# Context\nYou are working from the beehive repo root (cwd). Submodule: %[1]s.\n"+

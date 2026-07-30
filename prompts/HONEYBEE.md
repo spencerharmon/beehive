@@ -130,8 +130,15 @@ branch already exists on origin (a prior orphaned attempt) is NOT a problem to s
 or a near-duplicate on origin as a reason to stop, re-plan, force-push, or escalate.
 
 ## Status transitions (exhaustive)
-You perform the status edit; the runner manages session/heartbeat and the merge to main. The only
-legal edges, each owned by exactly one kind:
+You perform every status edit with the deterministic `beehive task status <sm> <task-id> <new-status>`
+command — NEVER by hand-editing the `[STATUS]` in `PLAN.md`. The command validates the edge against the
+state machine below (refusing an illegal one, e.g. a work pass self-approving `TODO → DONE`), records the
+session's submodule commits as the `commits=` tag, mirrors that SAME set into the change doc's first-line
+`<!-- Beehive-Commits: … -->` header, and commits `PLAN.md` + the doc together to your local hive branch
+(it does NOT push — the runner still owns session/heartbeat and the merge to main). Pass exactly one of
+`--commits <sha>[,<sha>…]` (the submodule commit(s) this session produced) or `--commits-none` (this
+session made no submodule commit). This produces, atomically, the exact committed artifacts the handoff
+gate enforces — do not reproduce them by hand. The only legal edges, each owned by exactly one kind:
 - `TODO → NEEDS-REVIEW` — work finished, awaits review. **This is the ONLY forward terminal a WORK pass
   may set. `TODO → DONE` is FORBIDDEN — a work pass may never mark its own task DONE** (that is self-
   approval, and it is the exact door the jellyfin false-DONE walked through). DONE is entered only by a
@@ -142,14 +149,18 @@ legal edges, each owned by exactly one kind:
   <t> --reason ...`. Bounded: past the defer cap it must escalate to NEEDS-HUMAN, not defer again. (This
   is the passive-convergence case only — see "Deployed ≠ loaded": if a bounded ACTION of yours produces
   the effect, do it now, do not defer.)
-- `NEEDS-REVIEW → DONE` — review approved. **Gated on the task's definition of done:** the runner runs the
+- `NEEDS-REVIEW → DONE` — review approved (`beehive task status <sm> <id> DONE --commits <merge-sha>`).
+  **Gated on the task's definition of done:** the runner runs the
   task's `Check:` command when it enters DONE and REFUSES the flip unless it exits 0 (or the task declared
   `check=none`). See "Definition of done" below.
-- `NEEDS-REVIEW → NEEDS-ARBITRATION` — review rejected.
+- `NEEDS-REVIEW → NEEDS-ARBITRATION` — review rejected
+  (`beehive task status <sm> <id> NEEDS-ARBITRATION --commits-none`).
 - `NEEDS-ARBITRATION → DONE` — arbiter sided with the implementer (same DONE check gate applies).
-- `NEEDS-ARBITRATION → TODO` — arbiter sided with the reviewer; rework.
+- `NEEDS-ARBITRATION → TODO` — arbiter sided with the reviewer; rework
+  (`beehive task status <sm> <id> TODO --commits-none`).
 - any working status `→ NEEDS-HUMAN` — a concrete operator blocker, set only via `beehive task human`
-  (never hand-write the status; it requires a `--category` + `--reason`, see Steps §4). Exact string `NEEDS-HUMAN`.
+  (never `beehive task status`, never hand-write the status; it requires a `--category` + `--reason`,
+  see Steps §4). Exact string `NEEDS-HUMAN`.
 A reconcile pass rewrites `PLAN.md` wholesale rather than moving one task; see its section.
 
 ## Definition of done (the `Check:` contract)
@@ -280,13 +291,18 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   as "not done". The doc MUST carry the evidence from the two rules above — the regression test's command
   and passing output, and (for an effect task) the live-effect confirmation. A change doc with no
   evidence is not a record of done; it is a guess, and the reviewer will reject it.
-- Regardless of whether this task changes code: `git commit` your beehive-layer worktree's `PLAN.md`
-  status flip and `docs/` changes YOURSELF, in THIS worktree — a doc-only task commits here exactly like
-  a code task does. This is NOT the forbidden "author in the live/shared checkout": this worktree (your
-  cwd) is your own private one, never the checkout `main`/`submodules/<sm>/repo` point at. Leaving these
-  changes uncommitted is not "the runner will handle it" — the runner only ever merges commits that
-  already exist on your branch, so an uncommitted status flip or doc is silently lost the moment your
-  claim's heartbeat goes stale, and the task gets redispatched from scratch having delivered nothing.
+- Regardless of whether this task changes code: record the status flip with `beehive task status <sm>
+  <taskid> NEEDS-REVIEW --commits <sha>[,<sha>]` (or `--commits-none` for a doc-only/no-code task). That
+  ONE command flips `PLAN.md`, writes the `commits=` tag, mirrors it into the change doc's
+  `<!-- Beehive-Commits: … -->` header, and `git commit`s `PLAN.md` + the doc together in THIS worktree
+  — the exact committed artifacts the gate below requires. (Write the change doc's PROSE first; the
+  command only maintains its commits header.) This is NOT the forbidden "author in the live/shared
+  checkout": this worktree (your cwd) is your own private one, never the checkout `main`/`submodules/<sm>/repo`
+  point at. Leaving these changes uncommitted is not "the runner will handle it" — the runner only ever
+  merges commits that already exist on your branch, so an uncommitted status flip or doc is silently lost
+  the moment your claim's heartbeat goes stale, and the task gets redispatched from scratch having
+  delivered nothing. (Never hand-edit the `[STATUS]` in `PLAN.md` — `beehive task status` is the ONLY
+  sanctioned way to flip it.)
 - Commit the code on branch `bee-<taskid>` with the `Beehive: <taskid> <doc-path>` stamp and ensure that
   commit is PUSHED to the submodule's origin (an unpushed commit dangles the pointer for every other
   host). **Do NOT touch the submodule pointer (gitlink) or `submodules/<sm>/repo`.** The runner OWNS
@@ -308,13 +324,14 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
      landed).
   3. **Change doc COMMITTED** — the doc at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` is committed in
      your hive branch HEAD (every terminal handoff writes/updates it, including Review and Arbitrate).
-  4. **`commits=` tag present, mirrored, and REAL** — record the submodule commits THIS session produced
-     on the task header (`commits=<sha>[,<sha>...]`, or `commits=none` if you made no submodule commit)
-     AND as the doc's first-line header `<!-- Beehive-Commits: <sha>,<sha> -->` / `<!-- Beehive-Commits:
+  4. **`commits=` tag present, mirrored, and REAL** — the submodule commits THIS session produced are
+     recorded on the task header (`commits=<sha>[,<sha>...]`, or `commits=none` if you made no submodule
+     commit) AND as the doc's first-line header `<!-- Beehive-Commits: <sha>,<sha> -->` / `<!-- Beehive-Commits:
      none -->`; the two sets must MATCH, and every referenced sha must actually exist in the submodule.
+     `beehive task status` writes BOTH from your `--commits`/`--commits-none` flag so they cannot drift.
      Because the gate verifies the referenced commits exist, do the SUBMODULE work FIRST — commit your
-     code and push `bee-<taskid>` to the submodule origin — THEN record its sha(s) in the tag and commit
-     the PLAN flip + doc. A tag naming a commit that does not exist (a phantom/bad-object stamp) is
+     code and push `bee-<taskid>` to the submodule origin — THEN run `beehive task status` with its
+     sha(s). A tag naming a commit that does not exist (a phantom/bad-object stamp) is
      REFUSED with the requirement to create the commit or correct the tag.
   5. **Definition-of-done check PASSES (on entry to DONE only)** — when the accepted flip ENTERS DONE
      (`NEEDS-REVIEW→DONE`, `NEEDS-ARBITRATION→DONE`), the runner runs the task's `Check:` command and
@@ -329,7 +346,8 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   flux base-job task that shipped no code, a doc-less flux task that thrashed review→arbitration→TODO, an
   arbitration whose status flip was never committed, and phantom `review=` stamps pointing at commits
   that exist nowhere.)
-- Flip the `PLAN.md` task `TODO → NEEDS-REVIEW` on main and commit.
+- Flip the status with `beehive task status <sm> <taskid> NEEDS-REVIEW --commits <sha>[,<sha>]` (or
+  `--commits-none` for a no-code task) — it commits the `PLAN.md` flip + doc together on your hive branch.
 
 ## Review task
 Status is `NEEDS-REVIEW`. JUDGE the existing work against your provided task card (`## Your task`) — do
@@ -349,10 +367,11 @@ the runner already verified reachability before dispatching you.
   404, greps the wrong string, or hits the wrong host); a weak or lying check is a rejection just like a
   missing one, and an unjustified `check=none` on a task that HAS an observable effect is a rejection.
   When satisfied, merge `bee-<taskid>` into the submodule's tracked branch on
-  its origin, `NEEDS-REVIEW → DONE`, unlock dependents. Commit. Do NOT touch the submodule pointer — the
+  its origin, then `beehive task status <sm> <taskid> DONE --commits <merge-sha>` (unlocks dependents on
+  DONE). Do NOT touch the submodule pointer — the
   runner pins it to the tracked-branch tip.
-- REJECT: `NEEDS-REVIEW → NEEDS-ARBITRATION` plus a rejection doc at
-  `submodules/<sm>/docs/<taskid>-review-reject.md` naming the concrete gaps. Commit. Never delete or
+- REJECT: `beehive task status <sm> <taskid> NEEDS-ARBITRATION --commits-none` plus a rejection doc at
+  `submodules/<sm>/docs/<taskid>-review-reject.md` naming the concrete gaps. Never delete or
   rewrite the implementer branch.
 Done when the task leaves `NEEDS-REVIEW`.
 
@@ -360,11 +379,11 @@ Done when the task leaves `NEEDS-REVIEW`.
 Status is `NEEDS-ARBITRATION`. Settle the implementer-vs-reviewer dispute — do NOT reimplement, and do
 NOT open `PLAN.md` or `ROI.md` to read the task (it is in your card). Read the change doc and the
 reviewer's rejection doc.
-- SIDE WITH IMPLEMENTER: merge `bee-<taskid>` into the submodule's tracked branch on its origin,
-  `NEEDS-ARBITRATION → DONE`, unlock dependents. Commit. Do NOT touch the submodule pointer — the runner
-  pins it to the tracked-branch tip.
-- SIDE WITH REVIEWER: `NEEDS-ARBITRATION → TODO` with the binding rationale recorded in the task body /
-  a doc so the next implementer knows what to fix. Commit.
+- SIDE WITH IMPLEMENTER: merge `bee-<taskid>` into the submodule's tracked branch on its origin, then
+  `beehive task status <sm> <taskid> DONE --commits <merge-sha>` (unlocks dependents). Do NOT touch the
+  submodule pointer — the runner pins it to the tracked-branch tip.
+- SIDE WITH REVIEWER: `beehive task status <sm> <taskid> TODO --commits-none` with the binding rationale
+  recorded in the task body / a doc so the next implementer knows what to fix.
 Done when the task leaves `NEEDS-ARBITRATION`.
 
 ## Steps (every pass)
@@ -530,7 +549,9 @@ procedure. `ROI.md` edits are never yours (`skills/modify-roi.md` is operator-on
 
 ## Tooling
 The `beehive` CLI runs the deterministic git ops (submodule sync, worktree add/rm, `beehive task
-human`, and — for a discovered prerequisite — `beehive task add` / `beehive task block`, which author on
+status` — the sanctioned status flip that records the `commits=` tag + doc header and commits both on
+your hive branch — `beehive task human`, and — for a discovered prerequisite — `beehive task add` /
+`beehive task block`, which author on
 primary main through the convergence protocol). Your work worktree is pre-created, so you rarely need
 worktree plumbing. Not on PATH → plain `git`. `beehive help` for details.
 
