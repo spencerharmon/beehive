@@ -774,6 +774,21 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		// honeybee can READ its dependency's real code (not an empty gitlink). Best-
 		// effort: never aborts the pass. See initLinkedSubmoduleCheckouts.
 		r.initLinkedSubmoduleCheckouts(ctx, sel, absRoot)
+	} else if sel.Kind == selectt.Review || sel.Kind == selectt.Arbitrate {
+		// Review/Arbitrate get an INSPECTION/MERGE worktree at the tracked tip, on a
+		// distinct bee-rev-<id> branch (never the worker's ref), with the implementer
+		// branch fetched — so the agent can diff/test AND merge it in, and the runner
+		// validates/pushes that merge on DONE (finalizeReviewMerge). BEST-EFFORT: a
+		// degenerate submodule (empty/unreachable gitlink, or a minimal test fixture
+		// with no checkout) never aborts a review — the completion guards
+		// (bounceIfUnreachable / finalizeReviewMerge's no-branch skip) handle it. On
+		// failure wtAbs is left "" (no worktree) and finalizeReviewMerge no-ops.
+		if w, handle, ok := r.setupReviewWorktree(ctx, sel, res.Branch, absRoot); ok {
+			wtAbs, wg = w, handle
+			r.initLinkedSubmoduleCheckouts(ctx, sel, absRoot)
+		} else {
+			r.logConcise("[honeybee] review worktree for %s unavailable; proceeding without one\n", sel.Task.ID)
+		}
 	}
 
 	// Context preamble: shipped in the binary (NOT the on-disk AGENTS.md, which is
@@ -790,20 +805,25 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"cwd is the beehive repo root. Submodule: %[1]s. Task under review: %[2]s.\n"+
 				"Beehive layer: write submodules/%[1]s/PLAN.md (status only) and submodules/%[1]s/docs/. Your task card "+
 				"(with its `Review:` note) is provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
-				"Implementer's work is on branch bee-%[2]s in submodules/%[1]s/repo — inspect read-only via git "+
-				"(fetch from origin if the branch is absent locally). Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md.\n"+
-				"APPROVE -> merge bee-%[2]s into the submodule's tracked branch on its origin, then `beehive task "+
-				"status %[1]s %[2]s DONE --commits <merge-sha>` (flips PLAN.md + records the commits tag/doc header + "+
-				"commits both; unlocks dependents). Do NOT touch the submodule pointer (gitlink) yourself — the runner pins it to the "+
-				"tracked-branch tip; that is the ONLY value it may ever hold (see docs/submodule-pointer-invariant.md). "+
-				"REJECT -> `beehive task status %[1]s %[2]s NEEDS-ARBITRATION --commits-none` + rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
-				"HANDOFF GATE (same for every terminal flip): before your flip is accepted the runner requires a CLEAN "+
-				"submodules/%[1]s/repo checkout, your PLAN.md flip COMMITTED, the change doc "+
-				"submodules/%[1]s/docs/bee-%[2]s-%[2]s.md COMMITTED with a first-line `<!-- Beehive-Commits: <sha>,<sha> -->` "+
-				"header (or `none`), and a matching `commits=<sha>,<sha>` (or `commits=none`) tag on the PLAN.md task "+
-				"header naming EXACTLY the submodule commits THIS session produced (an APPROVE merge commit; `none` for a "+
-				"REJECT that changed no code) — every referenced sha must actually exist in %[1]s. Commit the PLAN flip "+
-				"and the doc together, THIS session.\n"+
+				"The implementer's work is on branch bee-%[2]s. Your INSPECTION/MERGE worktree is $SUBMODULE_WORKTREE "+
+				"(checked out at the tracked-branch tip, with origin/bee-%[2]s fetched) — reach it ONLY via `beehive "+
+				"submodule git`, never a bare git or cd. Inspect: `beehive submodule git diff HEAD..origin/bee-%[2]s`, "+
+				"`beehive submodule git log origin/bee-%[2]s`. Change doc: submodules/%[1]s/docs/bee-%[2]s-%[2]s.md.\n"+
+				"To validate correctness, RUN the target's tests: `beehive submodule git merge origin/bee-%[2]s` in your "+
+				"worktree (resolve any conflicts with `beehive submodule git add`+`commit`), run the task's `Check:`, and "+
+				"record its live result in the doc as `<!-- Beehive-Check: pass — <evidence> -->`. LEAVE that merge "+
+				"committed in your worktree — the runner then validates it directly (no extra turn).\n"+
+				"APPROVE -> `beehive task status %[1]s %[2]s DONE` (NO --commits: the runner validates your merge — or "+
+				"performs it if you did not — runs the `Check:` on the merged tree, pushes it to the tracked branch, and "+
+				"stamps the real merge sha into the commits= tag + doc header). If you flip DONE without merging and the "+
+				"runner's merge CONFLICTS, the runner reverts your flip and hands you the conflicted files in this same "+
+				"worktree to resolve, same session. Do NOT push the tracked branch or touch the gitlink — the runner owns "+
+				"both (see docs/submodule-pointer-invariant.md).\n"+
+				"REJECT -> `beehive task status %[1]s %[2]s NEEDS-ARBITRATION --commits-none` + rejection doc "+
+				"submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
+				"HANDOFF GATE: before your flip is accepted the runner requires a CLEAN worktree, your PLAN.md flip "+
+				"COMMITTED, and the change doc COMMITTED (for an APPROVE carrying a `Check:`, with your `Beehive-Check:` "+
+				"result recorded). Commit the PLAN flip and the doc together, THIS session.\n"+
 				"The run completes when the task leaves NEEDS-REVIEW. Act autonomously.\n\n",
 			smName, sel.Task.ID)
 	case selectt.Arbitrate:
@@ -812,20 +832,20 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				"cwd is the beehive repo root. Submodule: %[1]s. Task in arbitration: %[2]s.\n"+
 				"Beehive layer: write submodules/%[1]s/PLAN.md (status only) and submodules/%[1]s/docs/. Your task card is "+
 				"provided below — do NOT open PLAN.md or ROI.md to read it.\n"+
-				"Implementer branch bee-%[2]s in submodules/%[1]s/repo; change doc submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; "+
-				"reviewer rejection doc submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
-				"SIDE WITH IMPLEMENTER -> merge bee-%[2]s into the submodule's tracked branch on its origin, then "+
-				"`beehive task status %[1]s %[2]s DONE --commits <merge-sha>` (unlocks dependents). Do NOT touch the submodule pointer (gitlink) yourself — the runner pins it to the "+
-				"tracked-branch tip (see docs/submodule-pointer-invariant.md). "+
-				"SIDE WITH REVIEWER -> `beehive task status %[1]s %[2]s TODO --commits-none` with the binding rationale; if a concrete operator blocker is exposed, "+
-				"run beehive task human %[1]s %[2]s --reason \"<specific blocker>\".\n"+
-				"HANDOFF GATE (same for every terminal flip): before your flip is accepted the runner requires a CLEAN "+
-				"submodules/%[1]s/repo checkout, your PLAN.md flip COMMITTED, the change doc "+
-				"submodules/%[1]s/docs/bee-%[2]s-%[2]s.md COMMITTED with a first-line `<!-- Beehive-Commits: <sha>,<sha> -->` "+
-				"header (or `none`), and a matching `commits=<sha>,<sha>` (or `commits=none`) tag on the PLAN.md task "+
-				"header naming EXACTLY the submodule commits THIS session produced (a merge commit if you side with the "+
-				"implementer; `none` for a TODO reset) — every referenced sha must actually exist in %[1]s. Commit the PLAN "+
-				"flip and the doc together, THIS session.\n"+
+				"Implementer branch bee-%[2]s (fetched to origin/bee-%[2]s); your INSPECTION/MERGE worktree is "+
+				"$SUBMODULE_WORKTREE at the tracked-branch tip — reach it ONLY via `beehive submodule git`. Change doc "+
+				"submodules/%[1]s/docs/bee-%[2]s-%[2]s.md; reviewer rejection doc "+
+				"submodules/%[1]s/docs/%[2]s-review-reject.md.\n"+
+				"SIDE WITH IMPLEMENTER -> optionally `beehive submodule git merge origin/bee-%[2]s` (resolve conflicts, run "+
+				"the `Check:`, record `<!-- Beehive-Check: -->`), leave it committed, then `beehive task status %[1]s %[2]s "+
+				"DONE` (NO --commits: the runner validates/performs the merge, runs the check, pushes to the tracked branch, "+
+				"and stamps the merge sha). On a runner merge CONFLICT your flip is reverted and the conflict handed back to "+
+				"you here to resolve, same session. Do NOT push the tracked branch or touch the gitlink — the runner owns "+
+				"both (see docs/submodule-pointer-invariant.md).\n"+
+				"SIDE WITH REVIEWER -> `beehive task status %[1]s %[2]s TODO --commits-none` with the binding rationale; if a "+
+				"concrete operator blocker is exposed, run beehive task human %[1]s %[2]s --reason \"<specific blocker>\".\n"+
+				"HANDOFF GATE: before your flip is accepted the runner requires a CLEAN worktree, your PLAN.md flip "+
+				"COMMITTED, and the change doc COMMITTED. Commit the PLAN flip and the doc together, THIS session.\n"+
 				"The run completes when the task leaves NEEDS-ARBITRATION. Act autonomously.\n\n",
 			smName, sel.Task.ID)
 	case selectt.Work:
@@ -918,17 +938,13 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// the HIVE/superrepo worktree (the beehive layer: PLAN.md, docs/) and, for a
 	// task-bearing kind, the SUBMODULE code checkout — and tell the agent to reach
 	// each through `beehive git` / `beehive submodule git` instead of a bare git or a
-	// `cd`. submoduleWt is the code worktree for Work and the shared repo checkout
-	// (which Review/Arbitrate merge into) otherwise; empty for Bootstrap/Reconcile.
+	// `cd`. submoduleWt is the per-pass submodule worktree: the code worktree for
+	// Work, the inspection/merge worktree for Review/Arbitrate; empty for
+	// Bootstrap/Reconcile (they touch only the beehive layer).
 	submoduleWt := ""
 	switch sel.Kind {
-	case selectt.Work:
+	case selectt.Work, selectt.Review, selectt.Arbitrate:
 		submoduleWt = wtAbs
-	case selectt.Review, selectt.Arbitrate:
-		submoduleWt = sel.Submodule.RepoDir()
-		if !filepath.IsAbs(submoduleWt) {
-			submoduleWt = filepath.Join(absRoot, submoduleWt)
-		}
 	}
 	preamble += worktreeContextPreamble(absRoot, submoduleWt)
 	// Precomputed task brief (Work only): hand the agent the worktree/branch/pointer
@@ -1243,6 +1259,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						}
 						return res, berr
 					}
+					// Beehive-layer PROTOCOL gate FIRST — must pass before the runner-owned
+					// merge pushes anything (a gate-rejected handoff must not land code on the
+					// tracked origin).
 					if hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch); gerr != nil {
 						if ferr := finish(""); ferr != nil {
 							return res, errors.Join(gerr, ferr)
@@ -1261,6 +1280,28 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						}
 						sel.Task.Status = workingStatus
 						prompt = revertedFlipPrompt(hint, workingStatus)
+						continue
+					}
+					// Runner-owned submodule merge for a Review/Arbitrate APPROVE (on-disk
+					// DONE), AFTER the gate passed: merge implementer branch into tracked in
+					// the agent's inspection worktree, run Check on the merged tree, push ONLY
+					// on pass, stamp the sha. A conflict/check failure reverts the flip to
+					// NEEDS-REVIEW/TODO and re-prompts; infra error is fail-closed. No-op for
+					// other kinds/flips.
+					if mh, revertTo, merr := r.finalizeReviewMerge(ctx, sel, wtAbs, absRoot); merr != nil {
+						if ferr := finish(""); ferr != nil {
+							return res, errors.Join(merr, ferr)
+						}
+						return res, merr
+					} else if mh != "" {
+						if rerr := r.revertGatedFlip(ctx, sel, absRoot, revertTo); rerr != nil {
+							if ferr := finish(""); ferr != nil {
+								return res, errors.Join(rerr, ferr)
+							}
+							return res, rerr
+						}
+						sel.Task.Status = revertTo
+						prompt = revertedFlipPrompt(mh, revertTo)
 						continue
 					}
 					// Publish first; only release + report complete if main advanced.
@@ -1443,6 +1484,10 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				}
 				return res, berr
 			}
+			// Beehive-layer PROTOCOL gate FIRST (clean worktree, flip + doc COMMITTED,
+			// commits tag, reviewer-recorded check). It must pass BEFORE the runner-owned
+			// submodule merge pushes anything: otherwise a handoff the gate rejects could
+			// still land the implementer's code on the tracked origin.
 			hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch)
 			if gerr != nil {
 				if ferr := finish(""); ferr != nil {
@@ -1466,6 +1511,31 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				}
 				sel.Task.Status = workingStatus
 				gateHint = revertedFlipPrompt(hint, workingStatus)
+			}
+			if done {
+				// Runner-owned submodule merge for a Review/Arbitrate APPROVE (on-disk
+				// DONE), AFTER the beehive-layer gate passed: merge the implementer branch
+				// into the tracked branch in the agent's inspection worktree, run the
+				// task's Check on the merged tree, push ONLY on pass, and stamp the merge
+				// sha. A conflict or check failure returns a fix-forward hint + the status
+				// to revert to (NEEDS-REVIEW / TODO) and pushes nothing; an infra error is
+				// fail-closed. No-op for Work, Bootstrap/Reconcile, and non-approve flips.
+				if mh, revertTo, merr := r.finalizeReviewMerge(ctx, sel, wtAbs, absRoot); merr != nil {
+					if ferr := finish(""); ferr != nil {
+						return res, errors.Join(merr, ferr)
+					}
+					return res, merr
+				} else if mh != "" {
+					done = false
+					if rerr := r.revertGatedFlip(ctx, sel, absRoot, revertTo); rerr != nil {
+						if ferr := finish(""); ferr != nil {
+							return res, errors.Join(rerr, ferr)
+						}
+						return res, rerr
+					}
+					sel.Task.Status = revertTo
+					gateHint = revertedFlipPrompt(mh, revertTo)
+				}
 			}
 		}
 		// Claim-ttl-wallcap race guard (session-audit-013 F1): the heartbeat above

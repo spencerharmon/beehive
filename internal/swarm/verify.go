@@ -134,12 +134,12 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	}
 
 	// The submodule checkout this pass may have committed into: the code worktree
-	// for Work, the submodules/<sm>/repo checkout for Review/Arbitrate (which merge
-	// a bee-branch into the tracked branch in place). Both share the module object
-	// store, so a commit made in either is visible to `cat-file` below. Normalize to
-	// an absolute path (Submodule.Path may be relative or absolute across callers).
+	// for Work, the inspection/merge worktree for Review/Arbitrate (where the runner
+	// merged the implementer branch into the tracked branch). All share the module
+	// object store, so a commit made in any is visible to `cat-file` below. Normalize
+	// to an absolute path (Submodule.Path may be relative or absolute across callers).
 	checkoutDir := wtAbs
-	if sel.Kind != selectt.Work || checkoutDir == "" {
+	if checkoutDir == "" {
 		checkoutDir = sel.Submodule.RepoDir()
 	}
 	if !filepath.IsAbs(checkoutDir) {
@@ -235,7 +235,13 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	// local-sharing hive (rem=="") falls back to local existence, which IS durable
 	// there (one shared object database). `commits=none` (len 0) trivially passes; the
 	// clean-checkout gate above already guards an undeclared uncommitted change.
-	if len(ct.Commits) > 0 {
+	// A Review/Arbitrate APPROVE's commit durability is owned by finalizeReviewMerge,
+	// which runs AFTER this gate: it performs the merge, pushes it to the tracked
+	// branch, and stamps the resulting sha — durable by construction. At gate time that
+	// merge does not exist yet and the task still carries the worker's stale tag, so
+	// skip reachability here for those kinds. Work (and any other writer) must have
+	// already pushed the commits it names on its own pass branch.
+	if len(ct.Commits) > 0 && sel.Kind != selectt.Review && sel.Kind != selectt.Arbitrate {
 		if !checkoutExists {
 			return commitsUnreachableFailPrompt(sel.Submodule.Name, ct.Commits[0], ct.Commits), nil
 		}
@@ -273,15 +279,15 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 
 	// (5) Definition-of-done check. When this handoff ENTERS DONE and the task
 	// declares a `Check:` command, that command IS the machine definition of done:
-	// run it and REFUSE the DONE unless it passes (exit 0). This gates the DONE
-	// *state* regardless of writer (review approve, arbitration, an interrupted-
-	// review finalize) — the enforcement the jellyfin false-DONE lacked
-	// (docs/dod-verification-spec.md). A `check=none` task declared no machine-
-	// checkable DoD (the absence is honest and review-scrutinized) and is not gated
-	// here; an UNDECLARED check is left to `beehive plan lint` (migration-safe: we
-	// gate on a check IF PRESENT, never retro-block a legacy DONE). An infra failure
-	// to RUN the check is fail-closed (block completion).
-	if t.Status == plan.Done && t.Check() != "" {
+	// run it and REFUSE the DONE unless it passes (exit 0).
+	//
+	// For Review/Arbitrate the check is owned by finalizeReviewMerge, which runs it
+	// against the MERGED tree in the inspection worktree BEFORE pushing (the tracked
+	// checkout here is still at the pre-merge tip, so re-running it on RepoDir would
+	// test the wrong code). So this gate covers only any OTHER writer that could
+	// enter DONE through the uniform gate. A `check=none` task is not gated; an
+	// UNDECLARED check is left to `beehive plan lint`. Infra failure is fail-closed.
+	if t.Status == plan.Done && t.Check() != "" && sel.Kind != selectt.Review && sel.Kind != selectt.Arbitrate {
 		if hint, err := r.checkGate(ctx, sel, t.ID, t.Check(), hiveAbs); err != nil || hint != "" {
 			return hint, err
 		}

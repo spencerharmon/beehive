@@ -163,10 +163,11 @@ gate enforces — do not reproduce them by hand. The only legal edges, each owne
   <t> --reason ...`. Bounded: past the defer cap it must escalate to NEEDS-HUMAN, not defer again. (This
   is the passive-convergence case only — see "Deployed ≠ loaded": if a bounded ACTION of yours produces
   the effect, do it now, do not defer.)
-- `NEEDS-REVIEW → DONE` — review approved (`beehive task status <sm> <id> DONE --commits <merge-sha>`).
-  **Gated on the task's definition of done:** the runner runs the
-  task's `Check:` command when it enters DONE and REFUSES the flip unless it exits 0 (or the task declared
-  `check=none`). See "Definition of done" below.
+- `NEEDS-REVIEW → DONE` — review approved (`beehive task status <sm> <id> DONE`, NO `--commits`).
+  **Gated on the task's definition of done:** the RUNNER performs the submodule merge, runs the
+  task's `Check:` on the MERGED tree, REFUSES the flip (reverts it to NEEDS-REVIEW) unless it exits 0 (or
+  the task declared `check=none`), then pushes the merge and stamps the merge sha. See "Definition of
+  done" below.
 - `NEEDS-REVIEW → NEEDS-ARBITRATION` — review rejected
   (`beehive task status <sm> <id> NEEDS-ARBITRATION --commits-none`).
 - `NEEDS-ARBITRATION → DONE` — arbiter sided with the implementer (same DONE check gate applies).
@@ -346,8 +347,9 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   verifies FIVE invariants — four committed-artifact (protocol, never correctness) plus the definition-of-
   done check:
   1. **Clean submodule checkout** — `git status --porcelain` in the checkout you touched (your code
-     worktree for Work; `submodules/<sm>/repo` for a Review/Arbitrate that merged a bee-branch) is empty.
-     Any uncommitted change (modified OR untracked) means work you never committed, which the merge drops.
+     worktree for Work; your Review/Arbitrate inspection/merge worktree `$SUBMODULE_WORKTREE`) is empty.
+     Any uncommitted change (modified OR untracked) means work you never committed — for a review, an
+     unresolved/uncommitted merge; the runner reverts your flip and asks you to finish it.
   2. **Status flip COMMITTED** — your `TODO→…`/`NEEDS-REVIEW→…`/`NEEDS-ARBITRATION→…` edit to `PLAN.md`
      is a real commit in your hive branch HEAD, not just on disk. The runner merges only committed
      history and does NOT commit the flip for you: an on-disk-only flip is silently lost if the pass ends
@@ -363,13 +365,16 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
      Because the gate verifies the referenced commits exist, do the SUBMODULE work FIRST — commit your
      code and push `bee-<taskid>` to the submodule origin — THEN run `beehive task status` with its
      sha(s). A tag naming a commit that does not exist (a phantom/bad-object stamp) is
-     REFUSED with the requirement to create the commit or correct the tag.
+     REFUSED with the requirement to create the commit or correct the tag. **Exception — a Review/
+     Arbitrate APPROVE:** you pass NO `--commits`; the runner performs the merge and STAMPS the real
+     merge sha into both the tag and the doc header itself.
   5. **Definition-of-done check PASSES (on entry to DONE only)** — when the accepted flip ENTERS DONE
-     (`NEEDS-REVIEW→DONE`, `NEEDS-ARBITRATION→DONE`), the runner runs the task's `Check:` command and
-     REFUSES the DONE unless it exits 0. A task that declared `check=none` is exempt (the absence was
-     justified). A check that cannot even be run (infra failure) fails closed. This is why a reviewer
-     must actually RUN the check before approving (see Review task): approving a check that passes on a
-     404 is the empty-checksum disease one layer down.
+     (`NEEDS-REVIEW→DONE`, `NEEDS-ARBITRATION→DONE`), the runner runs the task's `Check:` on the MERGED
+     tree (in your inspection worktree, BEFORE pushing) and REFUSES the DONE — reverting it to
+     NEEDS-REVIEW/TODO and discarding the un-pushed merge — unless it exits 0. A task that declared
+     `check=none` is exempt (the absence was justified). A check that cannot even be run (infra failure)
+     fails closed. This is why a reviewer must actually RUN the check before approving (see Review task):
+     approving a check that passes on a 404 is the empty-checksum disease one layer down.
   Any failing invariant REFUSES the handoff and hands you back the ONE thing to fix, same session — leave
   the status as-is and commit forward. "I wrote the files" is not "I committed the files": a task is not
   done until the code diff is a real pushed commit, and the PLAN flip + doc (with a truthful `commits=`
@@ -382,27 +387,34 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
 
 ## Review task
 Status is `NEEDS-REVIEW`. JUDGE the existing work against your provided task card (`## Your task`) — do
-NOT reimplement it, and do NOT open `PLAN.md` or `ROI.md` to read the task. Read (all read-only) the
-implementer branch `bee-<taskid>` (fetch from the submodule origin if absent locally) and the change
-doc; the task's `Review:` note is already in your card. A **doc-only task** (its `Files:` touch only
-`docs/`, `PLAN.md`, or other beehive-layer text, no submodule code) has NO `bee-<taskid>` CODE branch —
-its change doc is the only artifact (there is no pointer to move — the runner owns the gitlink). A missing `bee-<taskid>` branch / `couldn't
-find remote ref` there is EXPECTED, not a defect: review the change doc and PLAN.md state directly and do
-NOT burn turns re-probing git (`git log/show/fetch bee-<taskid>`) for a branch that was never created —
-the runner already verified reachability before dispatching you.
+NOT reimplement it, and do NOT open `PLAN.md` or `ROI.md` to read the task. Your INSPECTION/MERGE
+worktree is `$SUBMODULE_WORKTREE` (a checkout at the tracked-branch tip, with the implementer branch
+fetched as `origin/bee-<taskid>`) — reach it ONLY via `beehive submodule git`. Inspect read-only with
+`beehive submodule git diff HEAD..origin/bee-<taskid>` and `... log origin/bee-<taskid>`; the change doc
+is at `submodules/<sm>/docs/bee-<taskid>-<taskid>.md` and the task's `Review:` note is in your card. A
+**doc-only task** (its `Files:` touch only `docs/`, `PLAN.md`, or other beehive-layer text, no submodule
+code) has NO `bee-<taskid>` CODE branch — its change doc is the only artifact. A missing `bee-<taskid>`
+branch / `couldn't find remote ref` there is EXPECTED, not a defect: review the change doc and PLAN.md
+state directly and do NOT burn turns re-probing git — the runner already verified reachability before
+dispatching you.
 - APPROVE only when the change doc CARRIES the evidence: an automated regression test (command +
   passing result) for any behavioral change, and a live-effect confirmation for a deploy/service/
   migration task. No evidence in the doc ⇒ you cannot verify "done" ⇒ REJECT (do not approve on a
-  plausible-looking diff). **RUN the task's definition-of-done check yourself** — `beehive task check
-  <sm> <taskid>` — and confirm it both PASSES and asserts the REAL effect (not a check that passes on a
-  404, greps the wrong string, or hits the wrong host); a weak or lying check is a rejection just like a
-  missing one, and an unjustified `check=none` on a task that HAS an observable effect is a rejection. A
-  check that is a bare source-grep, or matches no approved framework stub in `submodules/<sm>/CHECKS.md`,
-  is likewise a rejection — the runner gate refuses it too.
-  When satisfied, merge `bee-<taskid>` into the submodule's tracked branch on
-  its origin, then `beehive task status <sm> <taskid> DONE --commits <merge-sha>` (unlocks dependents on
-  DONE). Do NOT touch the submodule pointer — the
-  runner pins it to the tracked-branch tip.
+  plausible-looking diff). **RUN the task's definition-of-done check yourself** in your worktree — merge
+  the work in first (`beehive submodule git merge origin/bee-<taskid>`, resolving any conflicts), then
+  `beehive task check <sm> <taskid>` — and confirm it both PASSES and asserts the REAL effect (not a
+  check that passes on a 404, greps the wrong string, or hits the wrong host); a weak or lying check is
+  a rejection just like a missing one, and an unjustified `check=none` on a task that HAS an observable
+  effect is a rejection. A check that is a bare source-grep, or matches no approved framework stub in
+  `submodules/<sm>/CHECKS.md`, is likewise a rejection — the runner gate refuses it too. Record the live
+  result in the doc as a `<!-- Beehive-Check: pass — <evidence> -->` line. LEAVE that merge committed in
+  your worktree — the runner validates it directly (no extra turn).
+  When satisfied: `beehive task status <sm> <taskid> DONE` (NO `--commits`). The RUNNER owns the
+  submodule merge: it validates your merge — or performs it if you did not — re-runs the `Check:` on the
+  merged tree, pushes it to the tracked branch, and stamps the real merge sha into the commits= tag +
+  doc header. If you flip DONE without merging and the runner's merge CONFLICTS, the runner reverts your
+  flip and hands you the conflicted files in THIS worktree to resolve, same session. Do NOT push the
+  tracked branch or touch the gitlink — the runner owns both.
 - REJECT: `beehive task status <sm> <taskid> NEEDS-ARBITRATION --commits-none` plus a rejection doc at
   `submodules/<sm>/docs/<taskid>-review-reject.md` naming the concrete gaps. Never delete or
   rewrite the implementer branch.
@@ -411,10 +423,14 @@ Done when the task leaves `NEEDS-REVIEW`.
 ## Arbitration task
 Status is `NEEDS-ARBITRATION`. Settle the implementer-vs-reviewer dispute — do NOT reimplement, and do
 NOT open `PLAN.md` or `ROI.md` to read the task (it is in your card). Read the change doc and the
-reviewer's rejection doc.
-- SIDE WITH IMPLEMENTER: merge `bee-<taskid>` into the submodule's tracked branch on its origin, then
-  `beehive task status <sm> <taskid> DONE --commits <merge-sha>` (unlocks dependents). Do NOT touch the
-  submodule pointer — the runner pins it to the tracked-branch tip.
+reviewer's rejection doc; your inspection/merge worktree is `$SUBMODULE_WORKTREE` (tracked tip, with
+`origin/bee-<taskid>` fetched) — reach it via `beehive submodule git`.
+- SIDE WITH IMPLEMENTER: optionally merge + test the work in your worktree (`beehive submodule git merge
+  origin/bee-<taskid>`, run the `Check:`, record `<!-- Beehive-Check: -->`), leave it committed, then
+  `beehive task status <sm> <taskid> DONE` (NO `--commits`). The runner validates/performs the merge,
+  re-runs the check, pushes to the tracked branch, and stamps the merge sha; a runner merge CONFLICT is
+  reverted and handed back to you to resolve, same session. Do NOT push the tracked branch or touch the
+  gitlink.
 - SIDE WITH REVIEWER: `beehive task status <sm> <taskid> TODO --commits-none` with the binding rationale
   recorded in the task body / a doc so the next implementer knows what to fix.
 Done when the task leaves `NEEDS-ARBITRATION`.

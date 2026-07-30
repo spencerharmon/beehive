@@ -34,14 +34,32 @@ func (r *Runner) runCheck(ctx context.Context, sel *selectt.Selection, check, le
 		// historical gate call — a bare shell in legacyDir, no validation, no sandbox.
 		return r.runVerify(ctx, legacyDir, "sh", "-c", check)
 	}
-	if err := r.CheckPolicy.Validate(check); err != nil {
-		return verifyOutcome{}, policyViolationError{err: err}
-	}
 	cwd := sel.Submodule.RepoDir()
 	if !filepath.IsAbs(cwd) {
 		cwd = filepath.Join(legacyDir, cwd)
 	}
-	rw, ro := CheckBinds(ctx, r.Repo, r.Links, sel.Submodule, cwd, legacyDir, r.CheckPolicy.ReadPaths)
+	return r.runCheckAt(ctx, sel, check, cwd, legacyDir)
+}
+
+// runCheckIn runs a task's `Check:` DoD in an explicit ABSOLUTE cwd (the
+// Review/Arbitrate inspection worktree, which holds the MERGED tree the runner is
+// about to push) instead of the submodule's tracked checkout. Same policy/sandbox
+// semantics as runCheck; the legacy (no-policy) path runs a bare shell in cwd.
+func (r *Runner) runCheckIn(ctx context.Context, sel *selectt.Selection, check, cwd string) (verifyOutcome, error) {
+	if r.CheckPolicy == nil {
+		return r.runVerify(ctx, cwd, "sh", "-c", check)
+	}
+	return r.runCheckAt(ctx, sel, check, cwd, cwd)
+}
+
+// runCheckAt is the shared policy/sandbox body: validate the command against the
+// allowlist (a violation fails CLOSED), resolve the sandbox binds for cwd, and run
+// under confinement. base is the directory used to resolve relative read paths.
+func (r *Runner) runCheckAt(ctx context.Context, sel *selectt.Selection, check, cwd, base string) (verifyOutcome, error) {
+	if err := r.CheckPolicy.Validate(check); err != nil {
+		return verifyOutcome{}, policyViolationError{err: err}
+	}
+	rw, ro := CheckBinds(ctx, r.Repo, r.Links, sel.Submodule, cwd, base, r.CheckPolicy.ReadPaths)
 	pl, err := r.CheckPolicy.Argv(check, cwd, rw, ro)
 	if err != nil {
 		return verifyOutcome{}, err

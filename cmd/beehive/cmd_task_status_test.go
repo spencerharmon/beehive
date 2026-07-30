@@ -109,3 +109,58 @@ func TestTaskStatusRequiresDoc(t *testing.T) {
 		}
 	})
 }
+
+// A Review/Arbitrate APPROVE (a review/arbitration state -> DONE) does NOT require
+// a commits designation: the runner performs the submodule merge and stamps the
+// real merge sha. The command flips the status and leaves commits= UNSET (the
+// runner fills it on completion).
+func TestTaskStatusApproveNoCommitsRunnerStamps(t *testing.T) {
+	root, _ := newHive(t)
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## r1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=abc1234 -->\nreview it.\n")
+	writeFileMW(t, root, "submodules/flux/docs/bee-r1-r1.md",
+		"<!-- Beehive-Commits: abc1234 -->\n\n<!-- Beehive-Check: pass — ok -->\nreviewed.\n")
+	commitPush(t, root, "seed review")
+
+	inDir(t, root, func() {
+		c := taskStatusCmd()
+		c.SetArgs([]string{"flux", "r1", "DONE"}) // NO --commits / --commits-none
+		if err := c.Execute(); err != nil {
+			t.Fatalf("approve without commits must succeed (runner stamps): %v", err)
+		}
+	})
+
+	b, _ := os.ReadFile(filepath.Join(root, "submodules/flux/PLAN.md"))
+	p, _ := plan.Parse(string(b))
+	tk := p.Find("r1")
+	if tk == nil || tk.Status != plan.StatusDone {
+		t.Fatalf("status not flipped to DONE: %+v", tk)
+	}
+	// The command must NOT overwrite/require a commits designation for an approve —
+	// it leaves the existing tag as-is (the runner stamps the real merge sha later).
+	if len(tk.Commits) != 1 || tk.Commits[0] != "abc1234" {
+		t.Fatalf("approve must leave the commits tag untouched for the runner to stamp, got %v", tk.Commits)
+	}
+	// The flip is committed locally on the hive branch.
+	logs := mustGit(t, root, "log", "--format=%s", "HEAD")
+	if !strings.Contains(logs, "plan: r1 NEEDS-REVIEW -> DONE") {
+		t.Fatalf("approve flip not committed locally:\n%s", logs)
+	}
+}
+
+// The commits designation stays MANDATORY for a worker handoff (X -> NEEDS-REVIEW):
+// the worker authored code and must name its sha(s) or declare none.
+func TestTaskStatusWorkerHandoffStillRequiresCommits(t *testing.T) {
+	root, _ := newHive(t)
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## w1 [TODO] <!-- attempts=0 deps= -->\ndo it.\n")
+	writeFileMW(t, root, "submodules/flux/docs/bee-w1-w1.md", "# w1\ndid it.\n")
+	commitPush(t, root, "seed work")
+	inDir(t, root, func() {
+		c := taskStatusCmd()
+		c.SetArgs([]string{"flux", "w1", "NEEDS-REVIEW"}) // missing commits designation
+		if err := c.Execute(); err == nil {
+			t.Fatal("worker handoff without --commits/--commits-none must error")
+		}
+	})
+}

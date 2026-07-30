@@ -201,25 +201,6 @@ func taskStatusCmd() *cobra.Command {
 				return fmt.Errorf("invalid target status %q; one of %s, %s, %s, %s", rawStatus,
 					plan.StatusReview, plan.StatusArb, plan.StatusDone, plan.StatusTODO)
 			}
-			// commits designation is MANDATORY: every terminal handoff must record the
-			// submodule commits this session produced (or commits=none), and the runner's
-			// gate refuses a flip that lacks it. Require exactly one of --commits/--commits-none
-			// so the tag can never be silently omitted.
-			if commitsNone == (strings.TrimSpace(commitsCSV) != "") {
-				return fmt.Errorf("exactly one of --commits <sha>[,<sha>...] or --commits-none is required " +
-					"(records the commits= tag the handoff gate enforces)")
-			}
-			var commits []string
-			if !commitsNone {
-				for _, s := range strings.Split(commitsCSV, ",") {
-					if s = strings.TrimSpace(s); s != "" {
-						commits = append(commits, s)
-					}
-				}
-				if len(commits) == 0 {
-					return fmt.Errorf("--commits was empty; pass the real submodule sha(s) or use --commits-none")
-				}
-			}
 			root, err := findRoot()
 			if err != nil {
 				return err
@@ -243,45 +224,86 @@ func taskStatusCmd() *cobra.Command {
 				return fmt.Errorf("task %q not found in %s", id, planRel)
 			}
 			from := t.Status
+
+			commitsGiven := commitsNone || strings.TrimSpace(commitsCSV) != ""
+			// A Review/Arbitrate APPROVE (a review/arbitration state -> DONE) does NOT
+			// require a commits designation: the RUNNER performs the submodule merge and
+			// stamps the real merge sha into the PLAN commits= tag AND the doc's
+			// Beehive-Commits header on completion. The agent MAY still pass --commits
+			// (e.g. it pre-merged and wants to name the sha) or --commits-none, and that is
+			// honored. Every OTHER handoff (worker -> NEEDS-REVIEW, reject -> NEEDS-
+			// ARBITRATION, rework -> TODO) MUST record exactly one, so the tag is never
+			// silently omitted.
+			isApprove := to == plan.StatusDone && (from == plan.StatusReview || from == plan.StatusArb)
+			runnerStamps := isApprove && !commitsGiven
+			if !runnerStamps {
+				if commitsNone == (strings.TrimSpace(commitsCSV) != "") {
+					return fmt.Errorf("exactly one of --commits <sha>[,<sha>...] or --commits-none is required " +
+						"(records the commits= tag the handoff gate enforces)")
+				}
+			}
+			var commits []string
+			if commitsGiven && !commitsNone {
+				for _, s := range strings.Split(commitsCSV, ",") {
+					if s = strings.TrimSpace(s); s != "" {
+						commits = append(commits, s)
+					}
+				}
+				if len(commits) == 0 {
+					return fmt.Errorf("--commits was empty; pass the real submodule sha(s) or use --commits-none")
+				}
+			}
 			if err := t.Transition(to, time.Now().UTC()); err != nil {
 				return err
 			}
-			t.Commits = commits
-			t.CommitsSet = true
-			// Mirror the commits set into the change doc's Beehive-Commits header so the
-			// PLAN tag and the doc agree (the gate refuses a mismatch). Default doc path is
-			// the standard bee-<id>-<id>.md change doc; --doc overrides for a non-standard
-			// branch name.
+			// Default doc path is the standard bee-<id>-<id>.md change doc; --doc overrides.
 			docRel := strings.TrimSpace(docFlag)
 			if docRel == "" {
 				docRel = filepath.Join("submodules", subName, "docs", "bee-"+id+"-"+id+".md")
 			}
 			docPath := filepath.Join(root, docRel)
-			docBytes, derr := os.ReadFile(docPath)
-			if derr != nil {
-				return fmt.Errorf("change doc %s must exist before the status flip "+
-					"(the handoff gate requires it committed with a matching Beehive-Commits header) "+
-					"— write it first, or pass --doc <path>: %w", docRel, derr)
-			}
-			newDoc := plan.SetDocCommitsHeader(string(docBytes), commits)
-			if newDoc != string(docBytes) {
-				if err := os.WriteFile(docPath, []byte(newDoc), 0o644); err != nil {
-					return err
+
+			commitPaths := []string{planRel}
+			tag := "<runner-stamped on completion>"
+			if runnerStamps {
+				// Leave commits= unset; the runner stamps the merge sha into the tag + doc
+				// header. Still commit the doc if present (the reviewer's Beehive-Check line
+				// lives there and the gate requires the doc committed).
+				if _, serr := os.Stat(docPath); serr == nil {
+					commitPaths = append(commitPaths, docRel)
 				}
+			} else {
+				t.Commits = commits
+				t.CommitsSet = true
+				// Mirror the commits set into the change doc's Beehive-Commits header so the
+				// PLAN tag and the doc agree (the gate refuses a mismatch).
+				docBytes, derr := os.ReadFile(docPath)
+				if derr != nil {
+					return fmt.Errorf("change doc %s must exist before the status flip "+
+						"(the handoff gate requires it committed with a matching Beehive-Commits header) "+
+						"— write it first, or pass --doc <path>: %w", docRel, derr)
+				}
+				newDoc := plan.SetDocCommitsHeader(string(docBytes), commits)
+				if newDoc != string(docBytes) {
+					if err := os.WriteFile(docPath, []byte(newDoc), 0o644); err != nil {
+						return err
+					}
+				}
+				commitPaths = append(commitPaths, docRel)
+				tag = plan.CommitsTagValue(commits)
 			}
 			if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
 				return err
 			}
-			tag := plan.CommitsTagValue(commits)
 			if noCommit {
-				fmt.Printf("%s %s: %s -> %s (commits=%s); PLAN.md + %s written, NOT committed (--no-commit)\n",
-					subName, id, from, to, tag, docRel)
+				fmt.Printf("%s %s: %s -> %s (commits=%s); PLAN.md + doc written, NOT committed (--no-commit)\n",
+					subName, id, from, to, tag)
 				return nil
 			}
 			// Local commit ONLY — no primary-main sync/publish. The runner merges the hive
 			// branch to main; a honeybee never touches remotes.
 			msg := fmt.Sprintf("plan: %s %s -> %s\n\nBeehive: %s %s", id, from, to, id, docRel)
-			if err := git.New(root).CommitPaths(cmd.Context(), msg, planRel, docRel); err != nil && err != git.ErrNothing {
+			if err := git.New(root).CommitPaths(cmd.Context(), msg, commitPaths...); err != nil && err != git.ErrNothing {
 				return err
 			}
 			fmt.Printf("%s %s: %s -> %s (commits=%s), committed to the local hive branch\n", subName, id, from, to, tag)

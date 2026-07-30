@@ -98,12 +98,21 @@ exact complement. Each pass, the runner automatically:
   re-stamps every turn; releases it on completion; on failure/timeout/cap leaves the
   stale claim as the GC signal. The agent never writes session/heartbeat and changes
   only the task STATUS.
-- **Creates the code worktree** (work kind) at
-  `.submodule-worktrees/<sm>/bee-<taskid>/` (a top-level hive dir, off the submodule
-  tip) before turn 1, and exports its absolute path as `SUBMODULE_WORKTREE` (the hive
-  worktree is `BEEHIVE_WORKTREE`). The agent edits there — reaching it with `beehive
-  submodule git` — and never runs worktree/submodule plumbing or writes
-  `submodules/<sm>/repo`.
+- **Creates the per-pass submodule worktree** at `.submodule-worktrees/<sm>/<branch>/`
+  (a top-level hive dir) before turn 1, exporting its absolute path as
+  `SUBMODULE_WORKTREE` (the hive worktree is `BEEHIVE_WORKTREE`). For a Work pass it is
+  the code worktree on `bee-<taskid>` off the submodule tip; for a Review/Arbitrate pass
+  it is an inspection/merge worktree at the tracked tip with the implementer branch
+  fetched. The agent reaches it with `beehive submodule git` and never runs
+  worktree/submodule plumbing or writes `submodules/<sm>/repo`.
+- **Owns the review/arbitrate submodule merge** — on a Review/Arbitrate APPROVE (the
+  agent flips DONE, no `--commits`), the runner merges the implementer branch into the
+  tracked branch in that worktree, runs the task's `Check:` on the merged tree BEFORE
+  pushing, pushes on pass, and stamps the real merge sha into the PLAN `commits=` tag +
+  doc header. A merge CONFLICT or a check FAILURE reverts the flip (NEEDS-REVIEW /
+  TODO), discards the un-pushed merge, and re-prompts the agent (a conflict is left in
+  the worktree to resolve in-session). The agent authors no submodule code for a review
+  — it may optionally pre-merge in its worktree, which the runner then validates.
 - **Checks out the cross-dep sibling submodules** a work task names in `deps=<sm>:<id>`
   into the pass worktree at their tracked gitlink, so the agent can READ its
   dependency's real committed code (`submodules/<dep-sm>/repo`) instead of an empty
