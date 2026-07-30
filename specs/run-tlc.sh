@@ -46,6 +46,13 @@ CASES=(
     "DependencyReadiness|DependencyReadiness_fixed.cfg|pass"
     "DependencyReadiness|DependencyReadiness_buggy.cfg|fail"
     "DependencyReadiness|DependencyReadiness_cycle_buggy.cfg|fail"
+    # DependencyReadiness WRITE-TIME half (writetime / acyclic): AddDep's cycle
+    # check and LinkSubmodules' reciprocal write. Fixed keeps the persisted dep
+    # graph acyclic (NoCycleWritten) and every link bidirectional
+    # (ReciprocalLinks); buggy drops the cycle check / writes a link one direction
+    # at a time and reproduces a written-in cycle or a non-reciprocal link.
+    "DependencyReadiness|DependencyReadiness_writetime_fixed.cfg|pass"
+    "DependencyReadiness|DependencyReadiness_writetime_buggy.cfg|fail"
     "ClaimRace|ClaimRace_fixed.cfg|pass"
     "ClaimRace|ClaimRace_buggy.cfg|fail"
     "ClaimGC|ClaimGC_fixed.cfg|pass"
