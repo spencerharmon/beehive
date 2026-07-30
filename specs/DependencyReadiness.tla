@@ -52,10 +52,19 @@ CONSTANTS
     Tasks,      \* the set of REAL task ids (a dep naming anything outside is phantom)
     DepEdges,   \* set of <<from, to>> edges; `to` may be a phantom id not in Tasks
     DepGuard,   \* TRUE: a phantom-dep yield escalates NEEDS-HUMAN instead of silent HELD
-    CycleGuard  \* TRUE: a cyclic task escalates NEEDS-HUMAN instead of silent HELD
+    CycleGuard, \* TRUE: a cyclic task escalates NEEDS-HUMAN instead of silent HELD
+    AtomicWrite \* WRITE-TIME toggle (WriteSpec only, ignored by the runtime Spec):
+                \* TRUE  -> AddDep is cycle-checked and LinkSubmodules writes both
+                \*          directions atomically (internal/links/links.go, fixed);
+                \* FALSE  -> the cycle check is dropped / raced and a link is written
+                \*          one direction at a time (a partial, non-reciprocal write).
 
-VARIABLE status   \* [Tasks -> Statuses]
-vars == <<status>>
+VARIABLE status   \* [Tasks -> Statuses] (runtime readiness model)
+\* Write-time model state (WriteSpec): the persisted dependency + link registry
+\* that internal/links/links.go AddDep / LinkSubmodules mutate.
+VARIABLE wedges   \* set of persisted directed dep edges <<from, to>>
+VARIABLE wlinks   \* set of persisted directed submodule-link edges <<a, b>>
+vars == <<status, wedges, wlinks>>
 
 (***************************************************************************)
 (* Scenario graphs. TLC .cfg files cannot express << >> tuple literals in a  *)
@@ -125,9 +134,12 @@ PhantomNeverHeld == \A t \in Tasks : (status[t] = "HELD") => ~HasPhantom(t)
 CycleNeverHeld == \A t \in Tasks : (status[t] = "HELD") => ~OnCycle(t)
 
 (***************************************************************************)
-(* Init: every task starts TODO.                                            *)
+(* Init: every task starts TODO; the write-time registry starts empty.       *)
 (***************************************************************************)
-Init == status = [t \in Tasks |-> "TODO"]
+Init ==
+    /\ status = [t \in Tasks |-> "TODO"]
+    /\ wedges = {}
+    /\ wlinks = {}
 
 (***************************************************************************)
 (* Actions                                                                 *)
@@ -146,6 +158,7 @@ Yield(t) ==
             IF OnCycle(t)    THEN (IF CycleGuard THEN "HUMAN" ELSE "HELD")
             ELSE IF HasPhantom(t) THEN (IF DepGuard THEN "HUMAN" ELSE "HELD")
             ELSE "HELD"]
+    /\ UNCHANGED <<wedges, wlinks>>
 
 \* A TODO task whose real deps are already all DONE, with no cycle and no phantom,
 \* is worked straight through to DONE (no yield needed).
@@ -155,6 +168,7 @@ DirectDone(t) ==
     /\ ~HasPhantom(t)
     /\ DepsAllDone(status, t)
     /\ status' = [status EXCEPT ![t] = "DONE"]
+    /\ UNCHANGED <<wedges, wlinks>>
 
 \* A legitimately HELD task (no cycle, no phantom) whose real deps are now all
 \* DONE is released back into the ready pool.
@@ -164,16 +178,18 @@ Unblock(t) ==
     /\ ~HasPhantom(t)
     /\ DepsAllDone(status, t)
     /\ status' = [status EXCEPT ![t] = "READY"]
+    /\ UNCHANGED <<wedges, wlinks>>
 
 \* The now-ready task is worked to completion.
 Progress(t) ==
     /\ status[t] = "READY"
     /\ status' = [status EXCEPT ![t] = "DONE"]
+    /\ UNCHANGED <<wedges, wlinks>>
 
 \* Terminal idle so an all-settled graph is not read as a deadlock.
 Terminal ==
     /\ \A t \in Tasks : status[t] \in {"DONE", "HUMAN"}
-    /\ UNCHANGED status
+    /\ UNCHANGED vars
 
 Next ==
     \/ \E t \in Tasks : Yield(t)
@@ -194,4 +210,122 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 (* Liveness: the graph never wedges -- every task reaches a terminal.        *)
 (***************************************************************************)
 EventuallyResolved == \A t \in Tasks : <>(status[t] \in {"DONE", "HUMAN"})
+
+(***************************************************************************)
+(* WRITE-TIME MODEL (WriteSpec)                                             *)
+(*                                                                         *)
+(* The runtime model above proves a cycle/phantom that ALREADY EXISTS in the  *)
+(* graph is escalated rather than silently wedged. This half proves the graph  *)
+(* can never have a cycle WRITTEN into it in the first place, and a submodule   *)
+(* link is always registered reciprocally -- the write-time invariants of      *)
+(* internal/links/links.go:                                                    *)
+(*                                                                         *)
+(*   AddDep(from,to)  appends the edge, then calls cycle()/HasCycle() and       *)
+(*     ROLLS BACK (returns an error, no state change) if the append closed a    *)
+(*     cycle -- so a cycle is refused BEFORE it is ever persisted. Modeled as   *)
+(*     AddDepAtomic: the edge is written only when the resulting graph stays    *)
+(*     acyclic. The buggy variant AddDepUnchecked drops the check (a dropped or *)
+(*     raced cycle guard) and can persist a cycle-closing edge.                 *)
+(*                                                                         *)
+(*   LinkSubmodules(a,b) registers BOTH submodules (an undirected link) in one  *)
+(*     call -- both directions or neither is ever observable. Modeled as        *)
+(*     LinkAtomic (both <<a,b>> and <<b,a>> in a single step). The buggy variant*)
+(*     writes one direction (LinkOneDir) then later the reverse (LinkReverse),  *)
+(*     exposing an intermediate NON-RECIPROCAL state where one submodule sees   *)
+(*     the link and its peer does not.                                          *)
+(*                                                                         *)
+(* CONSTANT toggle AtomicWrite selects the fixed (TRUE) vs buggy (FALSE)        *)
+(* protocol. Invariants (checked in EVERY reachable state):                    *)
+(*   NoCycleWritten  -- the persisted dep graph is acyclic (a cycle literally   *)
+(*     never appears, not merely "an existing cycle is handled").               *)
+(*   ReciprocalLinks -- every persisted link edge has its reverse present.      *)
+(***************************************************************************)
+
+\* Write-time scenario nodes and candidates (concrete; not cfg-substituted).
+WNodes == {"a", "b", "c"}
+
+\* Three dep edges that, added in any order, can only close a cycle on the third
+\* (a->b, b->c, c->a): the AddDep cycle check must refuse whichever edge closes it.
+CandDeps == {<<"a", "b">>, <<"b", "c">>, <<"c", "a">>}
+
+\* Candidate submodule link (unordered pair a--b) to register reciprocally.
+CandLinks == {<<"a", "b">>}
+
+\* Reachability / cycle detection over an ARBITRARY (state-carried) edge set E.
+RECURSIVE ReachesIn(_, _, _, _)
+ReachesIn(E, a, b, seen) ==
+    \/ <<a, b>> \in E
+    \/ \E m \in WNodes :
+        /\ <<a, m>> \in E
+        /\ m \notin seen
+        /\ ReachesIn(E, m, b, seen \cup {a})
+
+HasCycleIn(E) == \E n \in WNodes : ReachesIn(E, n, n, {})
+
+(***************************************************************************)
+(* Write-time actions                                                      *)
+(***************************************************************************)
+
+\* FIXED AddDep: persist a candidate edge only if the graph STAYS acyclic
+\* (models append + cycle()-check + rollback as one atomic refusal).
+AddDepAtomic(e) ==
+    /\ e \notin wedges
+    /\ e[1] # e[2]
+    /\ ~HasCycleIn(wedges \cup {e})
+    /\ wedges' = wedges \cup {e}
+    /\ UNCHANGED <<status, wlinks>>
+
+\* BUGGY AddDep: persist a candidate edge WITHOUT the cycle check (a dropped or
+\* raced guard) -- can write an edge that closes a cycle.
+AddDepUnchecked(e) ==
+    /\ e \notin wedges
+    /\ e[1] # e[2]
+    /\ wedges' = wedges \cup {e}
+    /\ UNCHANGED <<status, wlinks>>
+
+\* FIXED LinkSubmodules: register BOTH directions atomically.
+LinkAtomic(p) ==
+    /\ <<p[1], p[2]>> \notin wlinks
+    /\ wlinks' = wlinks \cup {<<p[1], p[2]>>, <<p[2], p[1]>>}
+    /\ UNCHANGED <<status, wedges>>
+
+\* BUGGY LinkSubmodules step 1: write only one direction (partial registration).
+LinkOneDir(p) ==
+    /\ <<p[1], p[2]>> \notin wlinks
+    /\ <<p[2], p[1]>> \notin wlinks
+    /\ wlinks' = wlinks \cup {<<p[1], p[2]>>}
+    /\ UNCHANGED <<status, wedges>>
+
+\* BUGGY LinkSubmodules step 2: later add the reverse (closes the reciprocity gap
+\* -- but the intermediate non-reciprocal state was already observable).
+LinkReverse(p) ==
+    /\ <<p[1], p[2]>> \in wlinks
+    /\ <<p[2], p[1]>> \notin wlinks
+    /\ wlinks' = wlinks \cup {<<p[2], p[1]>>}
+    /\ UNCHANGED <<status, wedges>>
+
+\* Always-enabled stutter so a settled write graph is not read as a deadlock.
+WriteStutter == UNCHANGED vars
+
+WriteNext ==
+    IF AtomicWrite
+    THEN \/ \E e \in CandDeps  : AddDepAtomic(e)
+         \/ \E p \in CandLinks : LinkAtomic(p)
+         \/ WriteStutter
+    ELSE \/ \E e \in CandDeps  : AddDepUnchecked(e)
+         \/ \E p \in CandLinks : LinkOneDir(p)
+         \/ \E p \in CandLinks : LinkReverse(p)
+         \/ WriteStutter
+
+WriteSpec == Init /\ [][WriteNext]_vars
+
+(***************************************************************************)
+(* Write-time invariants (safety; hold in EVERY reachable state).            *)
+(***************************************************************************)
+
+\* The persisted dependency graph is acyclic -- a cycle is never written.
+NoCycleWritten == ~HasCycleIn(wedges)
+
+\* Every persisted link edge is bidirectional (both submodules see the link).
+ReciprocalLinks == \A e \in wlinks : <<e[2], e[1]>> \in wlinks
 =============================================================================

@@ -251,6 +251,16 @@ with `DepEdges` (a `to` outside `Tasks` is phantom; `t<->t'` is a cycle), toggle
 silent HELD). Scenario graphs (`Tasks3/5`, `EdgesFixed/Phantom/Cycle`) are overridden
 into each cfg via `<-` because TLC cfgs cannot express `<<>>` tuple literals.
 
+The module also carries the **write-time half** of the same graph (`WriteSpec`,
+toggled by `AtomicWrite`): rather than the runtime readiness of an existing graph, it
+proves a cycle can never be *written* into `links.AddDep`'s registry and a
+`links.LinkSubmodules` link is always reciprocal. `AddDepAtomic` writes an edge only
+when the result stays acyclic (mirroring AddDep's append-check-rollback);
+`LinkAtomic` writes both directions in one step. The buggy variant (`AtomicWrite =
+FALSE`) drops the cycle check (`AddDepUnchecked`) and writes a link one direction at a
+time (`LinkOneDir`/`LinkReverse`), reproducing a `NoCycleWritten` or `ReciprocalLinks`
+counterexample.
+
 | Spec element | Kind | Code (`internal/…`) | Test / guard |
 |---|---|---|---|
 | `Yield` (real dep → HELD; phantom → escalate; cycle → escalate) | action + guards | `swarm.go taskYieldedBlocked` (accept a blocked yield only if every dep is a real task — local via `plan.Blocked`, cross via `selectt.LoadEdges`; fail-loud on a phantom); `select/graph.go InCycle` + `select/select.go graphGate` exclude a cyclic task; `links.CyclicNodes` (Tarjan SCC) | `swarm_test.go TestWorkYieldOnPhantomDepFailsLoud`; `select` `TestCyclicTasksNotSelected`; `links` `TestCyclicNodes`/`TestCycleExported` |
@@ -258,6 +268,11 @@ into each cfg via `<-` because TLC cfgs cannot express `<<>>` tuple literals.
 | `OnCycle` (reachability over real edges) | operator | `links.Cycle` / `links.CyclicNodes` over the combined graph; `Graph.Validate` (pre-commit / `beehive lint` cycle refusal); `links.AddDep` cycle-rejecting write | `links` `TestCycle*`; `TestPreCommitDepCycleGuardE2E` |
 | `PhantomNeverHeld` | invariant | phantom-dep refusal in `taskYieldedBlocked` | `DependencyReadiness_buggy.cfg` proves a phantom dep is silently held without `DepGuard` |
 | `CycleNeverHeld` | invariant | cyclic-task exclusion → escalation rather than silent hold (`graphGate` + `InCycle`) | `DependencyReadiness_cycle_buggy.cfg` proves a cycle is silently held without `CycleGuard` |
+| `AddDepAtomic` / `AddDepUnchecked` (`AtomicWrite` toggle) | write action + guard | `links.AddDep` (append the edge, then `cycle()`/`HasCycle` and roll back — no state change — if it closed a cycle) | `DependencyReadiness_writetime_buggy.cfg` proves an unchecked write persists a cycle; `TestPreCommitDepCycleGuardE2E` |
+| `LinkAtomic` / `LinkOneDir`+`LinkReverse` (`AtomicWrite` toggle) | write action | `links.LinkSubmodules` (register both submodules — an undirected link — in one call) | `DependencyReadiness_writetime_buggy.cfg` proves a one-direction-then-other write exposes a non-reciprocal state |
+| `HasCycleIn` (reachability over the persisted edge set) | operator | `links.cycle` / `links.Cycle` / `links.HasCycle` | `links` `TestCycle*` |
+| `NoCycleWritten` | write-time invariant (acyclic in every reachable state) | `links.AddDep` cycle-rejecting write refuses a cycle before it is ever persisted | `DependencyReadiness_writetime_fixed.cfg` holds; `DependencyReadiness_writetime_buggy.cfg` reproduces a written-in cycle |
+| `ReciprocalLinks` | write-time invariant (every link edge bidirectional) | `links.LinkSubmodules` registers both directions atomically | `DependencyReadiness_writetime_fixed.cfg` holds; `DependencyReadiness_writetime_buggy.cfg` reproduces a non-reciprocal link |
 | `EventuallyResolved` | liveness | real dep completes → DONE; phantom or cycle → NEEDS-HUMAN | `DependencyReadiness_fixed.cfg` |
 
 ## Layer 2 — `Selection.tla`
