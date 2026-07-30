@@ -84,6 +84,15 @@ CASES=(
     "TaskRemovalRace|TaskRemovalRace_fixed.cfg|pass"
     "TaskRemovalRace|TaskRemovalRace_orphan_buggy.cfg|fail"
     "TaskRemovalRace|TaskRemovalRace_loop_buggy.cfg|fail"
+    # CheckPolicy: the DoD `Check:` command-layer policy (internal/checkpolicy).
+    # Fixed = the DENYLIST design (admit anything opencode permits except the
+    # denied fake-test/dangerous commands). The buggy cfgs reproduce the two
+    # failure classes: the old ALLOWLIST refusing a real framework not enumerated
+    # (`go test`) -- RealFrameworkUsable -- and a denylist with an ABUSE HOLE that
+    # admits a bare source-grep as a fake definition of done -- NoFakeOnlyAdmitted.
+    "CheckPolicy|CheckPolicy_fixed.cfg|pass"
+    "CheckPolicy|CheckPolicy_allowlist_buggy.cfg|fail"
+    "CheckPolicy|CheckPolicy_abusehole_buggy.cfg|fail"
 )
 
 rc=0

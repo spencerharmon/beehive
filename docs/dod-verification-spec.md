@@ -237,7 +237,7 @@ history). A reconcile pass backfills `Check:` / `check=none` onto open tasks;
   injection** (`checkGroundTruth`); **runner auto-spawn of the `Verify-After-Merge`
   successor check task** (`spawnMergeVerifySuccessor`); the **review-ran-check
   completion predicate** (`verifyGate` invariant 6); the **check-command
-  sandbox/policy** (`internal/checkpolicy`: command allowlist + bubblewrap
+  sandbox/policy** (`internal/checkpolicy`: command denylist + bubblewrap
   filesystem confinement), wired into the DONE gate, the pass-start injection, and
   `beehive task check`.
 - **Planned (sequenced follow-ups):** none — the mechanism is complete. Remaining
@@ -251,16 +251,24 @@ cluster, pulls images) at three points — the DONE gate, the pass-start ground-
 injection, and `beehive task check` — all through the SAME policy so they confine
 identically. Two independent layers:
 
-- **Command allowlist (always enforced, host-independent).** Every command word the
-  check invokes must be in the allowlist (`DefaultAllowedCommands`: read-only
-  inspection, text processing, hashing, DNS, and the network/cluster clients a real
-  check needs — curl/kubectl/helm/skopeo/git). It deliberately excludes shells and
-  interpreters as a command word (so `… | sh`, `bash -c …`, `python -c …` are
-  refused) and destructive tools. A static shell lexer extracts command-position
-  words across pipes/`;`/`&&`/subshells/command-substitution and fails CLOSED on any
-  construct it cannot resolve to a concrete command (a `$VAR` command, `$(pick)` in
-  command position). A violation at the gate is a fix-forward prompt (the author
-  rewrites the check), not a silent GC loop.
+- **Command denylist (always enforced, host-independent).** The universe of
+  commands a honeybee may run at all is owned by the agent runtime (opencode)
+  permission config; a check is a SUBSET of that universe. Rather than re-enumerate a
+  positive allowlist (which refused every real test runner — `go test`, `dotnet
+  test`, `pytest`, `nix build` — by default and forced per-tool config widening),
+  the policy ADMITS anything opencode permits EXCEPT the commands on the denylist
+  (`DefaultDeniedCommands`). The denylist has two groups: (1) ANTI-ABUSE —
+  source-inspection / no-op tools whose presence signals a FAKE definition of done
+  (`grep`/`find`/`cat`/`test -f`, no-ops like `true`/`echo`); (2) SAFETY BACKSTOP —
+  because a Check executes via the RUNNER (not opencode's own sandboxed bash tool),
+  the highest-risk classes are denied even though opencode permits them: shells /
+  interpreters that smuggle code (`… | sh`, `bash -c …`, `python -c …`) and
+  destructive tools (`rm`/`dd`/`mkfs`/`shutdown`). A static shell lexer extracts
+  command-position words across pipes/`;`/`&&`/subshells/command-substitution and
+  fails CLOSED on any construct it cannot resolve to a concrete command (a `$VAR`
+  command, `$(pick)` in command position) — so a denied command cannot be smuggled
+  past the gate. A violation at the gate is a fix-forward prompt (the author rewrites
+  the check), not a silent GC loop. Formally modeled in `specs/CheckPolicy.tla`.
 - **Filesystem confinement (bubblewrap when present).** The check runs in a
   namespace whose only writable paths are its OWN submodule checkout + that
   checkout's git-common-dir (so `git` checks resolve their object store); its only
@@ -272,20 +280,23 @@ identically. Two independent layers:
   (verified: an escaping write lands in an ephemeral tmpfs; an unbound secret is
   absent).
 
-Config (`config.yaml`, layered; documented in `LOCALS.md`): `check_allowed_commands`
-(replaces the default set when non-empty), `check_sandbox` (`auto` default = bwrap
-if present else degrade to allowlist-only + a warning; `bwrap`; `off`),
+Config (`config.yaml`, layered; documented in `LOCALS.md`): `check_denied_commands`
+(replaces the default denylist when non-empty — an operator can both narrow it,
+trusting opencode's own restrictions, and widen it), `check_sandbox` (`auto` default
+= bwrap if present else degrade to denylist-only + a warning; `bwrap`; `off`),
 `check_require_sandbox` (make a missing bwrap fail-closed), `check_read_paths`. The
-allowlist is real enforcement; bwrap is the filesystem-containment layer on top. On
-a host without bwrap the DoD gate never wedges — the allowlist still applies.
+denylist is real enforcement; bwrap is the filesystem-containment layer on top. On
+a host without bwrap the DoD gate never wedges — the denylist still applies.
 
 ## Approved-check-framework registry (CHECKS.md)
 
-The command allowlist (above) bounds WHAT tools a check may invoke; it does NOT
-stop a check from being a *source-text assertion* built out of allowlisted tools
-(`grep -q Symbol repo/...`, `test -f repo/...`). That class passes the moment the
-code is written and proves nothing about the real effect — the DoD-lies disease
-one layer down. The **check-framework registry** closes it: a per-submodule
+The command denylist (above) bounds WHAT tools a check may invoke; it does NOT
+stop a check from being a *source-text assertion* built out of admitted tools
+(`curl … | jq -e` narrowed to a trivially-true predicate, a `git` read). That class
+proves nothing about the real effect — the DoD-lies disease one layer down. (The
+denylist's anti-abuse group already refuses the crudest form — a bare `grep`/`test
+-f` — but the registry is the SEMANTIC gate.) The **check-framework registry**
+closes it: a per-submodule
 `CHECKS.md` (beehive-layer, alongside PLAN.md) enumerates the APPROVED check
 frameworks (a real test runner, a compile, a build-pipeline/rollout status, an
 integration/e2e/endpoint probe) as stubs, and **every non-DONE task's
@@ -318,10 +329,10 @@ only gates when a real check is present, only for the Review kind.
   conflict-resolution path to the agent.
 - **Review-ran-check** — **adopted as a hard completion predicate** (verifyGate
   invariant 6, above).
-- **Probe sandbox** — **command allowlist + bubblewrap filesystem confinement**
+- **Probe sandbox** — **command denylist + bubblewrap filesystem confinement**
   scoped to the submodule + its linked submodules (derived from
   `SUBMODULE-LINKS.yaml`), with site creds/config declared in `check_read_paths`
-  and the low-risk tool set the default (`internal/checkpolicy`, above).
+  and the default denylist the baseline (`internal/checkpolicy`, above).
 
 ## Enforcement-point map (keep current)
 
@@ -336,7 +347,7 @@ only gates when a real check is present, only for the Review kind.
 | DoD check run at pass start (ground truth) | brief build | `checkGroundTruth` (`internal/swarm/verify.go`) |
 | Verify-After-Merge successor auto-spawn | completion, pre-publish | `spawnMergeVerifySuccessor` (`internal/swarm/swarm.go`) |
 | reviewer ran + recorded the check | handoff gate | `verifyGate` invariant 6 (`docRecordsCheck`), `internal/swarm/verify.go` |
-| check command allowlist + FS confinement | every check run (gate, injection, CLI) | `internal/checkpolicy`, `swarm.runCheck`/`CheckBinds` |
+| check command denylist + FS confinement | every check run (gate, injection, CLI) | `internal/checkpolicy`, `swarm.runCheck`/`CheckBinds` |
 | check / verify_after_merge / check=none schema | parse / serialize | `internal/plan/plan.go` |
 | convergence-wait self-defer + bound | yield-completion + counter | `taskYieldedBlocked`, `plan.MaxDefers`, `Task.Defer` |
 | DoD/dep hygiene surfaced deterministically | CLI | `beehive plan lint` (`cmd/beehive/cmd_plan.go`) |

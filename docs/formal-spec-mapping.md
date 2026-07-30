@@ -375,6 +375,37 @@ enabled forever, no escalation edge exists).
 | `NoDoneWhileUnconverged` | invariant | `Progress` (leaving the defer loop) is gated on the real external effect, never merely on having deferred enough times | holds in both cfgs — the bug is a liveness failure, not a false-progress safety one |
 | `Terminates` | liveness | `plan.MaxDefers` bound + `swarm.go`'s defer-cap refusal together guarantee the task always reaches DONE or NEEDS-HUMAN, regardless of whether the awaited effect ever converges | `DeferBound_fixed.cfg` (holds); `DeferBound_buggy.cfg` reproduces the livelock — Defer fires forever, Converge/Escalate never taken, Terminates violated with a counterexample trace |
 
+## Layer 2 — `CheckPolicy.tla`
+
+The DoD `Check:` command-layer policy behind `internal/checkpolicy`
+`Policy.Validate`. The universe of commands a honeybee may run is owned by the
+agent runtime (opencode) permission config (`swarm/opencode.go` `Open` sets the
+session permission); a check is a SUBSET of that universe. The design is a
+DENYLIST: `Validate` admits anything opencode permits EXCEPT the commands on the
+denylist (`checkpolicy.DefaultDeniedCommands`, or a config `check_denied_commands`
+override), and REFUSES any check it cannot statically resolve to concrete command
+words (`lexer.go` `commandWords` returning an error → fail closed). The denylist
+carries two groups: the ANTI-ABUSE fake-test tools (grep/find/cat/test/true — a
+source-text assertion masquerading as a real definition of done) and, because a
+Check executes via the RUNNER not opencode's own sandboxed bash tool, a SAFETY
+backstop of code-smuggling/destructive commands (bash/python/`| sh`/rm/dd). The
+two buggy cfgs reproduce the two failure classes: the pre-change ALLOWLIST design
+refusing a real framework it never enumerated, and a denylist with a hole that
+admits a bare source-grep.
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `Decide` (denylist branch) | action | `checkpolicy.go Validate` + `DefaultDeniedCommands` — admit iff no command word is on the denylist | `checkpolicy_test.go TestValidateAdmitsRealFrameworkChecks`, `TestValidateRefusesFakeTestTools`, `TestValidateRefusesDangerousChecks` |
+| `Decide` (allowlist branch, buggy) | action | the pre-change positive allowlist (removed `DefaultAllowedCommands`) that rejected an un-enumerated real runner | reproduced by `CheckPolicy_allowlist_buggy.cfg` |
+| `~analyzable ⇒ refuse` | guard | `Validate`'s fail-closed path when `commandWords` cannot resolve a variable/eval/command-subst used as the command | `checkpolicy_test.go TestValidateRefusesDangerousChecks` (`$CMD`, `$(pick)`, `eval`), `TestValidateRefusesUnterminatedQuote` |
+| `check ⊆ OpencodeAllowed` | contract | opencode's own permission config (`swarm/opencode.go` `Open`); the runtime universe a check subsets | — (runtime-owned; modeled as the `OpencodeAllowed` constant) |
+| config override replaces default | action | `config.go CheckDeniedCommands` → `Policy.Denied` (`cmd/honeybee/main.go`, `cmd/beehive/cmd_task.go`); non-empty REPLACES the default | `checkpolicy_test.go TestValidateConfiguredDenylistReplacesDefault` |
+| `NoDeniedAdmitted` | invariant | `Validate` refuses any check containing a denied word | `CheckPolicy_fixed.cfg` (holds); enforced at the gate via `swarm/verify.go checkPolicyFailPrompt` |
+| `SubsetOpencodeAllowed` | invariant | the layered contract (opencode universe ∖ denylist) | `CheckPolicy_fixed.cfg` |
+| `FailClosed` | invariant | `Validate` returns an error (never admit) on an un-analyzable check | `CheckPolicy_fixed.cfg`; `swarm_test.go TestVerifyGateRejectsDisallowedCheckByPolicy` (`\| sh`) |
+| `NoFakeOnlyAdmitted` | invariant (leading) | the anti-abuse group of `DefaultDeniedCommands`; complements the `CHECKS.md` framework registry (`internal/checks`) | `CheckPolicy_fixed.cfg` (holds); `CheckPolicy_abusehole_buggy.cfg` reproduces the fake-only admission (`{grep}`) when the group is dropped |
+| `RealFrameworkUsable` | invariant (the denylist win) | the denylist admits `go test`/`dotnet test`/`pytest`/`nix build` with no positive allowlist entry | `checkpolicy_test.go TestValidateAdmitsRealFrameworkChecks`; `CheckPolicy_allowlist_buggy.cfg` reproduces the old allowlist refusing `go test` |
+
 ## Adjacent-path audit — the handoff terminal-leak shape
 
 `TaskStatus.tla`'s `NoDoclessTerminal` (cfgs `TaskStatus_leak_{buggy,fixed}.cfg`)

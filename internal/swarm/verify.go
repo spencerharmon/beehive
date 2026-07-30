@@ -415,16 +415,17 @@ func checkUnapprovedFrameworkPrompt(taskID, subName, cmd, reason string) string 
 }
 
 // checkPolicyFailPrompt renders the fix-forward prompt for a check that violates
-// the command-allowlist policy (checkpolicy.Validate). The task cannot be DONE
-// until the check is rewritten with allowlisted, low-risk tools (or the operator
-// widens check_allowed_commands).
+// the command-denylist policy (checkpolicy.Validate). The task cannot be DONE
+// until the check is rewritten without denied commands (or the operator adjusts
+// check_denied_commands).
 func checkPolicyFailPrompt(taskID, check string, err error) string {
 	return fmt.Sprintf(
 		"Handoff gate FAILED: %[1]s's definition-of-done check is REJECTED by the check-command policy "+
-			"before it can run — %[2]v. A `Check:` must use low-risk, read-only/inspection tools scoped to "+
-			"this submodule (and its linked submodules); it may not invoke a shell/interpreter to smuggle code "+
-			"or reach outside its lane. Rewrite the check with allowlisted commands (or, if a tool is genuinely "+
-			"needed, ask the operator to add it to check_allowed_commands). `Check:` was `%[3]s`.",
+			"before it can run — %[2]v. A `Check:` may invoke anything the agent runtime permits EXCEPT the "+
+			"denylist: fake-test tools (`grep`/`find`/`cat`/`test -f`, no-ops like `true`/`echo`) and "+
+			"code-smuggling/destructive commands (`bash -c`, `python -c`, `… | sh`, `rm`, `dd`). Rewrite the "+
+			"check to exercise a REAL test framework scoped to this submodule (and its linked submodules); if a "+
+			"denied tool is genuinely needed, ask the operator to adjust check_denied_commands. `Check:` was `%[3]s`.",
 		taskID, err, oneLineCheck(check))
 }
 

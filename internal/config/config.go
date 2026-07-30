@@ -176,11 +176,12 @@ type Config struct {
 	// need a persistent interactive server, keep using AgentURL).
 	AgentEphemeral *bool `yaml:"agent_ephemeral"`
 
-	// CheckAllowedCommands is the command allowlist for a task's `Check:` DoD command
-	// (internal/checkpolicy). A non-empty list REPLACES the built-in low-risk default
-	// (checkpolicy.DefaultAllowedCommands) so an install states the full set it wants;
-	// empty = the default set. Documented in LOCALS.md.
-	CheckAllowedCommands []string `yaml:"check_allowed_commands"`
+	// CheckDeniedCommands is the command DENYLIST for a task's `Check:` DoD command
+	// (internal/checkpolicy). A non-empty list REPLACES the built-in default
+	// (checkpolicy.DefaultDeniedCommands) so an install states the full set it wants;
+	// empty = the default set. The check may invoke anything opencode permits EXCEPT
+	// these. Documented in LOCALS.md.
+	CheckDeniedCommands []string `yaml:"check_denied_commands"`
 	// CheckSandbox selects the filesystem-confinement layer for a `Check:` command:
 	// "auto" (default; bubblewrap if present else degrade to allowlist-only), "bwrap"
 	// (require it — see CheckRequireSandbox), or "off". Empty = "auto".
@@ -348,8 +349,8 @@ func merge(base, over Config) Config {
 	if over.AgentEphemeral != nil {
 		out.AgentEphemeral = over.AgentEphemeral
 	}
-	if len(over.CheckAllowedCommands) > 0 {
-		out.CheckAllowedCommands = over.CheckAllowedCommands
+	if len(over.CheckDeniedCommands) > 0 {
+		out.CheckDeniedCommands = over.CheckDeniedCommands
 	}
 	if over.CheckSandbox != "" {
 		out.CheckSandbox = over.CheckSandbox

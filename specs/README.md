@@ -27,7 +27,7 @@ them apart bounds the state space):
 | Layer | Module(s) | Models | Status |
 |-------|-----------|--------|--------|
 | **1. Shared git refs** | `MainConvergence.tla`, `SubmodulePointer.tla` | `main` fast-forward convergence + submodule gitlink durability/tracked-tip | **done** |
-| **2. Task lifecycle** | `TaskStatus.tla`, `ClaimRace.tla`, `DependencyReadiness.tla` | status state machine + the DONE-gates (durability + definition-of-done check) + on-disk-vs-published status/change-doc handoff-terminal-leak gating + claim/heartbeat/TTL concurrent-dispatch mutual exclusion + lost-work self-heal + dangling-dependency refusal | **done** |
+| **2. Task lifecycle** | `TaskStatus.tla`, `ClaimRace.tla`, `DependencyReadiness.tla`, `CheckPolicy.tla` | status state machine + the DONE-gates (durability + definition-of-done check) + the DoD `Check:` command-layer policy (denylist) + on-disk-vs-published status/change-doc handoff-terminal-leak gating + claim/heartbeat/TTL concurrent-dispatch mutual exclusion + lost-work self-heal + dangling-dependency refusal | **done** |
 | **3. beehived dances** | `EditorSessionNamespace.tla` *(planned)* | the three `edit-*` subsystems sharing `.worktrees/`, the reclaim/gc dance, remote session durability | planned |
 
 ## Layer 1 modules (this delivery)
@@ -182,6 +182,39 @@ Configs:
   heartbeat goes stale to selection and a second session dispatches on top of it —
   `NoDuplicateDispatch` violated. `AtMostOneLands` still holds (checked here to
   show the publish-conflict backstop survives the bug).
+
+### `CheckPolicy.tla`
+The DoD `Check:` command-layer policy (`internal/checkpolicy`), modeled as a
+DENYLIST: the universe of runnable commands is owned by the agent runtime
+(opencode) permission config; a check is a SUBSET of that universe, admitted iff
+no command word is on the denylist AND the check is statically analyzable (else
+refused, fail-closed). A check is a nonempty set of command words; TLC enumerates
+every check over a small command universe.
+
+- `NoDeniedAdmitted` — an admitted check never invokes a denied command.
+- `SubsetOpencodeAllowed` — an admitted check's commands are a subset of what
+  opencode permits.
+- `FailClosed` — a check that cannot be statically analyzed is never admitted (no
+  variable/eval/command-subst smuggles a denied command past the gate).
+- `NoFakeOnlyAdmitted` — **anti-abuse, leading property:** an admitted check
+  invokes at least one real framework; a check built only from source-inspection /
+  no-op tools (grep/find/test/true) is refused.
+- `RealFrameworkUsable` — **the denylist win:** a real-framework check opencode
+  permits and that is not denied is admitted with NO positive per-tool allowlist
+  entry (`go test` / `dotnet test` / `pytest` / `nix build` all work by default).
+
+Configs:
+- `CheckPolicy_fixed.cfg` — the denylist design; the denylist contains both the
+  anti-abuse group (grep) and the code-smuggling/destructive backstop (rm). No
+  error.
+- `CheckPolicy_allowlist_buggy.cfg` — the pre-change ALLOWLIST design (admit only
+  an enumerated positive set). `go test` is not enumerated, so a real, opencode-
+  permitted, non-abusive check is refused — `RealFrameworkUsable` violated (the
+  usability defect that forced per-tool config widening).
+- `CheckPolicy_abusehole_buggy.cfg` — a denylist with a HOLE (the fake-test tools
+  omitted): a bare source-`grep` check is admitted as a fake definition of done —
+  `NoFakeOnlyAdmitted` violated (why `DefaultDeniedCommands` must carry the
+  grep/find/test/true group).
 
 ### `EditorSessionNamespace.tla`
 The beehived chat-diff editor Manager and its reclaim/gc dance over the shared

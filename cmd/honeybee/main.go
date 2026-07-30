@@ -289,11 +289,11 @@ func run() error {
 
 	// Check-command policy (DoD `Check:` sandbox): command allowlist + filesystem
 	// confinement scoped to the task's submodule and its LINKED submodules. Assembled
-	// from the layered config over the low-risk default; the linked-submodule set is
+	// from the layered config over the default denylist; the linked-submodule set is
 	// DERIVED at runtime from SUBMODULE-LINKS.yaml (never hardcoded).
 	checkPol := checkpolicy.Default()
-	if len(eff.CheckAllowedCommands) > 0 {
-		checkPol.Allowed = eff.CheckAllowedCommands
+	if len(eff.CheckDeniedCommands) > 0 {
+		checkPol.Denied = eff.CheckDeniedCommands
 	}
 	if eff.CheckSandbox != "" {
 		checkPol.Sandbox = eff.CheckSandbox

@@ -209,8 +209,11 @@ func TestTaskDefer(t *testing.T) {
 // task check runs a task's Check: command and reflects its exit status.
 func TestTaskCheckRunsCommand(t *testing.T) {
 	root, _ := newHive(t)
+	// `sleep 0` exits 0 (pass); `timeout 0.01 sleep 5` is killed and exits non-zero
+	// (fail). Both use denylist-admitted commands so the check-command policy runs
+	// them; `true`/`false` would now be refused as no-op fake-test tools.
 	writeFileMW(t, root, "submodules/flux/PLAN.md",
-		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## ok [TODO] <!-- attempts=0 deps= -->\nx\nCheck: true\n\n## bad [TODO] <!-- attempts=0 deps= -->\nx\nCheck: false\n\n## none [TODO] <!-- attempts=0 deps= check=none -->\nx\n")
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## ok [TODO] <!-- attempts=0 deps= -->\nx\nCheck: sleep 0\n\n## bad [TODO] <!-- attempts=0 deps= -->\nx\nCheck: timeout 0.01 sleep 5\n\n## none [TODO] <!-- attempts=0 deps= check=none -->\nx\n")
 	commitPush(t, root, "seed flux plan")
 	inDir(t, root, func() {
 		if err := runTaskCheck(t, "flux", "ok"); err != nil {

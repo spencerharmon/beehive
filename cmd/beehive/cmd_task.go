@@ -630,12 +630,12 @@ func taskCheckCmd() *cobra.Command {
 				runDir = root
 			}
 			// Confine identically to the runner's gate: build the same check policy from
-			// layered config, enforce the command allowlist, and run under the same
+			// layered config, enforce the command denylist, and run under the same
 			// filesystem sandbox scoped to this submodule + its linked submodules.
 			pol := checkpolicy.Default()
 			if eff, cerr := config.Resolve(root, subName); cerr == nil {
-				if len(eff.CheckAllowedCommands) > 0 {
-					pol.Allowed = eff.CheckAllowedCommands
+				if len(eff.CheckDeniedCommands) > 0 {
+					pol.Denied = eff.CheckDeniedCommands
 				}
 				if eff.CheckSandbox != "" {
 					pol.Sandbox = eff.CheckSandbox

