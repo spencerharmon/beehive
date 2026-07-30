@@ -139,6 +139,23 @@ OK   TaskStatus_resolveloop_buggy.cfg (expected fail)
 | `NoDuplicateDispatch` | invariant | mid-turn keepalive + decoupled liveness window (`plan.Plan.Candidates`) + pre-dispatch re-confirm (`301964d`) | `ClaimRace_buggy.cfg` proves duplicate dispatch reachable without them |
 | `EventuallyLanded` | liveness | `claim` + selection fairness | `ClaimRace_fixed.cfg` |
 
+## Layer 2 — `TaskRemovalRace.tla`
+
+Models a work pass racing a concurrent removal of its task (or the whole
+`PLAN.md`) from `main` by a reconcile pass or an operator. Proves the two
+historical failure classes absent: an ORPHAN status write for a vanished task,
+and an INFINITE lost-work loop when the pass misreads the vanished branch.
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `Remove` | action | reconcile pass rewriting `PLAN.md` / operator deleting the task or plan on `main` | — (the modeled adversary) |
+| `PublishSafe` (fixed) | action | `swarm.go:1657 taskRemoved` re-reads main's PLAN each turn (called `swarm.go:1159`); publish gated on the task still being present | `swarm.go:1686` ("…no longer exists. Exiting.") / `:1695` ("…was removed… Exiting.") |
+| `PublishUnsafe` (buggy) | action | pre-fix runner that lands a status write without re-checking presence | reproduced by `TaskRemovalRace_orphan_buggy.cfg` |
+| `TerminateVanished` (fixed) | action | clean pass exit on vanished task: `swarm.go:1174` (removed→`finish`) plus durable-record finalize guards `finalizeIfMergedByRecord` (~`:1682`) / `finalizeIfAlreadyMerged` (~`:2680`) that stop `recoverIfLost` misreading the gone branch | `swarm.go` taskRemoved exit path |
+| `ReLoopVanished` (buggy) | action | naive `recoverIfLost` misreading the vanished `bee-<taskid>` branch/claim as "lost work" and re-dispatching forever | reproduced by `TaskRemovalRace_loop_buggy.cfg` |
+| `NoOrphanWrite` | invariant | the presence re-check (`taskRemoved`) before any status write lands | `TaskRemovalRace_orphan_buggy.cfg` proves an orphan write reachable without it |
+| `VanishedPassTerminates` | liveness | clean vanished-exit + durable-record finalize guards | `TaskRemovalRace_loop_buggy.cfg` proves the non-terminating loop reachable without them |
+
 ## Layer 2 — `PlanConvergence.tla`
 
 The reconcile-vs-status-flip merge race on structured PLAN.md CONTENT (as opposed
