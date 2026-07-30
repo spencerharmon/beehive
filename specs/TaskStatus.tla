@@ -64,9 +64,17 @@ CONSTANTS
     Limit,        \* reject/recover attempts limit; past it a task escalates NEEDS-HUMAN
     Gated,        \* TRUE: the handoff gate requires work durable-on-origin before DONE-ward edges
     CheckGated,   \* TRUE: entering DONE requires the task's declared DoD Check to pass (verifyGate inv 5)
-    RevertOverPin \* TRUE: gate-fail reverts on-disk status + gates the heartbeat publish (the fix).
+    RevertOverPin,\* TRUE: gate-fail reverts on-disk status + gates the heartbeat publish (the fix).
                   \* FALSE: gate-fail pins the on-disk status and the heartbeat publishes unconditionally
                   \* (the handoff-terminal-leak bug).
+    ModelResolve, \* TRUE: model the out-of-band operator Resolve edge NEEDS-HUMAN -> TODO
+                  \* (state.go Resolve). FALSE: NEEDS-HUMAN is terminal (the other cfgs, whose
+                  \* scope is the autonomous machine only -- behaviour is identical to before).
+    ResetAttemptsOnResolve \* only meaningful when ModelResolve. TRUE (the fix contract): Resolve
+                  \* resets attempts to 0 (a fresh rework budget per operator reopen) so the counter
+                  \* stays bounded. FALSE (state.go Resolve AS WRITTEN -- the diagnosed bug): Resolve
+                  \* leaves attempts untouched, so across resolve/retry cycles the rework counter
+                  \* grows without bound and the task loops escalate->resolve->escalate forever.
 
 VARIABLES
     status,       \* AGENT-WRITTEN on-disk status (the worktree's PLAN.md), one of Statuses
@@ -311,14 +319,24 @@ RequestHuman ==
     /\ prevStatus' = status
     /\ UNCHANGED <<attempts, workDurable, merged, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
-\* NOTE: the operator Resolve edge NEEDS-HUMAN -> TODO (state.go Resolve) is a
-\* legal edge (kept in LegalEdges) but is deliberately NOT an action here: it is
-\* an out-of-band operator action, outside the autonomous protocol's liveness
-\* scope. Modeling it would make NEEDS-HUMAN non-terminal and let a resolve/retry
-\* loop grow attempts without bound (Resolve does not reset attempts in the code) --
-\* realistic, but not a property of the autonomous machine. Within this module
-\* NEEDS-HUMAN is terminal, which is exactly the selector's own view (a NEEDS-HUMAN
-\* task is excluded from selection until an operator reopens it).
+\* The operator Resolve edge NEEDS-HUMAN -> TODO (internal/plan/state.go Resolve):
+\* an out-of-band operator reopens an escalated task. Modeled only when
+\* ModelResolve (the other cfgs keep NEEDS-HUMAN terminal, matching the selector's
+\* own view). The already-diagnosed defect: state.go Resolve does NOT reset
+\* Attempts, so a task that escalated at the attempts limit is reopened with its
+\* counter still at the limit; one more Reject/Recover escalates it again, the
+\* operator reopens again, and across resolve/retry cycles `attempts` grows without
+\* bound -- AttemptsBounded violated (the escalate->resolve->escalate loop). The fix
+\* contract (ResetAttemptsOnResolve = TRUE): Resolve resets attempts to 0, giving a
+\* fresh, bounded rework budget per operator reopen. NEEDS-HUMAN -> TODO is already
+\* a member of LegalEdges, so this action never breaks LegalTransitionsOnly.
+Resolve ==
+    /\ ModelResolve
+    /\ status = "HUMAN"
+    /\ status' = "TODO"
+    /\ attempts' = IF ResetAttemptsOnResolve THEN 0 ELSE attempts
+    /\ prevStatus' = status
+    /\ UNCHANGED <<workDurable, merged, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 (***************************************************************************)
 (* The handoff-terminal-leak layer: WriteDoc/GateCheck/Heartbeat.           *)
@@ -397,6 +415,7 @@ Next ==
     \/ RecoverLostWork
     \/ FinalizeAlreadyMerged
     \/ RequestHuman
+    \/ Resolve
     \/ WriteDoc
     \/ GateCheck
     \/ Heartbeat
