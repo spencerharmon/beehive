@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/checkpolicy"
+	"github.com/spencerharmon/beehive/internal/checks"
 	"github.com/spencerharmon/beehive/internal/claim"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/links"
@@ -1865,13 +1866,13 @@ func (r *Runner) completionChecklist(sel *selectt.Selection, branch string) ([]c
 	switch sel.Kind {
 	case selectt.Bootstrap:
 		_, err := os.Stat(sel.Submodule.PlanPath())
-		return []completionItem{{"PLAN.md exists", err == nil}}, nil
+		return []completionItem{{"PLAN.md exists", err == nil}, r.checksApprovedItem(sel)}, nil
 	case selectt.Reconcile:
 		ok, err := r.reconciled(sel)
 		if err != nil {
 			return nil, err
 		}
-		return []completionItem{{"PLAN.md ROI stamp matches ROI HEAD", ok}}, nil
+		return []completionItem{{"PLAN.md ROI stamp matches ROI HEAD", ok}, r.checksApprovedItem(sel)}, nil
 	case selectt.Review:
 		// Done once the reviewer moved the task out of NEEDS-REVIEW (-> DONE on
 		// approve, -> NEEDS-ARBITRATION on reject).
@@ -1891,6 +1892,60 @@ func (r *Runner) completionChecklist(sel *selectt.Selection, branch string) ([]c
 	default:
 		return r.workChecklist(sel, branch)
 	}
+}
+
+// checksApprovedItem is the completion predicate a bootstrap/reconcile pass must
+// meet before its PLAN.md write is accepted: EVERY open (non-DONE) task's declared
+// check (Check:/Verify-After-Merge:) matches an approved framework stub in the
+// submodule's CHECKS.md — the same whitelist `beehive plan lint` and the handoff
+// gate enforce, applied here so a plan-authoring pass cannot merge a task carrying
+// a bare source-grep DoD (or a check with no registry at all). The label carries
+// the offending task ids when unmet so the continuation report tells the agent
+// exactly what to fix. Read errors degrade to met=true (a transient read never
+// wedges the pass; PLAN.md-exists / stamp items drive it instead). Reads only the
+// beehive layer.
+func (r *Runner) checksApprovedItem(sel *selectt.Selection) completionItem {
+	const base = "every open task's check is an approved framework in CHECKS.md"
+	b, err := os.ReadFile(sel.Submodule.PlanPath())
+	if err != nil {
+		return completionItem{base, true}
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		return completionItem{base, true}
+	}
+	var openChecks []struct{ id, cmd string }
+	for _, t := range p.Tasks {
+		if t.Status == plan.Done {
+			continue
+		}
+		if c := t.Check(); c != "" {
+			openChecks = append(openChecks, struct{ id, cmd string }{t.ID, c})
+		}
+		if v := t.VerifyAfterMerge(); v != "" {
+			openChecks = append(openChecks, struct{ id, cmd string }{t.ID, v})
+		}
+	}
+	if len(openChecks) == 0 {
+		return completionItem{base, true}
+	}
+	chk, cerr := checks.Load(sel.Submodule.ChecksPath())
+	if errors.Is(cerr, checks.ErrNoChecksFile) {
+		return completionItem{base + fmt.Sprintf(" — UNMET: submodules/%s/CHECKS.md missing; create the approved-framework registry (docs/checks-framework-registry.md)", sel.Submodule.Name), false}
+	}
+	if cerr != nil {
+		return completionItem{base + fmt.Sprintf(" — UNMET: CHECKS.md does not parse: %v", cerr), false}
+	}
+	var bad []string
+	for _, oc := range openChecks {
+		if chk.Unapproved(oc.cmd) != "" {
+			bad = append(bad, oc.id)
+		}
+	}
+	if len(bad) > 0 {
+		return completionItem{base + " — UNMET for: " + strings.Join(bad, ", ") + " (rewrite the check to an approved framework, or add a stub to CHECKS.md)", false}
+	}
+	return completionItem{base, true}
 }
 
 // statusLeft reports whether the selected task has moved out of `from`. A task

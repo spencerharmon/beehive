@@ -187,6 +187,12 @@ Per submodule (`submodules/<name>/`):
 - `PLAN.md` — the honeybee-owned task list derived from `ROI.md`, carrying an ROI
   stamp `<!-- Beehive-ROI: <sha> -->`. Written by bootstrap/reconcile passes; do
   not hand-edit (it races the reconcile pass).
+- `CHECKS.md` — the honeybee-owned registry of APPROVED definition-of-done check
+  frameworks for this target (a real test runner / compile / rollout status /
+  integration probe). Every open task's `Check:` must match a stub here; a bare
+  source-grep matches none and is refused by the linter, the runner handoff gate,
+  and the reconcile/bootstrap completion gate. Owned by honeybees/agents who add
+  stubs as frameworks evolve. See `docs/checks-framework-registry.md`.
 - `docs/` — one terse, LLM-targeted change doc per task (`<branch>-<taskid>.md`).
 - `sessions/` — recorded honeybee transcripts (one `.md` per session branch).
 - `repo/` — the target's actual source, tracked as a git submodule (gitlink).

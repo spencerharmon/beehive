@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spencerharmon/beehive/internal/checkpolicy"
+	"github.com/spencerharmon/beehive/internal/checks"
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/links"
@@ -369,11 +371,13 @@ func taskAddCmd() *cobra.Command {
 				if err := t.SetCheck(check); err != nil {
 					return err
 				}
+				warnUnapprovedCheck(subName, check)
 			}
 			if verifyAfterMerge != "" {
 				if err := t.SetVerifyAfterMerge(verifyAfterMerge); err != nil {
 					return err
 				}
+				warnUnapprovedCheck(subName, verifyAfterMerge)
 			}
 			if notBefore != "" {
 				nb, err := parseUntil(notBefore, time.Now().UTC())
@@ -818,6 +822,32 @@ func taskReopenCmd() *cobra.Command {
 	return cmd
 }
 
+// warnUnapprovedCheck prints a non-fatal warning when cmd is not an approved
+// framework in the submodule's CHECKS.md (or the registry is missing). Authoring a
+// check is not BLOCKED here — the linter, the runner handoff gate, and the
+// reconcile/bootstrap completion gate enforce approval — but the author is told
+// immediately so they fix it before it reaches a gate. subName must be the
+// resolved submodule name.
+func warnUnapprovedCheck(subName, cmd string) {
+	if strings.TrimSpace(cmd) == "" {
+		return
+	}
+	root, err := findRoot()
+	if err != nil {
+		return
+	}
+	chk, err := checks.Load(filepath.Join(root, "submodules", subName, checks.ChecksFile))
+	if err != nil {
+		if errors.Is(err, checks.ErrNoChecksFile) {
+			fmt.Fprintf(os.Stderr, "beehive: WARNING submodules/%s/CHECKS.md (approved-check-framework registry) does not exist; a check must invoke an approved framework — create it (docs/checks-framework-registry.md)\n", subName)
+		}
+		return
+	}
+	if reason := chk.Unapproved(cmd); reason != "" {
+		fmt.Fprintf(os.Stderr, "beehive: WARNING check %q %s\n", cmd, reason)
+	}
+}
+
 // taskSetCheckCmd attaches or replaces the definition-of-done on an EXISTING task
 // (unlike `task add --check`, which only applies at creation) — used to backfill a
 // real check onto a task that lacked one, or to correct a weak/wrong check. Exactly
@@ -857,10 +887,16 @@ func taskSetCheckCmd() *cobra.Command {
 					if err := t.ReplaceVerifyAfterMerge(vam); err != nil {
 						return "", err
 					}
+					if sn, err := taskSubmoduleName(args[0]); err == nil {
+						warnUnapprovedCheck(sn, vam)
+					}
 					subject = "set Verify-After-Merge on " + t.ID
 				default:
 					if err := t.ReplaceCheck(check); err != nil {
 						return "", err
+					}
+					if sn, err := taskSubmoduleName(args[0]); err == nil {
+						warnUnapprovedCheck(sn, check)
 					}
 					subject = "set Check on " + t.ID
 				}

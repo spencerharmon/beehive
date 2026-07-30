@@ -181,13 +181,17 @@ func TestPlanValidateCommand(t *testing.T) {
 }
 
 // plan lint fails on a dangling local dep and on a defer-cap breach, warns (does
-// not fail) on open tasks missing a DoD declaration by default, and errors on
-// them with --strict.
+// not fail) on open tasks missing a DoD declaration by default, errors on them
+// with --strict, and errors on an open task whose check matches no approved
+// framework in CHECKS.md (or when CHECKS.md is missing while a check is declared).
 func TestPlanLint(t *testing.T) {
 	root, _ := newHive(t)
-	// Clean plan: a task with a Check and one with check=none — no issues.
+	// Approved-framework registry: a go-test stub the clean-plan checks match.
+	writeFileMW(t, root, "submodules/flux/CHECKS.md",
+		"# Checks — flux\n\n## go-test <!-- category=unit -->\nGo unit suite.\nMatch: (^|&&|;|\\s)go\\s+test\\b\n")
+	// Clean plan: a task with an APPROVED Check and one with check=none — no issues.
 	writeFileMW(t, root, "submodules/flux/PLAN.md",
-		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## a [TODO] <!-- attempts=0 deps= -->\nx\nCheck: true\n\n## b [DONE] <!-- attempts=0 deps= check=none -->\nx\n")
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## a [TODO] <!-- attempts=0 deps= -->\nx\nCheck: go test ./...\n\n## b [DONE] <!-- attempts=0 deps= check=none -->\nx\n")
 	commitPush(t, root, "seed clean plan")
 	inDir(t, root, func() {
 		if err := runPlanLint(t, "flux", false); err != nil {
@@ -195,9 +199,29 @@ func TestPlanLint(t *testing.T) {
 		}
 	})
 
+	// Unapproved check (a bare source-grep matching no stub) — hard error.
+	writeFileMW(t, root, "submodules/flux/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## a [TODO] <!-- attempts=0 deps= -->\nx\nCheck: grep -q Symbol repo/internal/x.go\n")
+	commitPush(t, root, "seed grep-check plan")
+	inDir(t, root, func() {
+		if err := runPlanLint(t, "flux", false); err == nil {
+			t.Fatal("a grep check matching no approved framework must fail lint")
+		}
+	})
+
+	// Declared check but NO CHECKS.md registry — hard error.
+	writeFileMW(t, root, "submodules/gostream/PLAN.md",
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## a [TODO] <!-- attempts=0 deps= -->\nx\nCheck: go test ./...\n")
+	commitPush(t, root, "seed plan without CHECKS.md")
+	inDir(t, root, func() {
+		if err := runPlanLint(t, "gostream", false); err == nil {
+			t.Fatal("a declared check with no CHECKS.md registry must fail lint")
+		}
+	})
+
 	// Dangling dep + defer-cap breach → hard errors regardless of --strict.
 	writeFileMW(t, root, "submodules/flux/PLAN.md",
-		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## a [TODO] <!-- attempts=0 deps=ghost -->\nx\nCheck: true\n\n## b [TODO] <!-- attempts=0 deps= defers=99 -->\nx\nCheck: true\n")
+		"<!-- Beehive-ROI: deadbeef -->\n# Plan\n\n## a [TODO] <!-- attempts=0 deps=ghost -->\nx\nCheck: go test ./...\n\n## b [TODO] <!-- attempts=0 deps= defers=99 -->\nx\nCheck: go test ./...\n")
 	commitPush(t, root, "seed broken plan")
 	inDir(t, root, func() {
 		if err := runPlanLint(t, "flux", false); err == nil {

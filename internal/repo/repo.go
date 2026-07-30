@@ -18,6 +18,7 @@ const (
 	AgentsFile    = "AGENTS.md"
 	HoneybeeFile  = "HONEYBEE.md"
 	PlanFile      = "PLAN.md"
+	ChecksFile    = "CHECKS.md"
 	ROIFile       = "ROI.md"
 	InfraFile     = "INFRASTRUCTURE.md"
 	Artifacts     = "ARTIFACTS.md"
@@ -98,6 +99,10 @@ func (s Submodule) RepoDir() string { return filepath.Join(s.Path, "repo") }
 // PlanPath, ROIPath, WorktreesDir locate coordination files.
 func (s Submodule) PlanPath() string { return filepath.Join(s.Path, PlanFile) }
 func (s Submodule) ROIPath() string  { return filepath.Join(s.Path, ROIFile) }
+
+// ChecksPath locates the approved-check-framework registry (CHECKS.md), a
+// beehive-layer file alongside PLAN.md (see internal/checks).
+func (s Submodule) ChecksPath() string { return filepath.Join(s.Path, ChecksFile) }
 
 // SubmoduleWorktreesDirName is the hive-root directory that holds EVERY
 // submodule's per-task CODE worktrees, deliberately OUTSIDE the beehive-layer

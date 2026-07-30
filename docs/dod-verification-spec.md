@@ -279,6 +279,23 @@ if present else degrade to allowlist-only + a warning; `bwrap`; `off`),
 allowlist is real enforcement; bwrap is the filesystem-containment layer on top. On
 a host without bwrap the DoD gate never wedges — the allowlist still applies.
 
+## Approved-check-framework registry (CHECKS.md)
+
+The command allowlist (above) bounds WHAT tools a check may invoke; it does NOT
+stop a check from being a *source-text assertion* built out of allowlisted tools
+(`grep -q Symbol repo/...`, `test -f repo/...`). That class passes the moment the
+code is written and proves nothing about the real effect — the DoD-lies disease
+one layer down. The **check-framework registry** closes it: a per-submodule
+`CHECKS.md` (beehive-layer, alongside PLAN.md) enumerates the APPROVED check
+frameworks (a real test runner, a compile, a build-pipeline/rollout status, an
+integration/e2e/endpoint probe) as stubs, and **every non-DONE task's
+`Check:`/`Verify-After-Merge:` must MATCH a stub** — a bare grep matches none and
+is refused. `CHECKS.md` is owned by honeybees/agents, who add stubs as a target's
+frameworks evolve. Format, matching, and migration: `internal/checks` and
+`docs/checks-framework-registry.md`. Enforced at the linter, the handoff gate
+(invariant 4.5), and the reconcile/bootstrap completion gate; DONE history is
+grandfathered.
+
 ## Review-ran-check (verifyGate invariant 6)
 
 A Review that approves a task carrying a real `Check:` (not `check=none`) must have
@@ -311,6 +328,7 @@ only gates when a real check is present, only for the Review kind.
 | Concern | Enforced at | Code |
 |---------|-------------|------|
 | DONE requires a passing check (or `check=none`) | handoff gate | `verifyGate` invariant 5, `internal/swarm/verify.go` |
+| check matches an approved framework in CHECKS.md | handoff gate + lint + reconcile/bootstrap completion | `verifyGate` invariant 4.5 (`internal/swarm/verify.go`), `beehive plan lint`, `checksApprovedItem` (`internal/swarm/swarm.go`), `internal/checks` |
 | work may not set DONE | completion predicate + gate | `workChecklist`, `gatedHandoff` |
 | no dangling dep (any writer) | parse / lint | `Plan.DanglingDeps`, `beehive plan lint`, `beehive task block` |
 | no dangling dep (yield) | yield-completion | `taskYieldedBlocked` |

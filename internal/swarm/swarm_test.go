@@ -5122,6 +5122,71 @@ func TestPassStartInjectsCheckGroundTruth(t *testing.T) {
 	}
 }
 
+// TestVerifyGateChecksApprovedFramework: the handoff gate refuses a terminal flip
+// whose declared check matches no approved framework in the submodule's CHECKS.md
+// (a bare source-grep, or any command with no registry at all), and allows it once
+// an approved stub matches. Driven directly against verifyGate.
+func TestVerifyGateChecksApprovedFramework(t *testing.T) {
+	ctx := context.Background()
+	g, rp, sm, planPath, _ := gateFixture(t)
+	subs, _ := rp.Submodules()
+	planBody := "## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\nCheck: grep -q Symbol repo/f\n"
+	os.WriteFile(planPath, []byte(planBody), 0o644)
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.NeedsReview}}
+	allowCheck := false
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if len(args) >= 2 && args[0] == "show" && strings.HasSuffix(args[1], "PLAN.md") {
+			return verifyOutcome{out: planBody}, nil
+		}
+		if len(args) >= 2 && args[0] == "show" { // change doc
+			return verifyOutcome{out: "<!-- Beehive-Commits: none -->\n<!-- Beehive-Check: pass -->\n\ndoc\n"}, nil
+		}
+		if len(args) > 0 && args[0] == "ls-tree" {
+			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
+		}
+		if name == "sh" { // invariant 5's DoD check
+			if !allowCheck {
+				t.Errorf("the DoD check must not run before the framework gate refuses")
+			}
+			return verifyOutcome{out: "ok"}, nil
+		}
+		return verifyOutcome{}, nil // git status: clean
+	}}
+	r := &Runner{Repo: rp, Git: g, RunVerify: gr.run}
+	wantRoot, _ := filepath.Abs(rp.Root)
+
+	// (1) No CHECKS.md while a check is declared -> refused, naming the registry.
+	hint, err := r.verifyGate(ctx, sel, "", wantRoot, "bee-T1")
+	if err != nil {
+		t.Fatalf("verifyGate err: %v", err)
+	}
+	if hint == "" || !strings.Contains(hint, "CHECKS.md") {
+		t.Fatalf("a declared check with no CHECKS.md must be refused; got %q", hint)
+	}
+
+	// (2) Registry present but the grep matches no stub -> still refused.
+	os.WriteFile(filepath.Join(sm, "CHECKS.md"), []byte("# Checks\n\n## go-test <!-- category=unit -->\nMatch: (^|&&|;|\\s)go\\s+test\\b\n"), 0o644)
+	hint, err = r.verifyGate(ctx, sel, "", wantRoot, "bee-T1")
+	if err != nil {
+		t.Fatalf("verifyGate err: %v", err)
+	}
+	if hint == "" || !strings.Contains(hint, "approved") {
+		t.Fatalf("an unapproved grep check must be refused; got %q", hint)
+	}
+
+	// (3) An APPROVED check (matches the go-test stub) that also passes -> allowed.
+	planBody = "## T1 [DONE] <!-- attempts=0 deps= commits=none -->\ngo\nCheck: go test ./...\n"
+	os.WriteFile(planPath, []byte(planBody), 0o644)
+	allowCheck = true
+	hint, err = r.verifyGate(ctx, sel, "", wantRoot, "bee-T1")
+	if err != nil {
+		t.Fatalf("verifyGate err: %v", err)
+	}
+	if hint != "" {
+		t.Fatalf("an approved+passing check must allow the handoff; got %q", hint)
+	}
+}
+
 // TestReviewSpawnsMergeVerifySuccessor: when a review approves a task that carried
 // a `Verify-After-Merge:` command (its live effect only exists after merge), the
 // runner AUTO-spawns a successor CHECK task whose `Check:` IS that command,
@@ -5135,6 +5200,7 @@ func TestReviewSpawnsMergeVerifySuccessor(t *testing.T) {
 	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
 	planPath := filepath.Join(sm, "PLAN.md")
 	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\nreview\nVerify-After-Merge: curl -sf https://x/live\n"), 0o644)
+	os.WriteFile(filepath.Join(sm, "CHECKS.md"), []byte("# Checks — sm\n\n## endpoint <!-- category=endpoint -->\nLive endpoint probe.\nMatch: (^|&&|;|\\s)curl\\b\n"), 0o644)
 	g.Commit(context.Background(), "seed")
 
 	rp, _ := repo.Open(root)

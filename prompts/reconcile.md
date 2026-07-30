@@ -19,6 +19,14 @@ You are given the diff of ROI.md from the last-reconciled commit to HEAD (ROI.md
   <sm> <id> --reason '<why>'` to return a false-DONE (a DONE whose real effect the check would fail) to
   TODO so it is re-driven, and `beehive task retarget-dep <sm> <id> --from <dep> --to <dep>` to fix a
   dangling/wrong dependency — all converge through the same non-racing protocol as the other task verbs.
+- **Every check must be an APPROVED framework in `CHECKS.md`.** Each task's `Check:`/`Verify-After-Merge:`
+  MUST MATCH a stub registered in `submodules/<sm>/CHECKS.md` — a real test runner / compile /
+  build-pipeline or rollout status / integration|e2e|endpoint probe. A bare source-grep
+  (`grep -q Symbol repo/...`, `test -f ...`) matches no stub and is REFUSED (it proves the code was
+  written, never that the effect works). `CHECKS.md` is a beehive-layer file you OWN: if the target uses a
+  framework not yet registered, ADD a stub for it (mirror an existing one), then point checks at it. Your
+  reconcile does NOT complete while any open task's check matches no stub (or `CHECKS.md` is missing) —
+  the completion gate reports the offending tasks. See `docs/checks-framework-registry.md`.
 - Cross-submodule dependencies are REAL tasks, never placeholders:
   - A dep is LOCAL (bare id -> a task in THIS PLAN.md) or CROSS-SUBMODULE (qualified `<other-sm>:<taskid>`,
     authorized by a registered link, satisfied only when that task is DONE). A bare dep naming no local

@@ -200,6 +200,16 @@ plausible diff merged. It is a task-body field, and the runner ENFORCES it (prom
   (a pure doc/refactor with no observable effect). Justify it in the body prose; a reviewer judges the
   justification. It is mutually exclusive with `Check:`. Silent absence is a defect `beehive plan lint`
   flags — declare one or the other.
+- **Every check must be an APPROVED framework in `CHECKS.md`.** A check must invoke a REAL test framework
+  — a test runner (`go test`), a compile (`go build`), a build-pipeline/rollout status (`flux get`,
+  `kubectl rollout status`), an integration/e2e/endpoint probe (`curl` + assert body) — and MUST MATCH a
+  stub registered in the submodule's `submodules/<sm>/CHECKS.md` (a beehive-layer file alongside PLAN.md).
+  A **bare source-grep** (`grep -q Symbol repo/...`, `test -f repo/...`) matches no framework stub and is
+  REFUSED — it passes the moment the code is written and proves nothing about the real effect. The linter,
+  the runner handoff gate, and the reconcile/bootstrap completion gate all enforce this. `CHECKS.md` is
+  OWNED by honeybees: if this target genuinely gained a new testing framework, ADD a stub for it to
+  `CHECKS.md` (then point your check at it) rather than reaching for a grep. See
+  `docs/checks-framework-registry.md`.
 When you FILE a task (`beehive task add`), give it its check: `--check '<cmd>'`,
 `--verify-after-merge '<cmd>'`, or `--check-none`.
 
@@ -216,6 +226,10 @@ range.
   observable effect (a pure doc/refactor) justified in its body. You TRANSLATE the operator's stated
   success criteria into an executable check — you do not invent a definition of done the ROI never asked
   for. Run `beehive plan lint <sm>` after: it reports tasks left without a check so coverage is visible.
+  Every check MUST match an approved framework stub in `submodules/<sm>/CHECKS.md` (a real test runner /
+  compile / rollout / integration probe — NEVER a bare source-grep); if the target gained a new framework,
+  add a stub to `CHECKS.md` first. `beehive plan lint <sm>` flags any check matching no stub (or a missing
+  registry). See `docs/checks-framework-registry.md`.
 - **Cross-submodule needs — author the real task in the OTHER submodule, never a placeholder.** If new
   intent means a task here needs work owned by another submodule, do NOT fake it with a local
   bare/sentinel dep. Create that work as a real task in the other submodule's `PLAN.md` (with its design
@@ -382,7 +396,9 @@ the runner already verified reachability before dispatching you.
   plausible-looking diff). **RUN the task's definition-of-done check yourself** — `beehive task check
   <sm> <taskid>` — and confirm it both PASSES and asserts the REAL effect (not a check that passes on a
   404, greps the wrong string, or hits the wrong host); a weak or lying check is a rejection just like a
-  missing one, and an unjustified `check=none` on a task that HAS an observable effect is a rejection.
+  missing one, and an unjustified `check=none` on a task that HAS an observable effect is a rejection. A
+  check that is a bare source-grep, or matches no approved framework stub in `submodules/<sm>/CHECKS.md`,
+  is likewise a rejection — the runner gate refuses it too.
   When satisfied, merge `bee-<taskid>` into the submodule's tracked branch on
   its origin, then `beehive task status <sm> <taskid> DONE --commits <merge-sha>` (unlocks dependents on
   DONE). Do NOT touch the submodule pointer — the

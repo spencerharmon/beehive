@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/spencerharmon/beehive/internal/checks"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -22,12 +24,15 @@ func planCmd() *cobra.Command {
 
 // planLintCmd reports definition-of-done and dependency hygiene for a submodule's
 // PLAN.md: open (non-DONE) tasks that declared neither a Check nor check=none;
+// open tasks whose Check:/Verify-After-Merge: command is NOT an approved framework
+// in the submodule's CHECKS.md (a bare source-grep, or any command matching no
+// registered stub — the class the check-framework registry exists to refuse);
 // dangling local dependencies (a dep naming no task in the plan — the class that
 // wedged the jellyfin repin task); and self-defer counters at or past the
 // MaxDefers bound. It is the deterministic replacement for a "periodic efficacy-
 // evaluation pass": coverage and rot are a command away, not a swarm session.
 // Read-only. Exits non-zero when any issue is found so a hook / CI can gate on it.
-// See docs/dod-verification-spec.md.
+// See docs/dod-verification-spec.md and docs/checks-framework-registry.md.
 func planLintCmd() *cobra.Command {
 	var strict bool
 	cmd := &cobra.Command{
@@ -81,6 +86,42 @@ func planLintCmd() *cobra.Command {
 					issues = append(issues, msg)
 				} else {
 					fmt.Fprintf(os.Stderr, "beehive: WARNING %s\n", msg)
+				}
+			}
+			// Approved-framework constraint: every OPEN task's declared check
+			// (Check: or Verify-After-Merge:) must MATCH a stub in the submodule's
+			// CHECKS.md — the whitelist that refuses a bare source-grep DoD. Grandfather
+			// DONE history (do not retro-gate). A missing CHECKS.md while open tasks
+			// declare checks is itself an error (the registry must exist).
+			checksRel := filepath.Join("submodules", subName, checks.ChecksFile)
+			chk, cerr := checks.Load(filepath.Join(root, checksRel))
+			var openChecks []struct{ id, kind, cmd string }
+			for _, t := range p.Tasks {
+				if t.Status == plan.Done {
+					continue
+				}
+				if c := t.Check(); c != "" {
+					openChecks = append(openChecks, struct{ id, kind, cmd string }{t.ID, "Check:", c})
+				}
+				if v := t.VerifyAfterMerge(); v != "" {
+					openChecks = append(openChecks, struct{ id, kind, cmd string }{t.ID, "Verify-After-Merge:", v})
+				}
+			}
+			switch {
+			case errors.Is(cerr, checks.ErrNoChecksFile):
+				if len(openChecks) > 0 {
+					issues = append(issues, fmt.Sprintf("%s does not exist but %d open task-check(s) require an approved framework — create the check-framework registry (see docs/checks-framework-registry.md)", checksRel, len(openChecks)))
+				}
+			case cerr != nil:
+				return cerr
+			default:
+				for _, oc := range openChecks {
+					if reason := chk.Unapproved(oc.cmd); reason != "" {
+						issues = append(issues, fmt.Sprintf("task %s: %s command %s", oc.id, oc.kind, reason))
+					}
+				}
+				for _, w := range chk.Warnings() {
+					fmt.Fprintf(os.Stderr, "beehive: WARNING %s: %s\n", checksRel, w)
 				}
 			}
 			if len(issues) > 0 {

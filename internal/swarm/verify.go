@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/spencerharmon/beehive/internal/checks"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -254,6 +255,22 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 		}
 	}
 
+	// (4.5) Approved-check-framework gate. When this handoff carries a declared
+	// check (Check: or Verify-After-Merge:), that command MUST match an approved
+	// framework stub in the submodule's CHECKS.md — the whitelist that refuses a bare
+	// source-grep DoD (grep -q Symbol repo/... proves the code was written, never that
+	// the effect works). This runs on ANY gated terminal handoff (not only DONE) so a
+	// work pass heading to NEEDS-REVIEW with an unapproved check is told immediately,
+	// informing the agent of the lint problem the same way the other invariants do. An
+	// undeclared check (check=none / no command) is out of scope here (that coverage
+	// gap is `beehive plan lint`'s). Read from the committed task (ct) — the check that
+	// is actually landing.
+	if ct.Check() != "" || ct.VerifyAfterMerge() != "" {
+		if hint := checkFrameworkGate(sel.Submodule.Name, hiveAbs, ct); hint != "" {
+			return hint, nil
+		}
+	}
+
 	// (5) Definition-of-done check. When this handoff ENTERS DONE and the task
 	// declares a `Check:` command, that command IS the machine definition of done:
 	// run it and REFUSE the DONE unless it passes (exit 0). This gates the DONE
@@ -338,6 +355,57 @@ func (r *Runner) checkGate(ctx context.Context, sel *selectt.Selection, taskID, 
 		return checkFailPrompt(taskID, check, o.out), nil
 	}
 	return "", nil
+}
+
+// checkFrameworkGate validates a task's declared check command(s) against the
+// submodule's approved-framework registry (CHECKS.md). It returns a fix-forward
+// prompt when a declared Check:/Verify-After-Merge: matches no approved stub (or
+// CHECKS.md is absent while a check is declared), else "". Pure/deterministic: it
+// only reads the beehive-layer CHECKS.md.
+func checkFrameworkGate(subName, hiveAbs string, ct *plan.Task) string {
+	checksPath := filepath.Join(hiveAbs, "submodules", subName, checks.ChecksFile)
+	chk, err := checks.Load(checksPath)
+	if errors.Is(err, checks.ErrNoChecksFile) {
+		return checkNoRegistryPrompt(ct.ID, subName)
+	}
+	if err != nil {
+		// A malformed registry is an author defect the agent can fix forward, not an
+		// infra failure — hand it back rather than fail-closed looping through GC.
+		return fmt.Sprintf(
+			"Handoff gate FAILED: %[2]s/CHECKS.md does not parse (%[3]v). Fix the check-framework registry "+
+				"(see docs/checks-framework-registry.md), commit it, and leave the status; the gate re-runs.",
+			ct.ID, subName, err)
+	}
+	for _, c := range []string{ct.Check(), ct.VerifyAfterMerge()} {
+		if reason := chk.Unapproved(c); reason != "" {
+			return checkUnapprovedFrameworkPrompt(ct.ID, subName, c, reason)
+		}
+	}
+	return ""
+}
+
+// checkNoRegistryPrompt tells the agent the submodule has no approved-framework
+// registry yet while its task declares a check.
+func checkNoRegistryPrompt(taskID, subName string) string {
+	return fmt.Sprintf(
+		"Handoff gate FAILED: %[1]s declares a definition-of-done check but submodules/%[2]s/CHECKS.md "+
+			"(the approved-check-framework registry) does not exist. A check must invoke a REAL test framework "+
+			"(a test runner, a compile, a build-pipeline/rollout status, an integration/e2e probe) — not a bare "+
+			"source grep. Create submodules/%[2]s/CHECKS.md registering the framework(s) this target uses (see "+
+			"docs/checks-framework-registry.md), point the check at a stub, commit both, and leave the status; "+
+			"the gate re-runs.",
+		taskID, subName)
+}
+
+// checkUnapprovedFrameworkPrompt tells the agent its check matches no approved
+// framework stub and must be rewritten (or a stub added).
+func checkUnapprovedFrameworkPrompt(taskID, subName, cmd, reason string) string {
+	return fmt.Sprintf(
+		"Handoff gate FAILED: %[1]s's definition-of-done check %[2]q %[3]s. Rewrite the check to invoke one of "+
+			"the approved frameworks in submodules/%[4]s/CHECKS.md (a real test runner / compile / rollout / "+
+			"integration probe — NEVER a bare `grep`/`test -f` on the source), or, if this target genuinely gained "+
+			"a new framework, add a stub for it to CHECKS.md and commit it. Then leave the status; the gate re-runs.",
+		taskID, cmd, reason, subName)
 }
 
 // checkPolicyFailPrompt renders the fix-forward prompt for a check that violates

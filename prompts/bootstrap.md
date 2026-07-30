@@ -17,6 +17,13 @@ Submodule has ROI.md, no PLAN.md. Bootstrap PLAN.md from intent.
   `--verify-after-merge '<cmd>'` for a merge-gated effect, or `--check-none` (justified in the body) for
   a task with no observable effect. The runner GATES DONE on it. Run `beehive plan lint <sm>` to confirm
   coverage. Translate the operator's stated criteria; do not invent a DoD the ROI never asked for.
+- **Every check must be an APPROVED framework in `CHECKS.md`.** Each task's `Check:`/`Verify-After-Merge:`
+  MUST MATCH a stub in `submodules/<sm>/CHECKS.md` — a real test runner / compile / build-pipeline or
+  rollout status / integration|e2e|endpoint probe. A bare source-grep matches no stub and is REFUSED.
+  `CHECKS.md` is a beehive-layer file you OWN: CREATE it for this target (register the frameworks it uses
+  — mirror another submodule's CHECKS.md), then point every check at a stub. Bootstrap does NOT complete
+  while any open task's check matches no stub (or `CHECKS.md` is missing). See
+  `docs/checks-framework-registry.md`.
 - **Weight each task on a logarithmic (base-2) priority scale (see "Weighting").**
 
 ## Weighting (logarithmic, base-2)
