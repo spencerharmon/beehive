@@ -42,6 +42,9 @@ CASES=(
     "EditorSessionNamespace|EditorSessionNamespace_buggy_namespace.cfg|fail"
     "EditorSessionNamespace|EditorSessionNamespace_buggy_liveguard.cfg|fail"
     "EditorSessionNamespace|EditorSessionNamespace_buggy_remote.cfg|fail"
+    "PlanConvergence|PlanConvergence_fixed.cfg|pass"
+    "PlanConvergence|PlanConvergence_stale_overwrite_buggy.cfg|fail"
+    "PlanConvergence|PlanConvergence_dedup_buggy.cfg|fail"
 )
 
 rc=0
