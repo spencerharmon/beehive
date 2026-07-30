@@ -35,6 +35,7 @@ CASES=(
     "TaskStatus|TaskStatus_leak_buggy.cfg|fail"
     "DependencyReadiness|DependencyReadiness_fixed.cfg|pass"
     "DependencyReadiness|DependencyReadiness_buggy.cfg|fail"
+    "DependencyReadiness|DependencyReadiness_cycle_buggy.cfg|fail"
     "ClaimRace|ClaimRace_fixed.cfg|pass"
     "ClaimRace|ClaimRace_buggy.cfg|fail"
     "EditorSessionNamespace|EditorSessionNamespace_fixed.cfg|pass"

@@ -135,21 +135,35 @@ Configs:
   recorded on `main` — `NoDoclessTerminal` violated, with trace.
 
 ### `DependencyReadiness.tla`
-Dependency readiness + the dangling-dependency refusal (`92d2ed1`, faithful to
-`internal/swarm/swarm.go taskYieldedBlocked`). A work pass may yield its task TODO
-held on a blocking dep, but only if the dep is a **real, existing task**.
+The N-task dependency graph with cross-submodule links (faithful to
+`internal/links/links.go`, `internal/select/graph.go`, and
+`internal/swarm/swarm.go taskYieldedBlocked`). Tasks depend on each other via
+`DepEdges`; a `to` id outside `Tasks` is a **phantom/dangling** dep
+(`plan.Plan.DanglingDeps`) and a `t <-> t'` pair is a **wait cycle**
+(`links.CyclicNodes`). Two independent guards toggle the broken vs fixed protocol:
+`DepGuard` (phantom dep → escalate vs silent hold) and `CycleGuard` (cycle →
+escalate vs silent hold).
 
-- `HeldImpliesRealDep` — a held (accepted-yield) task always has a real dep; a
-  phantom dep is never silently held.
-- `EventuallyResolved` — liveness: the task never wedges forever (real dep →
-  `DONE`; phantom dep → escalated `NEEDS-HUMAN`).
+- `PhantomNeverHeld` — a held (accepted-yield) task never has a phantom dep; a
+  dangling/cross-link dep is refused exactly like a local one.
+- `CycleNeverHeld` — a held task never lies on a dependency cycle; a cycle
+  escalates to `NEEDS-HUMAN` rather than silently deadlocking.
+- `EventuallyResolved` — liveness: every task reaches a terminal (real deps →
+  `DONE`; phantom or cycle → escalated `NEEDS-HUMAN`); the graph never wedges.
+
+Scenario graphs (`Tasks3/5`, `EdgesFixed/Phantom/Cycle`) are overridden into each
+cfg via `<-` because TLC cfgs cannot express `<<>>` tuple literals.
 
 Configs:
-- `DependencyReadiness_fixed.cfg` — phantom-dep refusal on. No error.
-- `DependencyReadiness_buggy.cfg` — any blocked yield accepted (pre-**`92d2ed1`**):
+- `DependencyReadiness_fixed.cfg` — both guards on. A normal chain resolves, a
+  phantom dep and a cycle each escalate. No error.
+- `DependencyReadiness_buggy.cfg` — phantom class, `DepGuard=FALSE` (pre-**`92d2ed1`**):
   a task yielded on a phantom dep is silently held forever —
   `flux:phantom-…-repin` wedged on the nonexistent `jellyfin:jellyfin-image-build`
-  — `HeldImpliesRealDep` (and `EventuallyResolved`) violated.
+  — `PhantomNeverHeld` (and `EventuallyResolved`) violated.
+- `DependencyReadiness_cycle_buggy.cfg` — cycle class, `CycleGuard=FALSE`: two
+  mutually-dependent tasks are silently held instead of escalating —
+  `CycleNeverHeld` (and `EventuallyResolved`) violated.
 
 ### `ClaimRace.tla`
 The commit-race claim protocol between two concurrent passes (faithful to

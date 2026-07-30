@@ -105,14 +105,22 @@ the `Resolve` action and treats `NEEDS-HUMAN` as terminal; this was surfaced by 
 
 ## Layer 2 — `DependencyReadiness.tla`
 
-Dependency readiness + the dangling-dependency refusal (`92d2ed1`).
+The N-task dependency graph with cross-submodule links (`internal/links/links.go`,
+`internal/select/graph.go`) and the two silent-wedge failure classes it forbids: a
+dangling/phantom dep (`92d2ed1`) and a dependency cycle. The module models N tasks
+with `DepEdges` (a `to` outside `Tasks` is phantom; `t<->t'` is a cycle), toggled by
+`DepGuard` (phantom → escalate vs silent HELD) and `CycleGuard` (cycle → escalate vs
+silent HELD). Scenario graphs (`Tasks3/5`, `EdgesFixed/Phantom/Cycle`) are overridden
+into each cfg via `<-` because TLC cfgs cannot express `<<>>` tuple literals.
 
 | Spec element | Kind | Code (`internal/…`) | Test / guard |
 |---|---|---|---|
-| `Yield` (real dep → HELD; phantom → loud escalate) | action + guard | `swarm.go:2092 taskYieldedBlocked` (accept a blocked yield only if every dep is a real task — local via `plan.Blocked`, cross via `selectt.LoadEdges`; fail-loud on a phantom) | `swarm_test.go TestWorkYieldOnPhantomDepFailsLoud` |
-| `DepCompletes` / `Unblock` / `ReadyFromTodo` | actions | selector readiness (`plan.Plan.Candidates` dep gate) | `plan_test.go TestDanglingDeps`; `plan.Plan.DanglingDeps` (`plan.go:578`) |
-| `HeldImpliesRealDep` | invariant | phantom-dep refusal in `taskYieldedBlocked` | `DependencyReadiness_buggy.cfg` proves a phantom dep is silently held without the guard |
-| `EventuallyResolved` | liveness | real dep completes → task proceeds; phantom dep escalates | `DependencyReadiness_fixed.cfg` |
+| `Yield` (real dep → HELD; phantom → escalate; cycle → escalate) | action + guards | `swarm.go taskYieldedBlocked` (accept a blocked yield only if every dep is a real task — local via `plan.Blocked`, cross via `selectt.LoadEdges`; fail-loud on a phantom); `select/graph.go InCycle` + `select/select.go graphGate` exclude a cyclic task; `links.CyclicNodes` (Tarjan SCC) | `swarm_test.go TestWorkYieldOnPhantomDepFailsLoud`; `select` `TestCyclicTasksNotSelected`; `links` `TestCyclicNodes`/`TestCycleExported` |
+| `HasPhantom` / `RealDeps` / `DepsAllDone` | operators | dangling local dep (`plan.Plan.DanglingDeps`, `plan.go`); cross-link resolution (`select/graph.go crossDepSatisfied`) | `plan_test.go TestDanglingDeps` |
+| `OnCycle` (reachability over real edges) | operator | `links.Cycle` / `links.CyclicNodes` over the combined graph; `Graph.Validate` (pre-commit / `beehive lint` cycle refusal); `links.AddDep` cycle-rejecting write | `links` `TestCycle*`; `TestPreCommitDepCycleGuardE2E` |
+| `PhantomNeverHeld` | invariant | phantom-dep refusal in `taskYieldedBlocked` | `DependencyReadiness_buggy.cfg` proves a phantom dep is silently held without `DepGuard` |
+| `CycleNeverHeld` | invariant | cyclic-task exclusion → escalation rather than silent hold (`graphGate` + `InCycle`) | `DependencyReadiness_cycle_buggy.cfg` proves a cycle is silently held without `CycleGuard` |
+| `EventuallyResolved` | liveness | real dep completes → DONE; phantom or cycle → NEEDS-HUMAN | `DependencyReadiness_fixed.cfg` |
 
 ## Layer 3 (delivered) — `EditorSessionNamespace.tla`
 

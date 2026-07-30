@@ -1,135 +1,197 @@
 -------------------------- MODULE DependencyReadiness -------------------------
 (***************************************************************************)
-(* Layer 2 (part c): dependency readiness and the dangling-dependency         *)
-(* refusal (92d2ed1, docs/dod-verification-spec.md).  A work pass that leaves  *)
-(* its task TODO because a blocking dependency is not yet DONE is a            *)
-(* legitimate, complete yield -- the selector holds the task until the dep is  *)
-(* DONE (or a not_before elapses).  But a dependency that names NO real task   *)
-(* can never become DONE, so treating it as "not DONE -> blocked" wedges the   *)
-(* task forever while masquerading as a clean dep-yield.  That is the defect   *)
-(* that stranded flux:phantom-library-bluegreen-repin-gitea-images on the      *)
-(* nonexistent jellyfin:jellyfin-image-build.                                  *)
+(* Layer 2: the N-task dependency graph with cross-submodule links            *)
+(* (internal/links/links.go, internal/select/graph.go) and the two silent-     *)
+(* wedge failure classes it must never permit.                                 *)
 (*                                                                         *)
-(* Fix (internal/swarm/swarm.go taskYieldedBlocked): a yield is accepted ONLY  *)
-(* if every blocking dep is a real, existing task (local plan / cross link     *)
-(* graph).  A phantom dep fails the pass LOUD (an error, never a silent        *)
-(* complete), so the task escalates instead of wedging.                        *)
+(* This module GENERALIZES the original single-dependency readiness spec to a  *)
+(* graph of N tasks whose dependency edges (DepEdges) may:                      *)
 (*                                                                         *)
-(* CONSTANT DepGuard selects the phantom-dep-refusing protocol (TRUE) vs the   *)
-(* pre-fix runner that silently accepts any blocked yield (FALSE).            *)
+(*   - name a REAL task (an id in Tasks)      -> a legitimate blocking dep;     *)
+(*   - name a PHANTOM/dangling id (NOT in     -> can never become DONE          *)
+(*     Tasks, e.g. a cross-link dep whose        (plan.Plan.DanglingDeps); and  *)
+(*     target task does not exist);                                            *)
+(*   - form a CYCLE among real tasks          -> a mutual, permanent wedge      *)
+(*     (t2 -> t3 -> t2), which the selector's    (links.CyclicNodes /           *)
+(*     combined graph must detect.               selectt.Graph.InCycle).        *)
 (*                                                                         *)
-(* Properties:                                                               *)
-(*   HeldImpliesRealDep (safety)  -- a held (accepted-yield) task always has a  *)
-(*     real dependency; a phantom dep is never silently held.                  *)
-(*   EventuallyResolved (liveness) -- the task never wedges forever: it always  *)
-(*     reaches DONE (its real dep completed and it finished) or NEEDS-HUMAN     *)
-(*     (a phantom dep failed the pass loud and escalated).                     *)
+(* Two independent historical failure classes, each a SILENT deadlock:         *)
+(*                                                                         *)
+(*   PHANTOM: a work pass yields its task blocked on a dep that names no real   *)
+(*     task; pre-fix the yield is accepted and the task is HELD forever         *)
+(*     (masquerading as a clean dep-yield). Stranded                            *)
+(*     flux:phantom-library-bluegreen-repin-gitea-images on the nonexistent    *)
+(*     jellyfin:jellyfin-image-build. Fix (92d2ed1, swarm.go taskYieldedBlocked*)
+(*     ): accept a blocked yield ONLY when every dep is a real task; a phantom  *)
+(*     dep fails the pass LOUD and the task escalates to NEEDS-HUMAN.           *)
+(*                                                                         *)
+(*   CYCLE: two (or more) tasks each depend on the other, so neither can ever   *)
+(*     reach DONE. Pre-fix the selector merely EXCLUDES a cyclic task from      *)
+(*     candidates (silently held out forever); the fix detects the cycle and    *)
+(*     escalates it to NEEDS-HUMAN rather than deadlocking silently.            *)
+(*                                                                         *)
+(* CONSTANT toggles select the broken vs fixed protocol independently:         *)
+(*   DepGuard   = TRUE  -> a phantom-dep yield escalates NEEDS-HUMAN (fixed);   *)
+(*                FALSE -> a phantom-dep yield is silently HELD (buggy).        *)
+(*   CycleGuard = TRUE  -> a cycle escalates NEEDS-HUMAN (fixed);              *)
+(*                FALSE -> a cyclic task is silently HELD (buggy).             *)
+(*                                                                         *)
+(* Invariants (safety):                                                      *)
+(*   PhantomNeverHeld -- a HELD (accepted-yield) task never has a phantom dep;  *)
+(*     a dangling/cross-link phantom dep is refused exactly like a local one.   *)
+(*   CycleNeverHeld   -- a HELD task never lies on a dependency cycle; a cycle  *)
+(*     escalates instead of masquerading as a legitimate blocked yield.         *)
+(* Liveness:                                                                  *)
+(*   EventuallyResolved -- every task always reaches a terminal (DONE for a     *)
+(*     task whose real deps complete; NEEDS-HUMAN for a phantom or a cycle);    *)
+(*     the graph never wedges forever.                                         *)
 (***************************************************************************)
 EXTENDS TLC
 
-CONSTANT DepGuard  \* TRUE: a blocked yield is accepted only when the blocking dep is real
+CONSTANTS
+    Tasks,      \* the set of REAL task ids (a dep naming anything outside is phantom)
+    DepEdges,   \* set of <<from, to>> edges; `to` may be a phantom id not in Tasks
+    DepGuard,   \* TRUE: a phantom-dep yield escalates NEEDS-HUMAN instead of silent HELD
+    CycleGuard  \* TRUE: a cyclic task escalates NEEDS-HUMAN instead of silent HELD
 
-VARIABLES
-    status,   \* TODO | HELD (yielded, awaiting dep) | READY (dep satisfied) | DONE | HUMAN
-    depReal,  \* the blocking dependency names a real, existing task
-    depDone   \* the real dependency has reached DONE
+VARIABLE status   \* [Tasks -> Statuses]
+vars == <<status>>
 
-vars == <<status, depReal, depDone>>
+(***************************************************************************)
+(* Scenario graphs. TLC .cfg files cannot express << >> tuple literals in a  *)
+(* CONSTANT assignment, so each configuration overrides Tasks/DepEdges with   *)
+(* one of these operators via `Tasks <- ...` / `DepEdges <- ...`.             *)
+(***************************************************************************)
+
+Tasks3 == {"t1", "t2", "t3"}
+Tasks5 == {"t1", "t2", "t3", "t4", "t5"}
+
+\* Fixed: a normal chain (t2->t1), a phantom dep (t3->ph, ph not a task), and a
+\* real cycle (t4<->t5).
+EdgesFixed == {<<"t2", "t1">>, <<"t3", "ph">>, <<"t4", "t5">>, <<"t5", "t4">>}
+
+\* Phantom-class bug: t3 depends on the phantom (dangling) id ph.
+EdgesPhantom == {<<"t2", "t1">>, <<"t3", "ph">>}
+
+\* Cycle-class bug: t2 and t3 depend on each other (a mutual wait cycle).
+EdgesCycle == {<<"t2", "t3">>, <<"t3", "t2">>}
 
 Statuses == {"TODO", "HELD", "READY", "DONE", "HUMAN"}
 
-TypeOK ==
-    /\ status \in Statuses
-    /\ depReal \in BOOLEAN
-    /\ depDone \in BOOLEAN
+(***************************************************************************)
+(* Graph helpers over the CONSTANT edge set (state-independent).            *)
+(***************************************************************************)
+
+\* The dependency ids of task t (may include phantom ids not in Tasks).
+DepsOf(t) == { e[2] : e \in { d \in DepEdges : d[1] = t } }
+
+\* t depends on at least one id that names no real task -> a phantom/dangling dep.
+HasPhantom(t) == \E d \in DepsOf(t) : d \notin Tasks
+
+\* The real (in-graph) dependencies of t.
+RealDeps(t) == DepsOf(t) \cap Tasks
+
+\* Edges restricted to real tasks (a phantom id is a sink, never on a cycle).
+RealEdges == { e \in DepEdges : e[2] \in Tasks /\ e[1] \in Tasks }
+
+\* Reaches(a, b): a can reach b following RealEdges without revisiting (bounded
+\* DFS over the finite Tasks set -- deterministic, terminates).
+RECURSIVE Reaches(_, _, _)
+Reaches(a, b, seen) ==
+    \/ <<a, b>> \in RealEdges
+    \/ \E m \in Tasks :
+        /\ <<a, m>> \in RealEdges
+        /\ m \notin seen
+        /\ Reaches(m, b, seen \cup {a})
+
+\* t lies on a dependency cycle: it can reach itself through real edges.
+OnCycle(t) == Reaches(t, t, {})
+
+\* All of t's real dependencies have reached DONE (in state s).
+DepsAllDone(s, t) == \A d \in RealDeps(t) : s[d] = "DONE"
+
+TypeOK == status \in [Tasks -> Statuses]
 
 (***************************************************************************)
 (* Invariants                                                              *)
 (***************************************************************************)
 
-\* A task held out of selection on a dep-yield always has a REAL dependency --
-\* a phantom dep is never accepted as a legitimate blocked yield.
-HeldImpliesRealDep == (status = "HELD") => depReal
+\* A task accepted as a legitimate blocked yield (HELD) never carries a phantom
+\* dep -- a dangling/cross-link dep is refused (escalated), never silently held.
+PhantomNeverHeld == \A t \in Tasks : (status[t] = "HELD") => ~HasPhantom(t)
+
+\* A HELD task never lies on a dependency cycle -- a cycle escalates to
+\* NEEDS-HUMAN rather than silently deadlocking as a masqueraded blocked yield.
+CycleNeverHeld == \A t \in Tasks : (status[t] = "HELD") => ~OnCycle(t)
 
 (***************************************************************************)
-(* Init: the task is TODO with a single blocking dependency that is either a  *)
-(* real task or a phantom (nonexistent) id -- both explored.                  *)
+(* Init: every task starts TODO.                                            *)
 (***************************************************************************)
-Init ==
-    /\ status = "TODO"
-    /\ depReal \in BOOLEAN
-    /\ depDone = FALSE
+Init == status = [t \in Tasks |-> "TODO"]
 
 (***************************************************************************)
 (* Actions                                                                 *)
 (***************************************************************************)
 
-\* The work pass runs and finds the task not ready (its blocking dep is not DONE),
-\* so it yields. taskYieldedBlocked decides how:
-\*   fixed  (DepGuard): a REAL dep -> a legitimate yield, task HELD; a PHANTOM dep
-\*     -> fail LOUD, the pass escalates the task to NEEDS-HUMAN rather than holding
-\*     it on a dependency that can never appear.
-\*   buggy: any blocked yield is accepted -> task HELD regardless (a phantom dep is
-\*     silently held forever).
-Yield ==
-    /\ status = "TODO"
-    /\ ~depDone
-    /\ status' = IF (DepGuard /\ ~depReal) THEN "HUMAN" ELSE "HELD"
-    /\ UNCHANGED <<depReal, depDone>>
+\* A work pass runs a TODO task that is NOT immediately completable (on a cycle,
+\* has a phantom dep, or a real dep is not yet DONE) and yields. The runner
+\* decides how, per guard:
+\*   on a cycle    -> NEEDS-HUMAN if CycleGuard else silently HELD (buggy wedge);
+\*   phantom dep   -> NEEDS-HUMAN if DepGuard   else silently HELD (buggy wedge);
+\*   real dep pend -> a legitimate HELD (blocked yield), released on Unblock.
+Yield(t) ==
+    /\ status[t] = "TODO"
+    /\ (OnCycle(t) \/ HasPhantom(t) \/ ~DepsAllDone(status, t))
+    /\ status' = [status EXCEPT ![t] =
+            IF OnCycle(t)    THEN (IF CycleGuard THEN "HUMAN" ELSE "HELD")
+            ELSE IF HasPhantom(t) THEN (IF DepGuard THEN "HUMAN" ELSE "HELD")
+            ELSE "HELD"]
 
-\* A real dependency is completed by its own pass.
-DepCompletes ==
-    /\ depReal
-    /\ ~depDone
-    /\ depDone' = TRUE
-    /\ UNCHANGED <<status, depReal>>
+\* A TODO task whose real deps are already all DONE, with no cycle and no phantom,
+\* is worked straight through to DONE (no yield needed).
+DirectDone(t) ==
+    /\ status[t] = "TODO"
+    /\ ~OnCycle(t)
+    /\ ~HasPhantom(t)
+    /\ DepsAllDone(status, t)
+    /\ status' = [status EXCEPT ![t] = "DONE"]
 
-\* The dependency was already DONE when the task was selected (it completed before
-\* this task's pass ran), so the task is worked straight through -- no yield needed.
-ReadyFromTodo ==
-    /\ status = "TODO"
-    /\ depDone
-    /\ status' = "DONE"
-    /\ UNCHANGED <<depReal, depDone>>
-
-\* The held task's dependency is now DONE, so the selector releases it back into
-\* the ready pool.
-Unblock ==
-    /\ status = "HELD"
-    /\ depDone
-    /\ status' = "READY"
-    /\ UNCHANGED <<depReal, depDone>>
+\* A legitimately HELD task (no cycle, no phantom) whose real deps are now all
+\* DONE is released back into the ready pool.
+Unblock(t) ==
+    /\ status[t] = "HELD"
+    /\ ~OnCycle(t)
+    /\ ~HasPhantom(t)
+    /\ DepsAllDone(status, t)
+    /\ status' = [status EXCEPT ![t] = "READY"]
 
 \* The now-ready task is worked to completion.
-Progress ==
-    /\ status = "READY"
-    /\ status' = "DONE"
-    /\ UNCHANGED <<depReal, depDone>>
+Progress(t) ==
+    /\ status[t] = "READY"
+    /\ status' = [status EXCEPT ![t] = "DONE"]
 
-\* Terminal idle so a completed/escalated task is not read as a deadlock.
-Done ==
-    /\ status \in {"DONE", "HUMAN"}
-    /\ UNCHANGED vars
+\* Terminal idle so an all-settled graph is not read as a deadlock.
+Terminal ==
+    /\ \A t \in Tasks : status[t] \in {"DONE", "HUMAN"}
+    /\ UNCHANGED status
 
 Next ==
-    \/ Yield
-    \/ DepCompletes
-    \/ ReadyFromTodo
-    \/ Unblock
-    \/ Progress
-    \/ Done
-
-(***************************************************************************)
-(* Liveness: the task never wedges forever.                                 *)
-(***************************************************************************)
-EventuallyResolved == <>(status \in {"DONE", "HUMAN"})
+    \/ \E t \in Tasks : Yield(t)
+    \/ \E t \in Tasks : DirectDone(t)
+    \/ \E t \in Tasks : Unblock(t)
+    \/ \E t \in Tasks : Progress(t)
+    \/ Terminal
 
 Fairness ==
-    /\ WF_vars(Yield)
-    /\ WF_vars(DepCompletes)
-    /\ WF_vars(ReadyFromTodo)
-    /\ WF_vars(Unblock)
-    /\ WF_vars(Progress)
+    /\ \A t \in Tasks : WF_vars(Yield(t))
+    /\ \A t \in Tasks : WF_vars(DirectDone(t))
+    /\ \A t \in Tasks : WF_vars(Unblock(t))
+    /\ \A t \in Tasks : WF_vars(Progress(t))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
+
+(***************************************************************************)
+(* Liveness: the graph never wedges -- every task reaches a terminal.        *)
+(***************************************************************************)
+EventuallyResolved == \A t \in Tasks : <>(status[t] \in {"DONE", "HUMAN"})
 =============================================================================
