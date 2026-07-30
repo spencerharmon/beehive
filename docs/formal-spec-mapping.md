@@ -192,6 +192,25 @@ into each cfg via `<-` because TLC cfgs cannot express `<<>>` tuple literals.
 | `CycleNeverHeld` | invariant | cyclic-task exclusion → escalation rather than silent hold (`graphGate` + `InCycle`) | `DependencyReadiness_cycle_buggy.cfg` proves a cycle is silently held without `CycleGuard` |
 | `EventuallyResolved` | liveness | real dep completes → DONE; phantom or cycle → NEEDS-HUMAN | `DependencyReadiness_fixed.cfg` |
 
+### Write-time half: `AddDep` / `LinkSubmodules` (never let a cycle or a non-reciprocal link be *written*)
+
+The invariants above model the RUNTIME wedge (a cycle that already exists deadlocking
+silently). The write-time model extends the same module with the complementary
+guarantee that `AddDep`/`LinkSubmodules` must uphold so that wedge can never be
+*reached* in the first place: the write-time graph (`wedges`) is acyclic in every
+reachable state, and a submodule link (`seenBy`) is always bidirectional. `AddDep` is
+modeled as a check-then-write race (`CheckDep`/`WriteDep` over `Writers`/`ProposedEdge`,
+toggled by `AtomicWrite`) and `LinkSubmodules` as an atomic-vs-split two-direction
+write (`LinkBoth` vs `LinkOneDirection`/`LinkOtherDirection`, toggled by `AtomicLink`).
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `CheckDep`/`WriteDep` (`AtomicWrite`) | actions + toggle | `links.go AddDep`: `l.Deps = append(l.Deps, e); if c := cycle(l.Deps); c != nil { undo }` — the append-then-check-then-undo sequence happens with no yield of control in between, i.e. atomically re-validated against the live graph, matching `AtomicWrite = TRUE` | `links` `TestAddDepRejectsCycle`/`TestAddDepConcurrent*` |
+| `WHasCycle` (parameterized cycle check) | operator | `links.go cycle()` / `HasCycle()` | `links` `TestCycle*` |
+| `LinkBoth`/`LinkOneDirection`/`LinkOtherDirection` (`AtomicLink`) | actions + toggle | `links.go LinkSubmodules(a, b)`: both `add(a)`/`add(b)` mutate the same in-memory `Submodules` slice before a single `Save` — no partial state is ever persisted, matching `AtomicLink = TRUE` | `links` `TestLinkSubmodulesReciprocal` |
+| `NoCycleWritten` | invariant | `AddDep`'s cycle-rejecting write (`links.go:94-97`) | `DependencyReadiness_writetime_buggy.cfg` proves a race between two concurrent `AddDep` calls (each checking a stale pre-write graph) can jointly write a cycle neither call would permit alone, without `AtomicWrite` |
+| `ReciprocalLinks` | invariant | `LinkSubmodules`'s single-`Save` atomic write of both directions | `DependencyReadiness_writetime_buggy.cfg` proves a split (non-atomic) write of the two link directions exposes a non-reciprocal intermediate state, without `AtomicLink` |
+
 ## Layer 2 — `Selection.tla`
 
 The deterministic task-selection layer (`internal/select/select.go` `Select` +

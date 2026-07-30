@@ -38,6 +38,10 @@ CASES=(
     "DependencyReadiness|DependencyReadiness_fixed.cfg|pass"
     "DependencyReadiness|DependencyReadiness_buggy.cfg|fail"
     "DependencyReadiness|DependencyReadiness_cycle_buggy.cfg|fail"
+    # Write-time acyclicity: AddDep/LinkSubmodules must never let a cycle or a
+    # non-reciprocal link be WRITTEN in the first place (writetime/acyclic).
+    "DependencyReadiness|DependencyReadiness_writetime_fixed.cfg|pass"
+    "DependencyReadiness|DependencyReadiness_writetime_buggy.cfg|fail"
     "ClaimRace|ClaimRace_fixed.cfg|pass"
     "ClaimRace|ClaimRace_buggy.cfg|fail"
     "EditorSessionNamespace|EditorSessionNamespace_fixed.cfg|pass"
