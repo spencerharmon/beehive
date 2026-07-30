@@ -432,7 +432,7 @@ func (c *Claimer) RecordReviewCommit(ctx context.Context, taskID, sha string) er
 // before any turn loop or session exists, so there is no later finish() to
 // piggyback the publish on. A publish conflict is benign (a peer already
 // resolved this exact task) and is swallowed, matching BounceUnreachable/Release.
-func (c *Claimer) FinalizeAlreadyMerged(ctx context.Context, taskID, gitlinkPath, note string) error {
+func (c *Claimer) FinalizeAlreadyMerged(ctx context.Context, taskID, gitlinkPath, note string, commits []string, docAbs, docRel string) error {
 	p, err := c.load()
 	if err != nil {
 		return err
@@ -441,13 +441,30 @@ func (c *Claimer) FinalizeAlreadyMerged(ctx context.Context, taskID, gitlinkPath
 	if t == nil {
 		return fmt.Errorf("finalize-already-merged: task %q absent", taskID)
 	}
-	if err := t.FinalizeAlreadyMerged(note, c.now()); err != nil {
+	if err := t.FinalizeAlreadyMerged(note, c.now(), commits); err != nil {
 		return err
 	}
 	if err := c.save(p); err != nil {
 		return err
 	}
-	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "finalize-already-merged"), c.planRel(), gitlinkPath); err != nil && err != git.ErrNothing {
+	paths := []string{c.planRel(), gitlinkPath}
+	// Mirror the stamped commit set into the change doc's Beehive-Commits header so
+	// the PLAN tag and the doc never disagree (the same invariant the handoff gate
+	// enforces on the normal path). Best-effort on a missing/unreadable doc.
+	if docAbs != "" && len(commits) > 0 {
+		if b, rerr := os.ReadFile(docAbs); rerr == nil {
+			nb := plan.SetDocCommitsHeader(string(b), commits)
+			if nb != string(b) {
+				if werr := os.WriteFile(docAbs, []byte(nb), 0o644); werr != nil {
+					return werr
+				}
+			}
+			if docRel != "" {
+				paths = append(paths, docRel)
+			}
+		}
+	}
+	if err := c.Git.CommitPaths(ctx, stampMsg(taskID, "finalize-already-merged"), paths...); err != nil && err != git.ErrNothing {
 		return err
 	}
 	if c.Publish != nil {

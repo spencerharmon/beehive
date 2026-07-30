@@ -496,7 +496,7 @@ func TestFinalizeAlreadyMergedPublishesImmediately(t *testing.T) {
 		},
 	}
 	note := fmt.Sprintf("already merged into tracked main (%s) by a prior interrupted review; runner-finalized DONE (no re-review)", mergedTip)
-	if err := c.FinalizeAlreadyMerged(ctx, "T1", "submodules/sm/repo", note); err != nil {
+	if err := c.FinalizeAlreadyMerged(ctx, "T1", "submodules/sm/repo", note, []string{mergedTip}, "", ""); err != nil {
 		t.Fatalf("finalize-already-merged: %v", err)
 	}
 	if !published {
@@ -512,6 +512,9 @@ func TestFinalizeAlreadyMergedPublishesImmediately(t *testing.T) {
 	tk := mp.Find("T1")
 	if tk.Status != plan.Done {
 		t.Fatalf("main status = %s, want DONE", tk.Status)
+	}
+	if !tk.CommitsSet || len(tk.Commits) != 1 || tk.Commits[0] != mergedTip {
+		t.Fatalf("main commits= must be stamped with the merged tip %s, got set=%v %v", mergedTip, tk.CommitsSet, tk.Commits)
 	}
 	if tk.Session != "" || !tk.Heartbeat.IsZero() {
 		t.Fatal("finalize-already-merged must release the claim on main")
@@ -531,7 +534,7 @@ func TestFinalizeAlreadyMergedPublishesImmediately(t *testing.T) {
 // TestFinalizeAlreadyMergedGuarded: only legal from NEEDS-REVIEW.
 func TestFinalizeAlreadyMergedGuarded(t *testing.T) {
 	c, ctx := setup(t)
-	if err := c.FinalizeAlreadyMerged(ctx, "T1", "submodules/sm/repo", "note"); err == nil {
+	if err := c.FinalizeAlreadyMerged(ctx, "T1", "submodules/sm/repo", "note", nil, "", ""); err == nil {
 		t.Fatal("finalize-already-merged on TODO must error")
 	}
 }

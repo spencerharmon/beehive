@@ -170,7 +170,7 @@ func (t *Task) BounceUnreachable(reason string) error {
 // bookkeeping, it never approves anything itself. note is appended as a body
 // line in the same free-form convention BounceUnreachable/Strand use. Valid
 // from NEEDS-REVIEW or NEEDS-ARBITRATION. Releases the active claim.
-func (t *Task) FinalizeAlreadyMerged(note string, now time.Time) error {
+func (t *Task) FinalizeAlreadyMerged(note string, now time.Time, commits []string) error {
 	if t.Status != StatusReview && t.Status != StatusArb {
 		return fmt.Errorf("plan: finalize-already-merged on non-reviewable task %s (%s)", t.ID, t.Status)
 	}
@@ -181,6 +181,14 @@ func (t *Task) FinalizeAlreadyMerged(note string, now time.Time) error {
 	t.Status = StatusDone
 	t.Session = ""
 	t.Heartbeat = time.Time{}
+	// Record the commits this already-merged handoff landed, so a runner-finalized
+	// interrupted review does not leave commits=none on a task that genuinely
+	// shipped code (the doc's Beehive-Commits header / review= already carry them).
+	// An empty set is left untouched (a genuine zero-diff finalize stays none).
+	if len(commits) > 0 {
+		t.Commits = commits
+		t.CommitsSet = true
+	}
 	t.appendNote("Review (runner-finalized): " + note)
 	return nil
 }

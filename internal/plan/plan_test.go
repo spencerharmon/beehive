@@ -256,11 +256,14 @@ func TestBounceUnreachableGuardedAndRequiresReason(t *testing.T) {
 // review's bookkeeping — it is not a verdict on a fresh review).
 func TestFinalizeAlreadyMerged(t *testing.T) {
 	tk := &Task{ID: "a", Status: StatusReview, Session: "bee-1", Heartbeat: time.Now(), Attempts: 1}
-	if err := tk.FinalizeAlreadyMerged("already merged into tracked main (a02a886) by a prior interrupted review; runner-finalized DONE (no re-review)", time.Now()); err != nil {
+	if err := tk.FinalizeAlreadyMerged("already merged into tracked main (a02a886) by a prior interrupted review; runner-finalized DONE (no re-review)", time.Now(), []string{"a02a886"}); err != nil {
 		t.Fatal(err)
 	}
 	if tk.Status != StatusDone {
 		t.Fatalf("status = %s, want DONE", tk.Status)
+	}
+	if !tk.CommitsSet || len(tk.Commits) != 1 || tk.Commits[0] != "a02a886" {
+		t.Fatalf("finalize must stamp the merged commit set, got set=%v %v", tk.CommitsSet, tk.Commits)
 	}
 	if tk.Session != "" || !tk.Heartbeat.IsZero() {
 		t.Fatal("finalize-already-merged must release the claim")
@@ -281,16 +284,16 @@ func TestFinalizeAlreadyMergedGuardedAndRequiresNote(t *testing.T) {
 	// Valid from either reviewable status (NEEDS-REVIEW or NEEDS-ARBITRATION):
 	// an interrupted review's merge can be finalized from both.
 	for _, st := range []Status{StatusReview, StatusArb} {
-		if err := (&Task{ID: "a", Status: st}).FinalizeAlreadyMerged("note", time.Now()); err != nil {
+		if err := (&Task{ID: "a", Status: st}).FinalizeAlreadyMerged("note", time.Now(), nil); err != nil {
 			t.Fatalf("finalize-already-merged rejected on %s: %v", st, err)
 		}
 	}
 	for _, st := range []Status{StatusTODO, StatusDone, StatusHuman} {
-		if err := (&Task{ID: "a", Status: st}).FinalizeAlreadyMerged("note", time.Now()); err == nil {
+		if err := (&Task{ID: "a", Status: st}).FinalizeAlreadyMerged("note", time.Now(), nil); err == nil {
 			t.Fatalf("finalize-already-merged allowed on %s", st)
 		}
 	}
-	if err := (&Task{ID: "a", Status: StatusReview}).FinalizeAlreadyMerged("", time.Now()); err == nil {
+	if err := (&Task{ID: "a", Status: StatusReview}).FinalizeAlreadyMerged("", time.Now(), nil); err == nil {
 		t.Fatal("finalize-already-merged allowed with an empty note")
 	}
 }

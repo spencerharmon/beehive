@@ -1399,6 +1399,9 @@ func TestReviewDispatchFinalizesByRecordWhenBranchGone(t *testing.T) {
 	if tk.Status != plan.Done {
 		t.Fatalf("status = %s, want DONE (finalized from the durable record)", tk.Status)
 	}
+	if !tk.CommitsSet || len(tk.Commits) != 1 || tk.Commits[0] != implSHA {
+		t.Fatalf("finalize-by-record must STAMP commits=<reviewed sha %s> (not leave commits=none on shipped code); got set=%v %v", implSHA, tk.CommitsSet, tk.Commits)
+	}
 	if tk.Session != "" || !tk.Heartbeat.IsZero() {
 		t.Fatal("finalize must release the claim")
 	}

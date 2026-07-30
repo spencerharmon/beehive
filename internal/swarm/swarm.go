@@ -2920,10 +2920,31 @@ func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Sele
 		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
 		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
 	}
-	if err := cl.FinalizeAlreadyMerged(ctx, sel.Task.ID, rel, note); err != nil {
+	commits, docAbs, docRel := r.finalizeCommitRecord(sel, absRoot, sha)
+	if err := cl.FinalizeAlreadyMerged(ctx, sel.Task.ID, rel, note, commits, docAbs, docRel); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// finalizeCommitRecord resolves the commit set + change-doc paths a
+// runner-finalized already-merged review should stamp. It PREFERS the doc's
+// existing Beehive-Commits header (the Work pass's authoritative record of the
+// real session commits) so a multi-commit task keeps its full set; it falls back
+// to the single proven-merged sha when the doc has no usable header. Without this
+// the finalize path left commits=none on a task that genuinely shipped code.
+func (r *Runner) finalizeCommitRecord(sel *selectt.Selection, absRoot, mergedSha string) (commits []string, docAbs, docRel string) {
+	commits = []string{mergedSha}
+	fsPath, rel, ok := changeDocPath(sel, absRoot)
+	if !ok {
+		return commits, "", ""
+	}
+	if b, err := os.ReadFile(fsPath); err == nil {
+		if shas, has := plan.ParseDocCommits(string(b)); has && len(shas) > 0 {
+			commits = shas
+		}
+	}
+	return commits, fsPath, rel
 }
 
 func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selection, branch, absRoot string) (bool, error) {
@@ -2996,7 +3017,8 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
 		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
 	}
-	if err := cl.FinalizeAlreadyMerged(ctx, sel.Task.ID, rel, note); err != nil {
+	commits, docAbs, docRel := r.finalizeCommitRecord(sel, absRoot, branchTip)
+	if err := cl.FinalizeAlreadyMerged(ctx, sel.Task.ID, rel, note, commits, docAbs, docRel); err != nil {
 		return false, err
 	}
 	return true, nil
