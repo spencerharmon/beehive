@@ -182,6 +182,31 @@ since cfgs cannot express function literals.
 | `NoPrematureDispatch` | invariant | `Candidates` holds a TODO task out of the main tier until `NotBeforeReached(now)` | `Selection_premature_buggy.cfg` proves early dispatch reachable when the gate is ignored (`GateHonored=FALSE`) |
 | `EventuallySelected` / `NoStarvation` | liveness | weighted-random with positive weight for every ready candidate (`weightedOrder`/`pickTask`) — every ready task eventually selected | `Selection_fixed.cfg` (holds); `Selection_starvation_buggy.cfg` reproduces the starvation lasso when fairness is dropped (`FairSelect=FALSE`) |
 
+## Layer 2 capstone — `CrossLayer.tla`
+
+The cross-layer COMPOSITION of `TaskStatus.tla`'s false-DONE gates with
+`DependencyReadiness.tla`'s dependency-edge readiness. Each lower spec proves its
+property in ISOLATION — `TaskStatus.NoFalseDone` (a task reaches DONE only with
+durable+merged work whose DoD `Check` passes, `72e2b4a`/`92d2ed1`) and
+`DependencyReadiness` (a dependent unblocks when its dep is DONE) — but neither says
+what happens when they MEET: a false-DONE is exactly the STATUS a downstream selector
+reads to unblock a dependent, so it PROPAGATES (the dependent builds on phantom /
+unverified upstream work). This module models one edge — a producer dep `P` running a
+distilled TaskStatus lifecycle (`PDoWork`→`PHandoff`→`PApprove`, each DONE-ward edge
+carrying the same `Gated` durability toggle and `CheckGated` DoD toggle) and a
+consumer dependent `C` (`CUnblock` keyed on the OBSERVED `pStatus="DONE"`, the
+realistic `crossDepSatisfied` selector behaviour, then `CProgress`). The composed
+invariant proves the two gates keep the observed-DONE unlock honest ACROSS the edge.
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `PHandoff` / `PApprove` DONE gates | action + guards | `swarm/verify.go verifyGate` (durable-on-origin `RemoteContainsCommit` `72e2b4a`; DoD `Check` inv 5 `92d2ed1`) — the same gates `TaskStatus.HandoffToReview`/`ReviewApprove` model, here on the dep of an edge | `swarm_test.go TestVerifyGateRefusesLocalOnlyUnpushedCommit`; DoD-check regression (`92d2ed1`) |
+| `CUnblock` (unlock on observed dep DONE) | action | `select/graph.go crossDepSatisfied` / `select.go graphGate` — a dependent's cross/local dep is satisfied only when the dep task's status is DONE | `select` cross-dep readiness tests |
+| `PTrulyDone` (durable ∧ merged ∧ DoD) | operator | the composition of `verify.go` durability + inv-5 DoD — `TaskStatus.NoFalseDone`'s antecedent, reused as the honest-unlock predicate | — |
+| `NoPrematureUnlock` | invariant | the false-DONE gates enforced on a dep BEFORE any dependent unblocks (`verifyGate` + `crossDepSatisfied` composed) | `CrossLayer_buggy.cfg` proves a non-durable false-DONE prematurely unlocks the dependent (durability gate off); `CrossLayer_buggy_check.cfg` proves a DoD false-DONE does too (check gate off) — both gates must compose across the edge |
+| `ConsumerNeverPhantom` | invariant | the dependent never finishes built on vanished upstream work | `CrossLayer_buggy.cfg` |
+| `EventuallyBothDone` | liveness | gates on → dep earns DONE, dependent then unblocks and completes; the edge never wedges | `CrossLayer_fixed.cfg` |
+
 ## Layer 3 (delivered) — `EditorSessionNamespace.tla`
 
 The beehived chat-diff editor Manager reclaim/gc dance (faithful to

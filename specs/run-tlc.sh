@@ -47,6 +47,12 @@ CASES=(
     "Selection|Selection_fixed.cfg|pass"
     "Selection|Selection_starvation_buggy.cfg|fail"
     "Selection|Selection_premature_buggy.cfg|fail"
+    # CrossLayer: the capstone composition of TaskStatus's false-DONE gates with
+    # DependencyReadiness's edge -- a false-DONE dep prematurely unlocks its
+    # dependent (crosslayer / composed / false-done / premature-unlock).
+    "CrossLayer|CrossLayer_fixed.cfg|pass"
+    "CrossLayer|CrossLayer_buggy.cfg|fail"
+    "CrossLayer|CrossLayer_buggy_check.cfg|fail"
 )
 
 rc=0
