@@ -60,6 +60,13 @@ CASES=(
     "DeferBound|DeferBound_buggy.cfg|fail"
     "BootstrapRace|BootstrapRace_fixed.cfg|pass"
     "BootstrapRace|BootstrapRace_buggy.cfg|fail"
+    # TaskRemovalRace: a work pass races a concurrent task/PLAN removal (reconcile
+    # or operator). Fixed re-checks presence before publish and exits cleanly on a
+    # vanished task; the buggy cfgs reproduce an orphan write and a non-terminating
+    # lost-work loop (removal / vanish).
+    "TaskRemovalRace|TaskRemovalRace_fixed.cfg|pass"
+    "TaskRemovalRace|TaskRemovalRace_orphan_buggy.cfg|fail"
+    "TaskRemovalRace|TaskRemovalRace_loop_buggy.cfg|fail"
 )
 
 rc=0
