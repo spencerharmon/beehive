@@ -56,6 +56,8 @@ CASES=(
     "PlanConvergence|PlanConvergence_fixed.cfg|pass"
     "PlanConvergence|PlanConvergence_stale_overwrite_buggy.cfg|fail"
     "PlanConvergence|PlanConvergence_dedup_buggy.cfg|fail"
+    "DeferBound|DeferBound_fixed.cfg|pass"
+    "DeferBound|DeferBound_buggy.cfg|fail"
 )
 
 rc=0

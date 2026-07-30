@@ -265,6 +265,33 @@ is what `NoForeignReclaim` catches; the same namespace scoping fixes both.
 `recoverMissingWorktree`'s "prefer the surviving local ref over an older remote
 tip" is captured by `Recoverable` counting `localBranch` first.
 
+## Layer 2 — `DeferBound.tla`
+
+The self-defer convergence-wait termination behind `internal/plan/mutate.go`
+`Defer` (bumps `not_before` + increments `Defers`, gated by `plan.MaxDefers`)
+and `Reopen` (`Defers = 0`). This is the mechanism behind `beehive task defer`
+and the runner's own re-check scheduling (HONEYBEE.md's "TODO -> TODO
+(self-defer)"): a work pass that did the work but finds the world has not
+converged yet re-checks after `until`, used for GitOps reconcile, CI runs, and
+the `Verify-After-Merge` successor-check's merge-gated live effect (the
+follow-up flagged in the Roadmap below). Failure class = LIVELOCK: a task
+defers forever on a convergence that never arrives (never escalates), or gives
+up before the effect actually lands. The external "converged" effect is
+modeled as a deliberately UNFAIR (adversarial) environment action — real
+convergence is never assumed to eventually happen, so termination must hold
+even if it never does. CONSTANT `Bounded` toggles the fix (`Defer` refuses
+past `MaxDefers` and the task escalates NEEDS-HUMAN instead, matching
+`swarm.go`'s defer-cap refusal) vs the buggy unbounded behavior (`Defer` stays
+enabled forever, no escalation edge exists).
+
+| Spec element | Kind | Code (`internal/…`) | Test / guard |
+|---|---|---|---|
+| `Defer` (bump not_before, increment Defers, capped) | action + guard | `plan/mutate.go Defer`; the cap enforcement is `swarm.go:2214` "work pass self-deferred task past the defer cap" refusal | `mutate_test.go` Defer tests; `swarm_test.go` defer-cap regression |
+| `Escalate` (bound exhausted, unconverged -> NEEDS-HUMAN) | action | the only remaining move once `swarm.go:2214-2215` refuses another `Defer` past `plan.MaxDefers` | `swarm_test.go` defer-cap refusal test |
+| `Reopen` (`Defers = 0` reset) | operator | `plan/mutate.go Reopen` — a fresh operator reopen gets a fresh defer budget | `mutate_test.go TestReopen*` |
+| `NoDoneWhileUnconverged` | invariant | `Progress` (leaving the defer loop) is gated on the real external effect, never merely on having deferred enough times | holds in both cfgs — the bug is a liveness failure, not a false-progress safety one |
+| `Terminates` | liveness | `plan.MaxDefers` bound + `swarm.go`'s defer-cap refusal together guarantee the task always reaches DONE or NEEDS-HUMAN, regardless of whether the awaited effect ever converges | `DeferBound_fixed.cfg` (holds); `DeferBound_buggy.cfg` reproduces the livelock — Defer fires forever, Converge/Escalate never taken, Terminates violated with a counterexample trace |
+
 ## Adjacent-path audit — the handoff terminal-leak shape
 
 `TaskStatus.tla`'s `NoDoclessTerminal` (cfgs `TaskStatus_leak_{buggy,fixed}.cfg`)
@@ -341,7 +368,11 @@ they are deliberately NOT modeled yet:
 - **`Verify-After-Merge` successor check task** — the merge-gated live-effect DoD
   carried by a runner-spawned successor task. When it lands, `TaskStatus.tla`
   gains a successor-check state and `NoFalseDone` extends to the merge-gated
-  effect. (Only the pre-merge `Check` gate is landed and modeled today.)
+  effect. (Only the pre-merge `Check` gate is landed and modeled today.) The
+  self-defer convergence-wait TERMINATION this successor check will lean on —
+  bounded re-check, escalate on exhaustion — is now modeled independently by
+  `DeferBound.tla` (Layer 2), so this follow-up need only add the successor
+  STATE, not re-derive its termination argument.
 - **DoD authoring/teaching layer** — post-select check injection, CLI verbs,
   generated-prompt edits. Prompt-only; no protocol invariant to model.
 
