@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
@@ -185,6 +186,19 @@ func (r *Runner) finalizeReviewMerge(ctx context.Context, sel *selectt.Selection
 		if _, err := wtg.RevParse(ctx, beeBranch); err != nil {
 			return "", "", nil
 		}
+		trackedRef = tracked
+	}
+
+	// The task's OWN code commits are those reachable from the implementer branch
+	// but NOT from the tracked-branch tip the bee was cut from. Resolve that tip to a
+	// FIXED sha NOW, before any merge/push mutates a ref, so the recorded set is the
+	// implementer's real commits — never the runner's synthetic merge commit, and
+	// never just the resulting HEAD tip (a fast-forward or multi-commit task would
+	// otherwise drop every sha but one). This is the commits= tag's contract, the
+	// same reachability the Work-path discoverSessionCommits reasons about.
+	baseSha, err := wtg.RevParse(ctx, trackedRef)
+	if err != nil {
+		return "", "", fmt.Errorf("review-merge: resolving tracked base %q: %w", trackedRef, err)
 	}
 
 	// (1) Fold in a tracked-branch tip that advanced since the worktree was cut, so
@@ -270,21 +284,27 @@ func (r *Runner) finalizeReviewMerge(ctx context.Context, sel *selectt.Selection
 		}
 	}
 
-	// (5) Stamp the real merge sha into the PLAN commits= tag + doc header on the
-	// hive branch, so the gate's commit invariants and finish()'s pin see it.
-	if serr := r.stampReviewMerge(ctx, sel, absRoot, mergeSHA); serr != nil {
+	// (5) Record the implementer's REAL code commits (baseSha..beeRef) — not the
+	// merge/HEAD tip — into the PLAN commits= tag + doc Beehive-Commits header. An
+	// empty range (a branch with no commits beyond the tracked base: a zero-diff
+	// approve) records commits=none.
+	taskCommits, terr := revListRange(ctx, wtg, baseSha, beeRef)
+	if terr != nil {
+		return "", "", fmt.Errorf("review-merge: listing task commits %s..%s: %w", baseSha, beeRef, terr)
+	}
+	if serr := r.stampReviewMerge(ctx, sel, absRoot, taskCommits, mergeSHA); serr != nil {
 		return "", "", serr
 	}
 	return "", "", nil
 }
 
-// stampReviewMerge writes the runner-produced merge sha into the PLAN task's
-// `commits=` tag and the change doc's first-line `<!-- Beehive-Commits: -->`
-// header (single source: internal/plan helpers, shared with the CLI + gate), then
-// commits both on the hive branch so finish() carries them to main.
-func (r *Runner) stampReviewMerge(ctx context.Context, sel *selectt.Selection, absRoot, sha string) error {
-	commits := []string{sha}
-
+// stampReviewMerge writes the implementer's real code commits into the PLAN
+// task's `commits=` tag and the change doc's first-line `<!-- Beehive-Commits: -->`
+// header (single source: internal/plan helpers, shared with the CLI + gate) — the
+// SAME slice into both so they can never drift — then commits both on the hive
+// branch so finish() carries them to main. mergeTip names the resulting merge/HEAD
+// tip for the commit message only (the pointer is pinned separately by finish()).
+func (r *Runner) stampReviewMerge(ctx context.Context, sel *selectt.Selection, absRoot string, commits []string, mergeTip string) error {
 	planPath := sel.Submodule.PlanPath()
 	pb, err := os.ReadFile(planPath)
 	if err != nil {
@@ -320,7 +340,8 @@ func (r *Runner) stampReviewMerge(ctx context.Context, sel *selectt.Selection, a
 	if err != nil {
 		return fmt.Errorf("stamp merge: resolving plan path: %w", err)
 	}
-	msg := fmt.Sprintf("plan: stamp %s merge %s (runner-owned review merge)\n\nBeehive: %s plan", sel.Task.ID, sha, sel.Task.ID)
+	msg := fmt.Sprintf("plan: stamp %s commits %s (runner-owned review merge tip %s)\n\nBeehive: %s plan",
+		sel.Task.ID, plan.CommitsTagValue(commits), mergeTip, sel.Task.ID)
 	if err := r.Git.CommitPaths(ctx, msg, planRel, docRel); err != nil && !errors.Is(err, git.ErrNothing) {
 		return fmt.Errorf("stamp merge: committing %s + %s: %w", planRel, docRel, err)
 	}
@@ -344,6 +365,24 @@ func changeDocPath(sel *selectt.Selection, absRoot string) (fsPath, rel string, 
 		}
 	}
 	return "", "", false
+}
+
+// revListRange returns the commit shas in `base..tip` (reachable from tip, not
+// from base) in git's default newest-first order — the implementer's own commits
+// relative to the tracked-branch base. An empty range yields an empty slice
+// (rendered as commits=none by the plan helpers), never an error.
+func revListRange(ctx context.Context, wtg *git.Repo, base, tip string) ([]string, error) {
+	out, err := wtg.Run(ctx, "rev-list", base+".."+tip)
+	if err != nil {
+		return nil, err
+	}
+	var shas []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			shas = append(shas, line)
+		}
+	}
+	return shas, nil
 }
 
 // conflictReviewHint is the fix-forward prompt handed to a Review/Arbitrate agent

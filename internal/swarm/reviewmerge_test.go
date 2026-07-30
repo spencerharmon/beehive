@@ -352,3 +352,127 @@ func TestReviewMergeConflictHandsBackToAgent(t *testing.T) {
 		t.Fatalf("resolved merge sha not stamped: %+v", tk)
 	}
 }
+
+// TestReviewMergeRecordsAllImplementerCommits is the regression for the
+// wrong-commit-sha bug: the runner-owned stamp must record the implementer's
+// ACTUAL code commits (tracked-base..bee), not the single resulting merge/HEAD
+// tip. A fast-forward or multi-commit task otherwise loses every sha but one, and
+// a real merge records the runner's synthetic merge commit instead of the code.
+// This fixture gives bee-R1 TWO commits and DIVERGES the tracked branch so the
+// runner's merge is a genuine merge commit — the case the single-commit fixture
+// never exercised.
+func TestReviewMergeRecordsAllImplementerCommits(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo.Init(root)
+	g := gitConfig(t, root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+
+	origin := bareOriginSeeded(t, g) // main @ base B
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	// bee-R1 = B -> C1 -> C2 (two implementer commits), pushed to origin.
+	sc := filepath.Join(t.TempDir(), "push")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+		t.Fatalf("scratch clone: %v", err)
+	}
+	scg := gitConfig(t, sc)
+	os.WriteFile(filepath.Join(sc, "c1.txt"), []byte("one\n"), 0o644)
+	if err := scg.Commit(ctx, "feat: commit one"); err != nil {
+		t.Fatalf("commit c1: %v", err)
+	}
+	c1, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse c1: %v", err)
+	}
+	os.WriteFile(filepath.Join(sc, "c2.txt"), []byte("two\n"), 0o644)
+	if err := scg.Commit(ctx, "feat: commit two"); err != nil {
+		t.Fatalf("commit c2: %v", err)
+	}
+	c2, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse c2: %v", err)
+	}
+	if _, err := scg.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-R1"); err != nil {
+		t.Fatalf("push bee-R1: %v", err)
+	}
+
+	// Diverge tracked main: B -> D, on a SEPARATE line from bee, so the runner's
+	// merge must create a real merge commit M (M is not in bee's history).
+	sc2 := filepath.Join(t.TempDir(), "diverge")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc2); err != nil {
+		t.Fatalf("diverge clone: %v", err)
+	}
+	sc2g := gitConfig(t, sc2)
+	os.WriteFile(filepath.Join(sc2, "d.txt"), []byte("diverge\n"), 0o644)
+	if err := sc2g.Commit(ctx, "chore: advance main"); err != nil {
+		t.Fatalf("commit d: %v", err)
+	}
+	dSha, err := sc2g.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse d: %v", err)
+	}
+	if _, err := sc2g.Run(ctx, "push", "origin", "HEAD:refs/heads/main"); err != nil {
+		t.Fatalf("push diverged main: %v", err)
+	}
+
+	// Change doc + a DONE flip committed on the hive (no Check: -> no DoD gate).
+	docRel := "submodules/sm/docs/bee-R1-R1.md"
+	os.WriteFile(filepath.Join(root, filepath.FromSlash(docRel)),
+		[]byte("<!-- Beehive-Commits: none -->\n\ndoc\n"), 0o644)
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [DONE] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
+	if err := g.CommitPaths(ctx, "seed handoff", "submodules/sm/PLAN.md", docRel); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+	r := &Runner{Repo: rp, Git: g, MaxTurns: 5, TTL: time.Hour}
+
+	w, _, ok := r.setupReviewWorktree(ctx, sel, "bee-R1", root)
+	if !ok {
+		t.Fatal("setupReviewWorktree failed")
+	}
+
+	hint, _, ferr := r.finalizeReviewMerge(ctx, sel, w, root)
+	if ferr != nil {
+		t.Fatalf("finalizeReviewMerge err: %v", ferr)
+	}
+	if hint != "" {
+		t.Fatalf("clean multi-commit approve must not be refused: %s", hint)
+	}
+	if !originMainContains(t, origin, w, "c1.txt") || !originMainContains(t, origin, w, "c2.txt") {
+		t.Fatal("both implementer commits must land on the tracked branch")
+	}
+
+	b, _ := os.ReadFile(planPath)
+	p, _ := plan.Parse(string(b))
+	tk := p.Find("R1")
+	if tk == nil || !tk.CommitsSet {
+		t.Fatalf("commits= not stamped: %+v", tk)
+	}
+	// EXACTLY the two implementer commits — never the merge commit, never the
+	// divergent main commit D, never a single dropped-to-tip sha.
+	if !plan.SameCommitSet(tk.Commits, []string{c1, c2}) {
+		t.Fatalf("commits= must be the implementer set {%s,%s}; got %v", c1, c2, tk.Commits)
+	}
+	for _, bad := range []string{dSha} {
+		for _, got := range tk.Commits {
+			if got == bad {
+				t.Fatalf("commits= must NOT contain the divergent/merge commit %s: %v", bad, tk.Commits)
+			}
+		}
+	}
+	doc, _ := os.ReadFile(filepath.Join(root, filepath.FromSlash(docRel)))
+	shas, hasHdr := plan.ParseDocCommits(string(doc))
+	if !hasHdr || !plan.SameCommitSet(shas, []string{c1, c2}) {
+		t.Fatalf("doc Beehive-Commits header must mirror the implementer set; got %v\n%s", shas, doc)
+	}
+}
