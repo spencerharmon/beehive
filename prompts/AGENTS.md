@@ -236,6 +236,7 @@ column below marks who each is for.
 | Repair a corrupt PLAN.md | a plan fails to parse (e.g. `bad heartbeat ""`) after a pass was killed mid-write | operator | `skills/repair-plan.md` |
 | Reset a lost-work / looping task | a task is stuck in a `recover-lost-work` loop or was escalated to `NEEDS-HUMAN` by it, and must be reimplemented cleanly (reset `attempts`, clear the stale claim, strip lost-work notes) | operator | `skills/reset-lost-work-task.md` |
 | Deferred verification | a work task's effect only shows after an external system converges (GitOps reconcile, CI run, cache/TTL) | honeybee | `skills/deferred-verification.md` |
+| Blue/green topology obfuscation | designing a blue/green (or any multi-instance rollout / cutover) deployment — keep the workload's Helm chart generic and push colors/roles/cutover up into the controller (Flux/Argo) + beehive layers | operator | `skills/bluegreen-topology-obfuscation.md` |
 | Update instructions | refreshing managed files to new binary defaults | operator | `skills/update-instructions.md` |
 
 The binary ships a default for every skill above; a site may add its own skill files
