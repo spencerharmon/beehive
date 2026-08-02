@@ -217,6 +217,14 @@ func TestBuildReleaseArtifactsScriptE2E(t *testing.T) {
 
 	build := exec.Command("sh", filepath.Join(root, "scripts/build-release-artifacts.sh"), dist)
 	build.Dir = root
+	// -buildvcs=false: this E2E test only asserts the artifacts + checksums
+	// exist and pass verify-release.sh, never embedded VCS metadata (the
+	// script already stamps its own BUILD_SHA via -ldflags), so go's auto
+	// VCS-stamping (which shells out to git status) is pure risk here — some
+	// checkout/sandbox environments make it fail with "error obtaining VCS
+	// status: exit status 128", spuriously failing this build regardless of
+	// the code under test.
+	build.Env = append(os.Environ(), "GOFLAGS=-buildvcs=false")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build-release-artifacts.sh failed: %v\n%s", err, out)
 	}

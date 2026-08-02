@@ -131,7 +131,14 @@ func buildHostBins(t *testing.T, root, dir string) string {
 		out := filepath.Join(dir, bin+"-"+tag)
 		b := exec.Command("go", "build", "-trimpath", "-o", out, "./cmd/"+bin)
 		b.Dir = root
-		b.Env = append(os.Environ(), "CGO_ENABLED=0")
+		// -buildvcs=false: this test only asserts static/CGO-free-ness, never
+		// embedded VCS metadata, so go's auto VCS-stamping (which shells out to
+		// git status) is pure risk here — some checkout environments (a fresh
+		// clone, an unusual worktree layout, a sandbox lacking a configured
+		// safe.directory) make it fail with "error obtaining VCS status: exit
+		// status 128", spuriously failing this build regardless of the code
+		// under test.
+		b.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=-buildvcs=false")
 		if o, err := b.CombinedOutput(); err != nil {
 			t.Fatalf("build %s: %v\n%s", bin, err, o)
 		}
@@ -202,7 +209,10 @@ func TestStaticBuildIsCGOFreeAndStatic(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "beehive")
 	build := exec.Command("go", "build", "-trimpath", "-o", out, "./cmd/beehive")
 	build.Dir = root
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	// -buildvcs=false: see buildHostBins — this test asserts CGO/static-ness
+	// only, and go's auto VCS-stamping git-shells-out in a way that can fail
+	// in some checkout/sandbox environments unrelated to the build itself.
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=-buildvcs=false")
 	if b, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("static build failed: %v\n%s", err, b)
 	}
