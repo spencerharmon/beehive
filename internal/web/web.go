@@ -24,6 +24,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/secrets"
 	"github.com/spencerharmon/beehive/internal/submod"
 )
 
@@ -339,6 +340,8 @@ func (s *Server) Routes() *http.ServeMux {
 	// Per-submodule "change remote" action, exposed beside the ROI editor: rewrite
 	// the tracked .gitmodules url + `git submodule sync` via the shared submod lib.
 	mux.HandleFunc("POST /submodule/{name}/remote", b((*Server).submoduleRemote))
+	mux.HandleFunc("GET /submodule/{name}/secrets", b((*Server).submoduleSecretsGet))
+	mux.HandleFunc("POST /submodule/{name}/secrets", b((*Server).submoduleSecretsPost))
 	mux.HandleFunc("GET /secrets", b((*Server).secretsGet))
 	mux.HandleFunc("POST /secrets", b((*Server).secretsPost))
 	mux.HandleFunc("GET /merge", b((*Server).mergeGet))
@@ -1297,6 +1300,59 @@ func (s *Server) secretsPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.secretsGet(w, r)
+}
+
+// submoduleSecretsGet lists the KEYS (never values) of one submodule's OWN
+// SECRETS.yaml.gpg at submodules/<name>/. It reuses the ACTIVE repo's keyring
+// (s.cfg.GPGHome) — the per-repo keyring isolation is unchanged; this only
+// namespaces the ciphertext file per submodule so a submodule's operator sees
+// and edits exactly that submodule's secrets, never a sibling's and never the
+// global set. Values are never returned to the template (secrets_panel renders
+// keys + write-only inputs only).
+func (s *Server) submoduleSecretsGet(w http.ResponseWriter, r *http.Request) {
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	keys, err := listSecretKeys(r.Context(), s.cfg.GPGHome, secrets.SubmodulePath(s.repo.Root, sm.Name))
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.render(w, "secrets_panel.html", map[string]interface{}{
+		"Keys":      keys,
+		"Submodule": sm.Name,
+		"Title":     pageTitle(sm.Name, "secrets"),
+		"Crumbs":    secretsCrumbs(sm.Name),
+	})
+}
+
+// submoduleSecretsPost writes one key into a submodule's OWN SECRETS.yaml.gpg
+// (submodules/<name>/), encrypted to the ACTIVE repo's recipient under its OWN
+// keyring. The write is scoped to the named submodule's file only; it never
+// touches the global root secrets or a sibling submodule's file.
+func (s *Server) submoduleSecretsPost(w http.ResponseWriter, r *http.Request) {
+	sm, err := s.submodule(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	key, val := r.FormValue("key"), r.FormValue("value")
+	if key == "" {
+		http.Error(w, "key required", 400)
+		return
+	}
+	p := secrets.SubmodulePath(s.repo.Root, sm.Name)
+	if err := setSecret(r.Context(), s.cfg.GPGHome, p, s.cfg.GPGRecipient, key, val); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if err := s.publishMain(r.Context(), "frontend: update secret "+sm.Name+"/"+key); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	s.submoduleSecretsGet(w, r)
 }
 
 func (s *Server) mergeGet(w http.ResponseWriter, r *http.Request) {

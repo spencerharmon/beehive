@@ -28,6 +28,11 @@ func explorerCrumbs(name string) []Crumb {
 	return []Crumb{crumbDashboard(), {Label: name}}
 }
 
+// secretsCrumbs: dashboard > <name> > secrets — the per-submodule secrets view.
+func secretsCrumbs(name string) []Crumb {
+	return []Crumb{crumbDashboard(), crumbSubmodule(name), {Label: "secrets"}}
+}
+
 // planCrumbs: dashboard > <name> > plan.
 func planCrumbs(name string) []Crumb {
 	return []Crumb{crumbDashboard(), crumbSubmodule(name), {Label: "plan"}}

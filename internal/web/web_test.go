@@ -6398,6 +6398,84 @@ func TestRegistrySecretKeyringIsolation(t *testing.T) {
 	}
 }
 
+// TestSubmoduleSecretsScopedPanel exercises the per-submodule secrets VIEW
+// without requiring gpg: an absent submodule secrets file lists no keys and
+// renders the panel scoped to that submodule (write-only forms posting to the
+// submodule-scoped action), and an unknown submodule 404s.
+func TestSubmoduleSecretsScopedPanel(t *testing.T) {
+	s, _, _ := twoRepoRegistry(t)
+	mux := s.Routes()
+
+	// Known submodule under the active repo (alpha -> redteam), no secrets file
+	// yet: 200, panel scoped to the submodule, "none", and the write-only add
+	// form POSTs to the submodule-scoped action (never the global /secrets).
+	w := getRepo(t, mux, "/submodule/redteam/secrets", "alpha")
+	if w.Code != 200 {
+		t.Fatalf("GET submodule secrets: %d %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"redteam secrets",
+		`action="/submodule/redteam/secrets"`,
+		`type="password"`,
+		"none",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("panel missing %q:\n%s", want, body)
+		}
+	}
+	// It must NOT post to the global secrets endpoint.
+	if strings.Contains(body, `action="/secrets"`) {
+		t.Fatalf("submodule panel leaked global /secrets action:\n%s", body)
+	}
+
+	// An unknown submodule 404s (no path to fabricate a secrets file outside the
+	// real submodule set).
+	if w := getRepo(t, mux, "/submodule/nope/secrets", "alpha"); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown submodule secrets = %d, want 404", w.Code)
+	}
+}
+
+// TestSubmoduleSecretsWriteScoped is the end-to-end write proof (requires gpg):
+// a secret written through a submodule's secrets handler lands ONLY in that
+// submodule's submodules/<name>/SECRETS.yaml.gpg — never the repo-root global
+// file — and is readable back through the same submodule view.
+func TestSubmoduleSecretsWriteScoped(t *testing.T) {
+	s, rootAlpha, _ := twoRealKeyringRegistry(t)
+	mux := s.Routes()
+	ctx := context.Background()
+
+	if w := postRepo(t, mux, "/submodule/redteam/secrets", "alpha",
+		url.Values{"key": {"sub_pw"}, "value": {"hunter2"}}); w.Code != 200 {
+		t.Fatalf("submodule secret write: %d %s", w.Code, w.Body)
+	}
+
+	subPath := filepath.Join(rootAlpha, "submodules", "redteam", repo.SecretsFile)
+	if _, err := os.Stat(subPath); err != nil {
+		t.Fatalf("submodule SECRETS.yaml.gpg not written at %s: %v", subPath, err)
+	}
+	// The write must NOT have landed in the repo-root global secrets file.
+	if _, err := os.Stat(filepath.Join(rootAlpha, repo.SecretsFile)); !os.IsNotExist(err) {
+		t.Fatalf("submodule secret leaked into global root secrets (stat err=%v)", err)
+	}
+
+	// Readable back through the active repo's keyring at the submodule path only.
+	homeA := s.siblings["alpha"].cfg.GPGHome
+	keys, err := listSecretKeys(ctx, homeA, subPath)
+	if err != nil || len(keys) != 1 || keys[0] != "sub_pw" {
+		t.Fatalf("submodule keys=%v err=%v, want [sub_pw]", keys, err)
+	}
+
+	// And the rendered view now shows the key (names only, never the value).
+	w := getRepo(t, mux, "/submodule/redteam/secrets", "alpha")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "sub_pw") {
+		t.Fatalf("submodule secrets view missing written key: %d %s", w.Code, w.Body)
+	}
+	if strings.Contains(w.Body.String(), "hunter2") {
+		t.Fatalf("SECURITY: submodule secrets view leaked a secret VALUE:\n%s", w.Body)
+	}
+}
+
 // TestSecretsNoKeyringFailsLoudly confirms the web secrets primitives refuse to
 // operate with no keyring configured (empty gpgHome) instead of silently falling
 // through to gpg's process-default keyring — the "no shared-keyring fallback"
