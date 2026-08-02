@@ -641,9 +641,20 @@ func (m *Manager) Reload(ctx context.Context) error {
 	for _, rec := range recs {
 		byBranch[rec.Branch] = rec
 	}
-	trusted, err := m.trustedRemote(ctx)
-	if err != nil {
-		return err
+	// editor-session-restart-rediscovery: a startup rediscovery must NEVER be
+	// defeated by remote reachability. Every persisted in-progress session lives
+	// entirely on LOCAL disk (its edit worktree + branch), so re-registering it
+	// needs no network at all — only the OPTIONAL cross-host recovery + reclaim-
+	// cleanup below wants a trusted remote. A transient remote failure at restart
+	// (origin down, auth/network hiccup) used to abort Reload here, dropping EVERY
+	// local editor session from the live registry — the exact "edit vanished after
+	// beehived restart" this task fixes. Degrade an unreachable/erroring remote to
+	// local-only recovery (trusted="") instead of aborting: the operator's real,
+	// committed + dirty in-flight edit is re-registered regardless, and the remote-
+	// dependent steps simply no-op until a later Reload finds the remote reachable.
+	trusted, terr := m.trustedRemote(ctx)
+	if terr != nil {
+		trusted = ""
 	}
 	wts, err := m.primary.Worktrees(ctx)
 	if err != nil {
@@ -681,10 +692,13 @@ func (m *Manager) Reload(ctx context.Context) error {
 	if trusted != "" {
 		// Recover sessions with NO local trace whatsoever — a different host, or
 		// a fully-lost local repo — from every edit-* branch the trusted remote
-		// still carries that this local loop never saw.
+		// still carries that this local loop never saw. This is OPTIONAL
+		// cross-host recovery: the LOCAL sessions above are already re-registered,
+		// so a remote failure while listing must never abort Reload and drop them
+		// (editor-session-restart-rediscovery) — skip the cross-host scan instead.
 		branches, err := m.primary.ListRemoteBranches(ctx, trusted, editBranchPrefix+"*")
 		if err != nil {
-			return err
+			return m.persist()
 		}
 		for _, branch := range branches {
 			if seen[branch] {
