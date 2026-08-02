@@ -1,4 +1,49 @@
-# release-verify: beehive's release/CI pipeline on self-hosted Zuul
+# release-verify: beehive's release/CI pipeline on self-hosted Gitea Actions
+
+## RE-PREMISE (ROI 0522a02): Gitea Actions, not Zuul
+
+This task was reopened and re-premised. The release/CI pipeline now targets
+**self-hosted Gitea Actions** — the runner attached to the same Gitea instance
+that already hosts the hive backup remote — **NOT Zuul, NOT GitHub Actions, NOT
+cosign-on-GitHub**. This SUPERSEDES the Zuul-based scope described in the rest
+of this doc below (which itself corrected an even older GitHub-Actions premise).
+
+What that means concretely, and what this pass did:
+
+- **Deleted** the superseded Zuul artifacts: `zuul.d/jobs.yaml`,
+  `zuul.d/project.yaml`, `playbooks/beehive-build-test.yaml`,
+  `playbooks/beehive-release-cross-compile.yaml`, and the Zuul regression guard
+  `internal/release/zuul_test.go`. The old `flux:zuul` cross-dep is gone —
+  Gitea Actions is self-contained (runner + workflow config live in beehive's
+  own source), so beehive CI no longer blocks on any flux/Zuul target.
+- **Authored** `.gitea/workflows/ci.yaml` (the gofmt/vet/build/test/smoke
+  build-test job) and `.gitea/workflows/release.yaml` (tag-triggered on `v*`):
+  a `cross-compile` matrix job (linux/darwin × amd64/arm64) that builds each
+  cmd — beehive, beehived, honeybee — at `CGO_ENABLED=0` and asserts each
+  artifact is static IN-JOB via `verify-release.sh SKIP_COSIGN=1`; then the
+  CI-only `publish` (cosign-sign the checksums, publish to this Gitea instance)
+  and clean-room `verify-release` (re-download + `cosign verify-blob`) jobs.
+- **Reused** the CI-agnostic `scripts/build-release-artifacts.sh` and
+  `scripts/verify-release.sh` unchanged — the Gitea workflow shells out to them
+  exactly as the deleted Zuul playbooks did, so the cross-compile+static-assert
+  logic has one home.
+- **Replaced** `internal/release/zuul_test.go` with
+  `internal/release/gitea_test.go`, which parses the `.gitea/workflows/*.yaml`
+  as workflow YAML and asserts the release contract (cross-compile matrix,
+  per-artifact static assertion, cosign-before-publish, clean-room re-verify),
+  and keeps the still-valid `build-release-artifacts.sh` contract + E2E tests.
+- **Updated** `internal/release/doc.go` and `docs/RELEASE-NOTES-TEMPLATE.md` to
+  name Gitea Actions (not Zuul) as the forward pipeline.
+
+Scope is beehive's OWN repo-specific CI (belongs in this repo's
+`.gitea/workflows/`); shared/reusable workflows are a separate `actions`-repo
+initiative and are NOT authored here. The `.github/workflows/ci.yml` GitHub
+pipeline is left in place (parallel, harmless) until the Gitea one is proven
+live; cutover is a follow-up.
+
+Everything below this heading is the PRIOR Zuul framing, retained for history.
+
+---
 
 ## Problem
 

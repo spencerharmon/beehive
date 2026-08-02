@@ -1,0 +1,41 @@
+# beehive CI on self-hosted Gitea Actions
+# ----------------------------------------
+# Runs on the self-hosted Gitea Actions runner attached to the same Gitea
+# instance that hosts the hive backup remote (see docs/tasks/release-verify.md).
+# Gitea Actions consumes GitHub-Actions-compatible workflow syntax, so this is
+# the non-release (gofmt/vet/build/test/smoke) half of beehive's CI — the exact
+# checks the older .github/workflows/ci.yml `build-test` job runs, kept in sync
+# so a cutover is a delete, not a rewrite.
+#
+# `runs-on` labels a self-hosted runner. `ubuntu-latest` here means "a runner
+# registered with the `ubuntu-latest` label on this Gitea instance" (Gitea maps
+# it to whatever image/host the operator registered); it must provide a POSIX
+# shell, a Go toolchain satisfying go.mod, git, and the `file` utility.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+permissions:
+  contents: read
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+      - name: gofmt (must report zero files)
+        run: gofmt -l . | tee /tmp/fmt && test ! -s /tmp/fmt
+      - name: go vet
+        run: go vet ./...
+      - name: build (CGO_ENABLED=0)
+        run: CGO_ENABLED=0 go build ./...
+      - name: test (race detector needs cgo, left enabled)
+        run: go test -race -count=1 ./...
+      - name: submodule selection/claim/worktree smoke test
+        run: ./scripts/submodule-smoke.sh

@@ -1,0 +1,161 @@
+# beehive release pipeline on self-hosted Gitea Actions
+# ------------------------------------------------------
+# Cuts a release on a `v*` tag: cross-compile every cmd static (CGO_ENABLED=0)
+# for linux/darwin x amd64/arm64, ASSERT each artifact is static IN-JOB, then
+# (live-only) cosign-sign the checksums, publish to this Gitea instance's
+# release + package registry, and re-verify with `cosign verify-blob` from a
+# clean checkout. See docs/tasks/release-verify.md.
+#
+# SCOPE SPLIT (task acceptance bar): the cross-compile matrix + per-artifact
+# static assertion is the STATIC, locally-reproducible deliverable — reproduce
+# it with `scripts/build-release-artifacts.sh dist` then
+# `SKIP_COSIGN=1 scripts/verify-release.sh dist` (no runner, no secrets). The
+# signing/publish/verify-blob steps below are CI-ONLY: they run on the deployed
+# Gitea Actions runner / by the operator once the runner is live, and are
+# explicitly OUT of this task's local Accept.
+#
+# This is beehive's OWN repo-specific pipeline and belongs in this repo's
+# .gitea/workflows/. Shared/reusable workflows live in the dedicated `actions`
+# repo (a flux/operator initiative) and are NOT authored here.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  # --- STATIC deliverable: cross-compile matrix + in-job static assertion -----
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+      - name: cross-compile static binaries + checksums (beehive, beehived, honeybee)
+        run: |
+          mkdir -p dist
+          for bin in beehive beehived honeybee; do
+            CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+              go build -trimpath -o dist/$bin-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/$bin
+          done
+          (cd dist && sha256sum \
+             beehive-${{ matrix.goos }}-${{ matrix.goarch }} \
+             beehived-${{ matrix.goos }}-${{ matrix.goarch }} \
+             honeybee-${{ matrix.goos }}-${{ matrix.goarch }} \
+             > SHA256SUMS-${{ matrix.goos }}-${{ matrix.goarch }})
+      - name: assert static linkage + CGO_ENABLED=0 + checksums (no signing here)
+        # SKIP_COSIGN — signing/publishing is live-only, never in this static job.
+        # verify-release.sh confirms every binary embeds CGO_ENABLED=0 and every
+        # linux ELF is `file`-statically-linked (darwin always links libSystem,
+        # so the ELF static-link assert is linux-only, by design).
+        run: SKIP_COSIGN=1 ./scripts/verify-release.sh dist
+      - name: upload artifacts for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  # --- CI-ONLY: sign, publish to this Gitea instance, verify from clean tree ---
+  publish:
+    needs: [cross-compile]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write   # keyless cosign OIDC (preferred); harmless if unused
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+      - name: gather all matrix artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@v3
+      - name: cosign-sign each checksums file
+        # Preferred: keyless OIDC (Gitea Actions must expose an OIDC token for
+        # id-token:write; the resulting cert identity/issuer are pipeline-
+        # specific — recorded in the release notes, never hardcoded here).
+        # Fallback when the runner has no OIDC: a documented key whose PRIVATE
+        # half lives ONLY in the beehive secret store (never committed). Set
+        # secret COSIGN_PRIVATE_KEY (+ COSIGN_PASSWORD) to take this path.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -eu
+          for sums in dist/SHA256SUMS-*; do
+            case "$sums" in *.sig|*.pem) continue ;; esac
+            if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
+              printf '%s' "$COSIGN_PRIVATE_KEY" > /tmp/cosign.key
+              cosign sign-blob --yes --key /tmp/cosign.key \
+                --output-signature "$sums.sig" "$sums"
+            else
+              cosign sign-blob --yes "$sums" \
+                --output-signature "$sums.sig" \
+                --output-certificate "$sums.pem"
+            fi
+          done
+          rm -f /tmp/cosign.key
+      - name: verify artifacts (static + checksum + cosign) before publishing
+        run: ./scripts/verify-release.sh dist
+      - name: publish release to this Gitea instance
+        # Uses the Gitea-native release action; GITHUB_TOKEN is injected by the
+        # Gitea Actions runner and scoped to this repo on this instance.
+        uses: https://gitea.com/actions/release-action@main
+        with:
+          files: dist/**
+          api_key: ${{ secrets.GITHUB_TOKEN }}
+
+  # --- CI-ONLY acceptance gate: re-verify published bytes from a clean tree ----
+  verify-release:
+    needs: [publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+      - uses: sigstore/cosign-installer@v3
+      - name: download the just-published artifacts for this os/arch
+        run: |
+          set -eu
+          mkdir -p dist
+          base="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          for f in \
+            beehive-${{ matrix.goos }}-${{ matrix.goarch }} \
+            beehived-${{ matrix.goos }}-${{ matrix.goarch }} \
+            honeybee-${{ matrix.goos }}-${{ matrix.goarch }} \
+            SHA256SUMS-${{ matrix.goos }}-${{ matrix.goarch }} \
+            SHA256SUMS-${{ matrix.goos }}-${{ matrix.goarch }}.sig; do
+            curl -fsSL "$base/$f" -o "dist/$f" || true
+          done
+      - name: verify (static + checksum + cosign) from a clean checkout
+        # COSIGN_IDENTITY_REGEXP / COSIGN_OIDC_ISSUER (keyless) or COSIGN_KEY
+        # (key fallback) come from this instance's release-workflow identity;
+        # see docs/RELEASE-NOTES-TEMPLATE.md. SKIP_COSIGN only for the key-less
+        # bootstrap window before OIDC is wired.
+        run: ./scripts/verify-release.sh dist
