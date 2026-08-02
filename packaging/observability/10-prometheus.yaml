@@ -60,6 +60,17 @@ data:
       - job_name: prometheus
         static_configs:
           - targets: ["localhost:9090"]
+      # beehive-host: the self-hosting host's process/resource metrics — this is
+      # the machine `beehived` runs on (systemd --user, not a k8s workload), so
+      # its resource pressure is scraped via the node-exporter already deployed
+      # on that node rather than an in-process /metrics endpoint (beehived has
+      # none yet). Job labeled distinctly so a beehive-specific dashboard panel
+      # can select on job="beehive-host" without pulling in every cluster node.
+      - job_name: beehive-host
+        static_configs:
+          - targets: ["kube-prometheus-stack-prometheus-node-exporter.monitoring.svc:9100"]
+            labels:
+              component: beehive-host
       - job_name: kubernetes-nodes
         kubernetes_sd_configs:
           - role: node
@@ -176,3 +187,25 @@ spec:
     - name: http
       port: 9090
       targetPort: 9090
+---
+# NodePort mirror of the ClusterIP service above — this is a single-node k3s
+# cluster co-located on the same host that runs `beehived`/honeybee checks, so
+# a NodePort lets a check `curl` Prometheus directly from the host without a
+# port-forward (which cannot run as a one-shot sandboxed check command).
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-nodeport
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: observability
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+      nodePort: 30909
