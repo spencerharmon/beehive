@@ -59,6 +59,33 @@ func (s *mockSession) Close() error { return nil }
 
 func (s *mockSession) Messages(ctx context.Context) ([]Message, error) { return nil, nil }
 
+// TestMain makes this package's git subprocesses hermetic: several tests spawn
+// real git commands (init/clone/commit) whose success has always silently
+// depended on the ambient environment providing a global git identity and
+// allowing the "file" transport (both are ordinary defaults on an
+// interactively-configured workstation, but are absent/denied under a clean
+// or sandboxed HOME — e.g. the honeybee Check: sandbox — causing spurious,
+// diff-independent failures like "Author identity unknown" and "transport
+// 'file' not allowed"). Point GIT_CONFIG_GLOBAL at a private, in-repo config
+// for the duration of this test binary so every git subprocess these tests
+// spawn behaves identically regardless of the ambient environment.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "beehive-swarm-test-gitconfig")
+	if err == nil {
+		cfg := filepath.Join(dir, "gitconfig")
+		body := "[user]\n\temail = t@t\n\tname = t\n[protocol \"file\"]\n\tallow = always\n"
+		if werr := os.WriteFile(cfg, []byte(body), 0o644); werr == nil {
+			os.Setenv("GIT_CONFIG_GLOBAL", cfg)
+			os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+		}
+	}
+	code := m.Run()
+	if dir != "" {
+		os.RemoveAll(dir)
+	}
+	os.Exit(code)
+}
+
 func gitInit(t *testing.T, dir string) *git.Repo {
 	g := git.New(dir)
 	ctx := context.Background()
