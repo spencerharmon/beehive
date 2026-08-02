@@ -84,6 +84,74 @@ func TestMultiDocRejected(t *testing.T) {
 	}
 }
 
+// TestScopedLoadLayering confirms ScopedLoad layers a submodule's secrets over
+// the global ones (most-specific wins on collision, submodule-only keys pass
+// through, global-only keys still visible), and that a sibling submodule's
+// secrets never leak into another submodule's resolution.
+func TestScopedLoadLayering(t *testing.T) {
+	home, rcpt := newKeyring(t)
+	root := t.TempDir()
+	ctx := context.Background()
+
+	global := Store{Path: GlobalPath(root), GPGHome: home, Recipient: rcpt}
+	if err := global.Save(ctx, map[string]any{"shared": "g", "global_only": "g2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	foo := Store{Path: SubmodulePath(root, "foo"), GPGHome: home, Recipient: rcpt}
+	if err := foo.Save(ctx, map[string]any{"shared": "foo-shadow", "foo_only": "f"}); err != nil {
+		t.Fatal(err)
+	}
+
+	bar := Store{Path: SubmodulePath(root, "bar"), GPGHome: home, Recipient: rcpt}
+	if err := bar.Save(ctx, map[string]any{"bar_only": "b"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// foo sees its own shadow of "shared", the global-only key, and its own
+	// key — but never bar's.
+	got, err := ScopedLoad(ctx, root, "foo", home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["shared"] != "foo-shadow" {
+		t.Fatalf("shared = %v, want most-specific shadow", got["shared"])
+	}
+	if got["global_only"] != "g2" {
+		t.Fatalf("global_only = %v, want inherited global value", got["global_only"])
+	}
+	if got["foo_only"] != "f" {
+		t.Fatalf("foo_only = %v, want foo's own value", got["foo_only"])
+	}
+	if _, ok := got["bar_only"]; ok {
+		t.Fatal("foo resolution must never see bar's submodule secret")
+	}
+
+	// bar sees the unshadowed global value plus its own key, never foo's.
+	got, err = ScopedLoad(ctx, root, "bar", home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["shared"] != "g" {
+		t.Fatalf("bar shared = %v, want unshadowed global value", got["shared"])
+	}
+	if got["bar_only"] != "b" {
+		t.Fatalf("bar_only = %v, want bar's own value", got["bar_only"])
+	}
+	if _, ok := got["foo_only"]; ok {
+		t.Fatal("bar resolution must never see foo's submodule secret")
+	}
+
+	// No submodule named: global only.
+	got, err = ScopedLoad(ctx, root, "", home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got["shared"] != "g" || got["global_only"] != "g2" {
+		t.Fatalf("global-only resolution = %v", got)
+	}
+}
+
 // TestEmptyGPGHomeFailsLoudly confirms a Store with no keyring configured refuses
 // every gpg operation instead of silently falling through to gpg's process-
 // default keyring (the shared-keyring fallback that would break per-repo secret

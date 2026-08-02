@@ -39,6 +39,41 @@ func SubmodulePath(root, name string) string {
 	return filepath.Join(root, "submodules", name, repo.SecretsFile)
 }
 
+// ScopedLoad decrypts and layers the global secrets doc under an optional
+// per-submodule doc, most-specific wins: a key present in submodules/<name>'s
+// SECRETS.yaml.gpg shadows a same-named key in the repo-root global one. This
+// is the isolation primitive — a caller resolving submodule "foo" reads ONLY
+// the global keyring plus foo's own submodule keyring, and has no path to a
+// sibling submodule's secrets (there is no "list all submodules" merge; each
+// resolution names exactly one submodule or none). submodule == "" returns
+// just the global doc, unchanged from a bare Store.Load. gpgHome is the single
+// keyring both the global and submodule files are decrypted with (the
+// existing per-repo GPGHome isolation guarantee is unaffected: submodule
+// namespacing layers UNDER it, it does not introduce a second keyring).
+func ScopedLoad(ctx context.Context, root, submodule, gpgHome string) (map[string]any, error) {
+	global := Store{Path: GlobalPath(root), GPGHome: gpgHome}
+	doc, err := global.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	merged := make(map[string]any, len(doc))
+	for k, v := range doc {
+		merged[k] = v
+	}
+	if submodule == "" {
+		return merged, nil
+	}
+	sub := Store{Path: SubmodulePath(root, submodule), GPGHome: gpgHome}
+	subDoc, err := sub.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range subDoc {
+		merged[k] = v // most-specific (submodule) wins over global
+	}
+	return merged, nil
+}
+
 // base returns the shared gpg args (keyring home + batch flags), erroring when no
 // keyring is configured. An empty GPGHome is REFUSED rather than run against
 // gpg's process-default keyring, so a mis-wired caller can never cross the
