@@ -176,3 +176,63 @@ func TestBuildEnvPreamble(t *testing.T) {
 		}
 	}
 }
+
+// TestMaterializeSecretsScopedToPassSubmodule proves the runner materializes the
+// pass submodule's OWN scope via SecretsFor (captured through the ExportSecretEnv
+// seam, so the real process env is untouched): it calls SecretsFor with exactly
+// the pass's submodule name and exports the returned map. A pass working "foo"
+// therefore materializes foo's scope, never a sibling's.
+func TestMaterializeSecretsScopedToPassSubmodule(t *testing.T) {
+	var gotSubmodule string
+	var exported map[string]string
+	calls := 0
+	r := &Runner{
+		SecretsFor: func(_ context.Context, sm string) (map[string]string, error) {
+			gotSubmodule = sm
+			return map[string]string{"API_TOKEN": "foo-secret"}, nil
+		},
+		ExportSecretEnv: func(m map[string]string) { calls++; exported = m },
+	}
+	r.materializeSecrets(context.Background(), "foo")
+	if gotSubmodule != "foo" {
+		t.Fatalf("SecretsFor called with submodule %q, want foo (the pass's own scope)", gotSubmodule)
+	}
+	if calls != 1 {
+		t.Fatalf("ExportSecretEnv called %d times, want exactly 1", calls)
+	}
+	if exported["API_TOKEN"] != "foo-secret" {
+		t.Fatalf("exported = %v, want the scoped secret materialized", exported)
+	}
+}
+
+// TestMaterializeSecretsInertWhenUnset confirms the materialization is inert when
+// SecretsFor is nil, when the submodule is empty, or when the scope resolves
+// empty — ExportSecretEnv is never called in any of those cases (byte-identical
+// to the historical no-secrets path).
+func TestMaterializeSecretsInertWhenUnset(t *testing.T) {
+	// SecretsFor nil: never touches the seam.
+	called := false
+	r := &Runner{ExportSecretEnv: func(map[string]string) { called = true }}
+	r.materializeSecrets(context.Background(), "foo")
+	if called {
+		t.Fatal("nil SecretsFor must not export anything")
+	}
+	// Empty submodule: no scope to materialize.
+	called = false
+	r.SecretsFor = func(context.Context, string) (map[string]string, error) {
+		return map[string]string{"K": "v"}, nil
+	}
+	r.materializeSecrets(context.Background(), "")
+	if called {
+		t.Fatal("empty submodule must not export anything")
+	}
+	// Empty scope: nothing to export.
+	called = false
+	r.SecretsFor = func(context.Context, string) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+	r.materializeSecrets(context.Background(), "foo")
+	if called {
+		t.Fatal("empty secret scope must not export anything")
+	}
+}

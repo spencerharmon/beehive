@@ -22,6 +22,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/secrets"
 	selectt "github.com/spencerharmon/beehive/internal/select"
 	"github.com/spencerharmon/beehive/internal/swarm"
 	"github.com/spencerharmon/beehive/internal/version"
@@ -355,6 +356,15 @@ func run() error {
 		// no honeybee re-derives the build env (audit session-audit-001 F1). Inert
 		// (nil) on a normal host — LOCALS.md is the human record of what to set.
 		BuildEnv: eff.BuildEnv,
+		// Per-submodule secret materialization (secret-per-submodule-cli): decrypt the
+		// pass submodule's SCOPED secrets (global layered under submodules/<name>'s
+		// own doc, most-specific wins) with this repo's OWN keyring (eff.GPGHome) and
+		// hand them to the runner as a flat env map. The runner materializes exactly
+		// that submodule's scope (own+global) into the pass — never a sibling's, since
+		// ScopedEnv names one submodule. Inert when no secrets file exists (empty map).
+		SecretsFor: func(ctx context.Context, submodule string) (map[string]string, error) {
+			return secrets.ScopedEnv(ctx, primaryRoot, submodule, eff.GPGHome)
+		},
 		// DoD `Check:` sandbox/policy (command allowlist + filesystem confinement) and
 		// the parsed links used to DERIVE the linked-submodule read paths.
 		CheckPolicy: &checkPol,

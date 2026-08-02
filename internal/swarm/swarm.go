@@ -213,6 +213,21 @@ type Runner struct {
 	// injectable seam: nil runs the real os.Setenv loop; tests set it to capture the
 	// exported map without mutating the real process env.
 	ExportEnv func(map[string]string)
+	// SecretsFor, when non-nil, returns the gpg-decrypted secrets scoped to the
+	// pass's submodule (secrets.ScopedEnv: the global doc layered UNDER
+	// submodules/<name>'s own doc, most-specific wins) as a flat KEY=VALUE map that
+	// the runner MATERIALIZES into the honeybee process env at agent spawn, so the
+	// pass's build/test subprocesses and the DoD `Check:` can read them. Wired from
+	// secrets.ScopedEnv in cmd/honeybee. The scope is the pass's OWN submodule only —
+	// ScopedEnv names exactly that submodule (own+global), never a sibling's — so a
+	// pass working submodule "foo" can never materialize submodule "bar"'s secrets.
+	// nil (the default) = inert: nothing materialized, byte-identical to before.
+	SecretsFor func(ctx context.Context, submodule string) (map[string]string, error)
+	// ExportSecretEnv applies the materialized secret map to the process env. The
+	// injectable seam mirroring ExportEnv: nil runs the real os.Setenv loop (sorted
+	// keys, deterministic); tests set it to capture the map without mutating the real
+	// process env.
+	ExportSecretEnv func(map[string]string)
 	// RunVerify runs the handoff protocol-gate command (`git status --porcelain`) in
 	// the code worktree and reports whether it ran-and-failed versus could-not-run
 	// (an infra error). The injectable seam: nil uses realRunVerify (real exec);
@@ -994,6 +1009,11 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	// stated preamble line, above, is the lever for opencode's sibling bash tool —
 	// see buildenv.go). No-op when BuildEnv is empty.
 	r.exportBuildEnv()
+	// Materialize this pass's submodule-SCOPED secrets (own + global, most-specific
+	// wins) into the honeybee process env, so the pass's build/test subprocesses and
+	// the DoD Check can read them. Scoped to smName — the pass's OWN submodule only,
+	// never a sibling's. Inert when SecretsFor is unset (nil) or the scope is empty.
+	r.materializeSecrets(ctx, smName)
 	// Thread the pass's worktree paths to the agent's `beehive git` /
 	// `beehive submodule git` invocations: export them into this process env AND
 	// write the per-pass repo.WorktreeEnvFile at the hive root (the reliable channel,

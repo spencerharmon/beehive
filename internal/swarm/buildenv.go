@@ -1,6 +1,7 @@
 package swarm
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -79,6 +80,41 @@ func buildEnvPreamble(env map[string]string) string {
 			"e.g. `%[1]s <your build/test command>`. Use this instead of a bare invocation; it is "+
 			"the mandated setup for this host (do not spend turns rediscovering it).\n\n",
 		prefix)
+}
+
+// materializeSecrets decrypts the pass submodule's SCOPED secrets (own + global,
+// most-specific wins) via SecretsFor and applies them to the honeybee process
+// environment, so any build/test subprocess the honeybee spawns — including the
+// DoD `Check:` — can read them. The scope is the pass's OWN submodule only
+// (SecretsFor names exactly that submodule), so a pass working "foo" can never
+// materialize a sibling's secrets. Deliberately NOT stated in any injected
+// preamble (unlike BuildEnv): secret VALUES must never reach the transcript, so
+// they travel only through the process env, never the prompt. ExportSecretEnv is
+// the injectable seam (nil = real os.Setenv over sorted keys; tests capture the
+// map). Inert when SecretsFor is nil, the submodule is empty, or the scope is
+// empty. A decrypt error is logged (Debug) and skipped, never fatal to the pass —
+// an unconfigured/absent keyring must not kill a task that needs no secret.
+func (r *Runner) materializeSecrets(ctx context.Context, submodule string) {
+	if r.SecretsFor == nil || submodule == "" {
+		return
+	}
+	env, err := r.SecretsFor(ctx, submodule)
+	if err != nil {
+		if r.Debug != nil {
+			fmt.Fprintf(r.Debug, "[honeybee] materialize secrets for %s: %v\n", submodule, err)
+		}
+		return
+	}
+	if len(env) == 0 {
+		return
+	}
+	if r.ExportSecretEnv != nil {
+		r.ExportSecretEnv(env)
+		return
+	}
+	for _, k := range sortedKeys(env) {
+		_ = os.Setenv(k, env[k])
+	}
 }
 
 // sortedKeys returns env's keys in lexical order, so both the exported os.Setenv

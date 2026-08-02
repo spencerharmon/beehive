@@ -121,5 +121,59 @@ func secretCmd() *cobra.Command {
 		},
 	}
 	c.AddCommand(add, update, edit)
+
+	set := &cobra.Command{
+		Use: "set <key> <value>", Short: "set one secret key (create or overwrite), leaving others intact",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := store()
+			if err != nil {
+				return err
+			}
+			if err := s.Set(cmd.Context(), args[0], args[1]); err != nil {
+				return err
+			}
+			fmt.Printf("secret %q set\n", args[0])
+			return nil
+		},
+	}
+	get := &cobra.Command{
+		Use: "get <key>", Short: "print one secret's value",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := store()
+			if err != nil {
+				return err
+			}
+			v, ok, err := s.Get(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("secret %q not found", args[0])
+			}
+			fmt.Println(v)
+			return nil
+		},
+	}
+	list := &cobra.Command{
+		Use: "list", Short: "list secret key names (never values) in this scope",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			s, err := store()
+			if err != nil {
+				return err
+			}
+			keys, err := s.Keys(cmd.Context())
+			if err != nil {
+				return err
+			}
+			for _, k := range keys {
+				fmt.Println(k)
+			}
+			return nil
+		},
+	}
+	c.AddCommand(set, get, list)
 	return c
 }

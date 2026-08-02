@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 
 	"github.com/spencerharmon/beehive/internal/repo"
 	"gopkg.in/yaml.v3"
@@ -72,6 +73,38 @@ func ScopedLoad(ctx context.Context, root, submodule, gpgHome string) (map[strin
 		merged[k] = v // most-specific (submodule) wins over global
 	}
 	return merged, nil
+}
+
+// ScopedEnv decrypts the submodule-scoped secrets (ScopedLoad: global layered
+// under submodule/<name>, most-specific wins) and flattens them into a
+// KEY=stringVALUE map suitable for materializing into a pass process env. Scalar
+// values are stringified (a string is used verbatim; anything else via fmt "%v");
+// a non-scalar value (a map/list) is skipped — a secret env var is a flat scalar,
+// and silently stringifying a nested structure would materialize a useless
+// "map[...]" blob rather than fail loudly, so it is omitted. This is the single
+// primitive the runner wires into the pass materialization path: resolving
+// submodule "foo" yields ONLY the global keyring plus foo's own scope and has no
+// path to a sibling's secrets (ScopedLoad names exactly one submodule or none).
+func ScopedEnv(ctx context.Context, root, submodule, gpgHome string) (map[string]string, error) {
+	doc, err := ScopedLoad(ctx, root, submodule, gpgHome)
+	if err != nil {
+		return nil, err
+	}
+	env := make(map[string]string, len(doc))
+	for k, v := range doc {
+		switch t := v.(type) {
+		case nil:
+			env[k] = ""
+		case string:
+			env[k] = t
+		case bool, int, int64, float64:
+			env[k] = fmt.Sprintf("%v", t)
+		default:
+			// Non-scalar (map/list): not a materializable env value; skip it.
+			continue
+		}
+	}
+	return env, nil
 }
 
 // base returns the shared gpg args (keyring home + batch flags), erroring when no
@@ -152,6 +185,52 @@ func (s Store) Add(ctx context.Context, yamlFile string) error {
 // Update merges a yaml file's keys, overwriting existing keys.
 func (s Store) Update(ctx context.Context, yamlFile string) error {
 	return s.merge(ctx, yamlFile, true)
+}
+
+// Keys returns the secret key names (sorted) in this store's scope, never the
+// values — the read primitive behind `beehive secret list`.
+func (s Store) Keys(ctx context.Context) ([]string, error) {
+	doc, err := s.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(doc))
+	for k := range doc {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+// Get returns one key's value stringified, and whether it was present — the read
+// primitive behind `beehive secret get <key>`.
+func (s Store) Get(ctx context.Context, key string) (string, bool, error) {
+	doc, err := s.Load(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	v, ok := doc[key]
+	if !ok {
+		return "", false, nil
+	}
+	if v == nil {
+		return "", true, nil
+	}
+	if str, isStr := v.(string); isStr {
+		return str, true, nil
+	}
+	return fmt.Sprintf("%v", v), true, nil
+}
+
+// Set writes ONE key/value (creating or overwriting it), leaving every other key
+// untouched — the write primitive behind `beehive secret set <key> <value>`.
+func (s Store) Set(ctx context.Context, key, value string) error {
+	cur, err := s.Load(ctx)
+	if err != nil {
+		return err
+	}
+	cur[key] = value
+	return s.Save(ctx, cur)
 }
 
 func (s Store) merge(ctx context.Context, yamlFile string, overwrite bool) error {

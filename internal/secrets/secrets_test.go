@@ -178,3 +178,79 @@ func TestEmptyGPGHomeFailsLoudly(t *testing.T) {
 		t.Fatal("Save with empty GPGHome must fail loudly (no shared-keyring fallback)")
 	}
 }
+
+// TestScopedEnvFlattens confirms ScopedEnv resolves the submodule-scoped doc
+// (own layered over global, most-specific wins) into a flat KEY=stringVALUE map:
+// scalar values are stringified, a submodule shadow wins, a sibling's secret
+// never appears, and a non-scalar value is skipped (never a "map[...]" blob).
+func TestScopedEnvFlattens(t *testing.T) {
+	home, rcpt := newKeyring(t)
+	root := t.TempDir()
+	ctx := context.Background()
+
+	global := Store{Path: GlobalPath(root), GPGHome: home, Recipient: rcpt}
+	if err := global.Save(ctx, map[string]any{"shared": "g", "n": 7, "nested": map[string]any{"a": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	foo := Store{Path: SubmodulePath(root, "foo"), GPGHome: home, Recipient: rcpt}
+	if err := foo.Save(ctx, map[string]any{"shared": "foo-wins", "foo_only": "f"}); err != nil {
+		t.Fatal(err)
+	}
+	bar := Store{Path: SubmodulePath(root, "bar"), GPGHome: home, Recipient: rcpt}
+	if err := bar.Save(ctx, map[string]any{"bar_only": "b"}); err != nil {
+		t.Fatal(err)
+	}
+
+	env, err := ScopedEnv(ctx, root, "foo", home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env["shared"] != "foo-wins" {
+		t.Fatalf("shared = %q, want most-specific shadow", env["shared"])
+	}
+	if env["n"] != "7" {
+		t.Fatalf("n = %q, want stringified scalar 7", env["n"])
+	}
+	if env["foo_only"] != "f" {
+		t.Fatalf("foo_only = %q, want foo's own value", env["foo_only"])
+	}
+	if _, ok := env["nested"]; ok {
+		t.Fatal("non-scalar value must be skipped, not stringified into env")
+	}
+	if _, ok := env["bar_only"]; ok {
+		t.Fatal("foo materialization must never contain a sibling's secret")
+	}
+}
+
+// TestStoreSetGetKeys confirms the single-key CLI primitives: Set writes one key
+// leaving others intact, Get returns present/absent correctly, and Keys lists
+// names (sorted) without values.
+func TestStoreSetGetKeys(t *testing.T) {
+	home, rcpt := newKeyring(t)
+	s := Store{Path: filepath.Join(t.TempDir(), "SECRETS.yaml.gpg"), GPGHome: home, Recipient: rcpt}
+	ctx := context.Background()
+
+	if err := s.Set(ctx, "alpha", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set(ctx, "beta", "2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set(ctx, "alpha", "overwritten"); err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := s.Get(ctx, "alpha")
+	if err != nil || !ok || v != "overwritten" {
+		t.Fatalf("Get alpha = %q,%v,%v; want overwritten,true,nil", v, ok, err)
+	}
+	if _, ok, _ := s.Get(ctx, "missing"); ok {
+		t.Fatal("Get missing must report not-present")
+	}
+	keys, err := s.Keys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 || keys[0] != "alpha" || keys[1] != "beta" {
+		t.Fatalf("Keys = %v, want sorted [alpha beta]", keys)
+	}
+}
