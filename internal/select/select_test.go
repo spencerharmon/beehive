@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -547,5 +548,80 @@ func TestSelectBackToBackNoReEmitAfterStamp(t *testing.T) {
 		if got == nil || got.Kind != Work || got.Task.ID != "T1" {
 			t.Fatalf("cycle %d: stamped head must not re-emit reconcile, got %+v", cycle, got)
 		}
+	}
+}
+
+// TestConcurrentReconcileDoesNotHaltOthers is the cluster-wide-fairness guard
+// (session audit 2026-08-03): a HIGH-weight submodule mid-reconcile (drifted AND
+// its .bee-lock-reconcile held by a live pass) must contribute NOTHING to the
+// pool — its own tasks ruled out for the reconcile's duration — while a separate
+// low-weight submodule's work stays selectable. The old "pick a submodule first,
+// then its task-or-fail" structure let the drifted high-weight submodule
+// monopolize the pass and starve everyone else.
+func TestConcurrentReconcileDoesNotHaltOthers(t *testing.T) {
+	_, g, root := hive(t)
+	ctx := context.Background()
+	sub(root, "hi", map[string]string{
+		"ROI.md":              "x",
+		"weight":              "5",
+		"PLAN.md":             "<!-- Beehive-ROI: dead -->\n## H1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+		".bee-lock-reconcile": "bee-other\n" + strconv.FormatInt(time.Now().Unix(), 10) + "\n",
+	})
+	sub(root, "lo", map[string]string{"ROI.md": "x", "PLAN.md": "## T1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	g.Commit(ctx, "seed")
+	stampAll(t, g, root, "lo")
+
+	s := sel(root, g)
+	for i := 0; i < 25; i++ {
+		got, err := s.Select(ctx)
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+		if got == nil || got.Submodule.Name != "lo" || got.Task.ID != "T1" {
+			t.Fatalf("draw %d: concurrent reconcile on hi must not halt lo; got %+v", i, got)
+		}
+	}
+}
+
+// TestHeldReconcileLockSoleSubYieldsNothing: when the only non-dormant submodule
+// is drifted with its reconcile lock held, nothing is selectable (the reconcile
+// is already in flight and its tasks are ruled out) — Select returns nil rather
+// than re-dispatching the same reconcile.
+func TestHeldReconcileLockSoleSubYieldsNothing(t *testing.T) {
+	_, g, root := hive(t)
+	ctx := context.Background()
+	sub(root, "a", map[string]string{
+		"ROI.md":              "x",
+		"PLAN.md":             "<!-- Beehive-ROI: dead -->\n## A1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+		".bee-lock-reconcile": "bee-other\n" + strconv.FormatInt(time.Now().Unix(), 10) + "\n",
+	})
+	g.Commit(ctx, "seed")
+	got, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("held reconcile lock must rule the submodule out entirely, got %+v", got)
+	}
+}
+
+// TestStaleReconcileLockReclaimable: a reconcile lock whose heartbeat expired past
+// TTL is dead — the drifted submodule offers its reconcile again so a live pass can
+// take over (mirrors stale-claim reclaim for tasks).
+func TestStaleReconcileLockReclaimable(t *testing.T) {
+	_, g, root := hive(t)
+	ctx := context.Background()
+	sub(root, "a", map[string]string{
+		"ROI.md":              "x",
+		"PLAN.md":             "<!-- Beehive-ROI: dead -->\n## A1 [TODO] <!-- attempts=0 deps= -->\ngo\n",
+		".bee-lock-reconcile": "bee-dead\n946684800\n",
+	})
+	g.Commit(ctx, "seed")
+	got, err := sel(root, g).Select(ctx)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if got == nil || got.Kind != Reconcile {
+		t.Fatalf("stale reconcile lock must be reclaimable; want Reconcile, got %+v", got)
 	}
 }

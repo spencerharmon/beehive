@@ -417,7 +417,11 @@ func run() error {
 			fmt.Println("honeybee: no workable task")
 			return nil
 		}
-		key := string(sel.Kind)
+		// Reconcile/bootstrap carry no task, so scope their reselect key by submodule
+		// (not bare kind) — otherwise a single lost reconcile-lock race would mark
+		// "reconcile" tried and abort the pass before it could reselect a DIFFERENT
+		// submodule's reconcile or any work.
+		key := sel.Submodule.Name + ":" + string(sel.Kind)
 		if claimable(sel.Kind) {
 			key = sel.Submodule.Name + ":" + sel.Task.ID
 		}

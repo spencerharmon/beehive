@@ -1,8 +1,15 @@
 // Package selectt performs deterministic, no-LLM task selection that always
-// yields a workable task: weighted-random over submodules, ROI-reconcile as
-// priority 0 (PLAN.md stamp vs ROI.md commit), bootstrap when PLAN absent, then
-// GC > arbitration > review > main by priority, dependency-gated, cycle-skipped,
-// NEEDS-HUMAN excluded. Dependency gating spans submodules: a TODO task whose dep
+// yields a workable task: it builds ONE cluster-wide pool of every selectable
+// item across all submodules, then does a weighted-random draw over the whole
+// pool (submodule-weight × task-weight). A submodule that has drifted (PLAN.md
+// stamp vs ROI.md commit) contributes ONLY its reconcile — its own tasks are
+// ruled out until the ROI is folded — and contributes nothing at all while a
+// concurrent reconcile/bootstrap already holds that submodule's lock. Because the
+// draw is cluster-wide, a busy high-weight submodule reconciling never starves
+// other submodules' work or their own reconciles (session audit 2026-08-03).
+// Bootstrap is offered when PLAN is absent; within a submodule GC > arbitration >
+// review > main tier ordering is applied by plan.Candidates, dependency-gated,
+// cycle-skipped, NEEDS-HUMAN excluded. Dependency gating spans submodules: a TODO task whose dep
 // names a linked submodule's task ("<submodule>:<taskid>") is held until that
 // task is DONE, and a task on a wait cycle is excluded rather than deadlocked
 // (this package owns the combined cross-submodule graph; see graph.go). A TODO
@@ -74,8 +81,8 @@ type Selector struct {
 // even a long turn, so a claim with no heartbeat for a full TTL is genuinely dead
 // (duplicate-dispatch-selection-guard, session-audit-015).
 
-// Select walks weighted-random submodules and returns the first workable item.
-// nil is returned only when no submodule has any workable task.
+// Select builds the cluster-wide candidate pool and returns one weighted-random
+// pick. nil is returned only when no submodule has any workable item.
 func (s *Selector) Select(ctx context.Context) (*Selection, error) {
 	subs, err := s.Repo.Submodules()
 	if err != nil {
@@ -97,33 +104,68 @@ func (s *Selector) Select(ctx context.Context) (*Selection, error) {
 	if err != nil {
 		return nil, err
 	}
-	order := s.weightedOrder(subs)
 	now := time.Now().UTC()
-	for _, sm := range order {
-		sel, err := s.fromSubmodule(ctx, sm, now, graph)
+	// Build ONE cluster-wide candidate pool, then weighted-random pick across all of
+	// it. This is the reconcile-starvation fix (session audit 2026-08-03): the prior
+	// design walked submodules in weighted order and returned the FIRST submodule that
+	// yielded anything, so a high-weight submodule (e.g. flux, weight 5) that was
+	// perpetually ROI-drifted monopolized the pass and starved every other submodule's
+	// reconcile AND work for hours. Now each submodule contributes its candidates to a
+	// shared pool and the pick is weighted-random over the WHOLE cluster, so a busy
+	// submodule reconciling never blocks the rest. A submodule's own tasks are ruled
+	// out while it is drifted (its PLAN is stale — it contributes only its reconcile)
+	// and entirely while a concurrent reconcile/bootstrap holds its lock (so a pass
+	// never wastes itself losing a lock race it can already see is held).
+	var pool []candidate
+	for _, sm := range subs {
+		cs, err := s.collect(ctx, sm, now, graph)
 		if err != nil {
 			return nil, err
 		}
-		if sel != nil {
-			return sel, nil
-		}
+		pool = append(pool, cs...)
 	}
-	return nil, nil
+	if len(pool) == 0 {
+		return nil, nil
+	}
+	return s.pick(pool), nil
 }
 
-func (s *Selector) fromSubmodule(ctx context.Context, sm repo.Submodule, now time.Time, graph *Graph) (*Selection, error) {
+// candidate is one selectable item plus its selection weight in the cluster-wide
+// pool. For a task the weight is submodule-weight × task-weight; for a reconcile /
+// bootstrap it is the submodule weight (task-weight 1 equivalent).
+type candidate struct {
+	sel    Selection
+	weight int
+}
+
+// collect returns every selectable candidate a single submodule contributes to the
+// cluster pool. A drifted submodule yields ONLY its reconcile (all its tasks are
+// ruled out until the ROI is folded); a submodule whose reconcile/bootstrap lock is
+// held by a live pass yields nothing (the operation is already in flight).
+func (s *Selector) collect(ctx context.Context, sm repo.Submodule, now time.Time, graph *Graph) ([]candidate, error) {
 	if sm.Dormant() {
 		return nil, nil
 	}
+	w := s.weight(sm)
 	if sm.NeedsBootstrap() {
-		return &Selection{Kind: Bootstrap, Submodule: sm}, nil
+		if s.lockHeld(sm, string(Bootstrap), now) {
+			return nil, nil
+		}
+		return []candidate{{Selection{Kind: Bootstrap, Submodule: sm}, w}}, nil
 	}
 	rng, err := s.reconcileRange(ctx, sm)
 	if err != nil {
 		return nil, err
 	}
 	if rng != "" {
-		return &Selection{Kind: Reconcile, Submodule: sm, DiffRange: rng}, nil
+		// Drifted: the PLAN predates the current ROI, so working any of this
+		// submodule's tasks would act on a stale plan. Rule them all out and offer
+		// only the reconcile — and nothing at all while a concurrent reconcile
+		// already holds the lock (its tasks stay ruled out for the duration).
+		if s.lockHeld(sm, string(Reconcile), now) {
+			return nil, nil
+		}
+		return []candidate{{Selection{Kind: Reconcile, Submodule: sm, DiffRange: rng}, w}}, nil
 	}
 	b, err := os.ReadFile(sm.PlanPath())
 	if err != nil {
@@ -137,23 +179,27 @@ func (s *Selector) fromSubmodule(ctx context.Context, sm repo.Submodule, now tim
 		return nil, err
 	}
 	cands := graphGate(sm, pl.Candidates(now, s.TTL), graph)
-	if len(cands) == 0 {
-		return nil, nil
+	out := make([]candidate, 0, len(cands))
+	for _, t := range cands {
+		// Tier the selection by the task's own status so the runner claims the right
+		// kind of session. A NEEDS-REVIEW / NEEDS-ARBITRATION task becomes Review /
+		// Arbitrate (judge existing work); everything else is Work. Candidates already
+		// excluded actively-claimed tasks, so a selected task is either unclaimed or
+		// holds a stale claim the runner's own claim will overwrite.
+		kind := Work
+		switch t.Status {
+		case plan.StatusReview:
+			kind = Review
+		case plan.StatusArb:
+			kind = Arbitrate
+		}
+		tw := t.Weight
+		if tw < 1 {
+			tw = 1
+		}
+		out = append(out, candidate{Selection{Kind: kind, Submodule: sm, Task: t}, w * tw})
 	}
-	t := s.pickTask(cands)
-	// Tier the selection by the task's own status so the runner claims the right
-	// kind of session. A NEEDS-REVIEW / NEEDS-ARBITRATION task becomes Review /
-	// Arbitrate (judge existing work); everything else is Work. Candidates already
-	// excluded actively-claimed tasks, so a selected task is either unclaimed or
-	// holds a stale claim the runner's own claim will overwrite.
-	kind := Work
-	switch t.Status {
-	case plan.StatusReview:
-		kind = Review
-	case plan.StatusArb:
-		kind = Arbitrate
-	}
-	return &Selection{Kind: kind, Submodule: sm, Task: t}, nil
+	return out, nil
 }
 
 // graphGate filters main-tier (TODO) candidates through the combined
@@ -229,28 +275,6 @@ func (s *Selector) refreshTrackedMain(ctx context.Context) error {
 	return s.Git.Pull(ctx, rem, "main")
 }
 
-// weightedOrder returns submodules shuffled, each repeated by its weight, so
-// higher-weighted submodules are tried first on average. Deterministic per Rand.
-func (s *Selector) weightedOrder(subs []repo.Submodule) []repo.Submodule {
-	pool := make([]repo.Submodule, 0, len(subs))
-	for _, sm := range subs {
-		w := s.weight(sm)
-		for i := 0; i < w; i++ {
-			pool = append(pool, sm)
-		}
-	}
-	s.Rand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
-	seen := map[string]bool{}
-	out := make([]repo.Submodule, 0, len(subs))
-	for _, sm := range pool {
-		if !seen[sm.Name] {
-			seen[sm.Name] = true
-			out = append(out, sm)
-		}
-	}
-	return out
-}
-
 // weight reads submodules/<name>/weight (positive int), default 1.
 func (s *Selector) weight(sm repo.Submodule) int {
 	b, err := os.ReadFile(filepath.Join(sm.Path, "weight"))
@@ -264,26 +288,46 @@ func (s *Selector) weight(sm repo.Submodule) int {
 	return n
 }
 
-// pickTask weighted-randomly chooses one candidate by Task.Weight.
-func (s *Selector) pickTask(cands []plan.Task) plan.Task {
+// lockHeld reports whether submodule sm's named singleton lock
+// (submodules/<sm>/.bee-lock-<name>) is currently held by a live pass — i.e. its
+// heartbeat ts is within TTL. Mirrors claim.readLock + claim.lockActive without
+// importing the claim package (avoids an import cycle). A missing/malformed lock
+// file reads as unlocked.
+func (s *Selector) lockHeld(sm repo.Submodule, name string, now time.Time) bool {
+	b, err := os.ReadFile(filepath.Join(sm.Path, ".bee-lock-"+name))
+	if err != nil {
+		return false
+	}
+	lines := strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)
+	if len(lines) < 2 {
+		return false
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(lines[1]), 10, 64)
+	if err != nil {
+		return false
+	}
+	return ts != 0 && now.Sub(time.Unix(ts, 0)) < s.TTL
+}
+
+// pick chooses one candidate from the cluster pool weighted-randomly by its weight
+// (submodule-weight × task-weight), the same weighted draw the old per-submodule
+// pickTask used — now applied across the whole cluster.
+func (s *Selector) pick(pool []candidate) *Selection {
 	total := 0
-	for _, t := range cands {
-		w := t.Weight
-		if w < 1 {
-			w = 1
+	for i := range pool {
+		if pool[i].weight < 1 {
+			pool[i].weight = 1
 		}
-		total += w
+		total += pool[i].weight
 	}
 	r := s.Rand.Intn(total)
-	for _, t := range cands {
-		w := t.Weight
-		if w < 1 {
-			w = 1
+	for i := range pool {
+		if r < pool[i].weight {
+			sel := pool[i].sel
+			return &sel
 		}
-		if r < w {
-			return t
-		}
-		r -= w
+		r -= pool[i].weight
 	}
-	return cands[len(cands)-1]
+	sel := pool[len(pool)-1].sel
+	return &sel
 }
