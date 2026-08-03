@@ -43,6 +43,15 @@ CASES=(
     "TaskStatus|TaskStatus_leak_buggy.cfg|fail"
     "TaskStatus|TaskStatus_resolveloop_fixed.cfg|pass"
     "TaskStatus|TaskStatus_resolveloop_buggy.cfg|fail"
+    # TaskStatus revert-content half: the "already-merged" review finalize shortcut
+    # (finalizeIfAlreadyMerged) concluded DONE from bare commit ANCESTRY, so a
+    # revert-after-merge that keeps the merge an ancestor while deleting the content
+    # finalized a false-DONE with the artifact absent (flux:omada-ingress-tls). The
+    # buggy cfg (ancestry-only finalize) reproduces the false-DONE counterexample;
+    # the fixed cfg (content/Check-gated finalize) holds NoFalseDone across the
+    # revert trace.
+    "TaskStatus|TaskStatus_revert_fixed.cfg|pass"
+    "TaskStatus|TaskStatus_revert_buggy.cfg|fail"
     "DependencyReadiness|DependencyReadiness_fixed.cfg|pass"
     "DependencyReadiness|DependencyReadiness_buggy.cfg|fail"
     "DependencyReadiness|DependencyReadiness_cycle_buggy.cfg|fail"

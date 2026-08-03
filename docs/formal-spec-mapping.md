@@ -110,12 +110,13 @@ transitions` + the recovery/escalation methods).
 | `ArbSideReviewer` attempts/limit → HUMAN | action | `plan/state.go:85 Reject` | `plan_test.go TestRejectAttempts`; `invariant_conformance_test.go TestInvariant_EscalationTerminates` |
 | `RecoverLostWork` | action | `plan/state.go:215 RecoverLostWork`; dispatch guards `swarm.go:2788 bounceIfUnreachable`, `:2878 recoverIfLost` | `swarm` recover-lost-work tests |
 | `FinalizeAlreadyMerged` | action | `plan/state.go FinalizeAlreadyMerged`; `swarm.go:2651 finalizeIfAlreadyMerged` (own bee tip, not ambient) | `swarm_test.go TestReviewDispatchDoesNotFinalizeOnAmbientPointerAncestry{Remote,LocalSharing}` |
+| `MergeInterrupted` + `RevertMerge` + `FinalizeAlreadyMerged` content gate (`ContentGated`) | adversary + action + guard | `swarm.go finalizeIfAlreadyMerged` — **the fix must gate the finalize on the reviewed TREE CONTENT surviving on `main` (re-run the task's `Check:` on the merged tree), NOT on the merge commit being a bare ANCESTOR**; the `review-revert-content-finalize-fix` Go task depends on this spec as its executable contract | `TaskStatus_revert_buggy.cfg` reproduces the false-DONE counterexample (`MergeInterrupted`→`RevertMerge`→`FinalizeAlreadyMerged`→DONE with `artifactOnMain = FALSE`); `TaskStatus_revert_fixed.cfg` holds `NoFalseDone` across the revert trace |
 | `RequestHuman` | action | `plan/state.go:255 RequestHuman` (+ `EscalationReady`) | `plan_test.go TestRequestHuman` |
 | `Resolve` (operator reopen `NEEDS-HUMAN → TODO`) + `ResetAttemptsOnResolve` fix contract | action + guard | `plan/state.go:294 Resolve` — **GAP: does NOT reset `t.Attempts`** (sets Status=TODO/clears claim only) | `TaskStatus_resolveloop_buggy.cfg` reproduces `AttemptsBounded` violated (escalate→resolve→escalate grows the counter unbounded); `TaskStatus_resolveloop_fixed.cfg` passes with attempts reset per reopen |
 | `PassCheck` + DoD gate on DONE-ward edges | action + guard | `swarm/verify.go:266 verifyGate` invariant 5 + `:282 checkGate` (run `Check` via `runVerify`, refuse DONE unless exit 0; `check=none` not gated; fail-closed on infra) (`92d2ed1`) | `swarm_test.go TestVerifyGateChecksDefinitionOfDone`, `TestVerifyGateCheckNoneNotGated` |
 | no `TODO → DONE` (work pass) | guard | `swarm.go:2071 workChecklist` refuses a work-set DONE; `gatedHandoff` drops Work→Done (`92d2ed1`) | `swarm_test.go TestWorkDoneFlipRefused` |
 | `LegalTransitionsOnly` | invariant | `plan/state.go:12 transitions` + `:19 CanTransition` (single source of truth) | `invariant_conformance_test.go TestInvariant_LegalTransitionsOnly` (exhaustive 5×5 matrix, independent of the code map) + `TestInvariant_HumanIsTerminalForAgent` |
-| `NoFalseDone` (durable ∧ merged ∧ DoD-check) | invariant | `verify.go verifyGate` (durability + invariant-5 check gate) + `finalizeIfAlreadyMerged`/`recordReviewedCommit` own-tip fix | `TaskStatus_buggy.cfg` (durability defect) + `TaskStatus_buggy_check.cfg` (jellyfin DoD defect) both prove false-DONE reachable when the respective gate is off |
+| `NoFalseDone` (durable ∧ merged ∧ content-on-main ∧ DoD-check) | invariant | `verify.go verifyGate` (durability + invariant-5 check gate) + `finalizeIfAlreadyMerged`/`recordReviewedCommit` own-tip fix + the pending content-gate fix (`review-revert-content-finalize-fix`) | `TaskStatus_buggy.cfg` (durability defect) + `TaskStatus_buggy_check.cfg` (jellyfin DoD defect) + `TaskStatus_revert_buggy.cfg` (revert-after-merge ancestry-only finalize) all prove false-DONE reachable when the respective gate is off |
 | `Terminates`, `LostWorkRecovers` | liveness | attempts/limit escalation + `recoverIfLost` dispatch guard | `invariant_conformance_test.go TestInvariant_EscalationTerminates` (deterministic escalation to terminal NEEDS-HUMAN) + `TaskStatus_fixed.cfg` |
 
 **Modeling note (verified against the code, not assumed):** the operator `Resolve`
@@ -160,6 +161,60 @@ Run-tlc.sh output (both new cases, wired into the CASES list):
 OK   TaskStatus_resolveloop_fixed.cfg (expected pass)
 OK   TaskStatus_resolveloop_buggy.cfg (expected fail)
 ```
+
+**Revert-content finalize (2026-08-02, flux:omada-ingress-tls):** the review
+"already-merged" finalize shortcut (`FinalizeAlreadyMerged` / `swarm.go`
+`finalizeIfAlreadyMerged`) concluded DONE from bare commit **ANCESTRY** — the merge
+commit stays in `main`'s history — rather than from the reviewed **TREE CONTENT**
+surviving on `main`. Live: `flux:omada-ingress-tls` sat DONE (`review=8b63d1b`,
+"already merged into tracked main … runner-finalized DONE (no re-review, branch not
+required)") yet the ingress never existed in-cluster — the reviewed merge (`6f34902`)
+was REVERTED 14 min later (`7f36d00 Revert "Merge branch bee-omada-ingress-tls"`),
+deleting all five delivered files. Ancestry ≠ content: the revert leaves the ancestry
+test green while the effect is gone, and the target's own `Check:` was never run
+("branch not required"). Same corpus-eating shape as the empty-checksum canonical bug.
+
+Modeled by splitting the single `merged` flag into two facts: `merged` (the merge
+commit is an **ancestor** of `main` — stays TRUE after a revert) and `artifactOnMain`
+(the reviewed **tree content** survives on `main` — a revert sets it FALSE). Two
+`ModelRevert`-guarded actions carry the trace: `MergeInterrupted` (the reviewer's
+merge lands the content and ancestry, but the session dies before flipping DONE,
+leaving status REVIEW/ARB) and `RevertMerge` (a later revert removes the content while
+keeping ancestry). `NoFalseDone` is strengthened to require `artifactOnMain`, and
+`FinalizeAlreadyMerged` gains a `ContentGated` guard. `CONSTANT ModelRevert = FALSE`
+in every OTHER cfg keeps `MergeInterrupted`/`RevertMerge` disabled — and since
+`merged` there only ever becomes TRUE alongside `status = DONE`, `FinalizeAlreadyMerged`
+stays unreachable exactly as before, so the existing 14 TaskStatus cases are byte-
+identical in behaviour.
+
+- `ContentGated = FALSE` (`TaskStatus_revert_buggy.cfg`) = the ancestry-only finalize
+  AS DIAGNOSED → a DONE state is reachable with the artifact absent (`artifactOnMain =
+  FALSE`); `NoFalseDone` violated with a counterexample trace. This is the **executable
+  contract** the Go fix (`review-revert-content-finalize-fix`) must satisfy.
+- `ContentGated = TRUE` (`TaskStatus_revert_fixed.cfg`) = the finalize requires the
+  reviewed content present on `main` (re-run the `Check:` on the merged tree) → the
+  revert-after-merge refuses DONE and the task re-earns it via a fresh approve that
+  re-lands the content (or terminates NEEDS-HUMAN past Limit); `NoFalseDone` holds
+  across every reachable state including the revert trace.
+
+Counterexample trace (`TaskStatus_revert_buggy.cfg`, `Limit = 1`):
+
+```
+State 1  <Init>                merged=FALSE  artifactOnMain=FALSE  status="TODO"
+State 2  DoWork                merged=FALSE  artifactOnMain=FALSE  status="TODO"   (bee work durable on origin)
+State 3  HandoffToReview       merged=FALSE  artifactOnMain=FALSE  status="REVIEW"
+State 4  MergeInterrupted      merged=TRUE   artifactOnMain=TRUE   status="REVIEW" (reviewer merged; session died pre-DONE)
+State 5  RevertMerge           merged=TRUE   artifactOnMain=FALSE  status="REVIEW" (revert deletes files; ancestry kept)
+State 6  FinalizeAlreadyMerged merged=TRUE   artifactOnMain=FALSE  status="DONE"   → NoFalseDone VIOLATED (content absent)
+```
+
+Run-tlc.sh output (both new cases, wired into the CASES list):
+
+```
+OK   TaskStatus_revert_fixed.cfg (expected pass)
+OK   TaskStatus_revert_buggy.cfg (expected fail)
+```
+
 
 ## Layer 2 — `ClaimRace.tla`
 
