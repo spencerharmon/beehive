@@ -288,7 +288,7 @@ func run() error {
 	// honeybee. Stamped on whatever task we work so peers see it as actively held.
 	session := wtBranch
 
-	// Check-command policy (DoD `Check:` sandbox): command allowlist + filesystem
+	// Check-command policy (DoD `Check:` sandbox): command denylist + filesystem
 	// confinement scoped to the task's submodule and its LINKED submodules. Assembled
 	// from the layered config over the default denylist; the linked-submodule set is
 	// DERIVED at runtime from SUBMODULE-LINKS.yaml (never hardcoded).
@@ -365,7 +365,7 @@ func run() error {
 		SecretsFor: func(ctx context.Context, submodule string) (map[string]string, error) {
 			return secrets.ScopedEnv(ctx, primaryRoot, submodule, eff.GPGHome)
 		},
-		// DoD `Check:` sandbox/policy (command allowlist + filesystem confinement) and
+		// DoD `Check:` sandbox/policy (command denylist + filesystem confinement) and
 		// the parsed links used to DERIVE the linked-submodule read paths.
 		CheckPolicy: &checkPol,
 		Links:       hiveLinks,

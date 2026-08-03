@@ -12,7 +12,7 @@ import (
 	selectt "github.com/spencerharmon/beehive/internal/select"
 )
 
-// policyViolationError marks a check that failed the command allowlist (as opposed
+// policyViolationError marks a check that failed the command denylist (as opposed
 // to an infra failure to run it). Callers unwrap it to hand the author a
 // fix-forward prompt instead of failing closed on an un-runnable command.
 type policyViolationError struct{ err error }
@@ -21,7 +21,7 @@ func (e policyViolationError) Error() string { return e.err.Error() }
 func (e policyViolationError) Unwrap() error { return e.err }
 
 // runCheck executes a task's `Check:` DoD command under the check policy: the
-// command allowlist is enforced (a violation is returned as an error → the gate
+// command denylist is enforced (a violation is returned as an error → the gate
 // fails CLOSED), and the command runs inside filesystem confinement scoped to the
 // task's OWN submodule checkout (writable) plus its LINKED submodule checkouts and
 // the operator-declared read paths (read-only). It returns the same verifyOutcome
@@ -53,7 +53,7 @@ func (r *Runner) runCheckIn(ctx context.Context, sel *selectt.Selection, check, 
 }
 
 // runCheckAt is the shared policy/sandbox body: validate the command against the
-// allowlist (a violation fails CLOSED), resolve the sandbox binds for cwd, and run
+// denylist (a violation fails CLOSED), resolve the sandbox binds for cwd, and run
 // under confinement. base is the directory used to resolve relative read paths.
 func (r *Runner) runCheckAt(ctx context.Context, sel *selectt.Selection, check, cwd, base string) (verifyOutcome, error) {
 	if err := r.CheckPolicy.Validate(check); err != nil {

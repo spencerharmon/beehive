@@ -183,7 +183,7 @@ type Config struct {
 	// these. Documented in LOCALS.md.
 	CheckDeniedCommands []string `yaml:"check_denied_commands"`
 	// CheckSandbox selects the filesystem-confinement layer for a `Check:` command:
-	// "auto" (default; bubblewrap if present else degrade to allowlist-only), "bwrap"
+	// "auto" (default; bubblewrap if present else degrade to denylist-only), "bwrap"
 	// (require it — see CheckRequireSandbox), or "off". Empty = "auto".
 	CheckSandbox string `yaml:"check_sandbox"`
 	// CheckRequireSandbox, when true, makes a requested-but-missing bubblewrap a HARD
@@ -191,7 +191,7 @@ type Config struct {
 	// distinguishable from an explicit false. Default false.
 	CheckRequireSandbox *bool `yaml:"check_require_sandbox"`
 	// CheckReadPaths are extra absolute host paths bound READ-ONLY into the check
-	// sandbox — the site-specific credentials/config an allowlisted check tool needs
+	// sandbox — the site-specific credentials/config a check tool needs
 	// (a kubeconfig outside ~/.kube, a CA bundle, a cloud config). The submodule and
 	// its LINKED submodule checkouts are NOT listed here; they are derived at runtime
 	// from SUBMODULE-LINKS.yaml. Documented in LOCALS.md.

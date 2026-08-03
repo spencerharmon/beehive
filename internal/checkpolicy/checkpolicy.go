@@ -8,13 +8,13 @@
 // plus the checkouts of submodules it is LINKED to via SUBMODULE-LINKS, derived at
 // runtime — never hardcoded — plus operator-declared read paths).
 //
-// The command layer is a DENYLIST, not an allowlist. The universe of commands a
-// honeybee may run at all is owned by the agent runtime's (opencode's) own
-// permission configuration; a check is a SUBSET of that universe. Rather than
-// re-enumerate a positive allowlist here (which forced an operator to widen config
-// for every real test runner — `go test`, `dotnet test`, `pytest`, `nix build` —
-// and rejected them by default), the policy ADMITS anything opencode allows EXCEPT
-// the commands on the denylist. The denylist exists to stop a honeybee ABUSING the
+// The command layer is a DENYLIST. There is deliberately NO positive allowlist:
+// the universe of commands a honeybee may run at all is owned by the agent
+// runtime's (opencode's) own permission configuration, and a check may run
+// ANYTHING opencode can run EXCEPT the commands on the denylist. Everything
+// available to opencode is available to a check — a check never needs a tool
+// "installed" or "allowlisted" that a bee can otherwise run. The denylist exists
+// to stop a honeybee ABUSING the
 // check as a fake definition of done — asserting a source-text fact instead of a
 // real effect (`grep`/`find`/`cat`/`test -f` on the checkout, or a no-op like
 // `true`/`echo` that always exits 0) — and, because a Check executes via the
@@ -55,9 +55,9 @@ import (
 
 // Sandbox modes for the filesystem-confinement layer.
 const (
-	SandboxAuto  = "auto"  // bwrap if available, else degrade to allowlist-only (default)
+	SandboxAuto  = "auto"  // bwrap if available, else degrade to denylist-only (default)
 	SandboxBwrap = "bwrap" // require bwrap (see RequireSandbox for the missing-bwrap behavior)
-	SandboxOff   = "off"   // no filesystem confinement; the command allowlist still applies
+	SandboxOff   = "off"   // no filesystem confinement; the command denylist still applies
 )
 
 // Policy is the resolved, per-install check policy (assembled from layered config,
@@ -72,10 +72,10 @@ type Policy struct {
 	// Sandbox selects the filesystem-confinement layer (SandboxAuto default).
 	Sandbox string
 	// RequireSandbox, when true, makes a requested-but-unavailable bwrap a hard error
-	// (fail-closed) instead of a degrade-to-allowlist-only. Default false.
+	// (fail-closed) instead of a degrade-to-denylist-only. Default false.
 	RequireSandbox bool
 	// ReadPaths are extra absolute host paths bound READ-ONLY into the sandbox — the
-	// site-specific credentials/config a check's allowlisted tools need (a kubeconfig
+	// site-specific credentials/config a check's tools need (a kubeconfig
 	// outside the default ~/.kube, a CA bundle, a cloud config). Operator-declared in
 	// config; documented in LOCALS.md. The submodule + linked-submodule checkouts are
 	// NOT listed here — they are derived at runtime and passed to Argv separately.
@@ -86,7 +86,7 @@ type Policy struct {
 // invoke, in two groups (see the package doc for the rationale). Everything else
 // opencode permits is admitted, so real test runners a check legitimately needs
 // (`go`, `dotnet`, `pytest`, `nix`, `cargo`, `make`, `npm`, …) pass by default
-// without any positive-allowlist entry.
+// with no per-tool config entry required (there is no positive allowlist to add to).
 //
 // Group 1 — ANTI-ABUSE: source-inspection and no-op tools whose presence signals a
 // FAKE definition of done (a task "passes" the moment the code is written, proving
@@ -170,7 +170,7 @@ func (p Policy) Validate(check string) error {
 	return nil
 }
 
-// commandBase reduces a command word to the basename used for allowlist lookup, so
+// commandBase reduces a command word to the basename used for denylist lookup, so
 // `/usr/bin/curl` and `curl` match the same entry. Filesystem confinement (bwrap)
 // separately prevents reaching a same-named binary outside the bound dirs.
 func commandBase(w string) string {

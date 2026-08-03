@@ -193,11 +193,16 @@ plausible diff merged. It is a task-body field, and the runner ENFORCES it (prom
   not assumption. Write a check that asserts the REAL effect (curl the endpoint and grep the expected
   body, `kubectl rollout status`, pull the image by digest) — never one that passes on a 404 or greps the
   wrong string. Run it yourself any time with `beehive task check <sm> <id>`.
-  Checks run under a SANDBOX: only ALLOWLISTED low-risk tools (curl, kubectl, git,
-  grep, jq, skopeo, … — no shells/interpreters as a command, no `… | sh`), confined
-  to your submodule's checkout and its LINKED submodules. Keep the check to those
-  tools and paths; if a check needs a credential/config outside them, that is an
-  operator `check_read_paths` decision, not a reason to widen the check.
+  Checks run under a SANDBOX with a command DENYLIST (there is NO allowlist):
+  a check may invoke ANYTHING the agent runtime (opencode) can run — `go test`,
+  `dotnet test`, `pytest`, `nix build`, `kubectl`, `curl`, `helm`, `skopeo`, `jq`, … —
+  EXCEPT a denied set: fake-test tools (`grep`/`find`/`cat`/`test -f`, no-ops like
+  `true`/`echo`) and code-smuggling/destructive commands (`bash -c`, `python -c`,
+  `… | sh`, `rm`, `dd`). The check is filesystem-confined to your submodule's checkout
+  and its LINKED submodules. So "the tool isn't installed / allowlisted" is NEVER a
+  reason to escalate or to weaken the check — if a bee can run it, the check can run it;
+  pick a REAL framework that exercises the effect. If a check needs a credential/config
+  OUTSIDE your submodule + `~/.kube`, that is an operator `check_read_paths` decision.
 - **`Verify-After-Merge:` <command>** — a DoD whose effect only exists AFTER the merge (GitOps and
   anything the reviewer lands). You cannot run it in-session (the merge does not exist yet at
   NEEDS-REVIEW); when this task reaches DONE the runner AUTO-spawns a successor CHECK task
@@ -481,6 +486,30 @@ Done when the task leaves `NEEDS-ARBITRATION`.
      schema, public API, an architecture fork). Reason = the options + each one's user-visible
      consequence. (An internal choice with no user-visible difference ≠ architecture — pick the
      cleaner one, note the tradeoff.)
+
+    **Before you escalate, RULE OUT the common false blockers (`skills/self-resolve-before-escalating.md`).**
+    The escalation corpus shows the MAJORITY of NEEDS-HUMAN filings were self-resolvable. If ANY of
+    these fits, do THAT instead of `beehive task human`:
+    - **"Install tool X" / the DoD check won't run in the sandbox** → there is NO allowlist, only a
+      denylist: a check runs anything opencode runs (`go test`, `dotnet`, `helm`, `flux`, `kubectl`,
+      a fetched `tla2tools.jar`) except the denied fake-test/destructive set. Re-target the `Check:`
+      to a real, sandbox-runnable framework (register it in `CHECKS.md`), or build/vendor the
+      prerequisite in the pipeline/CI the swarm already owns. Never escalate to have a tool installed.
+    - **"Commit unreachable / nothing to review / no implementer work"** → lost work, not a human
+      decision. Reset the task to TODO (`--commits-none`) so a fresh implementer redoes it; if the
+      deliverable already landed on the submodule `origin/main`, reconcile the bookkeeping
+      (`commits=<sha>` + change doc) to what is already on disk.
+    - **"Dependency is DONE but its effect is absent" / "task premise disproven" / "Check gates on a
+      resource that will never exist"** → dependency hygiene, NOT `contradiction`. DEFER-and-recheck
+      if it is converging, else FILE the missing prerequisite in the owning submodule and
+      `beehive task block` on it, or de-scope the stale/deprecated task and prune its dangling deps.
+    - **"Can't verify — cache poisoned / private IP unreachable / not converged"** → in-cluster
+      `kubectl` (restart/scale/clear-cache/`exec` probe) is YOUR job; async convergence is a DEFER.
+    - **A systemic block stranding N tasks** (one git-remote/config edit, one runner defect) →
+      escalate ONCE with the single fix and cross-link the siblings; never file a fresh NEEDS-HUMAN
+      per victim.
+    Escalate ONLY when what remains is a genuine `secret`, `external-permission`, `contradiction`, or
+    `architecture` blocker per the four definitions above.
     The `--reason` must LEAD with the operator-facing ask and stay short — the investigation narrative
     and evidence belong in the change doc, not the escalation. The runner will NOT let the pass end on
     a NEEDS-HUMAN with a blank reason or a missing/invalid `--category`.

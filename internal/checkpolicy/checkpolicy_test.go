@@ -8,8 +8,8 @@ import (
 func TestValidateAdmitsRealFrameworkChecks(t *testing.T) {
 	p := Default()
 	ok := []string{
-		// real test runners that the OLD allowlist rejected (not enumerated) and the
-		// denylist now admits by default — the point of the change.
+		// real test runners the denylist admits by default (a positive-allowlist
+		// design would have had to enumerate each) — the point of the denylist.
 		`go test ./...`,
 		`CGO_ENABLED=0 go build ./...`,
 		`dotnet test`,
