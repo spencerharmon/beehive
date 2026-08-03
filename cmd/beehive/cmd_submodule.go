@@ -209,6 +209,7 @@ func submoduleWorktreeCmd() *cobra.Command {
 			return nil
 		},
 	})
+	c.AddCommand(submoduleWorktreeExecCmd())
 	return c
 }
 

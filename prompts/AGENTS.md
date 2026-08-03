@@ -77,6 +77,23 @@ Never `git reset`/`checkout`/`stash` the live primary tree to "make room" — yo
 in-flight publishes. Always remove your worktree + branch when done.
 `skills/shared-checkout-edits.md` carries the full procedure and failure modes.
 
+**Running a worktree-scoped command — use the `exec` verbs, never `cd`.** Just as
+`beehive git` / `beehive submodule git` are the ONLY sanctioned way to run *git*
+against a worktree without `cd`-ing into it, `beehive worktree exec <branch> --
+<cmd>...` (CWD = the hive worktree `.worktrees/<branch>/`) and `beehive submodule
+worktree exec <submodule> <branch> -- <cmd>...` (CWD =
+`.submodule-worktrees/<submodule>/<branch>/`) are the sanctioned way to run any
+NON-git worktree-scoped command — a branch's build, test, or script. Each resolves
+the worktree by ABSOLUTE path (independent of your cwd), streams stdout/stderr,
+propagates the child's exit code, preserves `--` (every flag after it belongs to the
+child), and refuses a nonexistent worktree with an error naming the exact `beehive
+[submodule] worktree add` to create it. **Whenever you run — or instruct an operator
+to run — a script/test/build that lives on a branch, emit the exact `beehive
+[submodule] worktree exec …` invocation (naming the submodule and branch), never a
+`cd <path> && <cmd>` or a bare relative path.** This is especially required in a
+NEEDS-HUMAN escalation's Steps that name a script/test path: give the literal
+`beehive submodule worktree exec <sm> <branch> -- <cmd> <args>` the operator pastes.
+
 ## The deterministic runtime (don't redo what the runner does)
 
 A honeybee pass is a thin LLM turn-loop wrapped by a deterministic runner. The runner
