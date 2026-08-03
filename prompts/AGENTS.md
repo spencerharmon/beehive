@@ -290,3 +290,14 @@ add a local skill so agents can discover it.
   in the beehive submodule.
 - No shortcuts: compute real values; no placeholders, swallowed errors, or fake
   "done".
+- NEVER embed deployment-specific **infrastructure identifiers** — real hostnames,
+  domain names, public IPs / CIDRs, cluster or node names, credentials, or any other
+  site-specific fact — in a target's **source code** (the public or shared repo a
+  submodule tracks). Keep a strict dividing line: such values live ONLY on the
+  infrastructure side (the deployment / GitOps repo, the CI / actions config, and the
+  private config repos hosted in the operator's own forge) and are supplied to the code
+  at runtime from configuration or secrets. Engine and library code stays
+  infrastructure-agnostic; its docs, examples, and tests use neutral placeholders
+  (RFC2606 `example.com` / `example.net`, RFC5737 `192.0.2.0/24`). A real infra
+  identifier committed into tracked code is a bug. The concrete identifiers this rule
+  protects for THIS install are named in `LOCALS.md`.
