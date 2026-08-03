@@ -4949,6 +4949,124 @@ func TestVerifyGateLocalSharingAllowsUnpushedCommit(t *testing.T) {
 	}
 }
 
+// TestVerifyGatePresentReviewMergeShaNeverReportedAbsent is the regression for the
+// present-commit FALSE NEGATIVE observed live on runcible edgeos-static-route-
+// provider and omada-system-provider (2026-08-03): a Review/Arbitrate APPROVE
+// authored the merge correctly — the merge commit is PRESENT in the tracked
+// submodule checkout the runner just merged/pinned (`git cat-file -e` exits 0
+// there, in the primary hive checkout, AND on origin) — yet the handoff gate's
+// commits= existence check REJECTED the DONE flip ("commit <sha> does not exist in
+// submodule"), across 7+ identical retries, burning each pass to GC and finally
+// escalating NEEDS-HUMAN on a NON-blocker. The runner OWNS the Review/Arbitrate
+// merge (finalizeReviewMerge resolves + stamps the commits against the SAME merged
+// checkout it just produced), so verifyGate must NEVER re-derive their durability
+// against a DIFFERENT location (origin/bee-<id>'s ancestry, a stale clone, an
+// alternate object store): a commit present in the merged checkout can never be
+// reported absent for these kinds. Here the stamped sha is a merge commit that
+// lives in the tracked checkout but is NOT reachable from origin/bee-T1 — exactly
+// the runcible shape — so a gate that resolved existence against the remote bee
+// branch (the Work-path origin-durability check) would falsely reject it. It must
+// pass.
+func TestVerifyGatePresentReviewMergeShaNeverReportedAbsent(t *testing.T) {
+	ctx := context.Background()
+	for _, kind := range []selectt.Kind{selectt.Review, selectt.Arbitrate} {
+		t.Run(string(kind), func(t *testing.T) {
+			root := t.TempDir()
+			g := gitInit(t, root)
+			repo.Init(root)
+			sm := filepath.Join(root, "submodules", "sm")
+			os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+			repoDir := filepath.Join(sm, "repo")
+			os.MkdirAll(repoDir, 0o755)
+			rg := gitInit(t, repoDir)
+			os.WriteFile(filepath.Join(repoDir, "f"), []byte("x"), 0o644)
+			if err := rg.Commit(ctx, "base"); err != nil {
+				t.Fatalf("submodule base commit: %v", err)
+			}
+			// A bare origin carrying main + the implementer branch bee-T1 — but NOT
+			// the runner's review-merge commit.
+			origin := filepath.Join(t.TempDir(), "origin.git")
+			os.MkdirAll(origin, 0o755)
+			if _, err := git.New(origin).Run(ctx, "init", "-q", "--bare", "-b", "main"); err != nil {
+				t.Fatalf("bare origin init: %v", err)
+			}
+			if _, err := rg.Run(ctx, "remote", "add", "origin", origin); err != nil {
+				t.Fatalf("remote add: %v", err)
+			}
+			if _, err := rg.Run(ctx, "push", "-q", "origin", "main"); err != nil {
+				t.Fatalf("push main: %v", err)
+			}
+			// Implementer branch: one commit, pushed to origin.
+			if _, err := rg.Run(ctx, "checkout", "-q", "-b", "bee-T1"); err != nil {
+				t.Fatalf("branch bee-T1: %v", err)
+			}
+			os.WriteFile(filepath.Join(repoDir, "impl"), []byte("i"), 0o644)
+			if err := rg.Commit(ctx, "Beehive: T1 submodules/sm/docs/bee-T1-T1.md"); err != nil {
+				t.Fatalf("impl commit: %v", err)
+			}
+			if _, err := rg.Run(ctx, "push", "-q", "origin", "bee-T1"); err != nil {
+				t.Fatalf("push bee-T1: %v", err)
+			}
+			// The runner's review merge lands in the tracked checkout: back on main,
+			// merge the implementer branch, producing a merge commit present ONLY in
+			// this checkout (it is never pushed to origin/bee-T1).
+			if _, err := rg.Run(ctx, "checkout", "-q", "main"); err != nil {
+				t.Fatalf("checkout main: %v", err)
+			}
+			if _, err := rg.Run(ctx, "merge", "-q", "--no-ff", "-m", "runner review merge", "bee-T1"); err != nil {
+				t.Fatalf("review merge: %v", err)
+			}
+			mergeSHA, err := rg.RevParse(ctx, "HEAD")
+			if err != nil {
+				t.Fatalf("rev-parse merge HEAD: %v", err)
+			}
+			// The merge sha is PRESENT in the tracked checkout the runner merged...
+			if !git.New(repoDir).CommitExists(ctx, mergeSHA) {
+				t.Fatalf("merge sha %s must exist in the tracked checkout", mergeSHA)
+			}
+			// ...but NOT an ancestor of the remote implementer branch (the wrong ref a
+			// false-negative gate would resolve against): the exact runcible shape.
+			if anc, _ := git.New(repoDir).IsAncestor(ctx, mergeSHA, "origin/bee-T1"); anc {
+				t.Fatalf("merge sha must NOT be reachable from origin/bee-T1 (fixture invalid)")
+			}
+
+			// On-disk plan (status source for the gate): task at DONE carrying the real
+			// present merge sha.
+			os.WriteFile(filepath.Join(sm, "PLAN.md"),
+				[]byte("## T1 [DONE] <!-- attempts=0 deps= heartbeat=2026-06-29T10:00:00Z commits="+mergeSHA+" -->\ngo\n"), 0o644)
+
+			rp, _ := repo.Open(root)
+			subs, _ := rp.Submodules()
+			sel := &selectt.Selection{Kind: kind, Submodule: subs[0], Task: plan.Task{ID: "T1", Status: plan.NeedsReview}}
+
+			// Seams answer the committed-artifact reads (clean status, committed flip,
+			// committed doc) carrying the SAME present merge sha in both the PLAN
+			// commits= tag and the doc's Beehive-Commits header.
+			gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+				if len(args) >= 2 && args[0] == "show" {
+					if strings.HasSuffix(args[1], "PLAN.md") {
+						return verifyOutcome{out: "## T1 [DONE] <!-- attempts=0 deps= commits=" + mergeSHA + " -->\ngo\n"}, nil
+					}
+					return verifyOutcome{out: "<!-- Beehive-Commits: " + mergeSHA + " -->\n<!-- Beehive-Check: pass -->\n\ndoc\n"}, nil
+				}
+				if len(args) > 0 && args[0] == "ls-tree" {
+					return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
+				}
+				return verifyOutcome{}, nil // git status --porcelain: clean
+			}}
+			r := &Runner{Repo: rp, Git: g, RunVerify: gr.run}
+			wantRoot, _ := filepath.Abs(rp.Root)
+			hint, err := r.verifyGate(ctx, sel, repoDir, wantRoot, "bee-T1")
+			if err != nil {
+				t.Fatalf("verifyGate err: %v", err)
+			}
+			if hint != "" {
+				t.Fatalf("a Review/Arbitrate APPROVE whose merge sha is PRESENT in the tracked checkout must PASS the gate — never rejected as absent; got refusal: %q", hint)
+			}
+		})
+	}
+}
+
 // TestVerifyGateCheckNoneNotGated: a task that declared `check=none` has no
 // machine-checkable DoD and is NOT gated by invariant (5) — the DoD command is
 // never run and the handoff is allowed on the other invariants alone.
