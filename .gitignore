@@ -5,3 +5,14 @@
 /.submodule-worktrees/
 /.beehive-worktrees
 /AGENTS.md
+
+# Editor cruft
+# Emacs autosave (#file#), lock (.#file), and backup (file~) files
+\#*\#
+.\#*
+*~
+.DS_Store
+*.swp
+*.swo
+*.orig
+*.rej
