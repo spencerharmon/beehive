@@ -12,7 +12,7 @@ import (
 // verifier, not a full shell: any construct it cannot resolve to a concrete command
 // word — a variable used as the command (`$CMD …`), a command substitution in
 // command position (`$(pick) …`), an `eval` — is returned as an error so the caller
-// fails CLOSED (an un-vetted command never passes the allowlist by silence).
+// fails CLOSED (an un-vetted command never passes the denylist by silence).
 func commandWords(s string) ([]string, error) {
 	toks, err := lex(s)
 	if err != nil {

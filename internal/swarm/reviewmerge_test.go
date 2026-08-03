@@ -183,9 +183,9 @@ func TestReviewMergeRejectsDisallowedCheckByPolicy(t *testing.T) {
 	}
 }
 
-// TestReviewMergeRunsAllowlistedCheckUnderPolicy: an admitted (non-denied) Check
+// TestReviewMergeRunsAdmittedCheckUnderPolicy: an admitted (non-denied) Check
 // runs under the sandbox; a failing result refuses the approve, a passing one allows it.
-func TestReviewMergeRunsAllowlistedCheckUnderPolicy(t *testing.T) {
+func TestReviewMergeRunsAdmittedCheckUnderPolicy(t *testing.T) {
 	ctx := context.Background()
 	r, root, wtAbs, sel, _, _ := reviewMergeFixture(t, "curl -sf http://x/health")
 

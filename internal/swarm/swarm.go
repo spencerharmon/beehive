@@ -237,7 +237,7 @@ type Runner struct {
 	RunVerify func(ctx context.Context, dir, name string, args ...string) (verifyOutcome, error)
 
 	// CheckPolicy is the sandbox/policy for a task's `Check:` DoD command (command
-	// allowlist + filesystem confinement scoped to the task's submodule and its
+	// denylist + filesystem confinement scoped to the task's submodule and its
 	// LINKED submodules). Nil = legacy path: the check runs as a bare `sh -c` in the
 	// gate's dir with no validation or confinement (keeps every existing test
 	// byte-identical). Production (cmd/honeybee) always sets it from layered config.

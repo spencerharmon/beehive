@@ -253,11 +253,11 @@ identically. Two independent layers:
 
 - **Command denylist (always enforced, host-independent).** The universe of
   commands a honeybee may run at all is owned by the agent runtime (opencode)
-  permission config; a check is a SUBSET of that universe. Rather than re-enumerate a
-  positive allowlist (which refused every real test runner — `go test`, `dotnet
-  test`, `pytest`, `nix build` — by default and forced per-tool config widening),
-  the policy ADMITS anything opencode permits EXCEPT the commands on the denylist
-  (`DefaultDeniedCommands`). The denylist has two groups: (1) ANTI-ABUSE —
+  permission config; a check may run ANYTHING opencode can run EXCEPT the commands
+  on the denylist (`DefaultDeniedCommands`) — there is deliberately no positive
+  allowlist, so every real test runner (`go test`, `dotnet test`, `pytest`,
+  `nix build`) is admitted by default with no per-tool config. The denylist has two
+  groups: (1) ANTI-ABUSE —
   source-inspection / no-op tools whose presence signals a FAKE definition of done
   (`grep`/`find`/`cat`/`test -f`, no-ops like `true`/`echo`); (2) SAFETY BACKSTOP —
   because a Check executes via the RUNNER (not opencode's own sandboxed bash tool),

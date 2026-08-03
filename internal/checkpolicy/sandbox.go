@@ -17,7 +17,7 @@ var bwrapProbe = func() (string, bool) {
 	return p, true
 }
 
-// systemReadOnlyDirs are the host directories the allowlisted tools resolve against
+// systemReadOnlyDirs are the host directories the check's tools resolve against
 // (binaries, shared libs, CA certs / resolv.conf / passwd under /etc). They are
 // bound READ-ONLY so a check can run curl/kubectl/git but cannot mutate the host.
 // Missing entries are skipped (bind-try semantics) so this works across usrmerge
@@ -39,7 +39,7 @@ type Plan struct {
 // submodule checkouts + Policy.ReadPaths), all absolute. cwd is the working
 // directory the check runs in (normally the checkout). It returns a Plan, or an
 // error only when RequireSandbox is set and bubblewrap is unavailable
-// (fail-closed). The command allowlist is enforced separately via Validate — Argv
+// (fail-closed). The command denylist is enforced separately via Validate — Argv
 // assumes the check has already passed it.
 func (p Policy) Argv(check, cwd string, rwPaths []string, roPaths []string) (Plan, error) {
 	unsandboxed := Plan{Name: "sh", Args: []string{"-c", check}, Sandboxed: false}
@@ -52,7 +52,7 @@ func (p Policy) Argv(check, cwd string, rwPaths []string, roPaths []string) (Pla
 		if p.Sandbox == SandboxBwrap && p.RequireSandbox {
 			return Plan{}, errSandboxUnavailable
 		}
-		unsandboxed.Note = "bubblewrap not found; check ran WITHOUT filesystem confinement (command allowlist still enforced). Install bwrap or set check_sandbox: off to silence."
+		unsandboxed.Note = "bubblewrap not found; check ran WITHOUT filesystem confinement (command denylist still enforced). Install bwrap or set check_sandbox: off to silence."
 		return unsandboxed, nil
 	}
 

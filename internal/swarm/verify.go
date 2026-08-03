@@ -350,7 +350,7 @@ func (r *Runner) checkGate(ctx context.Context, sel *selectt.Selection, taskID, 
 	if err != nil {
 		var pv policyViolationError
 		if errors.As(err, &pv) {
-			// The check itself violates the command allowlist (an author defect, not an
+			// The check itself violates the command denylist (an author defect, not an
 			// infra failure): hand it back as a fix-forward prompt so the agent rewrites
 			// the check, rather than fail-closed looping the task through GC.
 			return checkPolicyFailPrompt(taskID, check, err), nil
@@ -808,14 +808,15 @@ func (r *Runner) checkGroundTruth(ctx context.Context, sel *selectt.Selection, h
 	if err != nil {
 		var pv policyViolationError
 		if errors.As(err, &pv) {
-			// The check violates the command-allowlist policy: it will be REFUSED at the
+			// The check violates the command-denylist policy: it will be REFUSED at the
 			// DONE gate. Say so now so the agent fixes the check early instead of
 			// discovering it only at handoff.
 			return fmt.Sprintf(
 				"## Ground truth (definition-of-done check)\n"+
 					"This task's `Check:` is REJECTED by the check-command policy (%v) and will be refused at "+
-					"the DONE gate. Rewrite it with allowlisted low-risk tools scoped to this submodule before "+
-					"handing off. `Check:` was `%s`.\n\n",
+					"the DONE gate. Rewrite it to exercise a REAL test framework (anything opencode can run — "+
+					"`go test`, `kubectl`, `curl`, `skopeo`, … — is admitted; only the denied fake-test/"+
+					"destructive commands are refused) scoped to this submodule before handing off. `Check:` was `%s`.\n\n",
 				pv.err, oneLineCheck(check))
 		}
 		// Could not even run the check (infra). Do not fabricate a result; the gate
