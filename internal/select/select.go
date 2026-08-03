@@ -1,7 +1,9 @@
 // Package selectt performs deterministic, no-LLM task selection that always
 // yields a workable task: it builds ONE cluster-wide pool of every selectable
 // item across all submodules, then does a weighted-random draw over the whole
-// pool (submodule-weight × task-weight). A submodule that has drifted (PLAN.md
+// pool (submodule-weight × task-weight). Reconcile/bootstrap form a priority tier
+// within that pool — folded promptly and fairly across every drifted submodule
+// (no single high-weight one monopolizes) before work is drawn. A submodule that has drifted (PLAN.md
 // stamp vs ROI.md commit) contributes ONLY its reconcile — its own tasks are
 // ruled out until the ROI is folded — and contributes nothing at all while a
 // concurrent reconcile/bootstrap already holds that submodule's lock. Because the
@@ -313,6 +315,18 @@ func (s *Selector) lockHeld(sm repo.Submodule, name string, now time.Time) bool 
 // (submodule-weight × task-weight), the same weighted draw the old per-submodule
 // pickTask used — now applied across the whole cluster.
 func (s *Selector) pick(pool []candidate) *Selection {
+	// Reconcile/bootstrap are a priority tier WITHIN the cluster pool: a drifted
+	// submodule contributes nothing but its reconcile (its own tasks are ruled out
+	// until the ROI is folded), so a weight-1 reconcile must not languish behind the
+	// whole cluster's work pool — fold it promptly. When any priority candidate is
+	// present, draw (weighted) among ONLY those, fairly across EVERY drifted submodule
+	// so no single high-weight one monopolizes and none starves. When none is present
+	// (nothing drifted, or every pending reconcile's lock is already held and was
+	// excluded upstream in collect) the pass still does useful work by drawing from
+	// the work pool — never a wasted pass.
+	if pri := priorityOnly(pool); len(pri) > 0 {
+		pool = pri
+	}
 	total := 0
 	for i := range pool {
 		if pool[i].weight < 1 {
@@ -330,4 +344,16 @@ func (s *Selector) pick(pool []candidate) *Selection {
 	}
 	sel := pool[len(pool)-1].sel
 	return &sel
+}
+
+// priorityOnly returns just the reconcile/bootstrap candidates from the pool (the
+// PLAN-freshness tier that outranks work when present).
+func priorityOnly(pool []candidate) []candidate {
+	var pri []candidate
+	for _, c := range pool {
+		if c.sel.Kind == Reconcile || c.sel.Kind == Bootstrap {
+			pri = append(pri, c)
+		}
+	}
+	return pri
 }

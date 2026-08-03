@@ -625,3 +625,38 @@ func TestStaleReconcileLockReclaimable(t *testing.T) {
 		t.Fatalf("stale reconcile lock must be reclaimable; want Reconcile, got %+v", got)
 	}
 }
+
+// TestReconcileTierFairAcrossDriftedSubs: reconcile is a priority tier (picked
+// over work while any is pending) AND fair across every drifted submodule — a
+// high-weight drifted submodule (flux w5) does NOT monopolize; a low-weight one
+// (phantom w1) still gets reconciled. Work is never picked while reconciles pend.
+func TestReconcileTierFairAcrossDriftedSubs(t *testing.T) {
+	_, g, root := hive(t)
+	ctx := context.Background()
+	sub(root, "flux", map[string]string{"ROI.md": "x", "weight": "5",
+		"PLAN.md": "<!-- Beehive-ROI: dead -->\n## F1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	sub(root, "phantom", map[string]string{"ROI.md": "x",
+		"PLAN.md": "<!-- Beehive-ROI: dead -->\n## P1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	sub(root, "work", map[string]string{"ROI.md": "x", "PLAN.md": "## W1 [TODO] <!-- attempts=0 deps= -->\ngo\n"})
+	g.Commit(ctx, "seed")
+	stampAll(t, g, root, "work") // only 'work' is non-drifted
+
+	s := sel(root, g)
+	seen := map[string]int{}
+	for i := 0; i < 300; i++ {
+		got, err := s.Select(ctx)
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+		if got == nil || got.Kind != Reconcile {
+			t.Fatalf("draw %d: reconcile tier must outrank work while drift pends; got %+v", i, got)
+		}
+		seen[got.Submodule.Name]++
+	}
+	if seen["flux"] == 0 || seen["phantom"] == 0 {
+		t.Fatalf("both drifted subs must be reconciled (fairness); got %+v", seen)
+	}
+	if seen["flux"] <= seen["phantom"] {
+		t.Fatalf("weight-5 flux should be picked more than weight-1 phantom; got %+v", seen)
+	}
+}
