@@ -290,6 +290,20 @@ add a local skill so agents can discover it.
   in the beehive submodule.
 - No shortcuts: compute real values; no placeholders, swallowed errors, or fake
   "done".
+- **A `NEEDS-HUMAN` whose real blocker is a buildable dependency is a misclassification, not a
+  standing human gate.** When resolving (or reviewing) a task escalated `NEEDS-HUMAN`, first ask
+  whether the swarm can itself build or provision the missing prerequisite (a Gitea Actions build
+  workflow, a provisioning task, an upstream-image switch, a script, a config) rather than it being
+  genuine human-only input (a secret only the operator holds, an out-of-cluster/host-root action, an
+  intent contradiction, or a hard-to-reverse architecture call — the four `--category` cases
+  `HONEYBEE.md` defines). If it is buildable, file that prerequisite as a real task (in this or the
+  owning linked submodule) and return the escalated task to `TODO` with a dependency edge on it
+  (`deps=…,<new-task>`) — never leave it `NEEDS-HUMAN` and never jump it straight to `DONE`. Example:
+  `jellyfin:pgsql-plugin-bundle` was escalated `NEEDS-HUMAN` "install a host .NET SDK"; the real fix
+  was a containerized Gitea Actions build, so it correctly became `TODO deps=…,gitea-actions-image-
+  workflow` instead of staying a standing human gate. This mirrors the honeybee's own "Discovered a
+  missing prerequisite" rule (`HONEYBEE.md`) applied to an already-escalated task; it does not weaken
+  the four legitimate `--category` cases — a genuinely un-automatable blocker stays `NEEDS-HUMAN`.
 - NEVER embed deployment-specific **infrastructure identifiers** — real hostnames,
   domain names, public IPs / CIDRs, cluster or node names, credentials, or any other
   site-specific fact — in a target's **source code** (the public or shared repo a

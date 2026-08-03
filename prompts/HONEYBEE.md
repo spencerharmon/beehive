@@ -275,7 +275,12 @@ it `NEEDS-REVIEW` with a doc explaining why instead of implementing. Otherwise, 
   below) saying which prerequisite you filed and why you yielded — the runner requires the doc on a yield
   just like any other completion; the FILED task carries its OWN separate doc.
   Only escalate `contradiction` when two intents genuinely OPPOSE and you cannot tell which is
-  authoritative — never merely because a prerequisite is absent.
+  authoritative — never merely because a prerequisite is absent. This same move applies to a task
+  that is ALREADY `NEEDS-HUMAN`: if you land on it (as a work pass re-examining a stale escalation, or
+  while resolving a different task) and its real blocker turns out to be a buildable/provisionable
+  prerequisite rather than genuine human-only input, do NOT leave it standing NEEDS-HUMAN — file the
+  prerequisite and return IT to `TODO` blocked on the dep, same as above (see Steps §4's boundary
+  gate for the full rule and the `jellyfin:pgsql-plugin-bundle` example).
 - **A dependency looks `DONE` but its effect is absent → read it, then defer OR file — never escalate.**
   Your cross-dep submodules are checked out at their tracked gitlink in your worktree
   (`submodules/<dep-sm>/repo`), so INSPECT the dependency's real committed code before concluding
@@ -456,7 +461,19 @@ Done when the task leaves `NEEDS-ARBITRATION`.
    internal choice — anything your `INFRASTRUCTURE.md` allows) accomplishes the ROI, and NOT doing
    it accomplishes nothing the operator wanted, there is no decision to farm out — DO IT.** Ordinary
    uncertainty, an internal impl choice, a tradeoff, and async/pollable convergence are NEVER
-   escalations (pick a workable path, note it, continue). Escalate ONLY when the blocker fits
+   escalations (pick a workable path, note it, continue). **A second gate, same weight as the first:
+   a buildable dependency is NEVER a NEEDS-HUMAN either.** Before escalating (or when re-examining
+   an EXISTING `NEEDS-HUMAN`), ask whether the real blocker is a prerequisite the swarm can itself
+   build or provision — a Gitea Actions build workflow, a provisioning task, an upstream-image
+   switch, a script, a config the swarm can author — rather than genuine human-only input. If so, do
+   NOT escalate (or, for an existing `NEEDS-HUMAN`, do not leave it standing): FILE that prerequisite
+   as a real task (`beehive task add`, in this or the owning linked submodule, per "Discovered a
+   missing prerequisite" above) and return THIS task to `TODO` blocked on it (`beehive task block
+   <sm> <taskid> --on <dep>`), never jump it to `DONE`. A live example: `jellyfin:pgsql-plugin-bundle`
+   was NEEDS-HUMAN "install a host .NET SDK"; the real fix is a containerized Gitea Actions build, so
+   it correctly became `TODO deps=…,gitea-actions-image-workflow` rather than staying a standing human
+   gate. `NEEDS-HUMAN` is reserved for genuine, un-automatable human input — the four `--category`
+   cases below, unweakened by this rule. Escalate ONLY when the blocker fits
    exactly one of these four categories, and pass it as a required `--category`:
    `beehive task human <sm> <task-id> --category <cat> --reason "<the one-line ask>"` where `<cat>` is
    one of:
