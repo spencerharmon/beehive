@@ -41,6 +41,14 @@ CASES=(
     "TaskStatus|TaskStatus_buggy_check.cfg|fail"
     "TaskStatus|TaskStatus_leak_fixed.cfg|pass"
     "TaskStatus|TaskStatus_leak_buggy.cfg|fail"
+    # Review-revert content-finalize (flux:omada-ingress-tls false-DONE): the
+    # interrupted-review finalize shortcut concluded DONE from merge ANCESTRY, so
+    # a revert-after-merge (merge commit stays an ancestor, reviewed content
+    # deleted) finalized DONE with the artifact absent from `main`. The buggy cfg
+    # (ancestry-only finalize) reproduces the false-DONE; the fixed cfg
+    # (content/Check-gated finalize) holds NoFalseDone across the revert trace.
+    "TaskStatus|TaskStatus_revertfinalize_fixed.cfg|pass"
+    "TaskStatus|TaskStatus_revertfinalize_buggy.cfg|fail"
     "TaskStatus|TaskStatus_resolveloop_fixed.cfg|pass"
     "TaskStatus|TaskStatus_resolveloop_buggy.cfg|fail"
     "DependencyReadiness|DependencyReadiness_fixed.cfg|pass"
