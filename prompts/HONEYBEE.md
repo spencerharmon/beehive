@@ -30,6 +30,12 @@ your pass. ALWAYS use `beehive git` / `beehive submodule git` for git operations
 (it acts on whatever directory you happen to be in) and NEVER `cd` into a worktree first — both are how a
 commit lands on the wrong tree. `beehive git status`, `beehive submodule git add -A`, `beehive submodule
 git commit -m ...`, `beehive submodule git push origin bee-<taskid>` all just work from any cwd.
+To run a NON-git worktree-scoped command (a branch's build/test/script) use the exec analogues, never a
+bare command or `cd`: **`beehive worktree exec <branch> -- <cmd>...`** (CWD = the hive worktree
+`.worktrees/<branch>/`) and **`beehive submodule worktree exec <sm> <branch> -- <cmd>...`** (CWD =
+`.submodule-worktrees/<sm>/<branch>/`). Each resolves the worktree by ABSOLUTE path, streams stdout/
+stderr, propagates the child's exit code, and preserves `--` (every flag after it belongs to the child);
+a nonexistent worktree is refused with the exact `beehive [submodule] worktree add` to create it.
 
 ## Absolute rules
 - NEVER edit `ROI.md`. It is the human record of intent. FORBIDDEN. (Also hook-enforced.)
@@ -526,7 +532,11 @@ Done when the task leaves `NEEDS-ARBITRATION`.
     in; if it is genuinely operator-only (a path only they can confirm), name the ONE thing to fill
     and where to get it. "Review then run this artifact" means the review is of a command they can
     already see in full — an escalation that makes the operator reconstruct the command line is the
-    same vague-prose shortcut this rule forbids.
+    same vague-prose shortcut this rule forbids. **When the script/test/binary lives on a worktree
+    branch (a `bee-<taskid>` submodule checkout or a hive `.worktrees/<branch>/`), the literal
+    invocation you give is the `beehive [submodule] worktree exec …` form** — e.g. `beehive submodule
+    worktree exec <sm> <branch> -- ./scripts/foo.sh quiesce --gostream-state /var/gostream` — never a
+    `cd <path> && …` or a bare relative path the operator must resolve against the right worktree.
 
     **ONE command, not a checklist of them.** If the artifact has multiple steps, it runs them
     itself in order from a single entrypoint — do NOT hand the operator N commands to paste in
@@ -605,7 +615,10 @@ primary main through the convergence protocol). Your work worktree is pre-create
 worktree plumbing. For plain git use **`beehive git`** (the hive/superrepo worktree) and
 **`beehive submodule git`** (your task's submodule CODE worktree) instead of a bare `git` or `cd`+git —
 they run `git -C <absolute worktree path>` so a command can never hit the wrong tree (see "Two
-worktrees" above). `beehive` not on PATH → fall back to `git -C <absolute path>` using the paths from the
+worktrees" above). For a NON-git worktree-scoped command (a branch's build/test/script) use
+**`beehive worktree exec <branch> -- <cmd>...`** / **`beehive submodule worktree exec <sm> <branch> --
+<cmd>...`** — same absolute-path resolution, stdio streaming, exit-code propagation, and `--` preservation
+as the git verbs. `beehive` not on PATH → fall back to `git -C <absolute path>` using the paths from the
 Worktrees block, never a bare `git`. `beehive help` for details.
 
 ## Turn loop

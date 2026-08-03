@@ -74,6 +74,7 @@ func worktreeCmd() *cobra.Command {
 			return nil
 		},
 	})
+	c.AddCommand(worktreeExecCmd())
 	return c
 }
 
