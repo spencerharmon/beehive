@@ -294,7 +294,19 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 // orphaned stub whose branch is gone is ended. sm/now/ttl (rather than a bare
 // dir) let it resolve sm's PLAN.md for the claim half.
 func (s *Server) sessionLive(ctx context.Context, sm repo.Submodule, id string, now time.Time, ttl time.Duration) bool {
-	p, _ := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	return s.sessionLiveAt(ctx, s.headSHA(ctx), sm, id, now, ttl)
+}
+
+// sessionLiveAt is sessionLive with the beehive repo HEAD resolved by the CALLER
+// and passed in, so a page that tests MANY sessions in one render (the plan
+// view calls it per claimed task row) resolves HEAD with a single `git
+// rev-parse` and shares it, exactly as headSHA's contract intends — instead of
+// re-spawning rev-parse per session, which made the plan page scale a git
+// subprocess per claim and dominated its render (pageload-plan-page-budget).
+// head is used only as the parse-cache key (identical to what s.headSHA(ctx)
+// would return within one request), so the liveness verdict is unchanged.
+func (s *Server) sessionLiveAt(ctx context.Context, head string, sm repo.Submodule, id string, now time.Time, ttl time.Duration) bool {
+	p, _ := s.planView(head, sm.PlanPath(), now, ttl)
 	if claimedSessions(p)[id] {
 		return true
 	}
@@ -306,9 +318,15 @@ func (s *Server) sessionLive(ctx context.Context, sm repo.Submodule, id string, 
 	if !isStub {
 		return false
 	}
-	rem, _ := s.git.Remote(ctx)
-	_, ok := s.branchTipTime(ctx, streamBranch, rem)
-	return ok
+	// A claimless stub is live iff its stream branch still exists. Resolve that
+	// from the whole-hive liveBranchSet SNAPSHOT (one cached `git for-each-ref`,
+	// TTL-memoized) rather than a per-branch `git log` — membership in the set is
+	// the exact "branch exists" signal branchTipTime's ok return derived, but
+	// batched. The plan view calls sessionLive once per claimed row (a stale
+	// claim falls through to here), so the per-branch subprocess made the plan
+	// page scale a git spawn per session and dominated its render
+	// (pageload-plan-page-budget); the shared snapshot collapses that to one.
+	return s.liveBranchSet(ctx)[streamBranch]
 }
 
 // sessionBody returns the transcript pane (the htmx-poll fragment): the flat

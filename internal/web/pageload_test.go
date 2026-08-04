@@ -174,7 +174,15 @@ func seedPerfServer(t *testing.T, nSessions, nTasks int) (*Server, string) {
 	}
 	os.WriteFile(filepath.Join(smDir, repo.ROIFile), []byte("# perf target\n"), 0o644)
 
-	// A large plan stresses the plan view (parse + render every task).
+	// A large plan stresses the plan view (parse + render every task). Roughly
+	// a third of the tasks carry a FRESH claim (session=+heartbeat) so the plan
+	// render exercises its per-row liveness path (planViewData ->
+	// sessionLiveAt): that path once re-resolved the repo HEAD (a `git
+	// rev-parse`) once PER claimed row, making the plan page scale a git
+	// subprocess per claim — the pageload-plan-page-budget regression this gate
+	// guards. A claim points at a session id whose stub file (written below)
+	// backs the claimless-liveness fallback too.
+	now := time.Now().UTC().Format(time.RFC3339)
 	var plan strings.Builder
 	plan.WriteString("<!-- Beehive-ROI: abc123 -->\n# Plan\n\n")
 	for i := 0; i < nTasks; i++ {
@@ -182,7 +190,11 @@ func seedPerfServer(t *testing.T, nSessions, nTasks int) (*Server, string) {
 		if i%3 == 0 {
 			status = "TODO"
 		}
-		fmt.Fprintf(&plan, "## task-%d [%s] <!-- attempts=%d deps= weight=16 -->\n", i, status, i%5)
+		claim := ""
+		if i%3 == 1 { // a third of the rows carry a fresh claim -> sessionLiveAt runs
+			claim = fmt.Sprintf(" session=bee-perf-%04d heartbeat=%s", i, now)
+		}
+		fmt.Fprintf(&plan, "## task-%d [%s] <!-- attempts=%d deps= weight=16%s -->\n", i, status, i%5, claim)
 		fmt.Fprintf(&plan, "implement feature %d with care and detail\nFiles: f%d.go\nDoc: br-task-%d.md\nAccept: works\n\n", i, i, i)
 	}
 	os.WriteFile(filepath.Join(smDir, repo.PlanFile), []byte(plan.String()), 0o644)

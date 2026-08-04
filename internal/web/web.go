@@ -1059,7 +1059,8 @@ func (s *Server) planBody(w http.ResponseWriter, r *http.Request) {
 // fragment (planBody) so both always agree on the live state.
 func (s *Server) planViewData(ctx context.Context, sm repo.Submodule) (Plan, error) {
 	now, ttl := time.Now(), s.ttl()
-	p, err := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	head := s.headSHA(ctx)
+	p, err := s.planView(head, sm.PlanPath(), now, ttl)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -1076,7 +1077,7 @@ func (s *Server) planViewData(ctx context.Context, sm repo.Submodule) (Plan, err
 		if it.Session == "" {
 			continue
 		}
-		it.Running = s.sessionLive(ctx, sm, it.Session, now, ttl)
+		it.Running = s.sessionLiveAt(ctx, head, sm, it.Session, now, ttl)
 		if it.Running {
 			it.SessionHref = "/submodule/" + sm.Name + "/session/" + it.Session
 		}
@@ -1090,7 +1091,17 @@ func (s *Server) planViewData(ctx context.Context, sm repo.Submodule) (Plan, err
 	// (e.g. a still-in-flight task's docs/tasks/<id>.md design doc). Both
 	// paths go through resolveDocHref (traversal + existence guarded), so a
 	// row with neither locatable is still never a dead link.
-	docs := changeDocsByTask(ctx, sm.RepoDir())
+	//
+	// changeDocsByTask scans the submodule's whole git history (one `git log`
+	// over every commit body) for the stamps — tens of ms on a history-heavy
+	// submodule, and previously re-run on EVERY plan render/poll. It changes
+	// only when the submodule gains a stamping commit, which always advances a
+	// tracked pointer and therefore the hive HEAD, so memoizing it per HEAD
+	// (viewCache) is correct and drops the steady-state plan render off the
+	// history walk (pageload-plan-page-budget).
+	docs, _ := cachedView(head, s.cache, "change-docs:"+sm.Name, func() (map[string]string, error) {
+		return changeDocsByTask(ctx, sm.RepoDir()), nil
+	})
 	for i := range p.Items {
 		p.Items[i].DocHref = resolveDocHref(sm, docs[p.Items[i].ID])
 		if p.Items[i].DocHref == "" && p.Items[i].Doc != "" {
