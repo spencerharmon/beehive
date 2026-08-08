@@ -322,6 +322,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /dashboard/body", b((*Server).dashboardBody))
 	mux.HandleFunc("GET /bootstrap", b((*Server).bootstrapAgent))
 	mux.HandleFunc("GET /stats", b((*Server).stats))
+	mux.HandleFunc("GET /metrics", b((*Server).metrics))
 	mux.HandleFunc("GET /submodule/{name}", b((*Server).explorer))
 	mux.HandleFunc("GET /submodule/{name}/branches", b((*Server).branches))
 	mux.HandleFunc("GET /submodule/{name}/commit/{sha}", b((*Server).commitView))
