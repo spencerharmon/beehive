@@ -139,6 +139,13 @@ func (s *Server) hiveSeries(ctx context.Context) []series {
 }
 
 func (s *Server) buildHiveSeries(ctx context.Context) []series {
+	// Capture the now-point timestamp BEFORE the (multi-second, whole-corpus)
+	// git walk below. Instant-only families have this single point; if it were
+	// stamped AFTER the walk it could land a few seconds past a concurrent
+	// query's `end` (which was fixed when the request arrived), and the range
+	// right-edge evaluation at `end` would miss it on the first cold query after
+	// a restart. Stamping at entry keeps T0 within the same second as `end`.
+	nowTs := time.Now().Unix()
 	byKey := map[string]*series{}
 	get := func(name string, lb labels) *series {
 		lb = sortedLabels(lb)
@@ -163,9 +170,8 @@ func (s *Server) buildHiveSeries(ctx context.Context) []series {
 	// historical family this pins the series' latest value to the live figure
 	// (the daily PLAN sample can lag the newest commit); for an instant-only
 	// family this is its sole point.
-	now := time.Now().Unix()
 	for _, sp := range s.liveSamples(ctx) {
-		get(sp.Name, sp.Labels).pts = append(get(sp.Name, sp.Labels).pts, point{now, sp.Value})
+		get(sp.Name, sp.Labels).pts = append(get(sp.Name, sp.Labels).pts, point{nowTs, sp.Value})
 	}
 
 	out := make([]series, 0, len(byKey))
