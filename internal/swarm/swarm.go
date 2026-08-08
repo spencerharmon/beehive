@@ -236,6 +236,13 @@ type Runner struct {
 	// verify.go and docs/runner-protocol-vs-correctness.md.
 	RunVerify func(ctx context.Context, dir, name string, args ...string) (verifyOutcome, error)
 
+	// RunGuard runs a diff-scoped mutation guard's command with an EXPLICIT
+	// environment (the guard ABI: BEEHIVE_GUARD_* + BEEHIVE_HONEYBEE), distinct from
+	// RunVerify because a guard needs its env set (RunVerify inherits the ambient env
+	// only). Nil = realRunGuard (real exec, sets cmd.Env); tests inject it to force a
+	// guard's allow/refuse outcome. See guard.go.
+	RunGuard func(ctx context.Context, cwd string, env []string, name string, args ...string) (verifyOutcome, error)
+
 	// CheckPolicy is the sandbox/policy for a task's `Check:` DoD command (command
 	// denylist + filesystem confinement scoped to the task's submodule and its
 	// LINKED submodules). Nil = legacy path: the check runs as a bare `sh -c` in the

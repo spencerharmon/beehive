@@ -277,6 +277,20 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 		}
 	}
 
+	// (4.6) Diff-scoped mutation guards. Independently of the DoD check, the submodule
+	// may declare GUARDS.md (internal/guards): policy commands that REFUSE a change
+	// touching a protected path under conditions the runner cannot model (which
+	// blue/green color is live, a mid-flight canary step, ...). A guard fires only
+	// when the committed diff intersects its Protects glob; it is judged from the
+	// merge-base baseline (tamper-proof) against LIVE release state. Scoped to Work —
+	// the kind that AUTHORS the submodule diff; a violating change is blocked here
+	// before it can ever reach review. Infra failure fails closed (returns an error).
+	if sel.Kind == selectt.Work && checkoutExists {
+		if hint, err := r.guardGate(ctx, sel, checkoutDir, hiveAbs, branch); err != nil || hint != "" {
+			return hint, err
+		}
+	}
+
 	// (5) Definition-of-done check. When this handoff ENTERS DONE and the task
 	// declares a `Check:` command, that command IS the machine definition of done:
 	// run it and REFUSE the DONE unless it passes (exit 0).

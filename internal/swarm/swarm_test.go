@@ -4302,6 +4302,10 @@ func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 		{dir: wantRoot, name: "git", args: []string{"show", "HEAD:submodules/sm/PLAN.md"}},
 		{dir: wantRoot, name: "git", args: []string{"ls-tree", "-r", "--name-only", "HEAD", "--", "submodules/sm/docs"}},
 		{dir: wantRoot, name: "git", args: []string{"show", "HEAD:submodules/sm/docs/bee-T1-T1.md"}},
+		// (4.6) diff-scoped mutation guards: probe the BASELINE registry (committed-read
+		// plumbing, not a toolchain check). Absent GUARDS.md here => no guards => allow.
+		{dir: wtDir, name: "git", args: []string{"merge-base", "HEAD", "bee-T1"}},
+		{dir: wtDir, name: "git", args: []string{"show", "bee-T1:GUARDS.md"}},
 	}
 	if !reflect.DeepEqual(gr.calls, want) {
 		t.Fatalf("the uniform gate must run status (worktree) -> show PLAN.md -> ls-tree -> show doc (all committed-artifact/protocol checks, no toolchain check):\n got %+v\nwant %+v", gr.calls, want)

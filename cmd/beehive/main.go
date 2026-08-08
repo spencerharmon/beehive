@@ -29,6 +29,7 @@ func main() {
 		editCmd(),
 		taskCmd(),
 		planCmd(),
+		guardsCmd(),
 		honeybeeCmd(),
 		hookCmd(),
 		lintCmd(),
