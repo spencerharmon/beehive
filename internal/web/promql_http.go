@@ -181,11 +181,12 @@ func (s *Server) promRangeQuery(w http.ResponseWriter, r *http.Request) {
 	if stepSec <= 0 {
 		stepSec = 1
 	}
-	for t := start.Unix(); t <= end.Unix(); t += stepSec {
+	// evalAt evaluates the query at one timestamp and folds the result into the
+	// accumulating matrix. Returns an error string on evaluation failure.
+	evalAt := func(t int64) error {
 		val, err := eng.eval(q, t)
 		if err != nil {
-			promErr(w, http.StatusUnprocessableEntity, "execution", err.Error())
-			return
+			return err
 		}
 		if val.isScalar {
 			key := "__scalar__"
@@ -196,7 +197,7 @@ func (s *Server) promRangeQuery(w http.ResponseWriter, r *http.Request) {
 				order = append(order, key)
 			}
 			ms.values = append(ms.values, []interface{}{float64(t), fmtVal(val.scalar)})
-			continue
+			return nil
 		}
 		for _, sp := range val.vec {
 			key := sigKey(sp.Name, sp.Labels)
@@ -207,6 +208,30 @@ func (s *Server) promRangeQuery(w http.ResponseWriter, r *http.Request) {
 				order = append(order, key)
 			}
 			ms.values = append(ms.values, []interface{}{float64(t), fmtVal(sp.Value)})
+		}
+		return nil
+	}
+	var lastT int64
+	for t := start.Unix(); t <= end.Unix(); t += stepSec {
+		if err := evalAt(t); err != nil {
+			promErr(w, http.StatusUnprocessableEntity, "execution", err.Error())
+			return
+		}
+		lastT = t
+	}
+	// Always evaluate a final point at the exact `end`. The step grid's last
+	// stamp (start + k*step) usually lands BEFORE `end` (Grafana aligns `end`
+	// down to a step boundary), so an instant-only family — whose sole point is
+	// the now-snapshot near `end` — would otherwise be invisible on a wide range
+	// (its now-point sits between the last grid stamp and `end`, and valueAt only
+	// looks backward). Emitting the true value AS OF `end` is honest (it is the
+	// current reading at the range's right edge) and is what makes the
+	// current-state panels (stranded, submodules, active honeybees) resolve on a
+	// 30-day dashboard instead of showing "No data".
+	if lastT != end.Unix() {
+		if err := evalAt(end.Unix()); err != nil {
+			promErr(w, http.StatusUnprocessableEntity, "execution", err.Error())
+			return
 		}
 	}
 	result := make([]map[string]interface{}, 0, len(order))
