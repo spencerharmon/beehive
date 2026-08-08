@@ -47,7 +47,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	writeTranscript(t, root, "bee-t3-100-1", "work", "github-copilot/claude-sonnet-5")
 	writeTranscript(t, root, "bee-t1-101-1", "work", "")
 
-	w := get(t, s, "/metrics")
+	w := get(t, s, "/prometheus/metrics")
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}

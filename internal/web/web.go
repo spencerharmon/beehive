@@ -141,6 +141,18 @@ type Server struct {
 	reg      config.Registry
 	siblings map[string]*Server // registry name -> per-repo server (incl. the container itself)
 	order    []string           // registry names sorted ascending; order[0] is the default active repo
+
+	// promHist memoizes the git-reconstructed PromQL series set (promapi.go) for a
+	// short TTL. It has its OWN mutex, deliberately NOT the viewCache: buildHiveSeries
+	// calls back into viewCache (computeStats -> cachedTTL live-branch-set), and
+	// viewCache's cachedTTL runs its loader UNDER its lock, so keying the history on
+	// the same cache would re-enter that lock and deadlock. The cold build runs
+	// without holding promHistMu; a stale hit serves the last value and refreshes in
+	// one background goroutine.
+	promHistMu  sync.Mutex
+	promHist    []series
+	promHistExp time.Time
+	promHistRun bool
 }
 
 // New builds a Server over the beehive repo at root.
@@ -322,7 +334,22 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /dashboard/body", b((*Server).dashboardBody))
 	mux.HandleFunc("GET /bootstrap", b((*Server).bootstrapAgent))
 	mux.HandleFunc("GET /stats", b((*Server).stats))
-	mux.HandleFunc("GET /metrics", b((*Server).metrics))
+	// PromQL API over git (no TSDB/scrape): a Grafana Prometheus datasource points
+	// at /prometheus. See internal/web/promapi.go.
+	mux.HandleFunc("GET /prometheus/metrics", b((*Server).metrics))
+	mux.HandleFunc("GET /prometheus/api/v1/query", b((*Server).promInstantQuery))
+	mux.HandleFunc("POST /prometheus/api/v1/query", b((*Server).promInstantQuery))
+	mux.HandleFunc("GET /prometheus/api/v1/query_range", b((*Server).promRangeQuery))
+	mux.HandleFunc("POST /prometheus/api/v1/query_range", b((*Server).promRangeQuery))
+	mux.HandleFunc("GET /prometheus/api/v1/labels", b((*Server).promLabels))
+	mux.HandleFunc("POST /prometheus/api/v1/labels", b((*Server).promLabels))
+	mux.HandleFunc("GET /prometheus/api/v1/label/{name}/values", b((*Server).promLabelValues))
+	mux.HandleFunc("GET /prometheus/api/v1/series", b((*Server).promSeries))
+	mux.HandleFunc("POST /prometheus/api/v1/series", b((*Server).promSeries))
+	mux.HandleFunc("GET /prometheus/api/v1/metadata", b((*Server).promMetadata))
+	mux.HandleFunc("GET /prometheus/api/v1/status/buildinfo", b((*Server).promBuildInfo))
+	mux.HandleFunc("GET /prometheus/-/healthy", b((*Server).promHealth))
+	mux.HandleFunc("GET /prometheus/-/ready", b((*Server).promHealth))
 	mux.HandleFunc("GET /submodule/{name}", b((*Server).explorer))
 	mux.HandleFunc("GET /submodule/{name}/branches", b((*Server).branches))
 	mux.HandleFunc("GET /submodule/{name}/commit/{sha}", b((*Server).commitView))
