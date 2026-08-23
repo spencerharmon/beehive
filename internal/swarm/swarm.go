@@ -27,10 +27,20 @@ import (
 	"github.com/spencerharmon/beehive/internal/version"
 )
 
-// Session is one opencode conversation; context persists across Prompt calls.
-// Prompt blocks until the assistant turn finishes and returns its reply text.
-// Messages returns the full structured history (user/assistant/reasoning/tools)
-// so the recorder can render a live transcript without re-driving the model.
+// Session is one agent-harness conversation; context persists across Prompt
+// calls, so a second Prompt on the SAME Session is the "continue" semantics
+// every honeybee turn loop, the chat-diff editor, and the resolution/bootstrap
+// agents rely on: the harness remembers everything said in prior turns without
+// the caller re-sending history. Prompt blocks until the assistant turn
+// finishes (or the implementation's own idle/progress watchdog abandons it —
+// opencode's concrete Prompt maps that to ErrTurnIdle) and returns its reply
+// text. Messages returns the full structured history (user/assistant/
+// reasoning/tools) so the recorder can render a live transcript in the
+// existing on-repo sessions/ format without re-driving the model. This is
+// exactly (and only) the surface Harness/Client callers may depend on — see
+// Harness below for the full provider-agnostic contract this and Client
+// together define, and internal/swarm/opencode.go for the concrete opencode
+// implementation.
 type Session interface {
 	Prompt(ctx context.Context, text string) (string, error)
 	Messages(ctx context.Context) ([]Message, error)
@@ -46,11 +56,37 @@ type aborter interface {
 	Abort(ctx context.Context) error
 }
 
-// Client opens opencode sessions. Open creates a session at cwd with the given
-// system prompt but sends no message yet, so callers can start recording before
-// the (often long) first turn runs.
+// Client opens agent-harness sessions. Open creates a session at cwd under the
+// given system prompt but sends no message yet, so callers can start recording
+// before the (often long) first turn runs. Client (session-opening) plus
+// Session (per-turn conversation, above) TOGETHER form the Harness contract:
+// every LLM turn in this codebase — honeybee work/review/arbitration, the
+// chat-diff editor, and the resolution/bootstrap agents — goes through exactly
+// these two interfaces, never a concrete driver type. *Opencode
+// (internal/swarm/opencode.go) is the first, and today only, implementation:
+// it opens a session over the opencode HTTP session API, drives one turn with
+// a PROGRESS idle watchdog (Opencode.IdleTimeout, surfaced as ErrTurnIdle on
+// stall), reuses the same session id across Prompt calls so "continue" turns
+// share context, honors provider/model/temperature/max-tokens from its fields,
+// and its Messages() feed the recorder that writes the sessions/ transcript.
+// A future pi harness driver is a second Client+Session implementation of this
+// same contract — see harness_test.go's fakeHarness for the shape a new driver
+// must satisfy, and Runner.Client / editor's local client field for the two
+// call sites that already depend on the interface alone, never *Opencode.
 type Client interface {
 	Open(ctx context.Context, cwd, system string) (Session, error)
+}
+
+// Harness names the FULL provider-agnostic contract (Client to open a session,
+// Session to drive its turns) that both the honeybee runner and the web/editor
+// chat-diff agent consume, so opencode and a future pi harness are
+// interchangeable implementations of one interface. It is spelled out here as
+// a documentation anchor; callers embed Client/Session directly (Runner.Client
+// is a Client, editor's client field is its own narrower Client+NewSession
+// alias over the same Session) rather than this combined type, since none of
+// them need both halves through a single value.
+type Harness interface {
+	Client
 }
 
 // modelSelector is an OPTIONAL Client capability: pick the model for the upcoming
