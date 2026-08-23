@@ -62,7 +62,9 @@ pass (ROI present, PLAN absent) will decompose each `ROI.md` into a weighted
 ## 4. Configure the runner
 
 Point the runner at its config (location is your choice — record it in `LOCALS.md`;
-a common spot is `/etc/beehive/config.yaml`). Typical keys: `agent_cmd`, `model`,
+a common spot is `/etc/beehive/config.yaml`). Typical keys: `agent_cmd`, `harness`
+(`opencode`, the default, or `pi`; layered host -> in-repo global -> per-submodule
+like every other key — see docs/install.md), `model`,
 `max_turns`, `reject_limit`, `ttl_minutes`, `turn_timeout_minutes`. These bound a
 pass and the claim TTL.
 

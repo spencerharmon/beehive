@@ -570,3 +570,96 @@ build_env:
 		t.Fatalf("host-scope GOTMPDIR = %q, want /host/tmp (a more specific layer mutated the host map)", v)
 	}
 }
+
+// TestResolveHarnessDefault confirms omitting the harness key at every layer
+// resolves to "opencode" — the exact pre-existing behavior — and that PiBin/
+// PiThinking stay their zero value, so an install that never sets `harness:`
+// gets a byte-identical Config surface to before this field existed.
+func TestResolveHarnessDefault(t *testing.T) {
+	hostDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+	write(t, filepath.Join(root, "config.yaml"), "model: global/model\n")
+
+	c, err := Resolve(root, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Harness != "opencode" {
+		t.Errorf("Harness = %q, want opencode (default, no layer set it)", c.Harness)
+	}
+	if c.PiBin != "" || c.PiThinking != "" {
+		t.Errorf("PiBin/PiThinking = %q/%q, want empty (opencode harness ignores them)", c.PiBin, c.PiThinking)
+	}
+}
+
+// TestResolveHarnessLayering proves harness=pi resolves with the SAME
+// most-specific-wins precedence as every other setting, at each of the three
+// layers in turn, and that the pi-specific fields (pi_bin/pi_thinking) merge
+// with the same rule.
+func TestResolveHarnessLayering(t *testing.T) {
+	t.Run("host sets it", func(t *testing.T) {
+		hostDir := t.TempDir()
+		root := t.TempDir()
+		t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+		write(t, filepath.Join(hostDir, "config.yaml"), "harness: pi\npi_bin: /opt/pi/bin/pi\npi_thinking: high\n")
+
+		c, err := Resolve(root, "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Harness != "pi" {
+			t.Errorf("Harness = %q, want pi (only host sets it)", c.Harness)
+		}
+		if c.PiBin != "/opt/pi/bin/pi" {
+			t.Errorf("PiBin = %q, want /opt/pi/bin/pi", c.PiBin)
+		}
+		if c.PiThinking != "high" {
+			t.Errorf("PiThinking = %q, want high", c.PiThinking)
+		}
+	})
+
+	t.Run("global overrides host", func(t *testing.T) {
+		hostDir := t.TempDir()
+		root := t.TempDir()
+		t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+		write(t, filepath.Join(hostDir, "config.yaml"), "harness: opencode\n")
+		write(t, filepath.Join(root, "config.yaml"), "harness: pi\npi_bin: pi\n")
+
+		c, err := Resolve(root, "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Harness != "pi" {
+			t.Errorf("Harness = %q, want pi (global wins over host)", c.Harness)
+		}
+	})
+
+	t.Run("per-submodule overrides global", func(t *testing.T) {
+		hostDir := t.TempDir()
+		root := t.TempDir()
+		t.Setenv("BEEHIVE_CONFIG_DIR", hostDir)
+		write(t, filepath.Join(root, "config.yaml"), "harness: opencode\n")
+		write(t, filepath.Join(root, "submodules", "x", "config.yaml"), "harness: pi\npi_thinking: low\n")
+
+		c, err := Resolve(root, "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Harness != "pi" {
+			t.Errorf("Harness = %q, want pi (submodule wins over global)", c.Harness)
+		}
+		if c.PiThinking != "low" {
+			t.Errorf("PiThinking = %q, want low (submodule wins)", c.PiThinking)
+		}
+
+		// A sibling submodule with no override still resolves the global value.
+		c2, err := Resolve(root, "y")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c2.Harness != "opencode" {
+			t.Errorf("sibling submodule Harness = %q, want opencode (global falls through)", c2.Harness)
+		}
+	})
+}

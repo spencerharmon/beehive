@@ -55,6 +55,25 @@ type Config struct {
 	AgentCmd     string `yaml:"agent_cmd"`     // opencode binary
 	AgentURL     string `yaml:"agent_url"`     // opencode server base URL
 	Model        string `yaml:"model"`         // provider/model for opencode (the fallback for every kind)
+
+	// Harness selects the agent HARNESS driver (internal/swarm.Client) the
+	// internal/swarm consumer (cmd/honeybee, internal/editor) instantiates for a
+	// turn: "opencode" (the default; empty/unset resolves here) or "pi". Layered
+	// via the SAME host -> in-repo global -> per-submodule precedence as every
+	// other setting (see merge/Resolve) — an install can pin a harness globally
+	// and let one submodule override it. An unset/empty value at every layer
+	// resolves to "opencode", so an install that never sets this key is
+	// UNCHANGED: byte-identical config surface and behavior to before this field
+	// existed. See swarm.BuildClient (internal/swarm/harness.go) for the actual
+	// selection.
+	Harness string `yaml:"harness"`
+	// PiBin is the pi binary path/name used when Harness resolves to "pi" (empty
+	// = swarm.Pi's own default, "pi" on PATH). Ignored for the opencode harness.
+	PiBin string `yaml:"pi_bin"`
+	// PiThinking is pi's thinking-level flag (off|minimal|low|medium|high|xhigh|
+	// max) used when Harness resolves to "pi"; empty = pi's own backend default.
+	// Ignored for the opencode harness.
+	PiThinking string `yaml:"pi_thinking"`
 	// Models routes the agent model per task kind ("work", "reconcile", "review",
 	// "arbitrate", "bootstrap"), so a near-deterministic kind can run on a cheap
 	// model while real code Work stays on the strong one (ROI: cut tokens per
@@ -209,6 +228,7 @@ func Defaults(dir string) Config {
 		GPGHome:                filepath.Join(dir, "gnupg"),
 		AgentCmd:               "opencode",
 		AgentURL:               "http://127.0.0.1:4096",
+		Harness:                "opencode",
 		TTLMinutes:             60,
 		MaxTurns:               15,
 		MergeRetries:           8,
@@ -301,6 +321,15 @@ func merge(base, over Config) Config {
 	}
 	if over.Model != "" {
 		out.Model = over.Model
+	}
+	if over.Harness != "" {
+		out.Harness = over.Harness
+	}
+	if over.PiBin != "" {
+		out.PiBin = over.PiBin
+	}
+	if over.PiThinking != "" {
+		out.PiThinking = over.PiThinking
 	}
 	// Models merges key-by-key (not whole-map replace): a more specific layer's
 	// entry for a kind wins, unset kinds fall through, so a submodule can override

@@ -147,6 +147,9 @@ system install's; a user install substitutes `~/.config/beehive`.
 | `gpg_home`      | `/etc/beehive/gnupg` | secrets keyring dir             |
 | `gpg_recipient` | `beehive@localhost`  | recipient for `SECRETS.yaml.gpg` (matches the installer-generated key) |
 | `agent_cmd`     | `opencode`           | agent backend binary            |
+| `harness`       | `opencode`           | agent HARNESS driver honeybee/the editor instantiate for a turn: `opencode` (default) or `pi`. Layered host -> in-repo global -> per-submodule like every other key, so one submodule can pin a different harness than the rest of the install. |
+| `pi_bin`        | (empty = `pi` on `PATH`) | pi binary path/name, used only when `harness: pi` |
+| `pi_thinking`   | (empty = pi's backend default) | pi's thinking level (`off`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`), used only when `harness: pi` |
 | `ttl_minutes`   | `60`                 | heartbeat TTL before GC         |
 | `max_turns`     | `15`                 | per-honeybee turn cap           |
 | `reject_limit`  | `3`                  | rejections before NEEDS-HUMAN   |

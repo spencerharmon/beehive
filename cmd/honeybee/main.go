@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -370,22 +369,36 @@ func run() error {
 		CheckPolicy: &checkPol,
 		Links:       hiveLinks,
 	}
-	oc := &swarm.Opencode{Base: eff.AgentURL, Model: eff.Model, Temperature: eff.Temperature, MaxTokens: eff.MaxTokens, IdleTimeout: time.Duration(eff.TurnIdleTimeoutMinutes) * time.Minute, HTTP: &http.Client{Timeout: 0}}
-	// Ephemeral agent (agent_ephemeral=true): spawn a dedicated opencode server for
-	// THIS pass and point the client at it, tearing it down on exit. This bounds the
-	// agent's memory to a single pass's lifetime — the shared long-lived server never
-	// releases per-session state and grew to a host-killing ~40 GB over days (the
-	// 2026-07-10 OOM). Spawned AFTER selection/worktree setup so a pass that finds no
-	// work never pays the startup cost. On spawn failure, fail the pass rather than
-	// silently falling back to a shared server the operator disabled on purpose.
-	if eff.AgentIsEphemeral() {
-		ea, err := swarm.SpawnEphemeralAgent(ctx, eff.AgentCmd, os.Stderr)
-		if err != nil {
-			return fmt.Errorf("spawn ephemeral opencode agent: %w", err)
+	// Harness selection (harness-config-selector): eff.Harness picks the agent
+	// driver swarm.BuildClient instantiates — "" / "opencode" (the default,
+	// byte-identical to the historical hardcoded *Opencode below) or "pi". Only
+	// the opencode harness supports the ephemeral-server spawn and Debug-writer
+	// wiring below (a *swarm.Pi type-asserts false and is configured directly by
+	// BuildClient instead), so this is additive: an install that never sets
+	// `harness:` sees no behavior change at all.
+	client := swarm.BuildClient(eff, time.Duration(eff.TurnIdleTimeoutMinutes)*time.Minute)
+	if oc, ok := client.(*swarm.Opencode); ok {
+		// Ephemeral agent (agent_ephemeral=true): spawn a dedicated opencode server for
+		// THIS pass and point the client at it, tearing it down on exit. This bounds the
+		// agent's memory to a single pass's lifetime — the shared long-lived server never
+		// releases per-session state and grew to a host-killing ~40 GB over days (the
+		// 2026-07-10 OOM). Spawned AFTER selection/worktree setup so a pass that finds no
+		// work never pays the startup cost. On spawn failure, fail the pass rather than
+		// silently falling back to a shared server the operator disabled on purpose.
+		if eff.AgentIsEphemeral() {
+			ea, err := swarm.SpawnEphemeralAgent(ctx, eff.AgentCmd, os.Stderr)
+			if err != nil {
+				return fmt.Errorf("spawn ephemeral opencode agent: %w", err)
+			}
+			defer ea.Close()
+			oc.Base = ea.Base
+			fmt.Fprintf(os.Stderr, "honeybee: ephemeral opencode agent at %s (torn down at pass end)\n", ea.Base)
 		}
-		defer ea.Close()
-		oc.Base = ea.Base
-		fmt.Fprintf(os.Stderr, "honeybee: ephemeral opencode agent at %s (torn down at pass end)\n", ea.Base)
+		if debug {
+			oc.Debug = os.Stderr
+		}
+	} else if pi, ok := client.(*swarm.Pi); ok && debug {
+		pi.Debug = os.Stderr
 	}
 	// Always-on concise activity to stderr so every scheduled `systemd-run … honeybee`
 	// pass is observable live via `journalctl --user -t honeybee` (pass kind, per-turn
@@ -395,9 +408,8 @@ func run() error {
 	// assistant text, tool OUTPUT bodies): a superset of the concise stream.
 	if debug {
 		runner.Debug = os.Stderr
-		oc.Debug = os.Stderr
 	}
-	runner.Client = oc
+	runner.Client = client
 
 	// Select -> claim -> run, reselecting on a lost claim race so a conflict costs
 	// at most a wasted selection, never a wasted session. `tried` stops us from
