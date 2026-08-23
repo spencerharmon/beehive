@@ -1,11 +1,15 @@
 package web
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/secrets"
 )
 
 // ---- JSON API: one additive endpoint per existing HTML view ----
@@ -232,4 +236,85 @@ func (s *Server) skillsJSON(w http.ResponseWriter, r *http.Request) {
 		"dances":  s.dancePanels(),
 		"cache":   cacheWidget(s.cache),
 	})
+}
+
+// secretsJSON mirrors secretsGet/submoduleSecretsGet (web.go): the SAME
+// key-names-only view every HTML secrets_panel shows, but as a single JSON
+// document covering BOTH scopes so the beemacs client can render one combined
+// view — the active repo's global secrets (root SECRETS.yaml.gpg) plus every
+// tracked submodule's OWN secrets file. Like the HTML panels, values are NEVER
+// returned, only key names, and every read goes through listSecretKeys with
+// the ACTIVE repo's own keyring (s.cfg.GPGHome) — no cross-repo keyring reuse.
+func (s *Server) secretsJSON(w http.ResponseWriter, r *http.Request) {
+	globalKeys, err := listSecretKeys(r.Context(), s.cfg.GPGHome, filepath.Join(s.repo.Root, repo.SecretsFile))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	subs, err := s.repo.Submodules()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	subSecrets := make([]map[string]interface{}, 0, len(subs))
+	for _, sm := range subs {
+		keys, err := listSecretKeys(r.Context(), s.cfg.GPGHome, secrets.SubmodulePath(s.repo.Root, sm.Name))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		subSecrets = append(subSecrets, map[string]interface{}{
+			"name": sm.Name,
+			"keys": keys,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"global":     globalKeys,
+		"submodules": subSecrets,
+	})
+}
+
+// secretsWriteJSON mirrors secretsPost/submoduleSecretsPost (web.go): writes
+// one key into either the active repo's global SECRETS.yaml.gpg (no
+// "submodule" field, or an empty one) or one named submodule's OWN secrets
+// file, reusing the SAME setSecret validation/GPG-write logic those HTML
+// handlers call — never duplicating it. Like every /api/editor/* and *.json
+// write handler, it returns {"error": "..."} (never a bare http.Error body) on
+// failure so the JSON client always gets a parseable response.
+func (s *Server) secretsWriteJSON(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Submodule string `json:"submodule"`
+		Key       string `json:"key"`
+		Value     string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.Key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key required"})
+		return
+	}
+	var p, label string
+	if req.Submodule == "" {
+		p = filepath.Join(s.repo.Root, repo.SecretsFile)
+		label = req.Key
+	} else {
+		sm, err := s.submodule(req.Submodule)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown submodule"})
+			return
+		}
+		p = secrets.SubmodulePath(s.repo.Root, sm.Name)
+		label = sm.Name + "/" + req.Key
+	}
+	if err := setSecret(r.Context(), s.cfg.GPGHome, p, s.cfg.GPGRecipient, req.Key, req.Value); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := s.publishMain(r.Context(), "frontend: update secret "+label); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	s.secretsJSON(w, r)
 }

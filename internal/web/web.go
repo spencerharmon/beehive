@@ -385,6 +385,8 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /submodule/{name}/secrets", b((*Server).submoduleSecretsPost))
 	mux.HandleFunc("GET /secrets", b((*Server).secretsGet))
 	mux.HandleFunc("POST /secrets", b((*Server).secretsPost))
+	mux.HandleFunc("GET /secrets.json", b((*Server).secretsJSON))
+	mux.HandleFunc("POST /secrets.json", b((*Server).secretsWriteJSON))
 	mux.HandleFunc("GET /merge", b((*Server).mergeGet))
 	mux.HandleFunc("POST /merge", b((*Server).mergePost))
 	mux.HandleFunc("POST /submodule/add", b((*Server).submoduleAdd))

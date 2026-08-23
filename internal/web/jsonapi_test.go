@@ -3,10 +3,13 @@ package web
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spencerharmon/beehive/internal/repo"
 )
 
 // TestJSONAPIDashboard locks GET /dashboard.json as an additive JSON mirror of
@@ -220,5 +223,127 @@ func TestJSONAPISkills(t *testing.T) {
 	}
 	if len(body.Dances) == 0 {
 		t.Fatalf("skills.json listed no dances")
+	}
+}
+
+// TestJSONAPISecretsEmpty locks GET /secrets.json's shape when no secrets
+// exist: a "global" key list and one "submodules" entry per tracked submodule,
+// all empty (never an error just because no SECRETS.yaml.gpg exists yet).
+func TestJSONAPISecretsEmpty(t *testing.T) {
+	s, _ := setup(t)
+	w := get(t, s, "/secrets.json")
+	if w.Code != http.StatusOK {
+		t.Fatalf("secrets.json: %d: %s", w.Code, w.Body)
+	}
+	var body struct {
+		Global     []string `json:"global"`
+		Submodules []struct {
+			Name string   `json:"name"`
+			Keys []string `json:"keys"`
+		} `json:"submodules"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, w.Body)
+	}
+	if len(body.Global) != 0 {
+		t.Fatalf("global keys = %v, want empty", body.Global)
+	}
+	var found bool
+	for _, sm := range body.Submodules {
+		if sm.Name == "alpha" {
+			found = true
+			if len(sm.Keys) != 0 {
+				t.Fatalf("alpha keys = %v, want empty", sm.Keys)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("secrets.json missing alpha submodule: %+v", body.Submodules)
+	}
+}
+
+// TestJSONAPISecretsWrite is the end-to-end write proof (requires gpg) for
+// POST /secrets.json: a global write (no "submodule" field) lands in the
+// active repo's root SECRETS.yaml.gpg and shows up under "global" on the next
+// GET; a submodule-scoped write ({"submodule":...}) lands ONLY in that
+// submodule's own file and shows up nested under its name — mirroring
+// secretsPost/submoduleSecretsPost's write scoping exactly, reusing the same
+// setSecret path (never duplicated logic).
+func TestJSONAPISecretsWrite(t *testing.T) {
+	s, rootAlpha, _ := twoRealKeyringRegistry(t)
+	mux := s.Routes()
+
+	// Global write via the active repo (alpha).
+	body := strings.NewReader(`{"key":"db_pw","value":"hunter2"}`)
+	req := httptest.NewRequest("POST", "/secrets.json", body)
+	req.AddCookie(&http.Cookie{Name: repoCookie, Value: "alpha"})
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("global secrets.json write: %d %s", w.Code, w.Body)
+	}
+	var got struct {
+		Global     []string `json:"global"`
+		Submodules []struct {
+			Name string   `json:"name"`
+			Keys []string `json:"keys"`
+		} `json:"submodules"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, w.Body)
+	}
+	if len(got.Global) != 1 || got.Global[0] != "db_pw" {
+		t.Fatalf("global keys after write = %v, want [db_pw]", got.Global)
+	}
+	if _, err := os.Stat(filepath.Join(rootAlpha, repo.SecretsFile)); err != nil {
+		t.Fatalf("global SECRETS.yaml.gpg not written: %v", err)
+	}
+
+	// Submodule-scoped write.
+	body2 := strings.NewReader(`{"submodule":"redteam","key":"sub_pw","value":"hunter3"}`)
+	req2 := httptest.NewRequest("POST", "/secrets.json", body2)
+	req2.AddCookie(&http.Cookie{Name: repoCookie, Value: "alpha"})
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("submodule secrets.json write: %d %s", w2.Code, w2.Body)
+	}
+	var got2 struct {
+		Submodules []struct {
+			Name string   `json:"name"`
+			Keys []string `json:"keys"`
+		} `json:"submodules"`
+	}
+	if err := json.Unmarshal(w2.Body.Bytes(), &got2); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, w2.Body)
+	}
+	var found bool
+	for _, sm := range got2.Submodules {
+		if sm.Name == "redteam" {
+			found = true
+			if len(sm.Keys) != 1 || sm.Keys[0] != "sub_pw" {
+				t.Fatalf("redteam keys = %v, want [sub_pw]", sm.Keys)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("secrets.json missing redteam submodule: %+v", got2.Submodules)
+	}
+	subPath := filepath.Join(rootAlpha, "submodules", "redteam", repo.SecretsFile)
+	if _, err := os.Stat(subPath); err != nil {
+		t.Fatalf("submodule SECRETS.yaml.gpg not written at %s: %v", subPath, err)
+	}
+
+	// Unknown submodule 404s.
+	body3 := strings.NewReader(`{"submodule":"nope","key":"k","value":"v"}`)
+	req3 := httptest.NewRequest("POST", "/secrets.json", body3)
+	req3.AddCookie(&http.Cookie{Name: repoCookie, Value: "alpha"})
+	req3.Header.Set("Content-Type", "application/json")
+	w3 := httptest.NewRecorder()
+	mux.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusNotFound {
+		t.Fatalf("unknown submodule write = %d, want 404", w3.Code)
 	}
 }
