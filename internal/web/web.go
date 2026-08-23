@@ -334,6 +334,13 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /dashboard/body", b((*Server).dashboardBody))
 	mux.HandleFunc("GET /bootstrap", b((*Server).bootstrapAgent))
 	mux.HandleFunc("GET /stats", b((*Server).stats))
+	// JSON API (beemacs-json-api): one additive JSON endpoint per existing HTML
+	// view above, for a browser-free client (the beemacs Emacs client and any
+	// other machine consumer) to read the exact same state — never replacing
+	// the HTML routes. See internal/web/jsonapi.go.
+	mux.HandleFunc("GET /dashboard.json", b((*Server).dashboardJSON))
+	mux.HandleFunc("GET /stats.json", b((*Server).statsJSON))
+	mux.HandleFunc("GET /skills.json", b((*Server).skillsJSON))
 	// PromQL API over git (no TSDB/scrape): a Grafana Prometheus datasource points
 	// at /prometheus. See internal/web/promapi.go.
 	mux.HandleFunc("GET /prometheus/metrics", b((*Server).metrics))
@@ -352,10 +359,15 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /prometheus/-/ready", b((*Server).promHealth))
 	mux.HandleFunc("GET /submodule/{name}", b((*Server).explorer))
 	mux.HandleFunc("GET /submodule/{name}/branches", b((*Server).branches))
+	mux.HandleFunc("GET /submodule/{name}/branches.json", b((*Server).branchesJSON))
 	mux.HandleFunc("GET /submodule/{name}/commit/{sha}", b((*Server).commitView))
+	mux.HandleFunc("GET /submodule/{name}/commit.json/{sha}", b((*Server).commitJSON))
 	mux.HandleFunc("GET /submodule/{name}/doc/{file...}", b((*Server).doc))
+	mux.HandleFunc("GET /submodule/{name}/doc.json/{file...}", b((*Server).docJSON))
 	mux.HandleFunc("GET /submodule/{name}/docs", b((*Server).docExplorer))
+	mux.HandleFunc("GET /submodule/{name}/docs.json", b((*Server).docsJSON))
 	mux.HandleFunc("GET /submodule/{name}/plan", b((*Server).plan))
+	mux.HandleFunc("GET /submodule/{name}/plan.json", b((*Server).planJSON))
 	mux.HandleFunc("GET /submodule/{name}/plan/body", b((*Server).planBody))
 	mux.HandleFunc("POST /submodule/{name}/plan/delete", b((*Server).planDelete))
 	mux.HandleFunc("GET /submodule/{name}/sessions", b((*Server).sessionsList))
@@ -364,6 +376,7 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /submodule/{name}/session/{branch}/body", b((*Server).sessionBody))
 	mux.HandleFunc("GET /submodule/{name}/session/{branch}/stream", b((*Server).sessionStream))
 	mux.HandleFunc("GET /roi/{name}", b((*Server).roiGet))
+	mux.HandleFunc("GET /submodule/{name}/roi.json", b((*Server).roiJSON))
 	mux.HandleFunc("POST /roi/{name}", b((*Server).roiPost))
 	// Per-submodule "change remote" action, exposed beside the ROI editor: rewrite
 	// the tracked .gitmodules url + `git submodule sync` via the shared submod lib.
