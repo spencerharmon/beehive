@@ -402,12 +402,24 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /submodule/{name}/env", b((*Server).envGet))
 	mux.HandleFunc("POST /submodule/{name}/env/deploy", b((*Server).envDeploy))
 	mux.HandleFunc("GET /human", b((*Server).human))
+	mux.HandleFunc("GET /human.json", b((*Server).humanJSON))
+	// human.json/{sub}/{id} (rather than /human/{sub}/{id}.json): net/http's
+	// ServeMux wildcard segments must be the WHOLE segment ({id}, never
+	// {id}.json), matching the same reason doc.json/{file...} is its own
+	// literal-then-wildcard segment instead of doc/{file...}.json.
+	mux.HandleFunc("GET /human.json/{sub}/{id}", b((*Server).humanTaskJSON))
 	mux.HandleFunc("GET /human/{sub}/{id}", b((*Server).humanResolvePage))
 	mux.HandleFunc("GET /human/{sub}/{id}/panel/{sid}", b((*Server).humanResolvePanel))
 	mux.HandleFunc("POST /human/{sub}/{id}/message/{sid}", b((*Server).humanResolveMessage))
 	mux.HandleFunc("POST /human/{sub}/{id}/publish/{sid}", b((*Server).humanResolvePublish))
 	mux.HandleFunc("POST /human/{sub}/{id}/discard/{sid}", b((*Server).humanResolveDiscard))
 	mux.HandleFunc("POST /human/{sub}/{id}/resolve", b((*Server).humanResolveApply))
+	mux.HandleFunc("POST /api/human/{sub}/{id}/session", b((*Server).apiHumanSession))
+	mux.HandleFunc("GET /api/human/{sub}/{id}/panel/{sid}", b((*Server).apiHumanPanel))
+	mux.HandleFunc("POST /api/human/{sub}/{id}/message/{sid}", b((*Server).apiHumanMessage))
+	mux.HandleFunc("POST /api/human/{sub}/{id}/publish/{sid}", b((*Server).apiHumanPublish))
+	mux.HandleFunc("POST /api/human/{sub}/{id}/discard/{sid}", b((*Server).apiHumanDiscard))
+	mux.HandleFunc("POST /api/human/{sub}/{id}/resolve", b((*Server).apiHumanResolve))
 	mux.HandleFunc("GET /hygiene", b((*Server).hygiene))
 	// Maintenance dances: named deterministic actions each with a read-only dry-run
 	// (plan) and a separate apply; destructive dances gate apply on confirm. They
@@ -1676,22 +1688,33 @@ func (s *Server) envDeploy(w http.ResponseWriter, r *http.Request) {
 	s.envGet(w, r)
 }
 
-func (s *Server) human(w http.ResponseWriter, r *http.Request) {
+// humanRow pairs a NEEDS-HUMAN task with the submodule that owns it, the shape
+// both the HTML /human list page and humanJSON render.
+type humanRow struct {
+	Sub  string
+	Item PlanItem
+}
+
+// humanRows scans every tracked submodule's plan for NEEDS-HUMAN tasks — the
+// SAME hive-wide scan human (HTML) and humanJSON (JSON) both render, so
+// neither duplicates the other's logic.
+func (s *Server) humanRows(ctx context.Context) []humanRow {
 	subs, _ := s.repo.Submodules()
-	type row struct {
-		Sub  string
-		Item PlanItem
-	}
-	var rows []row
-	head := s.headSHA(r.Context())
+	var rows []humanRow
+	head := s.headSHA(ctx)
 	for _, sm := range subs {
 		p, _ := s.planView(head, sm.PlanPath(), time.Now(), s.ttl())
 		for _, it := range p.Items {
 			if it.Status == StatusHuman {
-				rows = append(rows, row{Sub: sm.Name, Item: it})
+				rows = append(rows, humanRow{Sub: sm.Name, Item: it})
 			}
 		}
 	}
+	return rows
+}
+
+func (s *Server) human(w http.ResponseWriter, r *http.Request) {
+	rows := s.humanRows(r.Context())
 	s.render(w, "human.html", map[string]interface{}{"Rows": rows, "Title": pageTitle("human"), "Nav": "human"})
 }
 
