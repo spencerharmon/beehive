@@ -7,11 +7,16 @@
 # contract: fixed cfgs are expected to pass, bug cfgs are expected to fail. A
 # spec that does not behave as declared exits non-zero so CI catches spec rot.
 #
-# TLC jar: set TLA2TOOLS to override; defaults to the common install path.
+# TLC jar: set TLA2TOOLS to override; prefers a jar vendored at specs/.tools/
+# (the Check sandbox confines reads to this checkout, so the vendored copy is
+# reachable there), else the common host install path.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JAR="${TLA2TOOLS:-$HOME/.local/share/tla2tools.jar}"
+JAR="${TLA2TOOLS:-$HERE/.tools/tla2tools.jar}"
+if [ ! -f "$JAR" ]; then
+    JAR="$HOME/.local/share/tla2tools.jar"
+fi
 
 if [ ! -f "$JAR" ]; then
     echo "tla2tools.jar not found at $JAR (set TLA2TOOLS=/path/to/tla2tools.jar)" >&2
