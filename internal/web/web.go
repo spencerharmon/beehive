@@ -418,6 +418,9 @@ func (s *Server) Routes() *http.ServeMux {
 	}))
 	mux.HandleFunc("POST /dances/{name}/plan", b((*Server).dancePlanHandler))
 	mux.HandleFunc("POST /dances/{name}/apply", b((*Server).danceApplyHandler))
+	// Maintenance dances (JSON API): browser-free clients, e.g. beemacs-dances.
+	mux.HandleFunc("POST /api/dances/{name}/plan", b((*Server).apiDancePlan))
+	mux.HandleFunc("POST /api/dances/{name}/apply", b((*Server).apiDanceApply))
 	// AI editor chat (browser): one worktree branch per session. GET /edit is
 	// the ONE entry point for every edit-with-AI link (dashboard/explorer/
 	// roi_editor) and opens the publish-capable internal/editor Manager

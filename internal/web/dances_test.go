@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"os"
@@ -325,5 +326,99 @@ func TestWithPlanSyntaxHighlightsChatDiff(t *testing.T) {
 	}
 	if !strings.Contains(out, `class="hl-str"`) {
 		t.Errorf("chat-diff rows missing string highlight span; got:\n%s", out)
+	}
+}
+
+// TestAPIDanceUnknownIs404 is the JSON mirror of TestSkillUnknownIs404: the
+// /api/dances/{name}/plan and /apply routes 404 an unregistered name via a
+// JSON {"error": "..."} body, never an HTML fragment.
+func TestAPIDanceUnknownIs404(t *testing.T) {
+	s, _ := setup(t)
+	if w := postForm(t, s, "/api/dances/nope/plan", url.Values{}); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown plan: got %d want 404", w.Code)
+	}
+	if w := postForm(t, s, "/api/dances/nope/apply", url.Values{"confirm": {"on"}}); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown apply: got %d want 404", w.Code)
+	}
+}
+
+// TestAPIDanceResourcesReportOnly is the JSON mirror of
+// TestSkillResourcesReportOnly: plan returns the identity/flags plus the plan
+// payload, and apply on a report-only dance is a 400 (never a mutation).
+func TestAPIDanceResourcesReportOnly(t *testing.T) {
+	s, _ := setup(t)
+	w := postForm(t, s, "/api/dances/resources/plan", url.Values{})
+	if w.Code != http.StatusOK {
+		t.Fatalf("resources plan: got %d: %s", w.Code, w.Body)
+	}
+	var got struct {
+		Name        string `json:"name"`
+		Title       string `json:"title"`
+		Destructive bool   `json:"destructive"`
+		ReportOnly  bool   `json:"reportOnly"`
+		Plan        struct {
+			Empty bool `json:"empty"`
+			Diffs []struct {
+				Path   string `json:"path"`
+				Before string `json:"before"`
+				After  string `json:"after"`
+			} `json:"diffs"`
+		} `json:"plan"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v: %s", err, w.Body)
+	}
+	if got.Name != "resources" || !got.ReportOnly {
+		t.Fatalf("unexpected plan payload: %+v", got)
+	}
+	if w := postForm(t, s, "/api/dances/resources/apply", url.Values{"confirm": {"on"}}); w.Code != http.StatusBadRequest {
+		t.Fatalf("report-only apply: got %d want 400", w.Code)
+	}
+}
+
+// TestAPIDanceCleanupStaleConfirmGateAndApply is the JSON mirror of
+// TestSkillCleanupStaleConfirmGateAndApply: an unconfirmed destructive apply
+// reports confirmRequired without mutating, and a confirmed apply performs
+// precisely the proposed removals.
+func TestAPIDanceCleanupStaleConfirmGateAndApply(t *testing.T) {
+	s, root := setup(t)
+	stale, keep := seedStaleWorktrees(t, root)
+	exists := func(n string) bool {
+		_, err := os.Stat(filepath.Join(root, ".worktrees", n))
+		return err == nil
+	}
+
+	// Unconfirmed apply: no mutation, reports confirmRequired.
+	w := postForm(t, s, "/api/dances/cleanup-stale/apply", url.Values{})
+	if w.Code != http.StatusOK {
+		t.Fatalf("unconfirmed apply: got %d: %s", w.Code, w.Body)
+	}
+	var unconfirmed struct {
+		ConfirmRequired bool `json:"confirmRequired"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &unconfirmed); err != nil {
+		t.Fatalf("decode: %v: %s", err, w.Body)
+	}
+	if !unconfirmed.ConfirmRequired {
+		t.Fatalf("unconfirmed apply must report confirmRequired: %s", w.Body)
+	}
+	for _, n := range stale {
+		if !exists(n) {
+			t.Fatalf("unconfirmed apply mutated: %s removed", n)
+		}
+	}
+
+	// Confirmed apply: removes exactly the stale dirs, spares the kept one.
+	w = postForm(t, s, "/api/dances/cleanup-stale/apply", url.Values{"confirm": {"on"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("confirmed apply: got %d: %s", w.Code, w.Body)
+	}
+	for _, n := range stale {
+		if exists(n) {
+			t.Fatalf("confirmed apply left stale dir: %s", n)
+		}
+	}
+	if !exists(keep) {
+		t.Fatalf("confirmed apply removed the kept dir: %s", keep)
 	}
 }

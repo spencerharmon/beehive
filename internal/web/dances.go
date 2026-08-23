@@ -28,6 +28,103 @@ import (
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
+// ---- JSON API (browser-free clients, e.g. beemacs) ----
+//
+// These mirror the HTML /dances/{name}/plan and /dances/{name}/apply routes
+// exactly — same registry, same invocation guards (unknown -> 404, report-only
+// apply -> 400, destructive apply without confirm -> 200 with a
+// distinguishable "confirmation required" fact) — so the JSON and HTML
+// surfaces can never drift; only the response encoding differs (writeJSON
+// instead of s.render).
+
+// danceDiffJSON is the JSON encoding of one proposed file rewrite.
+type danceDiffJSON struct {
+	Path   string `json:"path"`
+	Before string `json:"before"`
+	After  string `json:"after"`
+}
+
+// dancePlanJSON is the JSON encoding of a dancePlan's dry-run result.
+type dancePlanJSON struct {
+	Empty bool            `json:"empty"`
+	Diffs []danceDiffJSON `json:"diffs"`
+}
+
+func newDancePlanJSON(p dancePlan) dancePlanJSON {
+	diffs := make([]danceDiffJSON, 0, len(p.Diffs))
+	for _, d := range p.Diffs {
+		if d == nil {
+			continue
+		}
+		diffs = append(diffs, danceDiffJSON{Path: d.Path, Before: d.Before, After: d.After})
+	}
+	return dancePlanJSON{Empty: p.Empty(), Diffs: diffs}
+}
+
+// apiDancePlanHandler is the JSON mirror of dancePlanHandler: runs a dance's
+// deterministic dry-run and returns its identity/flags plus the plan. An
+// unknown dance is a 404. It mutates nothing.
+func (s *Server) apiDancePlan(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	reg := s.dances()
+	sk, p, err := reg.plan(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, errUnknownDance) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"name":        sk.Name,
+		"title":       sk.Title,
+		"destructive": sk.Destructive,
+		"reportOnly":  sk.ReportOnly,
+		"plan":        newDancePlanJSON(p),
+	})
+}
+
+// apiDanceApply is the JSON mirror of danceApplyHandler: applies a dance after
+// the registry's invocation guards, accepting the same confirm form/query
+// param. An unknown dance is a 404, a report-only dance is a 400, and a
+// destructive dance invoked WITHOUT confirm performs NO mutation and instead
+// reports {"confirmRequired": true} alongside a fresh plan at 200 (the JSON
+// analogue of the HTML confirm-gate re-render).
+func (s *Server) apiDanceApply(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	reg := s.dances()
+	sk, res, err := reg.apply(r.Context(), name, isTrue(r.FormValue("confirm")))
+	if err != nil {
+		switch {
+		case errors.Is(err, errUnknownDance):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		case errors.Is(err, errReportOnly):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		case errors.Is(err, errConfirmRequired):
+			payload := map[string]interface{}{
+				"confirmRequired": true,
+				"error":           err.Error(),
+			}
+			if _, p, perr := reg.plan(r.Context(), name); perr == nil {
+				payload["plan"] = newDancePlanJSON(p)
+			}
+			writeJSON(w, http.StatusOK, payload)
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	payload := map[string]interface{}{
+		"name":   sk.Name,
+		"result": res,
+	}
+	if _, p, perr := reg.plan(r.Context(), name); perr == nil {
+		payload["plan"] = newDancePlanJSON(p)
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
 // The invocation-guard errors. They are sentinels (wrapped, matched with
 // errors.Is) so the HTTP layer maps each to a distinct status without string
 // matching, and so a caller can tell "no such dance" apart from "you must
