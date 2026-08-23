@@ -318,3 +318,58 @@ func (s *Server) secretsWriteJSON(w http.ResponseWriter, r *http.Request) {
 	}
 	s.secretsJSON(w, r)
 }
+
+// humanJSON mirrors human (web.go): the hive-wide NEEDS-HUMAN task listing
+// across every tracked submodule, using the SAME humanRows scan the HTML
+// /human list page renders (never a duplicated plan scan).
+func (s *Server) humanJSON(w http.ResponseWriter, r *http.Request) {
+	rows := s.humanRows(r.Context())
+	type item struct {
+		Sub      string   `json:"sub"`
+		ID       string   `json:"id"`
+		Desc     string   `json:"desc"`
+		Body     string   `json:"body"`
+		Deps     []string `json:"deps"`
+		Reason   string   `json:"reason"`
+		Category string   `json:"category"`
+	}
+	items := make([]item, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, item{
+			Sub:      row.Sub,
+			ID:       row.Item.ID,
+			Desc:     row.Item.Desc,
+			Body:     row.Item.Body,
+			Deps:     row.Item.Deps,
+			Reason:   row.Item.HumanReason,
+			Category: row.Item.Category,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"tasks": items})
+}
+
+// humanTaskJSON mirrors humanResolvePage's context (humanresolve.go): one
+// NEEDS-HUMAN task's PlanItem fields (desc/body/deps/reason/category) plus
+// whether a resolution session already exists for it, using the SAME
+// humanTask lookup the HTML resolve page calls — never a duplicated scan. A
+// task that is unknown or no longer NEEDS-HUMAN is a 404 (its link went
+// stale), matching humanResolvePage.
+func (s *Server) humanTaskJSON(w http.ResponseWriter, r *http.Request) {
+	sub, id := r.PathValue("sub"), r.PathValue("id")
+	sm, it, ok := s.humanTask(r.Context(), sub, id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	_, hasSession := s.humans.find(sub, id)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"sub":         sm.Name,
+		"id":          it.ID,
+		"desc":        it.Desc,
+		"body":        it.Body,
+		"deps":        it.Deps,
+		"reason":      it.HumanReason,
+		"category":    it.Category,
+		"has_session": hasSession,
+	})
+}

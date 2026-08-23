@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -276,4 +277,167 @@ func (s *Server) humanResolveApply(w http.ResponseWriter, r *http.Request) {
 	// is stale, and its worktree can be reclaimed.
 	s.humans.forget(r.Context(), sub, id)
 	http.Redirect(w, r, "/human", http.StatusSeeOther)
+}
+
+// ---- JSON API mirrors (browser-free clients, e.g. beemacs) ----
+//
+// Every handler below mirrors an existing HTML human-resolve handler exactly,
+// reusing the SAME session/panel-data/publish/resolve logic those handlers
+// call — never a duplicated code path — and returns {"error": "..."} on
+// failure per the writeJSON convention every *.json/api handler in this
+// package follows (jsonapi.go, editor.go's apiEditor* family), so
+// beemacs-api.el's error-detail extraction works unchanged.
+
+// panelJSON projects resolvePanelData into a JSON-safe map: Log is
+// []editor.Turn (already JSON-tagged) and Stat/Diffs marshal fine as-is, so
+// this is a pass-through — kept as its own helper so every mirror below
+// builds its response the same way.
+func panelJSON(data map[string]interface{}) map[string]interface{} {
+	return data
+}
+
+// apiHumanSession opens (or returns the existing) resolution session for
+// sub/id, mirroring humanResolvePage's s.humans.session call, and returns the
+// session id plus its current panel data so a JSON client can render the
+// workspace without an HTML scrape.
+func (s *Server) apiHumanSession(w http.ResponseWriter, r *http.Request) {
+	sub, id := r.PathValue("sub"), r.PathValue("id")
+	_, it, ok := s.humanTask(r.Context(), sub, id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	sess, err := s.humans.session(r.Context(), sub, it)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	data := panelJSON(s.resolvePanelData(r.Context(), sess))
+	data["sid"] = sess.ID
+	writeJSON(w, http.StatusOK, data)
+}
+
+// apiHumanPanel is the JSON mirror of humanResolvePanel: reuses
+// resolvePanelData directly rather than re-deriving the Log/Stat/Diffs/Busy/
+// Published/Error projection.
+func (s *Server) apiHumanPanel(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.humans.get(r.PathValue("sid"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such session"})
+		return
+	}
+	writeJSON(w, http.StatusOK, panelJSON(s.resolvePanelData(r.Context(), sess)))
+}
+
+// apiHumanMessage is the JSON mirror of humanResolveMessage: accepts
+// {"message": "..."}, runs one agent turn (sess.StartChat, backgrounded exactly
+// like the HTML handler since a tool-using turn can be long), and returns the
+// refreshed panel.
+func (s *Server) apiHumanMessage(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.humans.get(r.PathValue("sid"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such session"})
+		return
+	}
+	var req struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if msg := strings.TrimSpace(req.Message); msg != "" {
+		_ = sess.StartChat(context.Background(), msg)
+	}
+	writeJSON(w, http.StatusOK, panelJSON(s.resolvePanelData(r.Context(), sess)))
+}
+
+// apiHumanPublish is the JSON mirror of humanResolvePublish: the same gitMu-
+// held resolvePublish call, returning the refreshed panel with an "error"
+// field on failure rather than a raw 500 text body.
+func (s *Server) apiHumanPublish(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.humans.get(r.PathValue("sid"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such session"})
+		return
+	}
+	s.gitMu.Lock()
+	err := resolvePublish(r.Context(), sess)
+	s.gitMu.Unlock()
+	data := panelJSON(s.resolvePanelData(r.Context(), sess))
+	if err != nil {
+		data["error"] = err.Error()
+	}
+	writeJSON(w, http.StatusOK, data)
+}
+
+// apiHumanDiscard is the JSON mirror of humanResolveDiscard: forgets the
+// session (dropping unpublished changes) and, if the task is still
+// NEEDS-HUMAN, opens a fresh session — returning its id, or null if the task
+// is no longer blocked.
+func (s *Server) apiHumanDiscard(w http.ResponseWriter, r *http.Request) {
+	sub, id := r.PathValue("sub"), r.PathValue("id")
+	sess, ok := s.humans.get(r.PathValue("sid"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such session"})
+		return
+	}
+	md := sess.Meta()
+	s.humans.forget(r.Context(), md["sub"], md["task"])
+	if sm, it, blocked := s.humanTask(r.Context(), sub, id); blocked {
+		newSess, err := s.humans.session(r.Context(), sm.Name, it)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"sid": newSess.ID})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"sid": nil})
+}
+
+// apiHumanResolve is the JSON mirror of humanResolveApply: the same
+// plan.Task.Resolve + publishMain flow, returning {"error":...} on a
+// non-NEEDS-HUMAN conflict (or any other failure) per the writeJSON
+// convention instead of a raw 409/500 text body.
+func (s *Server) apiHumanResolve(w http.ResponseWriter, r *http.Request) {
+	sub, id := r.PathValue("sub"), r.PathValue("id")
+	sm, err := s.submodule(sub)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown submodule"})
+		return
+	}
+	planPath := sm.PlanPath()
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	t := p.Task(id)
+	if t == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	if err := t.Resolve(time.Now().UTC()); err != nil {
+		// Non-NEEDS-HUMAN (already resolved, or never blocked): a conflict, not a
+		// server fault — surface it without touching PLAN.md.
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	msg := fmt.Sprintf("frontend: resolve NEEDS-HUMAN %s (%s) -> TODO\n\nBeehive: %s plan", id, sm.Name, id)
+	if err := s.publishMain(r.Context(), msg); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "resolved locally but publish to remote failed: " + err.Error()})
+		return
+	}
+	s.humans.forget(r.Context(), sub, id)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "TODO"})
 }

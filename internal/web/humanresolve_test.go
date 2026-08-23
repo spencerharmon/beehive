@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -361,4 +362,263 @@ func httpPostForm(t *testing.T, u string, form url.Values) int {
 	}
 	resp.Body.Close()
 	return resp.StatusCode
+}
+
+// httpGetJSON GETs u and decodes the JSON body into v, returning the status code.
+func httpGetJSON(t *testing.T, u string, v interface{}) int {
+	t.Helper()
+	resp, err := http.Get(u)
+	if err != nil {
+		t.Fatalf("GET %s: %v", u, err)
+	}
+	defer resp.Body.Close()
+	if v != nil {
+		if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+			t.Fatalf("decode %s: %v", u, err)
+		}
+	}
+	return resp.StatusCode
+}
+
+// httpPostJSON POSTs body (marshaled as JSON, or nil for an empty body) to u
+// and decodes the JSON response into v, returning the status code.
+func httpPostJSON(t *testing.T, u string, body interface{}, v interface{}) int {
+	t.Helper()
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+		rd = strings.NewReader(string(b))
+	} else {
+		rd = strings.NewReader("")
+	}
+	resp, err := http.Post(u, "application/json", rd)
+	if err != nil {
+		t.Fatalf("POST %s: %v", u, err)
+	}
+	defer resp.Body.Close()
+	if v != nil {
+		if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+			t.Fatalf("decode %s: %v", u, err)
+		}
+	}
+	return resp.StatusCode
+}
+
+// TestHumanJSONListsAcrossSubmodules: GET /human.json returns the SAME
+// hive-wide NEEDS-HUMAN scan the HTML /human page renders (humanRows), never
+// a duplicated scan.
+func TestHumanJSONListsAcrossSubmodules(t *testing.T) {
+	_, _, ts := humanFixture(t, "")
+	var out struct {
+		Tasks []struct {
+			Sub      string `json:"sub"`
+			ID       string `json:"id"`
+			Reason   string `json:"reason"`
+			Category string `json:"category"`
+		} `json:"tasks"`
+	}
+	if code := httpGetJSON(t, ts.URL+"/human.json", &out); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	found := false
+	for _, tk := range out.Tasks {
+		if tk.Sub == "alpha" && tk.ID == "needs-token" {
+			found = true
+			if tk.Category != "secret" {
+				t.Fatalf("category = %q, want secret", tk.Category)
+			}
+			if !strings.Contains(tk.Reason, "api_token") {
+				t.Fatalf("reason missing blocker text: %q", tk.Reason)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("needs-token task missing from /human.json: %+v", out.Tasks)
+	}
+}
+
+// TestHumanTaskJSONContext: GET /human.json/{sub}/{id} returns one task's
+// context, and a stale/unknown link is a 404 — mirroring humanTask exactly.
+func TestHumanTaskJSONContext(t *testing.T) {
+	_, _, ts := humanFixture(t, "")
+	var out struct {
+		Sub        string `json:"sub"`
+		ID         string `json:"id"`
+		Desc       string `json:"desc"`
+		Reason     string `json:"reason"`
+		Category   string `json:"category"`
+		HasSession bool   `json:"has_session"`
+	}
+	if code := httpGetJSON(t, ts.URL+"/human.json/alpha/needs-token", &out); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	if out.Sub != "alpha" || out.ID != "needs-token" || out.Category != "secret" {
+		t.Fatalf("unexpected task context: %+v", out)
+	}
+	if out.HasSession {
+		t.Fatal("has_session should be false before any session is opened")
+	}
+	if code := httpStatus(t, ts.URL+"/human.json/alpha/does-not-exist"); code != http.StatusNotFound {
+		t.Fatalf("unknown task status = %d, want 404", code)
+	}
+}
+
+// TestAPIHumanSessionOpensAndReuses: POST /api/human/{sub}/{id}/session opens
+// (or returns the existing) resolution session, matching humanResolvePage's
+// session reuse behavior, and returns panel data alongside the sid.
+func TestAPIHumanSessionOpensAndReuses(t *testing.T) {
+	_, _, ts := humanFixture(t, "How can I help?")
+	var out1 struct {
+		SessID string `json:"SessID"`
+	}
+	if code := httpPostJSON(t, ts.URL+"/api/human/alpha/needs-token/session", nil, &out1); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	if out1.SessID == "" {
+		t.Fatal("no sid returned")
+	}
+	var out2 struct {
+		SessID string `json:"SessID"`
+	}
+	if code := httpPostJSON(t, ts.URL+"/api/human/alpha/needs-token/session", nil, &out2); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	if out2.SessID != out1.SessID {
+		t.Fatalf("second session open cut a new session: %s != %s", out1.SessID, out2.SessID)
+	}
+}
+
+// TestAPIHumanPanelMirrorsHTML: GET /api/human/{sub}/{id}/panel/{sid} reuses
+// resolvePanelData, so its shape matches the HTML panel's data exactly.
+func TestAPIHumanPanelMirrorsHTML(t *testing.T) {
+	s, _, ts := humanFixture(t, "How can I help?")
+	it := PlanItem{ID: "needs-token", Desc: "Wire the client.", HumanReason: "token"}
+	sess, err := s.humans.session(context.Background(), "alpha", it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		SessID string `json:"SessID"`
+		Busy   bool   `json:"Busy"`
+	}
+	if code := httpGetJSON(t, ts.URL+"/api/human/alpha/needs-token/panel/"+sess.ID, &out); code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	if out.SessID != sess.ID {
+		t.Fatalf("panel sid = %q, want %q", out.SessID, sess.ID)
+	}
+	if code := httpStatus(t, ts.URL+"/api/human/alpha/needs-token/panel/does-not-exist"); code != http.StatusNotFound {
+		t.Fatalf("unknown sid status = %d, want 404", code)
+	}
+}
+
+// TestAPIHumanMessageRunsTurn: POST /api/human/{sub}/{id}/message/{sid} runs
+// one agent turn and returns the refreshed panel, mirroring
+// humanResolveMessage.
+func TestAPIHumanMessageRunsTurn(t *testing.T) {
+	s, _, ts := humanFixture(t, "I inspected the blocker; add api_token in the Secrets panel.")
+	_ = httpGet(t, ts.URL+"/human/alpha/needs-token")
+	sess0, _ := s.humans.find("alpha", "needs-token")
+	var out map[string]interface{}
+	code := httpPostJSON(t, ts.URL+"/api/human/alpha/needs-token/message/"+sess0.ID,
+		map[string]string{"message": "what does this need?"}, &out)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	sess := waitIdle(t, s, "alpha", "needs-token")
+	found := false
+	for _, tn := range sess.Log() {
+		if tn.Role == "agent" && strings.Contains(tn.Text, "Secrets panel") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("agent reply not recorded: %+v", sess.Log())
+	}
+}
+
+// TestAPIHumanPublishAndResolveJSON: the JSON publish/discard/resolve mirrors
+// behave like their HTML counterparts (TestResolvePublishLandsChangesOnMain /
+// TestHumanResolveDiscardResetsSession / TestHumanResolveApplyReopens), never
+// duplicating the underlying resolvePublish/session/plan.Task.Resolve logic.
+func TestAPIHumanPublishAndResolveJSON(t *testing.T) {
+	client := &fakeAgentClient{
+		reply: "Documented the process in INFRASTRUCTURE.md.",
+		editFn: func(cwd string) {
+			p := filepath.Join(cwd, "submodules", "alpha", "INFRASTRUCTURE.md")
+			_ = os.MkdirAll(filepath.Dir(p), 0o755)
+			_ = os.WriteFile(p, []byte("# alpha infra\ndocumented via api\n"), 0o644)
+		},
+	}
+	s, root := editorFixtureClient(t, client)
+	planRel := "submodules/alpha/PLAN.md"
+	write(t, root+"/"+planRel, "<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+		"## needs-token [NEEDS-HUMAN] <!-- attempts=0 deps= weight=4 category=secret -->\n"+
+		"Wire the external API client.\n"+
+		"Human-needed: provide the API token in the secrets panel as api_token.\n")
+	if err := git.New(root).Commit(context.Background(), "seed needs-human task"); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s.Routes())
+	t.Cleanup(ts.Close)
+
+	it := PlanItem{ID: "needs-token", Desc: "Wire the client.", HumanReason: "token"}
+	sess, err := s.humans.session(context.Background(), "alpha", it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.Chat(context.Background(), "document the process"); err != nil {
+		t.Fatalf("chat: %v", err)
+	}
+
+	var pubOut map[string]interface{}
+	if code := httpPostJSON(t, ts.URL+"/api/human/alpha/needs-token/publish/"+sess.ID, nil, &pubOut); code != http.StatusOK {
+		t.Fatalf("publish status = %d: %+v", code, pubOut)
+	}
+	if e, ok := pubOut["error"]; ok && e != nil && e != "" {
+		t.Fatalf("publish returned error: %v", e)
+	}
+	got := gitShow(t, root, "HEAD", "submodules/alpha/INFRASTRUCTURE.md")
+	if !strings.Contains(got, "documented via api") {
+		t.Fatalf("published content not on main HEAD: %q", got)
+	}
+
+	// Discard should return null (task no longer needs a fresh session once
+	// published — the resolution work is done, but it is still NEEDS-HUMAN
+	// until explicitly resolved, so a fresh sid IS expected here).
+	var discardOut struct {
+		Sid interface{} `json:"sid"`
+	}
+	if code := httpPostJSON(t, ts.URL+"/api/human/alpha/needs-token/discard/"+sess.ID, nil, &discardOut); code != http.StatusOK {
+		t.Fatalf("discard status = %d", code)
+	}
+	if discardOut.Sid == nil {
+		t.Fatal("expected a fresh sid since the task is still NEEDS-HUMAN")
+	}
+
+	var resolveOut map[string]interface{}
+	if code := httpPostJSON(t, ts.URL+"/api/human/alpha/needs-token/resolve", nil, &resolveOut); code != http.StatusOK {
+		t.Fatalf("resolve status = %d: %+v", code, resolveOut)
+	}
+	head := gitShow(t, root, "HEAD", "submodules/alpha/PLAN.md")
+	p, err := plan.Parse(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk := p.Task("needs-token")
+	if tk == nil || tk.Status != plan.StatusTODO {
+		t.Fatalf("task not reopened to TODO: %+v", tk)
+	}
+
+	// A second resolve is a JSON 409, matching TestHumanResolveApplyRejectsNonHuman.
+	var conflictOut map[string]interface{}
+	if code := httpPostJSON(t, ts.URL+"/api/human/alpha/needs-token/resolve", nil, &conflictOut); code != http.StatusConflict {
+		t.Fatalf("second resolve status = %d, want 409", code)
+	}
+	if _, ok := conflictOut["error"]; !ok {
+		t.Fatalf("conflict response missing error field: %+v", conflictOut)
+	}
 }
