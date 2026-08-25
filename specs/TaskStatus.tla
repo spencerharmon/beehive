@@ -40,6 +40,24 @@
 (* CONSTANT Gated selects the handoff-gate-enforced protocol (TRUE) vs the    *)
 (* ungated pre-fix runner (FALSE).  See the .cfg files.                      *)
 (*                                                                         *)
+(* Review-revert content-finalize (the already-merged review shortcut,        *)
+(* live flux:omada-ingress-tls false-DONE): the interrupted-review finalize    *)
+(* (FinalizeAlreadyMerged) concluded "already merged into tracked main ...     *)
+(* runner-finalized DONE (no re-review, branch not required)" from commit       *)
+(* ANCESTRY -- the merge commit stays reachable in `main`'s history -- NOT      *)
+(* from the reviewed TREE CONTENT surviving.  A revert-after-merge             *)
+(* (`Revert "Merge branch bee-..."`) keeps the merge commit an ancestor while  *)
+(* DELETING every delivered file, so an ancestry-only finalize flips DONE       *)
+(* with the reviewed artifact absent from `main` and the target's own `Check:`  *)
+(* never run.  ancestry /= content.  VARIABLE `contentPresent` models the       *)
+(* reviewed tree content actually surviving on the tracked branch (a later      *)
+(* RevertMerge sets it FALSE while `merged`/ancestry stays TRUE), and CONSTANT   *)
+(* ContentFinalize selects the fix (TRUE: finalize refuses DONE unless the      *)
+(* content is PRESENT on `main` AND the declared Check passes -- never bare      *)
+(* ancestry) vs the bug (FALSE: ancestry-only finalize).  Same corpus-eating    *)
+(* shape as the empty-checksum canonical bug, one layer down on the Review      *)
+(* finalize path.  See the `_revertfinalize_*.cfg` files.                       *)
+(*                                                                         *)
 (* Layer 2 (part b), the handoff-terminal-leak: `status` above models the    *)
 (* AGENT-WRITTEN on-disk status only (the worktree's PLAN.md). It is NOT      *)
 (* what the selector/peers observe -- that is `published`, a separate         *)
@@ -67,6 +85,12 @@ CONSTANTS
     RevertOverPin,\* TRUE: gate-fail reverts on-disk status + gates the heartbeat publish (the fix).
                   \* FALSE: gate-fail pins the on-disk status and the heartbeat publishes unconditionally
                   \* (the handoff-terminal-leak bug).
+    ContentFinalize,\* TRUE (the fix): the interrupted-review finalize (FinalizeAlreadyMerged) requires
+                  \* the reviewed CONTENT present on `main` (contentPresent) -- not merely merge ancestry
+                  \* (merged) -- AND the declared Check, so a revert-after-merge cannot yield a false DONE;
+                  \* a reverted merge is re-opened (ReopenReverted) instead. FALSE (the bug,
+                  \* flux:omada-ingress-tls): finalize concludes DONE from ancestry (merged) alone, so a
+                  \* revert that removed the reviewed artifact still finalizes DONE.
     ModelResolve, \* TRUE: model the out-of-band operator Resolve edge NEEDS-HUMAN -> TODO
                   \* (state.go Resolve). FALSE: NEEDS-HUMAN is terminal (the other cfgs, whose
                   \* scope is the autonomous machine only -- behaviour is identical to before).
@@ -82,6 +106,9 @@ VARIABLES
     attempts,     \* rework attempts; Reject/Strand/RecoverLostWork/GateCheck bump it (state.go)
     workDurable,  \* the task's own bee work is committed AND durable on the submodule origin
     merged,       \* the task's own bee work has been merged into the tracked branch
+    contentPresent,\* the reviewed tree CONTENT actually survives on the tracked branch. A merge sets it
+                  \* TRUE alongside merged; a RevertMerge (revert-after-merge) sets it FALSE while the merge
+                  \* commit stays an ANCESTOR (merged stays TRUE) -- ancestry /= content.
     workLost,     \* adversary flag: the durable work was subsequently lost (branch GC'd, publish never landed)
     checkDeclared,\* the task declares a machine-checkable `Check:` DoD command (vs check=none/undeclared)
     checkPassed,  \* the declared Check currently exits 0 (the acceptance bar is actually met)
@@ -89,7 +116,7 @@ VARIABLES
     docOnMain,    \* the change doc is committed on `main` (durable, peer-visible)
     published     \* the status the runner's heartbeat has actually published to `main` (selector/peer view)
 
-vars == <<status, prevStatus, attempts, workDurable, merged, workLost,
+vars == <<status, prevStatus, attempts, workDurable, merged, contentPresent, workLost,
           checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 Statuses == {"TODO", "REVIEW", "ARB", "DONE", "HUMAN"}
@@ -118,6 +145,7 @@ TypeOK ==
     /\ attempts \in 0..(Limit + 1)
     /\ workDurable \in BOOLEAN
     /\ merged \in BOOLEAN
+    /\ contentPresent \in BOOLEAN
     /\ workLost \in BOOLEAN
     /\ checkDeclared \in BOOLEAN
     /\ checkPassed \in BOOLEAN
@@ -131,11 +159,12 @@ DodSatisfied == (~checkDeclared) \/ checkPassed
 
 \* The backing artifacts required before an on-disk terminal status is "earned":
 \* REVIEW needs the bee work durable on origin AND the change doc written;
-\* DONE additionally needs it merged and its declared DoD Check satisfied.
-\* Non-terminal statuses have nothing to gate.
+\* DONE additionally needs it merged, its reviewed CONTENT actually present on
+\* the tracked branch (not reverted away -- ancestry is not enough), and its
+\* declared DoD Check satisfied. Non-terminal statuses have nothing to gate.
 ArtifactsPresent ==
     CASE status = "REVIEW" -> workDurable /\ docWritten
-      [] status = "DONE"   -> workDurable /\ merged /\ docWritten /\ DodSatisfied
+      [] status = "DONE"   -> workDurable /\ merged /\ contentPresent /\ docWritten /\ DodSatisfied
       [] OTHER             -> TRUE
 
 (***************************************************************************)
@@ -148,10 +177,12 @@ LegalTransitionsOnly ==
     (status /= prevStatus) => (<<prevStatus, status>> \in LegalEdges)
 
 \* A task is DONE only when its own work is real: durable on origin AND merged
-\* into the tracked branch AND (92d2ed1) its declared definition-of-done Check is
-\* satisfied. This is the anti-false-DONE invariant.
+\* into the tracked branch AND its reviewed CONTENT actually survives on the
+\* tracked branch (a revert-after-merge that keeps only merge ANCESTRY is NOT
+\* enough -- the flux:omada-ingress-tls false-DONE) AND (92d2ed1) its declared
+\* definition-of-done Check is satisfied. This is the anti-false-DONE invariant.
 NoFalseDone ==
-    (status = "DONE") => (workDurable /\ merged /\ DodSatisfied)
+    (status = "DONE") => (workDurable /\ merged /\ contentPresent /\ DodSatisfied)
 
 \* The attempts counter never runs away past the escalation point.
 AttemptsBounded == attempts <= Limit + 1
@@ -188,6 +219,7 @@ Init ==
     /\ attempts = 0
     /\ workDurable = FALSE
     /\ merged = FALSE
+    /\ contentPresent = FALSE
     /\ workLost = FALSE
     /\ checkDeclared \in BOOLEAN   \* explore both a check-declared task and a check=none task
     /\ checkPassed = FALSE         \* the acceptance bar starts unmet
@@ -208,7 +240,7 @@ DoWork ==
     /\ workDurable' = TRUE
     /\ workLost' = FALSE
     /\ prevStatus' = status
-    /\ UNCHANGED <<status, attempts, merged, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<status, attempts, merged, contentPresent, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 \* The agent meets the acceptance bar: it does the real work so the declared DoD
 \* Check command now exits 0. Optional and unforced -- an agent CAN hand off
@@ -220,7 +252,7 @@ PassCheck ==
     /\ ~checkPassed
     /\ checkPassed' = TRUE
     /\ prevStatus' = status
-    /\ UNCHANGED <<status, attempts, workDurable, merged, workLost, checkDeclared, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<status, attempts, workDurable, merged, contentPresent, workLost, checkDeclared, docWritten, docOnMain, published>>
 
 \* TODO -> NEEDS-REVIEW. The handoff gate: in the fixed protocol the terminal
 \* flip is refused unless the work is durable on origin (verify.go +
@@ -230,7 +262,7 @@ HandoffToReview ==
     /\ (Gated => workDurable)
     /\ status' = "REVIEW"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, merged, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<attempts, workDurable, merged, contentPresent, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 \* Review approves: merge the bee tip into the tracked branch, NEEDS-REVIEW -> DONE.
 \* Gated: refuse to approve work that is not durable on origin (no ambient/phantom
@@ -241,6 +273,7 @@ ReviewApprove ==
     /\ (Gated => workDurable)
     /\ ((CheckGated /\ checkDeclared) => checkPassed)
     /\ merged' = TRUE
+    /\ contentPresent' = TRUE
     /\ status' = "DONE"
     /\ prevStatus' = status
     /\ UNCHANGED <<attempts, workDurable, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
@@ -250,7 +283,7 @@ ReviewReject ==
     /\ status = "REVIEW"
     /\ status' = "ARB"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, merged, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<attempts, workDurable, merged, contentPresent, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 \* Arbiter sides with the implementer: merge, NEEDS-ARBITRATION -> DONE. Also
 \* gated on the DoD check (the gate covers DONE entered via arbitration too).
@@ -259,6 +292,7 @@ ArbSideImpl ==
     /\ (Gated => workDurable)
     /\ ((CheckGated /\ checkDeclared) => checkPassed)
     /\ merged' = TRUE
+    /\ contentPresent' = TRUE
     /\ status' = "DONE"
     /\ prevStatus' = status
     /\ UNCHANGED <<attempts, workDurable, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
@@ -271,7 +305,7 @@ ArbSideReviewer ==
     /\ attempts' = attempts + 1
     /\ status' = IF attempts + 1 > Limit THEN "HUMAN" ELSE "TODO"
     /\ prevStatus' = status
-    /\ UNCHANGED <<workDurable, merged, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<workDurable, merged, contentPresent, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 \* Adversary: the durable work is subsequently lost -- the bee branch was reclaimed
 \* / GC'd and the publish never landed, so what looked reviewable now points at a
@@ -283,7 +317,7 @@ LoseWork ==
     /\ workDurable' = FALSE
     /\ workLost' = TRUE
     /\ prevStatus' = status
-    /\ UNCHANGED <<status, attempts, merged, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<status, attempts, merged, contentPresent, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 \* Runner recovers a task whose work is unrecoverable everywhere: reset to TODO
 \* (attempts++, past limit -> NEEDS-HUMAN). Valid from REVIEW or ARB (state.go
@@ -296,28 +330,84 @@ RecoverLostWork ==
     /\ status' = IF attempts + 1 > Limit THEN "HUMAN" ELSE "TODO"
     /\ workLost' = FALSE
     /\ prevStatus' = status
-    /\ UNCHANGED <<workDurable, merged, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<workDurable, merged, contentPresent, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 \* Runner completes interrupted review bookkeeping: the bee work is already merged
 \* into tracked main, so finalize NEEDS-REVIEW/ARB -> DONE without a new session.
-\* Requires merged, so the work is real; and (verifyGate inv 5) the DoD check must
+\* Requires merged, so the merge landed; and (verifyGate inv 5) the DoD check must
 \* be satisfied -- the interrupted-review finalize is exactly the path the jellyfin
 \* false-DONE walked through, so it is gated on the check too.
+\* ContentFinalize (the review-revert fix): the shortcut additionally requires the
+\* reviewed CONTENT to actually SURVIVE on the tracked branch (contentPresent) --
+\* NOT merely that the merge commit is an ancestor. A revert-after-merge keeps
+\* merged/ancestry TRUE while contentPresent goes FALSE; ancestry-only finalize
+\* (ContentFinalize = FALSE) then flips DONE with the artifact gone from `main`
+\* (the flux:omada-ingress-tls false-DONE). The fixed protocol re-opens such a
+\* reverted merge (ReopenReverted) instead of finalizing it.
 FinalizeAlreadyMerged ==
     /\ status \in {"REVIEW", "ARB"}
     /\ merged
     /\ workDurable
+    /\ (ContentFinalize => contentPresent)
     /\ ((CheckGated /\ checkDeclared) => checkPassed)
     /\ status' = "DONE"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, merged, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<attempts, workDurable, merged, contentPresent, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+
+\* The runner's merge for this task landed on the tracked branch, but the session
+\* that would have flipped the status to DONE was interrupted (killed / GC'd)
+\* before doing so, so the on-disk status is still REVIEW/ARB while the work is
+\* MERGED. This is exactly the state the interrupted-review finalize shortcut
+\* (FinalizeAlreadyMerged) exists to complete. The merge carries the reviewed
+\* content, so contentPresent is TRUE at this instant -- until a later RevertMerge.
+MergeLandsInterrupted ==
+    /\ status \in {"REVIEW", "ARB"}
+    /\ ~merged
+    /\ (Gated => workDurable)
+    /\ merged' = TRUE
+    /\ contentPresent' = TRUE
+    /\ prevStatus' = status
+    /\ UNCHANGED <<status, attempts, workDurable, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+
+\* Adversary: a revert-after-merge lands on the tracked branch
+\* (`Revert "Merge branch bee-..."`). It REMOVES the reviewed tree content
+\* (contentPresent -> FALSE) while the original merge commit stays REACHABLE in
+\* history, so ancestry (merged) is UNCHANGED. This is the exact live shape of
+\* flux:omada-ingress-tls: 6f34902 merged, 7f36d00 reverted it 14 min later,
+\* deleting all five delivered files, yet the merge remained an ancestor of main.
+\* Deliberately NOT forced (an environment adversary, like LoseWork).
+RevertMerge ==
+    /\ status \in {"REVIEW", "ARB"}
+    /\ merged
+    /\ contentPresent
+    /\ contentPresent' = FALSE
+    /\ prevStatus' = status
+    /\ UNCHANGED <<status, attempts, workDurable, merged, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+
+\* The review-revert FIX (ContentFinalize): the runner detects that a merge whose
+\* content was REVERTED away (merged ancestry present, contentPresent FALSE) is
+\* NOT a completable interrupted review -- it re-opens the task for rework rather
+\* than finalizing it DONE on bare ancestry. merged is cleared (the tracked branch
+\* no longer carries the work), attempts++ (past Limit -> NEEDS-HUMAN) so the task
+\* still terminates. Enabled only in the fixed protocol; the buggy protocol has no
+\* such guard and lets FinalizeAlreadyMerged flip DONE.
+ReopenReverted ==
+    /\ ContentFinalize
+    /\ status \in {"REVIEW", "ARB"}
+    /\ merged
+    /\ ~contentPresent
+    /\ attempts' = attempts + 1
+    /\ status' = IF attempts + 1 > Limit THEN "HUMAN" ELSE "TODO"
+    /\ merged' = FALSE
+    /\ prevStatus' = status
+    /\ UNCHANGED <<workDurable, contentPresent, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 \* Honeybee escalates a concrete blocker: any non-DONE working status -> NEEDS-HUMAN.
 RequestHuman ==
     /\ status \in {"TODO", "REVIEW", "ARB"}
     /\ status' = "HUMAN"
     /\ prevStatus' = status
-    /\ UNCHANGED <<attempts, workDurable, merged, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<attempts, workDurable, merged, contentPresent, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 \* The operator Resolve edge NEEDS-HUMAN -> TODO (internal/plan/state.go Resolve):
 \* an out-of-band operator reopens an escalated task. Modeled only when
@@ -336,7 +426,7 @@ Resolve ==
     /\ status' = "TODO"
     /\ attempts' = IF ResetAttemptsOnResolve THEN 0 ELSE attempts
     /\ prevStatus' = status
-    /\ UNCHANGED <<workDurable, merged, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
+    /\ UNCHANGED <<workDurable, merged, contentPresent, workLost, checkDeclared, checkPassed, docWritten, docOnMain, published>>
 
 (***************************************************************************)
 (* The handoff-terminal-leak layer: WriteDoc/GateCheck/Heartbeat.           *)
@@ -348,7 +438,7 @@ WriteDoc ==
     /\ ~docWritten
     /\ docWritten' = TRUE
     /\ prevStatus' = status
-    /\ UNCHANGED <<status, attempts, workDurable, merged, workLost,
+    /\ UNCHANGED <<status, attempts, workDurable, merged, contentPresent, workLost,
                    checkDeclared, checkPassed, docOnMain, published>>
 
 \* The runner's handoff gate: fires whenever the on-disk status sits at an
@@ -369,7 +459,7 @@ GateCheck ==
           ELSE /\ UNCHANGED attempts
                /\ UNCHANGED status
     /\ prevStatus' = status
-    /\ UNCHANGED <<workDurable, merged, workLost, checkDeclared, checkPassed,
+    /\ UNCHANGED <<workDurable, merged, contentPresent, workLost, checkDeclared, checkPassed,
                    docWritten, docOnMain, published>>
 
 \* The runner's per-turn heartbeat: internal/claim Heartbeat ->
@@ -395,7 +485,7 @@ Heartbeat ==
                        /\ UNCHANGED docOnMain
           ELSE /\ published' = status
                /\ UNCHANGED docOnMain
-    /\ UNCHANGED <<status, prevStatus, attempts, workDurable, merged, workLost,
+    /\ UNCHANGED <<status, prevStatus, attempts, workDurable, merged, contentPresent, workLost,
                    checkDeclared, checkPassed, docWritten>>
 
 \* Terminal idle so a completed task does not read as a deadlock.
@@ -414,6 +504,9 @@ Next ==
     \/ LoseWork
     \/ RecoverLostWork
     \/ FinalizeAlreadyMerged
+    \/ MergeLandsInterrupted
+    \/ RevertMerge
+    \/ ReopenReverted
     \/ RequestHuman
     \/ Resolve
     \/ WriteDoc
@@ -455,6 +548,8 @@ Fairness ==
     /\ WF_vars(ArbSideReviewer)
     /\ WF_vars(RecoverLostWork)
     /\ WF_vars(FinalizeAlreadyMerged)
+    /\ WF_vars(MergeLandsInterrupted)
+    /\ WF_vars(ReopenReverted)
     /\ WF_vars(WriteDoc)
     /\ WF_vars(GateCheck)
     /\ WF_vars(Heartbeat)
