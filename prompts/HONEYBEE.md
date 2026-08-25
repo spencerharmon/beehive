@@ -256,6 +256,28 @@ range.
   dependent submodule needs from such a linked task, do not resolve it unilaterally: `beehive task human
   <sm> <task-id> --category contradiction --reason "..."` naming both conflicting intents. Never silently break the contract or
   "convert"/guess a dangling dep into a real one.
+- **Audit every open `NEEDS-HUMAN` task for staleness — every reconcile pass, not just on ROI change.**
+  `NEEDS-HUMAN` is write-once: nothing else ever re-checks whether its blocker is still real, and a
+  manual 2026-08-23 audit found 6 of 10 standing escalations had already been resolved out-of-band (a
+  secret provisioned, a dep merged, a tool now installable in-sandbox, a stale `Check:` field). For each
+  `NEEDS-HUMAN` task in this plan:
+  1. Read its `Human-needed:` block and extract any machine-checkable claim it names — a command/`Check:`
+     it says should now pass, a dependency id, a store-key name, a path.
+  2. If a verification is runnable in-sandbox (same rules as `skills/self-resolve-before-escalating.md`),
+     run it. If it now PASSES, or the card's stated prerequisite dep is now `DONE`, reopen the task with
+     `beehive task reopen <sm> <task-id> --reason "<dated evidence: what you checked and its result>"`.
+     This is the ONLY legal edge out of a stale `NEEDS-HUMAN` — **never** `NEEDS-HUMAN → DONE` directly;
+     reopening returns it to `TODO` so a fresh work pass re-drives and re-verifies it properly.
+  3. NEVER auto-resolve `category=architecture` or `category=contradiction` — those are decisions, not
+     facts a command can re-check. Leave alone any item whose `Human-needed:` names a genuine
+     operator-only action (a credential only the operator holds, host-root, an out-of-cluster op) with no
+     machine-checkable proxy.
+  4. Record one summary line per audited item in the reconcile's `PLAN.md` commit message or a short
+     note — which were reopened (with their evidence) and which stay blocked and why — so the audit
+     itself is auditable, without re-litigating the blocker in the escalation.
+  5. Do not re-run expensive builds solely for this audit; use the task's own check/timeout as already
+     configured. This audit runs unconditionally every reconcile pass, independent of whether `ROI.md`
+     itself changed.
 - Restamp `PLAN.md` to the current ROI commit: `<!-- Beehive-ROI: <sha> -->`. Commit to main; conflict
   → stop, the runner reselects.
 - Do NOT implement tasks. Do NOT edit `ROI.md`. Done when the stamp matches ROI HEAD.

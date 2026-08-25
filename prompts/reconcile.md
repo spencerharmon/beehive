@@ -51,6 +51,23 @@ You are given the diff of ROI.md from the last-reconciled commit to HEAD (ROI.md
   - Current 8-tier order (P1 > P2 > correctness > completeness > configuration > aesthetics > chat-diff
     editor > deferred) -> `128, 64, 32, 16, 8, 4, 2, 1`. Emit `weight=N` in the header; omit only for the
     bottom (weight=1) tier. Re-emit weights for existing tasks when their tier moved.
+- **Audit every open `NEEDS-HUMAN` task for staleness, unconditionally, every pass** (not gated on the
+  ROI diff touching it). A manual audit (2026-08-23) found 6 of 10 standing escalations had already been
+  resolved out-of-band (secret provisioned, dep merged, tool now installable in-sandbox, stale `Check:`
+  field) yet stayed `NEEDS-HUMAN` forever because nothing re-checks a write-once escalation:
+  1. Read the task's `Human-needed:` block; extract any machine-checkable claim (a command/`Check:` it
+     says should now pass, a dep id, a store-key name, a path).
+  2. Run any in-sandbox-runnable verification (same rules as `skills/self-resolve-before-escalating.md`).
+     If it passes, or the stated prerequisite dep is now `DONE`, reopen:
+     `beehive task reopen <sm> <task-id> --reason "<dated evidence>"`. This is the only legal exit from a
+     stale `NEEDS-HUMAN` -- never flip `NEEDS-HUMAN -> DONE` directly; reopening returns it to `TODO` so a
+     work pass re-drives and re-verifies it.
+  3. NEVER auto-resolve `category=architecture` or `category=contradiction` (decisions, not re-checkable
+     facts), and leave alone any item whose `Human-needed:` names a genuine operator-only action (a
+     credential only the operator holds, host-root, an out-of-cluster op) with no machine-checkable proxy.
+  4. Note which items were reopened (with evidence) and which stay blocked (and why) so the audit itself
+     is auditable -- without relitigating the blocker in the escalation text.
+  5. Do not re-run expensive builds solely for this audit; reuse the task's own configured check/timeout.
 - Update the PLAN.md ROI stamp to the current ROI.md commit: `<!-- Beehive-ROI: <sha> -->`.
 - NEVER edit ROI.md. Commit PLAN.md to main; conflict -> reselect.
 - Do NOT implement tasks; reconciliation ends at a committed, restamped PLAN.md.
