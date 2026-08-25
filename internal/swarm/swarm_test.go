@@ -1207,6 +1207,139 @@ func TestReviewDispatchFinalizesAlreadyMergedRemote(t *testing.T) {
 	}
 }
 
+// TestReviewDispatchReopensRevertedContentInsteadOfFinalizing is the regression
+// for review-revert-content-finalize-fix (live: flux:omada-ingress-tls
+// false-DONE 2026-08-02). bee-R1's tip is merged into tracked main (a genuine
+// interrupted-review shape finalizeIfAlreadyMerged exists to complete), but a
+// LATER "Revert" commit on tracked main deletes the file bee-R1 delivered while
+// the original merge commit stays reachable — ancestry reads green, content is
+// gone. Pre-fix, finalizeIfAlreadyMerged concluded DONE from bare ancestry alone.
+// Post-fix it must detect the reverted content and re-open the task for rework
+// (TODO, attempts incremented) instead of ever finalizing DONE.
+func TestReviewDispatchReopensRevertedContentInsteadOfFinalizing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	g := gitInit(t, root)
+	repo.Init(root)
+	sm := filepath.Join(root, "submodules", "sm")
+	os.MkdirAll(filepath.Join(sm, "docs"), 0o755)
+	origin := bareOriginSeeded(t, g)
+	repoDir := filepath.Join(sm, "repo")
+	if _, err := g.Run(ctx, "clone", "-q", origin, repoDir); err != nil {
+		t.Fatalf("clone submodule: %v", err)
+	}
+	gitConfig(t, repoDir)
+
+	sc := filepath.Join(t.TempDir(), "push")
+	if _, err := g.Run(ctx, "clone", "-q", origin, sc); err != nil {
+		t.Fatalf("scratch clone: %v", err)
+	}
+	scg := gitConfig(t, sc)
+
+	// The implementer's real work on bee-R1, pushed to origin.
+	os.WriteFile(filepath.Join(sc, "feature.txt"), []byte("delivered work\n"), 0o644)
+	if err := scg.Commit(ctx, "feat: deliver feature.txt"); err != nil {
+		t.Fatalf("commit implementer work: %v", err)
+	}
+	implSHA, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse implementer commit: %v", err)
+	}
+	if _, err := scg.Run(ctx, "push", "origin", "HEAD:refs/heads/bee-R1"); err != nil {
+		t.Fatalf("push bee-R1: %v", err)
+	}
+
+	// A prior (interrupted) review merges bee-R1 into tracked main and pushes it
+	// (the exact shape finalizeIfAlreadyMerged completes bookkeeping for).
+	if _, err := scg.Run(ctx, "reset", "--hard", "origin/main"); err != nil {
+		t.Fatalf("reset to main: %v", err)
+	}
+	if _, err := scg.Run(ctx, "merge", "--no-ff", "-m", "Merge branch bee-R1", implSHA); err != nil {
+		t.Fatalf("merge bee-R1: %v", err)
+	}
+	mergeSHA, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse merge: %v", err)
+	}
+	if err := scg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push merged main: %v", err)
+	}
+
+	// A LATER commit reverts that merge: feature.txt is deleted from tracked main
+	// while the merge commit (and implSHA) stay reachable ancestors.
+	if _, err := scg.Run(ctx, "revert", "-m", "1", "--no-edit", mergeSHA); err != nil {
+		t.Fatalf("revert merge: %v", err)
+	}
+	if err := scg.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push reverted main: %v", err)
+	}
+	revertedTip, err := scg.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse reverted tip: %v", err)
+	}
+	if ok, _ := scg.IsAncestor(ctx, implSHA, revertedTip); !ok {
+		t.Fatal("test bug: implSHA must remain an ancestor of the reverted tip")
+	}
+	if _, err := os.Stat(filepath.Join(sc, "feature.txt")); err == nil {
+		t.Fatal("test bug: feature.txt must be gone after the revert")
+	}
+
+	// The beehive gitlink is left at the PRE-merge recorded pointer (the
+	// implementer's own commit) — exactly the interrupted-review shape.
+	if _, err := g.Run(ctx, "update-index", "--add", "--cacheinfo", "160000,"+implSHA+",submodules/sm/repo"); err != nil {
+		t.Fatalf("seed pre-merge gitlink: %v", err)
+	}
+	planPath := filepath.Join(sm, "PLAN.md")
+	os.WriteFile(planPath, []byte("## R1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=none -->\nreview\n"), 0o644)
+	if _, err := g.Run(ctx, "add", "submodules/sm/PLAN.md"); err != nil {
+		t.Fatalf("add plan: %v", err)
+	}
+	if _, err := g.Run(ctx, "commit", "-m", "seed"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	rp, _ := repo.Open(root)
+	subs, _ := rp.Submodules()
+	sel := &selectt.Selection{Kind: selectt.Review, Submodule: subs[0], Task: plan.Task{ID: "R1", Status: plan.NeedsReview}}
+
+	r := &Runner{Repo: rp, Git: g, Client: &refusingClient{t: t}, MaxTurns: 5, TTL: time.Hour}
+	res, err := r.Run(ctx, sel, "sys", "first")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !res.Completed {
+		t.Fatalf("a reverted-content already-merged shape must still be handled (reopened) at dispatch time, got %+v", res)
+	}
+	b, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatalf("read plan: %v", err)
+	}
+	p, err := plan.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	tk := p.Find("R1")
+	if tk == nil {
+		t.Fatal("task R1 vanished from PLAN.md")
+	}
+	if tk.Status == plan.Done {
+		t.Fatalf("status = DONE, want the task re-opened for rework (reverted content must never finalize DONE on bare ancestry)")
+	}
+	if tk.Status != plan.StatusTODO {
+		t.Fatalf("status = %s, want TODO (reopened, attempts under limit)", tk.Status)
+	}
+	if tk.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (the reopen must bump attempts so this loop is bounded)", tk.Attempts)
+	}
+	if tk.Session != "" || !tk.Heartbeat.IsZero() {
+		t.Fatal("reopen must release the claim")
+	}
+	joined := strings.Join(tk.Body, "\n")
+	if !contains(joined, "feature.txt") {
+		t.Fatalf("plan body missing the reverted path feature.txt in the reopen reason:\n%s", joined)
+	}
+}
+
 // TestRecordReviewedCommitRecordsBranchTipNotAmbientPointer is the regression
 // for record-review-commit-ambient-pointer: a completed Work pass on a BUSY
 // submodule must record its OWN bee-<taskid> tip as ReviewCommit, never the

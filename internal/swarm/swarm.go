@@ -2966,6 +2966,23 @@ func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Sele
 		// through to the branch-based guards / normal dispatch.
 		return false, err
 	}
+	// review-revert-content-finalize-fix: ancestry alone is NOT proof the delivered
+	// work still exists — a revert-after-merge keeps the reviewed commit reachable
+	// while deleting/overwriting every file it delivered. Verify the reviewed TREE
+	// actually survives on trackedRef before ever finalizing DONE from this shortcut;
+	// see contentReverted's doc comment for the exact check.
+	reverted, changed, cerr := r.contentReverted(ctx, sg, sha, trackedRef)
+	if cerr != nil {
+		return false, cerr
+	}
+	if reverted {
+		reason := fmt.Sprintf(
+			"recorded reviewed commit %s is an ancestor of tracked %s, but its delivered content no longer "+
+				"matches there (reverted/overwritten paths: %s) — reopening for rework instead of finalizing "+
+				"DONE on bare ancestry",
+			sha, tracked, strings.Join(changed, ", "))
+		return r.reopenReverted(ctx, sel, reason)
+	}
 	// Merged: sync THIS pass's private submodule checkout to the tracked tip so the
 	// gitlink bump (FinalizeAlreadyMerged -> CommitPaths) records the real HEAD,
 	// exactly as finalizeIfAlreadyMerged does.
@@ -2976,6 +2993,26 @@ func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Sele
 	if err != nil {
 		return false, err
 	}
+	// review-revert-content-finalize-fix: the content survives — now run the task's
+	// OWN definition-of-done `Check:` on the tracked tree, exactly as a normal review
+	// approve does before ever stamping DONE. A `check=none` task is exempt.
+	if check := sel.Task.Check(); check != "" && !sel.Task.CheckNone {
+		o, cerr := r.runCheckIn(ctx, sel, check, repoDir)
+		if cerr != nil {
+			var pv policyViolationError
+			if errors.As(cerr, &pv) {
+				return false, cerr
+			}
+			return false, fmt.Errorf("finalize-if-merged-by-record: running DoD check for %s: %w", sel.Task.ID, cerr)
+		}
+		if o.exitErr {
+			reason := fmt.Sprintf(
+				"recorded reviewed commit %s is merged into tracked %s (%s) but the task's Check: %q failed on "+
+					"the tracked tree: %s — reopening for rework instead of finalizing DONE without running it",
+				sha, tracked, tip, check, o.out)
+			return r.reopenReverted(ctx, sel, reason)
+		}
+	}
 	note := fmt.Sprintf(
 		"recorded reviewed commit %s already merged into tracked %s (%s) by a prior interrupted review; runner-finalized DONE (no re-review, branch not required)",
 		sha, tracked, tip)
@@ -2985,6 +3022,77 @@ func (r *Runner) finalizeIfMergedByRecord(ctx context.Context, sel *selectt.Sele
 	}
 	commits, docAbs, docRel := r.finalizeCommitRecord(sel, absRoot, sha)
 	if err := cl.FinalizeAlreadyMerged(ctx, sel.Task.ID, rel, note, commits, docAbs, docRel); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// contentReverted implements the review-revert-content-finalize-fix contract's
+// content-survives test: ancestry (git merge-base --is-ancestor) proves the
+// reviewed commit tip stays reachable in trackedRef's history, but says NOTHING
+// about whether the files it delivered still exist there — a
+// `Revert "Merge branch bee-<taskid>"` (the live flux:omada-ingress-tls shape)
+// deletes every delivered file while leaving the original merge commit an
+// ancestor of main, so ancestry alone reads green with the effect gone. This
+// resolves the files tip's OWN commit(s) changed (tip vs its first parent — the
+// delivered diff) and reports whether ANY of those exact paths differ between tip
+// and trackedRef (deleted, restored, or otherwise overwritten since). An empty
+// delivered-file set (e.g. a doc-only/no-op commit) is vacuously not reverted.
+// Fails CLOSED on a git error (never silently treats an unreadable tree as safe).
+func (r *Runner) contentReverted(ctx context.Context, sg *git.Repo, tip, trackedRef string) (reverted bool, changed []string, err error) {
+	out, err := sg.Run(ctx, "diff", "--name-only", tip+"^", tip)
+	if err != nil {
+		// tip has no resolvable parent (a root commit) or some other git failure —
+		// fall back to treating the WHOLE tree at tip as delivered.
+		out, err = sg.Run(ctx, "ls-tree", "-r", "--name-only", tip)
+		if err != nil {
+			return false, nil, fmt.Errorf("content-reverted: listing files delivered by %s: %w", tip, err)
+		}
+	}
+	var files []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			files = append(files, line)
+		}
+	}
+	if len(files) == 0 {
+		return false, nil, nil
+	}
+	args := append([]string{"diff", "--name-only", tip, trackedRef, "--"}, files...)
+	diffOut, err := sg.Run(ctx, args...)
+	if err != nil {
+		return false, nil, fmt.Errorf("content-reverted: diffing delivered paths %s..%s: %w", tip, trackedRef, err)
+	}
+	var changedPaths []string
+	for _, line := range strings.Split(diffOut, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			changedPaths = append(changedPaths, line)
+		}
+	}
+	return len(changedPaths) > 0, changedPaths, nil
+}
+
+// reopenReverted re-opens a NEEDS-REVIEW/NEEDS-ARBITRATION task whose merge
+// survives ancestry but whose delivered content was reverted/overwritten (or
+// whose Check: fails on the tracked tree) — the review-revert-content-finalize-fix
+// contract's `ReopenReverted`: never finalize DONE on bare ancestry, but also
+// never silently drop the task. Reuses claim.Claimer.RecoverLostWork's exact
+// attempts/limit escalation (reset to TODO under the limit, NEEDS-HUMAN past it) —
+// the same bounded-reopen mechanism already governs an unrecoverable lost-work
+// shape, and a reverted-content shape is symmetric: real prior work exists but is
+// no longer usable as-is, so the task goes back for rework rather than looping
+// this shortcut forever. Always returns true (the task WAS handled — recovered or
+// escalated) unless the recovery write itself errors.
+func (r *Runner) reopenReverted(ctx context.Context, sel *selectt.Selection, reason string) (bool, error) {
+	cl := &claim.Claimer{
+		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
+		Session: r.Session, Publish: r.Publish, Remote: r.Remote,
+	}
+	limit := r.RejectLimit
+	if limit <= 0 {
+		limit = 3
+	}
+	if err := cl.RecoverLostWork(ctx, sel.Task.ID, reason, limit); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -3056,6 +3164,23 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 	if err != nil || !merged {
 		return false, err
 	}
+	// review-revert-content-finalize-fix: ancestry alone does not prove the
+	// delivered work still exists — a revert-after-merge keeps branchTip reachable
+	// while deleting/overwriting every file it delivered. Verify the reviewed TREE
+	// actually survives on trackedRef before ever finalizing DONE from this
+	// shortcut; see contentReverted's doc comment for the exact check.
+	reverted, changed, cerr := r.contentReverted(ctx, sg, branchTip, trackedRef)
+	if cerr != nil {
+		return false, cerr
+	}
+	if reverted {
+		reason := fmt.Sprintf(
+			"bee-%s (%s) is an ancestor of tracked %s, but its delivered content no longer matches there "+
+				"(reverted/overwritten paths: %s) — reopening for rework instead of finalizing DONE on bare "+
+				"ancestry",
+			sel.Task.ID, branchTip, tracked, strings.Join(changed, ", "))
+		return r.reopenReverted(ctx, sel, reason)
+	}
 	// The recorded pointer is already folded into tracked main: sync THIS pass's
 	// own (private, per-pass) submodule checkout to that tip — exactly
 	// syncWorktreeBase's pattern — so the beehive-layer gitlink bump below
@@ -3072,6 +3197,26 @@ func (r *Runner) finalizeIfAlreadyMerged(ctx context.Context, sel *selectt.Selec
 	tip, err := sg.RevParse(ctx, "HEAD")
 	if err != nil {
 		return false, err
+	}
+	// review-revert-content-finalize-fix: the content survives — now run the task's
+	// OWN definition-of-done `Check:` on the tracked tree, exactly as a normal
+	// review approve does before ever stamping DONE. A `check=none` task is exempt.
+	if check := sel.Task.Check(); check != "" && !sel.Task.CheckNone {
+		o, cerr := r.runCheckIn(ctx, sel, check, repoDir)
+		if cerr != nil {
+			var pv policyViolationError
+			if errors.As(cerr, &pv) {
+				return false, cerr
+			}
+			return false, fmt.Errorf("finalize-if-already-merged: running DoD check for %s: %w", sel.Task.ID, cerr)
+		}
+		if o.exitErr {
+			reason := fmt.Sprintf(
+				"bee-%s is merged into tracked %s (%s) but the task's Check: %q failed on the tracked tree: %s "+
+					"— reopening for rework instead of finalizing DONE without running it",
+				sel.Task.ID, tracked, tip, check, o.out)
+			return r.reopenReverted(ctx, sel, reason)
+		}
 	}
 	note := fmt.Sprintf(
 		"already merged into tracked %s (%s) by a prior interrupted review; runner-finalized DONE (no re-review)",
