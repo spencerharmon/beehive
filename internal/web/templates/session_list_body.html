@@ -1,6 +1,6 @@
 {{with .Sync}}<p class="sync-status{{if .Err}} stale{{end}}">followed {{.Ago}} ago{{if .Err}} · pull stalled: {{.Err}}{{end}}</p>{{end}}
 <ul class="sessions">
-{{range .Sessions}}<li>
+{{range $sess := .Sessions}}<li>
   <a href="/submodule/{{$.Name}}/session/{{.ID}}">{{.Display}}</a>
   {{if .Live}}<span class="badge live">running</span>{{else}}<span class="badge">idle</span>{{end}}
   {{if .Kind}}<span class="badge">{{.Kind}}</span>{{end}}
@@ -8,6 +8,7 @@
   {{if .TaskHref}}<a href="{{.TaskHref}}" aria-label="task for {{.Display}}">task</a>{{end}}
   {{if .DocHref}}<a href="{{.DocHref}}" aria-label="change doc for {{.Display}}">doc</a>{{end}}
   {{if .FlipHref}}<a href="{{.FlipHref}}" aria-label="commit for {{.Display}}">commit</a>{{end}}
+  {{range .Commits}}<a href="{{.Href}}" aria-label="submodule commit {{.SHA}} for {{$sess.Display}}"><code>{{.SHA}}</code></a>{{end}}
   <span class="ago">{{.Ago}} ago</span>
 </li>{{else}}<li>no sessions yet</li>{{end}}
 </ul>

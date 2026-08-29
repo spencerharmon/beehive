@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
 )
 
@@ -46,6 +47,35 @@ type sessionLink struct {
 	DocHref  string // link to view that doc (branch-graph-sectioned), "" if unresolved
 	FlipSHA  string // short hive commit sha that flipped the task DONE, "" if not (yet) applicable
 	FlipHref string // link to view that hive commit (delivery-traceability), "" if unresolved
+	// Commits (session-list-commit-link) fans the task's submodule commit(s)
+	// out onto the session-list row: one short-sha link PER commit the task's
+	// terminal handoff produced (its `commits=` tag / the change doc's
+	// `<!-- Beehive-Commits: ... -->` header), not just the first/flip sha.
+	// nil when the task has no resolvable submodule commit — never a dead link.
+	Commits []commitLink
+}
+
+// commitLink is one submodule commit surfaced on a session row/page
+// (session-list-commit-link): a short sha and a link to VIEW that commit in the
+// submodule's history (the branches view's per-commit anchor, where
+// commitGraph renders each sha with `id="commit-<sha>"`). Href is "" only if
+// the sha is empty (guarded away before it is ever emitted), so a rendered
+// commitLink is always a live link.
+type commitLink struct {
+	SHA  string // short (<=12) submodule commit sha, for display
+	Href string // link to view that commit in the submodule's branch graph
+}
+
+// submoduleCommitHref links to a submodule code commit in the branches view,
+// anchored on the per-commit row commitGraph renders (`id="commit-<sha>"`,
+// branch_view.html). The sha is shortened to 12 chars to match the anchor the
+// branch graph emits (commitGraph's SHA[:min(12,...)]). "" for an empty sha so
+// the caller never emits a dead link.
+func submoduleCommitHref(smName, sha string) string {
+	if sha == "" {
+		return ""
+	}
+	return "/submodule/" + smName + "/branches#commit-" + sha
 }
 
 // taskIDForSession derives the task id a session's file stem names, reusing
@@ -129,8 +159,10 @@ func (s *Server) sessionLinksFor(ctx context.Context, head string, sm repo.Submo
 		return out
 	}
 	planIDs := make(map[string]bool, len(p.Items))
+	planCommits := make(map[string][]string, len(p.Items))
 	for _, it := range p.Items {
 		planIDs[it.ID] = true
+		planCommits[it.ID] = it.Commits
 	}
 	docs, _ := cachedView(head, s.cache, "delivery-docs:"+sm.Name, func() (map[string]string, error) {
 		return changeDocsByTask(ctx, sm.RepoDir()), nil
@@ -150,12 +182,79 @@ func (s *Server) sessionLinksFor(ctx context.Context, head string, sm repo.Submo
 			link.FlipSHA = f.FlipSHA
 			link.FlipHref = f.FlipHref
 		}
+		// session-list-commit-link: fan the task's submodule commit(s) out —
+		// one short-sha link per commit. Prefer the live plan's `commits=` tag
+		// (already parsed into p.Items); fall back to the change doc's
+		// `<!-- Beehive-Commits: ... -->` header (git-derived, so a task retired
+		// from the current plan still resolves its commits) — the two are the
+		// SAME record the runner's handoff gate keeps in agreement. Empty for a
+		// no-commit task, so the row shows no link and no error.
+		shas := taskCommits(planIDs[t], planCommits[t])
+		if len(shas) == 0 && !planIDs[t] {
+			shas = docCommits(sm, docs[t])
+		}
+		link.Commits = commitLinksFor(sm, shas)
 		out[id] = link
 	}
 	return out
 }
 
-// sessionsPageSize bounds how many sessions the sessions view renders at once
+// taskCommits resolves the submodule commit sha(s) for a task from the live
+// plan's `commits=` tag (planCommits, already parsed) when the task is still in
+// the current plan (inPlan). A task retired from the plan has no in-memory tag;
+// the caller then falls back to docCommits (the change doc's git-committed
+// header). Returns nil (no commit, no link) when the task names no commit.
+func taskCommits(inPlan bool, planCommits []string) []string {
+	if inPlan {
+		return planCommits
+	}
+	return nil
+}
+
+// docCommits recovers a retired task's submodule commit shas from its change
+// doc's `<!-- Beehive-Commits: ... -->` header (session-list-commit-link's
+// fallback for a task no longer in the live plan, so its `commits=` tag is gone
+// from memory but the git-committed doc header survives). docPath is the raw
+// stamp path changeDocsByTask returned; it is normalized and read from the
+// submodule's docs/ dir (the SAME anchoring resolveDocHref uses), so it can
+// never escape the submodule. Returns nil (no link) when the path is empty,
+// unresolvable, unreadable, or names no commit.
+func docCommits(sm repo.Submodule, docPath string) []string {
+	rel := normalizeDocPath(sm, docPath)
+	if rel == "" {
+		return nil
+	}
+	b, err := os.ReadFile(filepath.Join(sm.Path, "docs", filepath.FromSlash(rel)))
+	if err != nil {
+		return nil
+	}
+	shas, _ := plan.ParseDocCommits(string(b))
+	return shas
+}
+
+// commitLinksFor turns a task's submodule commit shas into one live commitLink
+// per sha (session-list-commit-link), each a short (<=12) sha plus a link to
+// view that commit in sm's branch graph (submoduleCommitHref). An empty sha is
+// skipped so a stray "" (a malformed tag entry) never becomes a dead link;
+// nil/empty input yields nil, rendering as no link at all.
+func commitLinksFor(sm repo.Submodule, shas []string) []commitLink {
+	if len(shas) == 0 {
+		return nil
+	}
+	out := make([]commitLink, 0, len(shas))
+	for _, sha := range shas {
+		sha = strings.TrimSpace(sha)
+		if sha == "" {
+			continue
+		}
+		short := sha[:min(12, len(sha))]
+		out = append(out, commitLink{SHA: short, Href: submoduleCommitHref(sm.Name, short)})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
 // (pageload-sessions-pagination): the sessions/ directory grows without limit as
 // a hive runs, so rendering EVERY session per paint makes load cost scale with
 // total session count. The list is windowed to one page of this many sessions

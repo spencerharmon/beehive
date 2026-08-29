@@ -7846,6 +7846,185 @@ func TestSessionListLinksDegradeGracefully(t *testing.T) {
 	}
 }
 
+// TestSessionListSubmoduleCommitLinks is session-list-commit-link's end-to-end
+// assertion: a session-list row surfaces its task's SUBMODULE commit(s) as one
+// short-sha link PER commit (the task's `commits=` tag), not just the first —
+// a single-commit task shows one link, a multi-commit task shows one link per
+// commit each with the correct branch-graph anchor href, and a task with no
+// resolvable commit shows none. The negative control proves the multi-commit
+// fan-out is guarded: a task's SECOND sha must not be attributed to a DIFFERENT
+// task's row.
+func TestSessionListSubmoduleCommitLinks(t *testing.T) {
+	s, root := setup(t)
+
+	// A plan whose three tasks exercise single / multi / none commit sets. The
+	// `commits=` tag is the primary source session-list-commit-link fans out.
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## single [DONE] <!-- attempts=0 deps= commits=aaaaaaaaaaaa1111 -->\nbuilt\nDoc: bee-single.md\n\n"+
+			"## multi [DONE] <!-- attempts=0 deps= commits=bbbbbbbbbbbb2222,cccccccccccc3333 -->\nbuilt\nDoc: bee-multi.md\n\n"+
+			"## nocommit [DONE] <!-- attempts=0 deps= commits=none -->\ndoc only\nDoc: bee-nocommit.md\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const model = "github-copilot/claude-opus-4.8"
+	const singleStem = "bee-single-1700000000-11111"
+	const multiStem = "bee-multi-1700000001-22222"
+	const noneStem = "bee-nocommit-1700000002-33333"
+	writeTranscript(t, root, singleStem, "work", model)
+	writeTranscript(t, root, multiStem, "work", model)
+	writeTranscript(t, root, noneStem, "work", model)
+
+	list := get(t, s, "/submodule/alpha/sessions/body")
+	if list.Code != 200 {
+		t.Fatalf("sessions/body status %d: %s", list.Code, list.Body)
+	}
+	lb := list.Body.String()
+
+	// The submodule commit shas are shortened to 12 (matching commitGraph's
+	// branch-graph anchor) and linked to the branches view's per-commit anchor.
+	const (
+		singleSHA = "aaaaaaaaaaaa"
+		multiSHA1 = "bbbbbbbbbbbb"
+		multiSHA2 = "cccccccccccc"
+	)
+	singleLink := `<a href="/submodule/alpha/branches#commit-` + singleSHA + `" aria-label="submodule commit ` + singleSHA + ` for single"><code>` + singleSHA + `</code></a>`
+	multiLink1 := `<a href="/submodule/alpha/branches#commit-` + multiSHA1 + `" aria-label="submodule commit ` + multiSHA1 + ` for multi"><code>` + multiSHA1 + `</code></a>`
+	multiLink2 := `<a href="/submodule/alpha/branches#commit-` + multiSHA2 + `" aria-label="submodule commit ` + multiSHA2 + ` for multi"><code>` + multiSHA2 + `</code></a>`
+
+	// Single-commit row: exactly one short-sha link.
+	if !strings.Contains(lb, singleLink) {
+		t.Errorf("single-commit row missing its one commit link %q:\n%s", singleLink, lb)
+	}
+	// Multi-commit row: one link PER commit, each with the correct href.
+	if !strings.Contains(lb, multiLink1) {
+		t.Errorf("multi-commit row missing first commit link %q:\n%s", multiLink1, lb)
+	}
+	if !strings.Contains(lb, multiLink2) {
+		t.Errorf("multi-commit row missing second commit link %q:\n%s", multiLink2, lb)
+	}
+	// The fan-out is real: both multi shas are present, and they are the SECOND
+	// pair distinct from the single row's sha (a first-sha-only implementation
+	// would surface only multiSHA1).
+	if strings.Count(lb, "branches#commit-"+multiSHA2) != 1 {
+		t.Errorf("multi-commit row must surface its SECOND sha exactly once (fan-out, not first-only):\n%s", lb)
+	}
+
+	// Negative control: the no-commit row (commits=none) surfaces NO submodule
+	// commit link, and crucially neither multi sha leaked onto it — the fan-out
+	// is scoped per task, never cross-attributed.
+	if strings.Contains(lb, `aria-label="submodule commit `+multiSHA1+` for nocommit"`) ||
+		strings.Contains(lb, `aria-label="submodule commit `+multiSHA2+` for nocommit"`) ||
+		strings.Contains(lb, `aria-label="submodule commit `+singleSHA+` for nocommit"`) {
+		t.Errorf("no-commit row must carry NO submodule commit link (no cross-attribution):\n%s", lb)
+	}
+	if strings.Contains(lb, `for nocommit"><code>`) {
+		t.Errorf("no-commit row (commits=none) must render no short-sha commit link at all:\n%s", lb)
+	}
+}
+
+// TestSessionListSubmoduleCommitLinksWhiteBox drives sessionLinksFor directly
+// (session-list-commit-link) so the single/multi/none fan-out and the
+// per-commit href are asserted at the resolver, independent of template markup:
+// a single-commit task resolves one commitLink, a multi-commit task resolves
+// one commitLink per sha in order with the branch-graph href, and a
+// commits=none task resolves nil (no link) — with a negative control proving
+// the multi task's second sha is NOT attributed to the single task.
+func TestSessionListSubmoduleCommitLinksWhiteBox(t *testing.T) {
+	s, root := setup(t)
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## single [DONE] <!-- attempts=0 deps= commits=aaaaaaaaaaaa1111 -->\nbuilt\n\n"+
+			"## multi [DONE] <!-- attempts=0 deps= commits=bbbbbbbbbbbb2222,cccccccccccc3333 -->\nbuilt\n\n"+
+			"## nocommit [DONE] <!-- attempts=0 deps= commits=none -->\ndoc only\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	sm, err := s.submodule("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	head := s.headSHA(ctx)
+	p, _ := s.planView(head, sm.PlanPath(), time.Now(), s.ttl())
+	ids := []string{
+		"bee-single-1700000000-11111",
+		"bee-multi-1700000001-22222",
+		"bee-nocommit-1700000002-33333",
+	}
+	links := s.sessionLinksFor(ctx, head, sm, p, ids)
+
+	single := links[ids[0]].Commits
+	if len(single) != 1 || single[0].SHA != "aaaaaaaaaaaa" ||
+		single[0].Href != "/submodule/alpha/branches#commit-aaaaaaaaaaaa" {
+		t.Fatalf("single: want one commitLink to aaaaaaaaaaaa, got %+v", single)
+	}
+	multi := links[ids[1]].Commits
+	if len(multi) != 2 ||
+		multi[0].SHA != "bbbbbbbbbbbb" || multi[0].Href != "/submodule/alpha/branches#commit-bbbbbbbbbbbb" ||
+		multi[1].SHA != "cccccccccccc" || multi[1].Href != "/submodule/alpha/branches#commit-cccccccccccc" {
+		t.Fatalf("multi: want two ordered commitLinks (b.., c..), got %+v", multi)
+	}
+	if none := links[ids[2]].Commits; none != nil {
+		t.Fatalf("nocommit: want nil (no link), got %+v", none)
+	}
+	// Negative control: the multi task's second sha is NOT on the single row.
+	for _, cl := range single {
+		if cl.SHA == "cccccccccccc" {
+			t.Fatalf("single row must not be cross-attributed the multi task's second sha")
+		}
+	}
+}
+
+// TestSessionListSubmoduleCommitLinksRetiredTask covers the doc-header fallback
+// (session-list-commit-link): a task RETIRED from the current plan has no
+// in-memory `commits=` tag, so its submodule commit(s) are recovered from the
+// change doc's `<!-- Beehive-Commits: ... -->` header instead — still a live,
+// correct per-commit link, never a dead link.
+func TestSessionListSubmoduleCommitLinksRetiredTask(t *testing.T) {
+	s, root := setup(t)
+	// Current plan does NOT contain "retired".
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## other [TODO] <!-- attempts=0 deps= -->\nstill here\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The retired task's change doc carries its commit header (the git-derived
+	// source that survives plan retirement).
+	docsDir := filepath.Join(root, "submodules", "alpha", "docs")
+	if err := os.MkdirAll(docsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(docsDir, "bee-retired.md"),
+		[]byte("<!-- Beehive-Commits: dddddddddddd4444 -->\n# retired doc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitRepoAt(t, filepath.Join(root, "submodules", "alpha", "repo"), "impl retired\n\nBeehive: retired bee-retired.md")
+
+	sm, err := s.submodule("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	head := s.headSHA(ctx)
+	p, _ := s.planView(head, sm.PlanPath(), time.Now(), s.ttl())
+	id := "bee-retired-1700000000-11111"
+	link := s.sessionLinksFor(ctx, head, sm, p, []string{id})[id]
+
+	if link.TaskHref != "" {
+		t.Errorf("retired task must have no TaskHref (not in current plan), got %q", link.TaskHref)
+	}
+	if len(link.Commits) != 1 || link.Commits[0].SHA != "dddddddddddd" ||
+		link.Commits[0].Href != "/submodule/alpha/branches#commit-dddddddddddd" {
+		t.Fatalf("retired task must resolve its commit from the doc header, got %+v", link.Commits)
+	}
+}
+
 // TestSessionListRowWraps is session-list-row-flex-wrap: session-list-links-labels
 // grew each ul.sessions <li> from ~3 items to up to 8 (name link + up to four
 // badges + task/doc/commit deep links + right-pushed timestamp), but ul.sessions li

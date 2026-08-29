@@ -59,6 +59,7 @@ type PlanItem struct {
 	Stale       bool      // claim past the TTL (GC-reclaimable; owner presumed dead)
 	Doc         string    // linked change-doc path from a body "Doc:" line, "" if none
 	DocHref     string    // link to view the change doc (from the commit stamp or the design Doc), "" if unresolved
+	Commits     []string  // submodule commit shas this task's terminal handoff produced (the `commits=` tag), nil for none
 	HumanReason string    // explicit NEEDS-HUMAN reason from a body "Human-needed:" line (may span multiple lines)
 	Category    string    // NEEDS-HUMAN escalation category (secret|external-permission|contradiction|architecture), "" if unclassified/runner-forced
 	// Running and SessionHref are active-honeybee-plan-view-unify's row-level
@@ -329,6 +330,7 @@ func projectTask(t *plan.Task, now time.Time, ttl time.Duration) PlanItem {
 		Stale:       t.Stale(now, ttl),
 		HumanReason: t.HumanReason(),
 		Category:    string(t.HumanCategory),
+		Commits:     t.Commits,
 	}
 	if len(t.Body) > 0 {
 		it.Body = strings.Join(t.Body, "\n")
