@@ -2,9 +2,11 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,19 +48,21 @@ type activeHoneybee struct {
 //     divergent one.
 //   - every OTHER (not already counted above) live session stub under
 //     sessions/: a stub names a stream branch (repo.ParseSessionStub) that
-//     the runner deletes only once the pass truly ends, so the branch's mere
-//     existence (branchTipTime's ok, regardless of its tip's age — a running
-//     pass can go quiet for a whole turn without writing) is a Bootstrap/
-//     Reconcile pass's ONLY liveness signal, since it claims no PLAN task at
-//     all.
+//     the runner deletes once the pass truly ends. Because that delete is
+//     unreliable (a crashed/killed pass leaves the branch behind), mere
+//     existence is NOT enough — the branch must ALSO have advanced its tip
+//     within the TTL (sessionBranchSet's recency gate). That recency window
+//     is a claimless Bootstrap/Reconcile pass's ONLY liveness signal, since
+//     it claims no PLAN task at all, and mirrors the claim model's own
+//     heartbeat-within-TTL rule for a claimed pass.
 //
 // A task whose claim has gone STALE (past the TTL) is excluded by the first
 // rule, and — having no session id counted yet — is only reachable via the
-// second: it counts only if its OWN session happens to still have a live
-// stub. In the common case a dead/stale claim's session either never wrote a
-// stub or its branch is long gone (the runner's own deferred cleanup, or a
-// later pass's cleanup skill, reclaims it), so a stale claim reliably drops
-// out of the set.
+// second: it counts only if its OWN session's stream branch is still advancing
+// within the TTL. In the common case a dead/stale claim's session either never
+// wrote a stub, its branch is long gone (the runner's own deferred cleanup, or
+// a later pass's cleanup skill, reclaims it), or its branch tip is older than
+// the TTL — so a stale claim reliably drops out of the set.
 //
 // This is the ONE place a stream-branch liveness check happens; every
 // consumer needing "is honeybee X active" reads THIS set (or, for a single
@@ -66,7 +70,7 @@ type activeHoneybee struct {
 // claimedSessions below for the claim half plus its own targeted stub read —
 // see sessionLive/sessionInfos), never a re-derived rule of its own.
 func (s *Server) activeHoneybees(ctx context.Context, sm repo.Submodule, p Plan) []activeHoneybee {
-	return s.activeHoneybeesLive(ctx, sm, p, nil)
+	return s.activeHoneybeesLive(ctx, sm, p, nil, time.Now(), s.ttl())
 }
 
 // activeHoneybeesLive is activeHoneybees with the live-stream-branch set passed
@@ -77,7 +81,9 @@ func (s *Server) activeHoneybees(ctx context.Context, sm repo.Submodule, p Plan)
 // of one per submodule (which, over 7 submodules, was the dominant page-load
 // cost). live==nil means "resolve it myself" — the path a single-submodule
 // caller (or a test) takes; a non-nil (possibly empty) set is used verbatim.
-func (s *Server) activeHoneybeesLive(ctx context.Context, sm repo.Submodule, p Plan, live map[string]bool) []activeHoneybee {
+// now/ttl bound the recency gate the self-resolved set applies (see
+// sessionBranchSet) and are ignored when a set is passed in.
+func (s *Server) activeHoneybeesLive(ctx context.Context, sm repo.Submodule, p Plan, live map[string]bool, now time.Time, ttl time.Duration) []activeHoneybee {
 	seen := map[string]bool{}
 	var out []activeHoneybee
 	for _, it := range p.Items {
@@ -146,7 +152,7 @@ func (s *Server) activeHoneybeesLive(ctx context.Context, sm repo.Submodule, p P
 	// once for every submodule instead of once per submodule).
 	if live == nil {
 		rem, _ := s.git.Remote(ctx)
-		live = s.sessionBranchSet(ctx, rem)
+		live = s.sessionBranchSet(ctx, rem, now, ttl)
 	}
 	for _, c := range cands {
 		if live[c.branch] {
@@ -159,33 +165,51 @@ func (s *Server) activeHoneybeesLive(ctx context.Context, sm repo.Submodule, p P
 // liveBranchSet resolves the whole-hive live-stream-branch snapshot ONCE (a
 // single `git for-each-ref`) for a page that renders every submodule, so
 // activeHoneybeesLive can share it across all of them instead of re-spawning
-// the identical git subprocess per submodule. Best-effort: a git error yields
-// an empty set (no claimless stub counts live), never a failed page.
-func (s *Server) liveBranchSet(ctx context.Context) map[string]bool {
+// the identical git subprocess per submodule. now/ttl bound the recency gate
+// (see sessionBranchSet): only branches whose tip advanced within ttl of now
+// are members. Best-effort: a git error yields an empty set (no claimless stub
+// counts live), never a failed page.
+func (s *Server) liveBranchSet(ctx context.Context, now time.Time, ttl time.Duration) map[string]bool {
 	// The whole-hive `git for-each-ref` costs tens of ms and is identical for
 	// every submodule on a page; it also is not HEAD-keyable (a stub branch
 	// appears/vanishes with no commit). A short TTL memo (cachedTTL) makes a
-	// polled dashboard/stats pay it at most once per window, and its coarse
-	// liveness is invisibly stale next to the minutes-long claim TTL.
-	return cachedTTL(s.cache, "live-branch-set", 2*time.Second, func(bg context.Context) map[string]bool {
+	// polled dashboard/stats pay it at most once per window. The memo key carries
+	// ttl (the recency window) so a differently-configured server never reads a
+	// peer key's set; now is NOT in the key — the 2s memo window is invisibly
+	// stale next to the minutes-long liveness ttl, so reusing the window's first
+	// `now` is exact enough.
+	key := fmt.Sprintf("live-branch-set:%d", int64(ttl))
+	return cachedTTL(s.cache, key, 2*time.Second, func(bg context.Context) map[string]bool {
 		rem, _ := s.git.Remote(bg)
-		return s.sessionBranchSet(bg, rem)
+		return s.sessionBranchSet(bg, rem, now, ttl)
 	})
 }
 
-// sessionBranchSet returns the set of session STREAM branches that currently
-// exist, as a single in-memory snapshot resolved with ONE `git for-each-ref`
-// rather than a git subprocess per branch. A stub's stream branch is deleted by
-// the runner only once its pass truly ends, so membership in this set is the
-// exact liveness signal activeHoneybees needs for a claimless (Bootstrap/
-// Reconcile) pass — the same signal branchTipTime derives per-branch, but
-// batched. Both the local ref and, when distributed, the remote-tracking ref
-// resolve a branch as live, mirroring branchTipTime's own preference order.
-// Best-effort: a git error yields an empty set (no claimless stub counts live),
-// never a failed page.
-func (s *Server) sessionBranchSet(ctx context.Context, rem string) map[string]bool {
+// sessionBranchSet returns the set of session STREAM branches that are LIVE, as
+// a single in-memory snapshot resolved with ONE `git for-each-ref` rather than a
+// git subprocess per branch. Liveness is branch existence GATED ON TIP RECENCY:
+// a branch is a member only when its tip advanced within ttl of now.
+//
+// Mere existence is NOT sufficient. The runner is supposed to delete a session's
+// stream branch once its pass truly ends, but a crashed/killed/host-died pass
+// (or a deferred cleanup that never runs) leaves the branch behind — a mature
+// hive accumulates thousands of such orphans. Keying liveness on bare existence
+// therefore reported every one of those long-dead sessions as "running" (the
+// recurring false-positive bug). The tip-recency gate mirrors the claim model
+// exactly — a claim is live only while its heartbeat is within ttl — so a
+// claimless Bootstrap/Reconcile stub (which has no PLAN heartbeat) is live only
+// while its transcript stream advanced within the same ttl window. ttl is the
+// server's claim TTL (minutes), far wider than 44d9309's failed 15s window, so a
+// genuinely running pass mid-quiet-turn stays live while a month-dead orphan
+// correctly drops out. Both the local ref and, when distributed, the remote-
+// tracking ref are considered, taking the LATER tip (mirroring branchTipTime's
+// preference order). Best-effort: a git error yields an empty set (no claimless
+// stub counts live), never a failed page.
+func (s *Server) sessionBranchSet(ctx context.Context, rem string, now time.Time, ttl time.Duration) map[string]bool {
 	set := map[string]bool{}
-	out, err := s.git.Run(ctx, "for-each-ref", "--format=%(refname:short)", "refs/heads/", "refs/remotes/")
+	// %(committerdate:unix) carries each ref's tip time in the SAME for-each-ref,
+	// so the recency gate costs no extra git subprocess.
+	out, err := s.git.Run(ctx, "for-each-ref", "--format=%(refname:short) %(committerdate:unix)", "refs/heads/", "refs/remotes/")
 	if err != nil {
 		return set
 	}
@@ -193,16 +217,38 @@ func (s *Server) sessionBranchSet(ctx context.Context, rem string) map[string]bo
 	if rem != "" {
 		prefix = rem + "/"
 	}
+	cutoff := now.Add(-ttl)
+	// Collect the LATEST tip per branch NAME first (a branch may have both a local
+	// ref and a fresher remote-tracking ref, or vice versa), then apply the
+	// recency gate once so local/remote can never disagree on a name's liveness.
+	tips := map[string]time.Time{}
 	for _, line := range strings.Split(out, "\n") {
-		ref := strings.TrimSpace(line)
-		if ref == "" {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		// A local branch is live by its bare name; a remote-tracking ref
-		// (<rem>/<branch>) is live by its branch component.
-		set[ref] = true
+		ref, tsStr, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		sec, perr := strconv.ParseInt(strings.TrimSpace(tsStr), 10, 64)
+		if perr != nil {
+			continue
+		}
+		tip := time.Unix(sec, 0)
+		// Resolve the bare branch name: a remote-tracking ref (<rem>/<branch>)
+		// contributes under its branch component; a local ref under its own name.
+		name := ref
 		if prefix != "" && strings.HasPrefix(ref, prefix) {
-			set[strings.TrimPrefix(ref, prefix)] = true
+			name = strings.TrimPrefix(ref, prefix)
+		}
+		if cur, seen := tips[name]; !seen || tip.After(cur) {
+			tips[name] = tip
+		}
+	}
+	for name, tip := range tips {
+		if tip.After(cutoff) {
+			set[name] = true
 		}
 	}
 	return set

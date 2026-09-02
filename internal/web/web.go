@@ -713,7 +713,7 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 	// Resolve the live-stream-branch snapshot ONCE for the whole dashboard and
 	// share it across every submodule's activeHoneybees call — a single git
 	// for-each-ref for the page instead of one per submodule.
-	live := s.liveBranchSet(ctx)
+	live := s.liveBranchSet(ctx, now, ttl)
 	var views []subView
 	for _, sm := range subs {
 		v := subView{Name: sm.Name, State: "active"}
@@ -748,7 +748,7 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 					v.Human++
 				}
 			}
-			v.Bees = len(s.activeHoneybeesLive(ctx, sm, p, live))
+			v.Bees = len(s.activeHoneybeesLive(ctx, sm, p, live, now, ttl))
 			v.Working = v.Bees > 0
 		}
 		// Env badge: the submodule's own blue/green deploy state via the typed

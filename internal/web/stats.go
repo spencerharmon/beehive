@@ -208,7 +208,7 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 	// Resolve the live-stream-branch snapshot ONCE and share it across every
 	// submodule's ActiveNow computation (a single git for-each-ref for the whole
 	// /stats page instead of one per submodule).
-	live := s.liveBranchSet(ctx)
+	live := s.liveBranchSet(ctx, now, ttl)
 	for _, sm := range sms {
 		// The heavy, TIME-INDEPENDENT figures (session-header scan, per-model
 		// attribution, stranded walk) come memoized per HEAD from statsAggregate
@@ -228,7 +228,7 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 		// FRESH every request here, never memoized. A PLAN.md parse error leaves
 		// it 0 rather than failing the whole page (mirrors subViews' resilience).
 		if p, perr := s.planView(head, sm.PlanPath(), now, ttl); perr == nil {
-			st.ActiveNow = len(s.activeHoneybeesLive(ctx, sm, p, live))
+			st.ActiveNow = len(s.activeHoneybeesLive(ctx, sm, p, live, now, ttl))
 		}
 		// delivery-traceability: link each DONE task to the hive commit that
 		// flipped it (half a) and its submodule code/doc (half b) — see

@@ -4384,8 +4384,21 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	gitRun("commit", "-q", "-m", "seed")
 	// Fresh stream branch for the "live" session (tip time ~now).
 	gitRun("branch", "bee-live-stream")
-	// A stream branch whose tip is OLD (a running session mid-quiet-turn). Liveness
-	// must come from the branch existing, not from recent transcript writes.
+	// A stream branch whose tip is OLD but still WITHIN the TTL (a running session
+	// mid-quiet-turn). Liveness must survive a quiet turn: an in-window tip is live.
+	cw := exec.Command("git", "commit", "-q", "--allow-empty", "-m", "recent-but-quiet tip")
+	cw.Dir = root
+	recent := time.Now().Add(-2 * time.Minute).Format("2006-01-02T15:04:05")
+	cw.Env = append(os.Environ(),
+		"GIT_COMMITTER_DATE="+recent, "GIT_AUTHOR_DATE="+recent)
+	if out, err := cw.CombinedOutput(); err != nil {
+		t.Fatalf("recent commit: %v\n%s", err, out)
+	}
+	gitRun("branch", "bee-quiet-stream")
+	gitRun("reset", "-q", "--hard", "HEAD~1") // working tree back at seed
+	// A stream branch whose tip is ANCIENT (far past the TTL): the runner's branch
+	// delete never ran (crash/kill/host-death), leaving a long-dead orphan. It must
+	// NOT count as running — the recurring false-positive bug.
 	cs := exec.Command("git", "commit", "-q", "--allow-empty", "-m", "stale tip")
 	cs.Dir = root
 	cs.Env = append(os.Environ(),
@@ -4406,7 +4419,8 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 		}
 	}
 	write("bee-live.md", repo.SessionStub("bee-live-stream"))   // branch exists, fresh -> live
-	write("bee-stale.md", repo.SessionStub("bee-stale-stream")) // branch exists, OLD tip -> still live
+	write("bee-quiet.md", repo.SessionStub("bee-quiet-stream")) // branch exists, tip within TTL -> live
+	write("bee-stale.md", repo.SessionStub("bee-stale-stream")) // branch exists, ancient tip (past TTL) -> NOT live
 	write("bee-dead.md", repo.SessionStub("bee-dead-stream"))   // branch gone -> NOT live
 	write("bee-final.md", "# final transcript\nall done.\n")    // non-stub -> NOT live
 
@@ -4419,11 +4433,32 @@ func TestSessionLivenessBranchGone(t *testing.T) {
 	for _, in := range infos {
 		got[in.ID] = in.Live
 	}
+	// The canonical active-honeybee set (dashboard/stats counter path) must agree:
+	// a claimless stub whose branch tip is ancient (past TTL) is NOT a running bee,
+	// while the fresh and in-window-quiet stubs are. This proves the recency gate
+	// closes the false positive across EVERY consumer, not just the sessions list.
+	p, perr := s.planView(s.headSHA(ctx), sm.PlanPath(), time.Now(), s.ttl())
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	beeSet := map[string]bool{}
+	for _, b := range s.activeHoneybees(ctx, sm, p) {
+		beeSet[b.Session] = true
+	}
+	if !beeSet["bee-live"] || !beeSet["bee-quiet"] {
+		t.Errorf("activeHoneybees want bee-live+bee-quiet counted, got %v", beeSet)
+	}
+	if beeSet["bee-stale"] {
+		t.Errorf("activeHoneybees counted bee-stale (ancient orphan branch) — the dashboard-counter false positive")
+	}
 	if !got["bee-live"] {
 		t.Errorf("bee-live: want Live=true (fresh stream branch)")
 	}
-	if !got["bee-stale"] {
-		t.Errorf("bee-stale: want Live=true (branch exists though tip is old) — the false-idle bug")
+	if !got["bee-quiet"] {
+		t.Errorf("bee-quiet: want Live=true (branch tip old but within TTL) — the false-idle guard for a quiet turn")
+	}
+	if got["bee-stale"] {
+		t.Errorf("bee-stale: want Live=false (branch tip ancient, past TTL), got true — the orphaned-branch false-positive bug")
 	}
 	if got["bee-dead"] {
 		t.Errorf("bee-dead: want Live=false (stream branch gone), got true — the orphaned-stub bug")

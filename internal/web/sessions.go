@@ -22,7 +22,7 @@ type sessionInfo struct {
 	ID       string // file stem, e.g. bee-T3-1751210912
 	Modified time.Time
 	Ago      string // human "3s"/"5m" since last write
-	Live     bool   // stream branch still exists = honeybee still running
+	Live     bool   // stream branch exists AND its tip is within TTL = honeybee still running
 	Display  string // session-list-links-labels: ID shortened for display (sessionDisplayName)
 	Kind     string // stats-tag-model's kind tag (sessionTags), "" if undetermined
 	Model    string // stats-tag-model's model tag (sessionTags), "" if undetermined
@@ -389,9 +389,11 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 // whether id currently claims a fresh PLAN task (claimedSessions); only when
 // unclaimed (id has no PLAN task at all — a Bootstrap/Reconcile pass, or a
 // stale/finished claim) does it fall back to the stub's own liveness: a STUB
-// file whose stream branch still exists is live, a final transcript or an
-// orphaned stub whose branch is gone is ended. sm/now/ttl (rather than a bare
-// dir) let it resolve sm's PLAN.md for the claim half.
+// file whose stream branch still exists AND advanced its tip within TTL is
+// live, a final transcript, an orphaned stub whose branch is gone, or a stub
+// whose branch tip is older than the TTL is ended. sm/now/ttl (rather than a
+// bare dir) let it resolve sm's PLAN.md for the claim half and bound the
+// recency gate for the stub half.
 func (s *Server) sessionLive(ctx context.Context, sm repo.Submodule, id string, now time.Time, ttl time.Duration) bool {
 	return s.sessionLiveAt(ctx, s.headSHA(ctx), sm, id, now, ttl)
 }
@@ -417,15 +419,17 @@ func (s *Server) sessionLiveAt(ctx context.Context, head string, sm repo.Submodu
 	if !isStub {
 		return false
 	}
-	// A claimless stub is live iff its stream branch still exists. Resolve that
-	// from the whole-hive liveBranchSet SNAPSHOT (one cached `git for-each-ref`,
-	// TTL-memoized) rather than a per-branch `git log` — membership in the set is
-	// the exact "branch exists" signal branchTipTime's ok return derived, but
-	// batched. The plan view calls sessionLive once per claimed row (a stale
-	// claim falls through to here), so the per-branch subprocess made the plan
-	// page scale a git spawn per session and dominated its render
+	// A claimless stub is live iff its stream branch still exists AND advanced its
+	// tip within the TTL. Resolve that from the whole-hive liveBranchSet SNAPSHOT
+	// (one cached `git for-each-ref` carrying each tip's committerdate, TTL-
+	// memoized) rather than a per-branch `git log` — membership in the set is
+	// exactly "branch exists and is recent", the recency-gated form of
+	// branchTipTime's ok+tip, batched. The plan view calls sessionLive once per
+	// claimed row (a stale claim falls through to here), so the per-branch
+	// subprocess made the plan page scale a git spawn per session and dominated
+	// its render
 	// (pageload-plan-page-budget); the shared snapshot collapses that to one.
-	return s.liveBranchSet(ctx)[streamBranch]
+	return s.liveBranchSet(ctx, now, ttl)[streamBranch]
 }
 
 // sessionBody returns the transcript pane (the htmx-poll fragment): the flat
@@ -667,10 +671,12 @@ func (s *Server) sessionInfos(ctx context.Context, sm repo.Submodule, now time.T
 // Live unions the SAME two canonical signals activeHoneybees does (active-
 // honeybee-count-unify): a fresh PLAN-task claim on this session id (claimed,
 // from sm's own plan view), OR — the only signal available for a claimless
-// Bootstrap/Reconcile pass — a STUB file whose streaming branch still exists.
-// An entry whose file is a STUB is a running session: its freshness/liveness
-// come from the streaming branch's tip commit time, not the stub's (fixed)
-// mtime. A non-stub entry is a finished session, dated by its file mtime.
+// Bootstrap/Reconcile pass — a STUB file whose streaming branch exists AND
+// advanced its tip within the TTL.
+// An entry whose file is a STUB with a recent stream branch is a running
+// session: its freshness/liveness come from the streaming branch's tip commit
+// time, not the stub's (fixed) mtime. A non-stub entry is a finished session,
+// dated by its file mtime.
 //
 // Display/Kind/Model/sessionLink are session-list-links-labels' additions: a
 // shortened display name (sessionDisplayName), the kind+model tags stats-tag-
@@ -734,14 +740,19 @@ func (s *Server) sessionInfosPage(ctx context.Context, sm repo.Submodule, now ti
 		live := claimed[id]
 		if raw, err := os.ReadFile(filepath.Join(dir, id+".md")); err == nil {
 			if branch, isStub := repo.ParseSessionStub(string(raw)); isStub {
-				// A stub streams to an isolated branch that the honeybee deletes on exit
-				// (deferred, even on error/orphaned publish). So branch existence tracks
-				// the live process directly: live iff the branch still exists. Do NOT gate
-				// on tip recency — a running session can go many seconds (a long quiet
-				// turn) without writing transcript, and must not flip to idle meanwhile.
+				// A stub streams to an isolated branch that the runner deletes when the
+				// pass ends — but that delete is unreliable (a crashed/killed pass leaves
+				// the branch behind, and a mature hive accumulates thousands of such
+				// orphans), so branch existence ALONE wrongly reports a long-dead session
+				// as running. Gate liveness on tip recency: live iff the branch exists AND
+				// its tip advanced within the TTL — the same claim-model window a claimed
+				// pass's heartbeat obeys, and far wider than a per-turn quiet gap, so a
+				// genuinely running pass never flips to idle mid-turn. The tip is still
+				// used as the Modified/Ago time regardless of liveness so the list dates
+				// and orders the row by real activity.
 				if t, ok := s.branchTipTime(ctx, branch, rem); ok {
 					mod = t
-					live = true
+					live = t.After(now.Add(-ttl))
 				}
 			}
 		}
