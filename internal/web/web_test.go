@@ -4647,6 +4647,140 @@ func TestActiveHoneybeesUnifiedAcrossDashboardAndSessions(t *testing.T) {
 	}
 }
 
+// TestDashboardCounterMatchesSessionsListProductionIDs reproduces the operator-
+// reported "dashboard indicators don't match the sessions list" bug with the
+// PRODUCTION id shapes the earlier unified test never exercised: a claimed pass
+// stamps its task with a claim TOKEN (`<sm>-<epoch>-<pid>`) that is NOT the id of
+// its transcript file (`bee-<taskid>-<epoch>-<pid>`); the two are bridged only by
+// the stream branch `<token>-session`. Because the dashboard counter enumerated
+// CLAIMS while the sessions list enumerated session FILES in that other
+// namespace, a single live work pass was counted twice by the dashboard (claim +
+// its own transcript) and a just-claimed pass whose stub had not landed yet was
+// counted by the dashboard but invisible in the list. The invariant: the
+// dashboard/stats bee count MUST equal the number of Live rows the sessions list
+// shows. Cases here: (A) a claimed pass WITH a landed transcript (must count
+// once, not twice); (B) a claimed pass whose transcript stub has NOT landed (must
+// still be one, via a synthesized "starting" row); (C) a claimless reconcile with
+// a live stream branch; (D) a long-dead orphan (must count in neither).
+func TestDashboardCounterMatchesSessionsListProductionIDs(t *testing.T) {
+	s, root := setup(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	ttl := time.Hour
+	fresh := now.Add(-3 * time.Minute).Truncate(time.Second).Format(time.RFC3339)
+
+	// Production-shaped PLAN: two ACTIVE claims whose tokens are `alpha-<E>-<P>`,
+	// NOT their transcript file ids. T1's transcript has landed (case A); T2's has
+	// not (case B).
+	planPath := filepath.Join(root, "submodules", "alpha", repo.PlanFile)
+	if err := os.WriteFile(planPath, []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## t1 [NEEDS-REVIEW] <!-- attempts=0 deps= session=alpha-1000-42 heartbeat="+fresh+" -->\nlanded transcript\n\n"+
+			"## t2 [NEEDS-REVIEW] <!-- attempts=0 deps= session=alpha-2000-43 heartbeat="+fresh+" -->\nno stub yet\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gitRun := func(env []string, args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if env != nil {
+			c.Env = append(os.Environ(), env...)
+		}
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	gitRun(nil, "add", "-A")
+	gitRun(nil, "commit", "-q", "-m", "seed")
+	// Fresh stream branches for T1 (claimed, landed) and the claimless reconcile.
+	gitRun(nil, "branch", "alpha-1000-42-session") // T1's stream branch (bridge = token+"-session")
+	gitRun(nil, "branch", "alpha-3000-44-session") // claimless reconcile's live branch
+	// A long-dead orphan branch (case D): tip far past the TTL.
+	gitRun([]string{"GIT_COMMITTER_DATE=2001-01-01T00:00:00", "GIT_AUTHOR_DATE=2001-01-01T00:00:00"},
+		"commit", "-q", "--allow-empty", "-m", "ancient")
+	gitRun(nil, "branch", "alpha-9000-99-session")
+	gitRun(nil, "reset", "-q", "--hard", "HEAD~1")
+
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(sessDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// (A) T1's transcript stub: file id is bee-t1-<E>-<P>, streaming to T1's branch.
+	write("bee-t1-1001-42.md", repo.SessionStub("alpha-1000-42-session"))
+	// (C) claimless reconcile transcript stub -> its own live branch.
+	write("bee-reconcile-3000-44.md", repo.SessionStub("alpha-3000-44-session"))
+	// (D) a long-dead orphan stub whose branch tip is ancient.
+	write("bee-old-9000-99.md", repo.SessionStub("alpha-9000-99-session"))
+	// (B) NO stub file for T2's claim (alpha-2000-43) — its pass has not planted one yet.
+
+	sm, err := s.submodule("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Canonical set: exactly ONE honeybee per real pass — T1 (claim, deduped
+	// against its own transcript), T2 (claim, no stub), reconcile (claimless live).
+	// The dead orphan is excluded. Count = 3, NOT 4 (the double-count bug would
+	// have counted T1's transcript separately).
+	bees := s.activeHoneybees(ctx, sm, p)
+	if len(bees) != 3 {
+		sessions := make([]string, len(bees))
+		for i, b := range bees {
+			sessions[i] = b.Session
+		}
+		t.Fatalf("activeHoneybees = %d %v, want 3 (T1 once, T2, reconcile; no double-count, no orphan)", len(bees), sessions)
+	}
+
+	// The dashboard counter and the sessions-list live-row count MUST be equal.
+	views, err := s.subViews(ctx, now, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beesCount int
+	for _, v := range views {
+		if v.Name == "alpha" {
+			beesCount = v.Bees
+		}
+	}
+	infos := s.sessionInfos(ctx, sm, now, ttl)
+	liveRows := 0
+	live := map[string]bool{}
+	for _, in := range infos {
+		live[in.ID] = in.Live
+		if in.Live {
+			liveRows++
+		}
+	}
+	if beesCount != liveRows {
+		t.Errorf("dashboard bees=%d but sessions-list live rows=%d — the indicators must match", beesCount, liveRows)
+	}
+	if beesCount != 3 {
+		t.Errorf("dashboard alpha.Bees = %d, want 3", beesCount)
+	}
+	// Per-row liveness verdicts.
+	if !live["bee-t1-1001-42"] {
+		t.Error("bee-t1-1001-42 (claimed pass's landed transcript) want Live=true via the stream-branch bridge")
+	}
+	if !live["alpha-2000-43"] {
+		t.Error("alpha-2000-43 (claim with no landed stub) want a synthesized Live=true row so the list matches the counter")
+	}
+	if !live["bee-reconcile-3000-44"] {
+		t.Error("bee-reconcile-3000-44 (claimless live stream branch) want Live=true")
+	}
+	if live["bee-old-9000-99"] {
+		t.Error("bee-old-9000-99 (ancient orphan branch) want Live=false")
+	}
+}
+
 // TestPlanViewActiveUnified is active-honeybee-plan-view-unify's regression:
 // the plan/task-list view's "running" determination must be the SAME
 // canonical active-honeybee signal every other consumer (dashboard 🐝 counter,

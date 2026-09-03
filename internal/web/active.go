@@ -31,9 +31,25 @@ import (
 // which is what lets a claim and its own session file be deduped into ONE
 // entry instead of double-counted.
 type activeHoneybee struct {
-	Session string // the claim/session token; also the sessions/<Session>.md file stem
+	Session string // the claim/session token, OR a claimless stub's file stem
 	TaskID  string // the PLAN task this session claims; "" for a claimless Bootstrap/Reconcile pass
+	// Branch is the honeybee's stream branch — the ONE canonical identity that
+	// unifies the two id namespaces this set unions. A claimed pass stamps its
+	// task with a claim TOKEN (`<sm>-<epoch>-<pid>`, cmd/honeybee's wtBranch) that
+	// is NOT the id of its transcript file (`bee-<taskid>-<epoch>-<pid>`); the ONE
+	// value both share is the stream branch `<claimtoken>-session` (wtBranch +
+	// "-session"), which the transcript stub also references. Deduping on Branch
+	// (not Session) is therefore what stops a single live work pass being counted
+	// twice — once as its claim, once as its own transcript stub.
+	Branch string
 }
+
+// streamBranchForClaim maps a claim token (plan.Task.Session, == cmd/honeybee's
+// wtBranch) to the stream branch its transcript streams to. The mapping is fixed
+// at the single runner construction site (cmd/honeybee/main.go: sessBranch =
+// wtBranch + "-session"); it is the bridge between the claim namespace and the
+// session-file/stream-branch namespace.
+func streamBranchForClaim(session string) string { return session + "-session" }
 
 // activeHoneybees returns the deduped set of honeybees actively working sm
 // right now, unioning two signals and NEVER inferring from a task's status:
@@ -85,11 +101,19 @@ func (s *Server) activeHoneybees(ctx context.Context, sm repo.Submodule, p Plan)
 // sessionBranchSet) and are ignored when a set is passed in.
 func (s *Server) activeHoneybeesLive(ctx context.Context, sm repo.Submodule, p Plan, live map[string]bool, now time.Time, ttl time.Duration) []activeHoneybee {
 	seen := map[string]bool{}
+	// claimedBranch holds the STREAM branch of every active claim, so pass 2 can
+	// recognize a claimed pass's OWN transcript stub (which references that same
+	// branch) and NOT count it a second time as a "claimless" session — the exact
+	// double-count that made the dashboard bee counter disagree with the sessions
+	// list (the counter saw claim+stub as two honeybees; the list saw one file).
+	claimedBranch := map[string]bool{}
 	var out []activeHoneybee
 	for _, it := range p.Items {
 		if it.Active && !seen[it.Session] {
 			seen[it.Session] = true
-			out = append(out, activeHoneybee{Session: it.Session, TaskID: it.ID})
+			br := streamBranchForClaim(it.Session)
+			claimedBranch[br] = true
+			out = append(out, activeHoneybee{Session: it.Session, TaskID: it.ID, Branch: br})
 		}
 	}
 	ents := scanSessionDir(sm.SessionsDir())
@@ -155,8 +179,15 @@ func (s *Server) activeHoneybeesLive(ctx context.Context, sm repo.Submodule, p P
 		live = s.sessionBranchSet(ctx, rem, now, ttl)
 	}
 	for _, c := range cands {
+		// A claimed pass's OWN transcript stub references its claim's stream branch;
+		// it is already counted via the claim above, so skip it here — otherwise the
+		// same honeybee counts twice. Only a genuinely CLAIMLESS live stub
+		// (Bootstrap/Reconcile) with a recent branch is a new honeybee.
+		if claimedBranch[c.branch] {
+			continue
+		}
 		if live[c.branch] {
-			out = append(out, activeHoneybee{Session: c.id})
+			out = append(out, activeHoneybee{Session: c.id, Branch: c.branch})
 		}
 	}
 	return out

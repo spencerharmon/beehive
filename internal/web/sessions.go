@@ -693,18 +693,63 @@ func (s *Server) sessionInfosPage(ctx context.Context, sm repo.Submodule, now ti
 	// the stats are independent, so fanning them across a worker pool hides the
 	// per-file latency. The window is chosen before paying any per-session I/O.
 	scanned := scanSessionDir(dir)
-	if len(scanned) == 0 {
-		return sessionPage{Page: 1, Pages: 1, Size: size}
+	head := s.headSHA(ctx)
+	p, _ := s.planView(head, sm.PlanPath(), now, ttl)
+	claimed := claimedSessions(p)
+	rem, _ := s.git.Remote(ctx)
+	// Stream branches of every ACTIVE claim. A claimed pass stamps its task with a
+	// claim TOKEN that is NOT the id of its transcript file; the bridge between the
+	// two namespaces is the stream branch <token>-session (streamBranchForClaim),
+	// which the transcript stub also references. This is what lets a claimed pass's
+	// transcript read live here EXACTLY as the dashboard counter counts it.
+	claimedBranch := map[string]bool{}
+	for _, it := range p.Items {
+		if it.Active {
+			claimedBranch[streamBranchForClaim(it.Session)] = true
+		}
 	}
 	type entRef struct {
 		id  string
 		mod time.Time
 	}
-	refs := make([]entRef, 0, len(scanned))
+	refs := make([]entRef, 0, len(scanned)+len(claimedBranch))
+	fileIDs := make(map[string]bool, len(scanned))
 	for _, e := range scanned {
 		refs = append(refs, entRef{id: e.ID, mod: e.Mod})
+		fileIDs[e.ID] = true
 	}
-	// Newest-first by file mtime so page 1 holds the freshest sessions.
+	// Synthesize a live row for every active claim whose transcript stub has NOT
+	// yet landed. A pass stamps its PLAN claim BEFORE it plants its session stub —
+	// a window of up to minutes for a review/arbitration pass that merges/checks
+	// first. Without a synth row the dashboard counter (which counts the claim, per
+	// the "fresh claim = active" rule) and this list (which enumerates session
+	// FILES) disagree for that whole window — the exact dashboard-vs-list mismatch.
+	// The synth row's id is the claim TOKEN, so the existing claimed[id] branch in
+	// the window loop renders it live with no special case, and the session view
+	// degrades to "waiting for session output…". Once the real stub lands it carries
+	// the same stream branch (present[br]) and the synth is dropped — no duplicate.
+	if len(claimedBranch) > 0 {
+		present := s.presentStubBranches(sm)
+		for _, it := range p.Items {
+			if !it.Active {
+				continue
+			}
+			br := streamBranchForClaim(it.Session)
+			if present[br] || fileIDs[it.Session] {
+				continue // its transcript already appears as a real file row
+			}
+			mod := it.Heartbeat
+			if mod.IsZero() {
+				mod = now
+			}
+			refs = append(refs, entRef{id: it.Session, mod: mod})
+		}
+	}
+	if len(refs) == 0 {
+		return sessionPage{Page: 1, Pages: 1, Size: size}
+	}
+	// Newest-first by file mtime (synth rows carry their claim heartbeat) so page 1
+	// holds the freshest sessions and the just-started synth rows.
 	sort.Slice(refs, func(i, j int) bool { return refs[i].mod.After(refs[j].mod) })
 
 	total := len(refs)
@@ -728,10 +773,6 @@ func (s *Server) sessionInfosPage(ctx context.Context, sm repo.Submodule, now ti
 	}
 	window := refs[start:end]
 
-	head := s.headSHA(ctx)
-	p, _ := s.planView(head, sm.PlanPath(), now, ttl)
-	claimed := claimedSessions(p)
-	rem, _ := s.git.Remote(ctx)
 	out := make([]sessionInfo, 0, len(window))
 	ids := make([]string, 0, len(window))
 	for _, ref := range window {
@@ -747,13 +788,18 @@ func (s *Server) sessionInfosPage(ctx context.Context, sm repo.Submodule, now ti
 				// as running. Gate liveness on tip recency: live iff the branch exists AND
 				// its tip advanced within the TTL — the same claim-model window a claimed
 				// pass's heartbeat obeys, and far wider than a per-turn quiet gap, so a
-				// genuinely running pass never flips to idle mid-turn. The tip is still
-				// used as the Modified/Ago time regardless of liveness so the list dates
-				// and orders the row by real activity.
+				// genuinely running pass never flips to idle mid-turn. OR the branch is
+				// owned by an ACTIVE claim (claimedBranch) — that is how a claimed pass's
+				// transcript (whose file id ≠ its claim token) reads live here EXACTLY as
+				// the dashboard counter counts it. The tip is still used as the
+				// Modified/Ago time regardless of liveness so the list dates/orders by
+				// real activity.
+				recent := false
 				if t, ok := s.branchTipTime(ctx, branch, rem); ok {
 					mod = t
-					live = t.After(now.Add(-ttl))
+					recent = t.After(now.Add(-ttl))
 				}
+				live = live || recent || claimedBranch[branch]
 			}
 		}
 		tags := s.sessionTags(sessionRef{submodule: sm.Name, path: filepath.Join(dir, id+".md")})
@@ -786,6 +832,46 @@ func (s *Server) sessionInfosPage(ctx context.Context, sm repo.Submodule, now ti
 		PrevPage: page - 1,
 		NextPage: page + 1,
 	}
+}
+
+// presentStubBranches returns the set of stream branches referenced by a STUB
+// session file currently on disk for sm — i.e. which sessions have a landed
+// transcript placeholder. sessionInfosPage uses it to decide whether an active
+// claim's transcript has landed yet (so it can synthesize a "starting" row when
+// it has NOT, keeping the list's live count equal to the dashboard counter). It
+// mirrors activeHoneybeesLive's bounded scan: only files small enough to be a
+// stub are opened (a mature hive's sessions/ is mostly large finished
+// transcripts), and only a prefix of each is read, fanned across the worker pool.
+func (s *Server) presentStubBranches(sm repo.Submodule) map[string]bool {
+	dir := sm.SessionsDir()
+	out := map[string]bool{}
+	var probe []string
+	for _, e := range scanSessionDir(dir) {
+		if e.Size > stubProbeBytes {
+			continue // too large to be a stub: a finished transcript
+		}
+		probe = append(probe, e.ID)
+	}
+	if len(probe) == 0 {
+		return out
+	}
+	branches := parallelMap(probe, func(id string) string {
+		raw, err := readFilePrefix(filepath.Join(dir, id+".md"), stubProbeBytes)
+		if err != nil {
+			return ""
+		}
+		branch, isStub := repo.ParseSessionStub(string(raw))
+		if !isStub {
+			return ""
+		}
+		return branch
+	})
+	for _, b := range branches {
+		if b != "" {
+			out[b] = true
+		}
+	}
+	return out
 }
 
 // branchTipTime returns the last-commit time of a session branch (preferring the
