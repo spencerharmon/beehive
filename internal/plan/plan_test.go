@@ -91,6 +91,66 @@ func TestBadStatus(t *testing.T) {
 	}
 }
 
+func TestRejectNULByte(t *testing.T) {
+	corrupt := "## t1 [TODO] <!-- attempts=0 deps= -->\nbody here\x00\x00 tail\n"
+	_, err := Parse(corrupt)
+	if err == nil {
+		t.Fatal("want error on NUL byte in PLAN.md")
+	}
+	if !strings.Contains(err.Error(), "NUL byte") {
+		t.Fatalf("want NUL-byte error, got %v", err)
+	}
+}
+
+func TestRejectDuplicateTaskID(t *testing.T) {
+	dup := "## t1 [TODO] <!-- attempts=0 deps= -->\nfirst card\n\n## t1 [NEEDS-HUMAN] <!-- attempts=0 deps= -->\nstranded twin\n"
+	_, err := Parse(dup)
+	if err == nil {
+		t.Fatal("want error on duplicate task id")
+	}
+	if !strings.Contains(err.Error(), "duplicate task id") {
+		t.Fatalf("want duplicate-task-id error, got %v", err)
+	}
+}
+
+func TestWriteFileValidatesAndPersists(t *testing.T) {
+	p, err := Parse(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "PLAN.md")
+	if err := WriteFile(path, p); err != nil {
+		t.Fatalf("WriteFile valid plan: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse(string(got)); err != nil {
+		t.Fatalf("written plan does not re-parse: %v", err)
+	}
+	// No stray temp file left in the directory.
+	ents, _ := os.ReadDir(filepath.Dir(path))
+	for _, e := range ents {
+		if strings.Contains(e.Name(), ".tmp-") {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
+func TestWriteFileRefusesCorruptInMemoryPlan(t *testing.T) {
+	// A Plan carrying two tasks with the same ID would serialize to a duplicate
+	// heading; WriteFile must refuse it rather than persist a corrupt PLAN.md.
+	p := &Plan{Tasks: []*Task{{ID: "dup", Status: StatusTODO}, {ID: "dup", Status: StatusTODO}}}
+	path := filepath.Join(t.TempDir(), "PLAN.md")
+	if err := WriteFile(path, p); err == nil {
+		t.Fatal("want WriteFile to refuse a plan with a duplicate task id")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("corrupt plan must not be written; stat err=%v", err)
+	}
+}
+
 func TestStateMachine(t *testing.T) {
 	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
 	tk := &Task{ID: "a", Status: StatusTODO}

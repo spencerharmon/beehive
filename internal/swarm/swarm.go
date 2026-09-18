@@ -3554,7 +3554,7 @@ func (r *Runner) revertGatedFlip(ctx context.Context, sel *selectt.Selection, ab
 	}
 	rejected := t.Status
 	t.Status = working
-	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+	if err := plan.WriteFile(planPath, p); err != nil {
 		return fmt.Errorf("revert gated flip: writing %s: %w", planPath, err)
 	}
 	rel, err := filepath.Rel(absRoot, planPath)
@@ -3745,7 +3745,7 @@ func (r *Runner) spawnMergeVerifySuccessor(ctx context.Context, sel *selectt.Sel
 	if err := p.AddTask(succ); err != nil {
 		return err
 	}
-	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+	if err := plan.WriteFile(planPath, p); err != nil {
 		return err
 	}
 	rel, err := filepath.Rel(absRoot, planPath)

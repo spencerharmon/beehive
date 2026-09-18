@@ -173,7 +173,7 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	}
 	cp, err := plan.Parse(show.out)
 	if err != nil {
-		return "", fmt.Errorf("verify gate: parsing committed PLAN.md: %w", err)
+		return planCorruptFailPrompt(sel.Submodule.Name, err), nil
 	}
 	ct := cp.Find(sel.Task.ID)
 	if ct == nil || ct.Status != t.Status {
@@ -584,7 +584,7 @@ func (r *Runner) autoBookkeep(ctx context.Context, sel *selectt.Selection, wtAbs
 		}
 	}
 	if changed {
-		if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+		if err := plan.WriteFile(planPath, p); err != nil {
 			return fmt.Errorf("auto-bookkeep: writing %s: %w", planPath, err)
 		}
 	}
@@ -736,6 +736,20 @@ func docUncommittedFailPrompt(docPath string) string {
 // flip that is present on disk but NOT committed in the hive HEAD. Without a
 // committed flip, an abnormal exit (wall-deadline/GC) merges committed history and
 // discards the on-disk-only flip — the decision is silently lost.
+func planCorruptFailPrompt(submodule string, parseErr error) string {
+	return fmt.Sprintf(
+		"Handoff gate FAILED: the committed PLAN.md for submodule %[1]s does NOT parse "+
+			"cleanly (%[2]v). It is corrupt — typically a NUL byte from a write killed "+
+			"mid-flush, or a duplicate task heading from an interrupted status flip — and the "+
+			"runner will NOT merge or publish a plan it cannot re-read. Repair PLAN.md IN YOUR "+
+			"WORKTREE this session (strip any NUL bytes; collapse any duplicate `## <id> […]` "+
+			"heading down to the single authoritative card — keep the one whose status/metadata "+
+			"reflects reality, delete the stranded twin) so that `beehive plan validate %[1]s` "+
+			"passes, then COMMIT the repair to the hive branch. See skills/repair-plan.md. The "+
+			"gate re-runs automatically once the committed plan parses.",
+		submodule, parseErr)
+}
+
 func planFlipUncommittedFailPrompt(taskID string, st plan.Status) string {
 	return fmt.Sprintf(
 		"Handoff gate FAILED: your PLAN.md status flip to %[2]s for %[1]s is on disk but NOT "+

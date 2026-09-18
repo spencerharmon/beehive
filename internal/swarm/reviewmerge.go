@@ -320,7 +320,7 @@ func (r *Runner) stampReviewMerge(ctx context.Context, sel *selectt.Selection, a
 	}
 	t.Commits = commits
 	t.CommitsSet = true
-	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+	if err := plan.WriteFile(planPath, p); err != nil {
 		return fmt.Errorf("stamp merge: writing %s: %w", planPath, err)
 	}
 

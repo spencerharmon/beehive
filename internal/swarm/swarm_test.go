@@ -5056,6 +5056,40 @@ func TestVerifyGateRefusesLocalOnlyUnpushedCommit(t *testing.T) {
 	}
 }
 
+// TestVerifyGateRefusesCorruptCommittedPlan proves the runner never accepts a
+// terminal handoff (and thus never merges/publishes) when the committed PLAN.md
+// is corrupt. Here the committed plan carries a DUPLICATE task heading (an
+// interrupted status flip's signature — exactly the flux/PLAN.md failure). The
+// gate must hand back the repair fix-forward prompt, not pass and not hard-error.
+func TestVerifyGateRefusesCorruptCommittedPlan(t *testing.T) {
+	ctx := context.Background()
+	r, sel, wtDir, root, sha := durabilityFixture(t, true /*withRemote*/, true /*push*/)
+	corrupt := "## T1 [NEEDS-REVIEW] <!-- attempts=0 deps= commits=" + sha + " -->\ngo\n\n## T1 [TODO] <!-- attempts=0 deps= -->\nstranded twin\n"
+	gr := &gateRec{resp: func(name string, args []string) (verifyOutcome, error) {
+		if len(args) >= 2 && args[0] == "show" {
+			if strings.HasSuffix(args[1], "PLAN.md") {
+				return verifyOutcome{out: corrupt}, nil
+			}
+			return verifyOutcome{out: "<!-- Beehive-Commits: " + sha + " -->\n\ndoc\n"}, nil
+		}
+		if len(args) > 0 && args[0] == "ls-tree" {
+			return verifyOutcome{out: "submodules/sm/docs/bee-T1-T1.md"}, nil
+		}
+		return verifyOutcome{}, nil
+	}}
+	r.RunVerify = gr.run
+	hint, err := r.verifyGate(ctx, sel, wtDir, root, "bee-T1")
+	if err != nil {
+		t.Fatalf("gate must hand back a fix-forward hint, not a hard error: %v", err)
+	}
+	if hint == "" {
+		t.Fatal("gate must REFUSE a corrupt (duplicate-heading) committed PLAN.md; it passed")
+	}
+	if !contains(hint, "corrupt") || !contains(hint, "repair") {
+		t.Fatalf("refusal must point to plan repair, got: %q", hint)
+	}
+}
+
 // TestVerifyGateAllowsPushedCommit is the positive control: the same shape with
 // bee-T1 pushed to origin passes the durability check cleanly.
 func TestVerifyGateAllowsPushedCommit(t *testing.T) {

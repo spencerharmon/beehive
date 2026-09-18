@@ -32,6 +32,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/spencerharmon/beehive/internal/fsatomic"
 )
 
 const humanReasonPrefix = "Human-needed:"
@@ -209,6 +211,15 @@ var (
 
 // Parse reads PLAN.md text.
 func Parse(s string) (*Plan, error) {
+	// Corruption guard: a NUL byte is never valid in a PLAN.md and is the
+	// signature of a pass killed mid-write (bufio's line splitter would otherwise
+	// carry the NUL straight into a task body/header and the plan would parse
+	// "fine" while silently corrupt). Reject it up front so every consumer — the
+	// runner handoff gate, the review merge, reconcile — fails closed rather than
+	// merging a corrupt plan. See prompts/skills/repair-plan.md.
+	if i := strings.IndexByte(s, 0); i >= 0 {
+		return nil, fmt.Errorf("plan: NUL byte at offset %d — PLAN.md is corrupt (likely a pass killed mid-write); repair per skills/repair-plan.md", i)
+	}
 	p := &Plan{}
 	sc := bufio.NewScanner(strings.NewReader(s))
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
@@ -242,6 +253,19 @@ func Parse(s string) (*Plan, error) {
 	}
 	for _, t := range p.Tasks {
 		t.Body = trimTrailingBlank(t.Body)
+	}
+	// Uniqueness guard: a duplicate task-ID heading is a corrupt plan (typically an
+	// interrupted status-flip write that left the old and new card both present).
+	// The parser keeps every heading and Plan.Task/Find returns the FIRST, so a
+	// duplicate silently strands its twin and drives a re-selection loop (the twin
+	// task never reaches a terminal state that any writer targets). Reject it here
+	// so the runner handoff gate and review merge refuse to merge such a plan.
+	seen := make(map[string]struct{}, len(p.Tasks))
+	for _, t := range p.Tasks {
+		if _, dup := seen[t.ID]; dup {
+			return nil, fmt.Errorf("plan: duplicate task id %q — PLAN.md is corrupt (an interrupted status-flip left two cards for one task); repair per skills/repair-plan.md", t.ID)
+		}
+		seen[t.ID] = struct{}{}
 	}
 	// DoD schema validation: `check=none` (justified absence) and a `Check:` body
 	// command are mutually exclusive — a task carrying both contradicts itself about
@@ -333,6 +357,26 @@ func parseHeader(m []string) (*Task, error) {
 		}
 	}
 	return t, nil
+}
+
+// WriteFile serializes p and writes it to path atomically and durably, but only
+// after re-parsing the serialization to prove it is well-formed. This is the
+// single choke point every runner PLAN.md write goes through, giving two
+// guarantees a plain os.WriteFile cannot:
+//
+//   - Never write a plan we cannot read back. Parse(p.String()) must succeed, so
+//     an in-memory plan that would serialize to a duplicate task ID (or any other
+//     parse-rejected corruption) is refused HERE, before it can reach the working
+//     tree or be committed/merged. The runner never publishes a plan it cannot
+//     re-read.
+//   - Never leave a torn file. fsatomic.WriteFile writes via temp+fsync+rename so
+//     a crash mid-write cannot truncate the plan or leave NUL holes in it.
+func WriteFile(path string, p *Plan) error {
+	s := p.String()
+	if _, err := Parse(s); err != nil {
+		return fmt.Errorf("refusing to write corrupt PLAN.md to %s: %w", path, err)
+	}
+	return fsatomic.WriteFile(path, []byte(s), 0o644)
 }
 
 func trimTrailingBlank(ls []string) []string {

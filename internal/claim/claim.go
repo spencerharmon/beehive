@@ -72,7 +72,7 @@ func (c *Claimer) load() (*plan.Plan, error) {
 }
 
 func (c *Claimer) save(p *plan.Plan) error {
-	return os.WriteFile(c.Sub.PlanPath(), []byte(p.String()), 0o644)
+	return plan.WriteFile(c.Sub.PlanPath(), p)
 }
 
 // planRel is the beehive-repo-relative path of this submodule's PLAN.md, used to
