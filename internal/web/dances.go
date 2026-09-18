@@ -405,13 +405,20 @@ func (s *Server) danceRepairPlan() *dance {
 }
 
 // isEmptyTranscript reports whether a session .md is a recorded transcript that
-// captured ZERO turns: a header (`# session …`, the metadata line, `## user`)
-// with a whitespace-only body. That is the artifact a pass which spawned but
-// produced no work leaves behind; a task stuck in a re-selection loop accretes
-// thousands of them (observed live: one flux task, ~6200 empty transcripts over
-// two months). A live/abandoned streaming STUB (still pointing at its session
-// branch) is NOT empty — its content may yet land — so stubs are excluded, as are
-// any transcript carrying a real turn after `## user`.
+// captured ZERO turns. Two shapes qualify, both left by a pass that spawned but
+// did no work (a task stuck in a re-selection loop accretes thousands — observed
+// live: one flux task, ~6200 empty transcripts):
+//
+//   - header + metadata + `## user` with a whitespace-only body; and
+//   - header + metadata only, with NO `## ` turn heading at all (the pass died
+//     before even the first turn marker was written).
+//
+// A live/abandoned streaming STUB (still pointing at its session branch) is NOT
+// empty — its content may yet land, and while it streams main carries only the
+// stub — so stubs are excluded. A non-stub transcript, by the streaming model, is
+// already finalized (the sweep merged its branch), so an empty one is final and
+// its content unrecoverable. Only a recognized `# session ` transcript is ever
+// treated as prunable, so an unrelated .md is never touched.
 func isEmptyTranscript(content string) bool {
 	if strings.TrimSpace(content) == "" {
 		return true
@@ -419,13 +426,17 @@ func isEmptyTranscript(content string) bool {
 	if _, isStub := repo.ParseSessionStub(content); isStub {
 		return false
 	}
-	// Everything after the FIRST `## ` heading (the `## user` turn) must be blank.
-	// A real transcript has the injected task context and/or `## assistant` turns
-	// there; a zero-turn pass has nothing.
+	if !strings.HasPrefix(strings.TrimLeft(content, " \t\r\n\ufeff"), "# session ") {
+		return false // not a recognized session transcript: never ours to touch
+	}
+	// The turns live under `## user`/`## assistant` headings. No `## ` heading at
+	// all => the pass recorded nothing (header + metadata only) => empty.
 	idx := strings.Index(content, "\n## ")
 	if idx < 0 {
-		return false // no turn heading at all: unrecognized shape, do not touch
+		return true
 	}
+	// A `## ` heading exists: everything after that first (`## user`) heading line
+	// must be blank for the transcript to be a zero-turn one.
 	rest := content[idx+1:]
 	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
 		rest = rest[nl+1:]

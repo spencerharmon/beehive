@@ -318,6 +318,14 @@ func TestSkillPruneEmptySessionsConfirmGateAndApply(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A header-ONLY transcript (no `## user` heading at all — the pass died before
+	// the first turn marker; this is the bulk shape observed live) must also prune.
+	headerOnly := "bee-loop-1783000008-9.md"
+	if err := os.WriteFile(filepath.Join(sessDir, headerOnly), []byte(
+		"# session "+headerOnly+"\n\nsubmodule: alpha · kind: work · branch: bee-loop · model: m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	emptyFiles = append(emptyFiles, headerOnly)
 	// A real transcript (must be KEPT) and a live streaming stub (must be KEPT).
 	real := "bee-real-1783000010-3.md"
 	if err := os.WriteFile(filepath.Join(sessDir, real), []byte("# session r\n\n## user\ndo it\n## assistant\ndone\n"), 0o644); err != nil {
@@ -325,6 +333,11 @@ func TestSkillPruneEmptySessionsConfirmGateAndApply(t *testing.T) {
 	}
 	stub := "bee-live-1783000020-4.md"
 	if err := os.WriteFile(filepath.Join(sessDir, stub), []byte(repo.SessionStub("alpha-1783000020-4-session")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A non-transcript .md (no `# session ` header) must never be touched.
+	other := "notes.md"
+	if err := os.WriteFile(filepath.Join(sessDir, other), []byte("# random notes\n\nnot a session\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	exists := func(n string) bool {
@@ -382,6 +395,9 @@ func TestSkillPruneEmptySessionsConfirmGateAndApply(t *testing.T) {
 	}
 	if !exists(stub) {
 		t.Fatal("confirmed apply must KEEP the live streaming stub")
+	}
+	if !exists(other) {
+		t.Fatal("confirmed apply must KEEP a non-transcript .md")
 	}
 }
 
