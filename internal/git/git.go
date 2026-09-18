@@ -807,6 +807,121 @@ func (r *Repo) PublishPrimaryMain(ctx context.Context, remote string) error {
 	return fmt.Errorf("git: publish primary main exhausted retries")
 }
 
+// CommitAndPublishPrimary is the crash-safe replacement for the direct-on-primary
+// pair CommitPaths -> PublishPrimaryMain. Those two steps commit onto LOCAL main
+// FIRST and push to origin SECOND, so an interruption in the window between them
+// strands a commit on local main that origin never received -> a local-ahead fork
+// that ff-only pullMain can never cross (regression f152b9b, 2026-07-21, which
+// routed the manufacture CLI verbs onto this path; the 2026-09-16 pillar freeze).
+//
+// This reorders to PUSH-BEFORE-ADVANCE, exactly the ordering proven fork-free in
+// specs/MainConvergeCrash.tla (the `fixed` configuration): the commit is built as
+// an object with commit-tree WITHOUT moving any branch ref, PUBLISHED to
+// origin/main first, and only then does local main fast-forward to it via a
+// compare-and-swap update-ref (no worktree reset -- the index/worktree already
+// hold the published tree, so main stays clean and a concurrent writer's tree is
+// never clobbered). A crash at ANY point leaves either (origin unchanged, local
+// unchanged) or (origin ahead, local behind) -- both trivially reconciled by
+// ff-only pullMain, never a local-ahead fork.
+//
+// The rare concurrent-origin-advance case (push rejected non-fast-forward, or the
+// CAS losing to a concurrent local commit) degrades to the old advance-local +
+// merge-retry publish, whose small residual local-ahead window is now backstopped
+// by beehived's D2 ReconcileMainFork -- so it can never fork durably either.
+//
+// commit-tree bypasses client-side hooks, so the ROI-protect invariant the
+// pre-commit hook enforces is replicated here (and the server pre-receive still
+// enforces it on the push): a honeybee identity may never publish an ROI.md edit.
+// Returns ErrNothing (like CommitPaths) when the paths carry no change; callers
+// treat that as success. remote=="" is a local-only hive: it commits on main with
+// the normal hook-running git commit and never touches a remote.
+func (r *Repo) CommitAndPublishPrimary(ctx context.Context, remote, msg string, paths ...string) error {
+	if os.Getenv("BEEHIVE_HONEYBEE") == "1" {
+		for _, p := range paths {
+			if isROIPath(p) {
+				return fmt.Errorf("beehive: honeybee identity may not modify ROI.md")
+			}
+		}
+	}
+	if len(paths) == 0 {
+		// Nothing to commit; still drain any residual local-ahead to origin.
+		if remote == "" {
+			return ErrNothing
+		}
+		if err := r.PublishPrimaryMain(ctx, remote); err != nil {
+			return err
+		}
+		return ErrNothing
+	}
+	if _, err := r.Run(ctx, append([]string{"add", "--"}, paths...)...); err != nil {
+		return err
+	}
+	st, err := r.Run(ctx, append([]string{"status", "--porcelain", "--"}, paths...)...)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(st) == "" {
+		// No change from these paths; still drain any residual local-ahead.
+		if remote != "" {
+			if err := r.PublishPrimaryMain(ctx, remote); err != nil {
+				return err
+			}
+		}
+		return ErrNothing
+	}
+	// Local-only hive: no remote to publish to; a plain (hook-running) commit on
+	// main carries no cross-anchor crash window.
+	if remote == "" {
+		_, err := r.Run(ctx, append([]string{"commit", "-m", msg, "--"}, paths...)...)
+		return err
+	}
+	parent, err := r.RevParse(ctx, "HEAD")
+	if err != nil {
+		return err
+	}
+	treeOut, err := r.Run(ctx, "write-tree")
+	if err != nil {
+		return err
+	}
+	cOut, err := r.Run(ctx, "commit-tree", strings.TrimSpace(treeOut), "-p", parent, "-m", msg)
+	if err != nil {
+		return err
+	}
+	c := strings.TrimSpace(cOut)
+	// PUBLISH FIRST.
+	_, perr := r.Run(ctx, "push", remote, c+":refs/heads/main")
+	if perr == nil {
+		// Origin has c. Advance local main to it via CAS (expected old value =
+		// parent). No worktree reset: index+worktree already equal c's tree.
+		if _, err := r.Run(ctx, "update-ref", "refs/heads/main", c, parent); err != nil {
+			// A concurrent local commit moved main under us; origin already holds c.
+			// Leave the anchors for ff-only pullMain / D2 to converge -- origin is
+			// authoritative and nothing was lost.
+			return nil
+		}
+		return nil
+	}
+	if !isNonFastForward(perr) {
+		return perr
+	}
+	// Concurrent origin advance: adopt c onto local main, then merge-retry publish
+	// (D2-backstopped residual window).
+	if _, err := r.Run(ctx, "update-ref", "refs/heads/main", c, parent); err != nil {
+		if serr := r.SyncMainFromRemote(ctx, remote); serr != nil {
+			return serr
+		}
+		return r.PublishPrimaryMain(ctx, remote)
+	}
+	return r.PublishPrimaryMain(ctx, remote)
+}
+
+// isROIPath reports whether a committed path is a target's human-owned ROI.md,
+// mirroring the pre-commit hook's `(^|/)ROI\.md$` guard.
+func isROIPath(p string) bool {
+	p = strings.TrimSpace(p)
+	return p == "ROI.md" || strings.HasSuffix(p, "/ROI.md")
+}
+
 // ReconcileMainFork heals a divergence between local primary main and remote/main
 // that ff-only pull cannot cross. It is the authoritative background counterpart
 // to the viewer's ff-only pullMain (which DELIBERATELY never merges, so it can

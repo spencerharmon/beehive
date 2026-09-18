@@ -1471,3 +1471,144 @@ func TestReconcileMainForkSurfacesConflict(t *testing.T) {
 		t.Fatalf("origin/main mutated on a conflicting fork: before=%s after=%s", originBefore, after)
 	}
 }
+
+// --- D1: CommitAndPublishPrimary, push-before-advance manufacture publish ------
+//
+// These lock the crash-window closure for the direct-on-primary path (the
+// regression f152b9b opened): the commit reaches origin BEFORE local main
+// advances, so local main is never durably ahead of origin. Companion to
+// specs/MainConvergeCrash.tla (the `fixed` reorder configuration).
+
+// Happy path: the change is published to origin AND local main advances to it,
+// with local main never left ahead of origin, and a clean worktree.
+func TestCommitAndPublishPrimaryPublishesFirst(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "base", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push base: %v", err)
+	}
+	// author a manufacture-style edit in the working tree, then publish it.
+	writeFile(t, a, "PLAN.md", "plan v1\n")
+	if err := a.CommitAndPublishPrimary(ctx, "origin", "plan: add task", "PLAN.md"); err != nil {
+		t.Fatalf("CommitAndPublishPrimary: %v", err)
+	}
+	local, _ := a.RevParse(ctx, "HEAD")
+	// origin/main carries the new commit (published).
+	c := cloneOf(t, origin, "c")
+	remoteHead, _ := c.RevParse(ctx, "HEAD")
+	if remoteHead != local {
+		t.Fatalf("not published: origin=%s local=%s", remoteHead, local)
+	}
+	if readFile(t, c, "PLAN.md") != "plan v1\n" {
+		t.Fatal("published tree missing the edit")
+	}
+	// local main is NOT ahead of origin (the invariant the crash window broke).
+	if out, _ := a.Run(ctx, "rev-list", "--count", "origin/main..HEAD"); strings.TrimSpace(out) != "0" {
+		t.Fatalf("local main left %s commit(s) ahead of origin (crash-window fork risk)", strings.TrimSpace(out))
+	}
+	if out, _ := a.Run(ctx, "status", "--porcelain"); strings.TrimSpace(out) != "" {
+		t.Fatalf("worktree not clean after publish:\n%s", out)
+	}
+}
+
+// Concurrent origin advance (push rejected non-fast-forward): the primitive still
+// converges and loses nothing — the local edit and the concurrent remote commit
+// both survive on a merged, published main.
+func TestCommitAndPublishPrimaryConcurrentAdvanceConverges(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "base", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push base: %v", err)
+	}
+	// a peer advances origin on a DIFFERENT file after a synced.
+	peer := cloneOf(t, origin, "peer")
+	peerTip := commitFile(t, peer, "peer.txt", "peer\n", "peer edit")
+	if err := peer.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("peer push: %v", err)
+	}
+	// a authors its own edit on a stale base and publishes -> push non-ff -> merge-retry.
+	writeFile(t, a, "PLAN.md", "plan v1\n")
+	if err := a.CommitAndPublishPrimary(ctx, "origin", "plan: add task", "PLAN.md"); err != nil {
+		t.Fatalf("CommitAndPublishPrimary concurrent: %v", err)
+	}
+	c := cloneOf(t, origin, "c")
+	// both sides present on the published, converged main.
+	if readFile(t, c, "PLAN.md") != "plan v1\n" || readFile(t, c, "peer.txt") != "peer\n" {
+		t.Fatal("converged main dropped a side")
+	}
+	if !c.sharesHistory(ctx, peerTip) {
+		t.Fatal("peer commit lost from history")
+	}
+	local, _ := a.RevParse(ctx, "HEAD")
+	remoteHead, _ := c.RevParse(ctx, "HEAD")
+	if local != remoteHead {
+		t.Fatalf("local/origin not converged: local=%s origin=%s", local, remoteHead)
+	}
+}
+
+// No change from the given paths: returns ErrNothing (like CommitPaths), makes no
+// commit, and leaves main untouched.
+func TestCommitAndPublishPrimaryNoChangeErrNothing(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	tip := commitFile(t, a, "PLAN.md", "plan v1\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push base: %v", err)
+	}
+	// re-publish the identical content -> nothing staged.
+	writeFile(t, a, "PLAN.md", "plan v1\n")
+	if err := a.CommitAndPublishPrimary(ctx, "origin", "plan: noop", "PLAN.md"); err != ErrNothing {
+		t.Fatalf("want ErrNothing on no-op, got %v", err)
+	}
+	if got, _ := a.RevParse(ctx, "HEAD"); got != tip {
+		t.Fatalf("no-op moved HEAD: %s != %s", got, tip)
+	}
+}
+
+// Local-only hive (remote==""): commits on main with the hook-running path, no
+// remote touched.
+func TestCommitAndPublishPrimaryLocalOnly(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	base := commitFile(t, r, "seed", "s\n", "seed")
+	writeFile(t, r, "PLAN.md", "plan v1\n")
+	if err := r.CommitAndPublishPrimary(ctx, "", "plan: local", "PLAN.md"); err != nil {
+		t.Fatalf("local-only publish: %v", err)
+	}
+	head, _ := r.RevParse(ctx, "HEAD")
+	if head == base {
+		t.Fatal("local-only publish did not commit")
+	}
+	if readFile(t, r, "PLAN.md") != "plan v1\n" {
+		t.Fatal("committed tree missing edit")
+	}
+}
+
+// ROI guard: under the honeybee identity, an ROI.md path is refused and nothing is
+// committed or published (mirrors the pre-commit hook that commit-tree bypasses).
+func TestCommitAndPublishPrimaryROIGuard(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	tip := commitFile(t, a, "base", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("push base: %v", err)
+	}
+	t.Setenv("BEEHIVE_HONEYBEE", "1") // guard fires on the path; no working-tree write needed
+	err := a.CommitAndPublishPrimary(ctx, "origin", "plan: sneak roi", "submodules/x/ROI.md")
+	if err == nil {
+		t.Fatal("honeybee identity was allowed to publish an ROI.md edit")
+	}
+	if got, _ := a.RevParse(ctx, "HEAD"); got != tip {
+		t.Fatalf("ROI-guard path still moved HEAD: %s != %s", got, tip)
+	}
+	c := cloneOf(t, origin, "c")
+	if remoteHead, _ := c.RevParse(ctx, "HEAD"); remoteHead != tip {
+		t.Fatalf("ROI-guard path mutated origin: %s != %s", remoteHead, tip)
+	}
+}

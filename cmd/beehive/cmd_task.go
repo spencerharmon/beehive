@@ -92,10 +92,7 @@ func taskHumanCmd() *cobra.Command {
 				return err
 			}
 			msg := fmt.Sprintf("plan: request human for %s (%s)\n\nBeehive: %s plan\nCategory: %s\nReason: %s", args[1], cat, args[1], cat, t.HumanReason())
-			if err := git.New(root).CommitPaths(cmd.Context(), msg, planRel); err != nil && err != git.ErrNothing {
-				return err
-			}
-			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
+			if err := rootGit.CommitAndPublishPrimary(cmd.Context(), remote, msg, planRel); err != nil && err != git.ErrNothing {
 				return err
 			}
 			fmt.Printf("%s %s -> %s\n", subName, args[1], plan.StatusHuman)
@@ -424,10 +421,7 @@ func taskAddCmd() *cobra.Command {
 				return err
 			}
 			msg := fmt.Sprintf("plan: file task %s in %s\n\nBeehive: %s %s", id, subName, id, docRel)
-			if err := rootGit.CommitPaths(cmd.Context(), msg, planRel, docRel); err != nil && err != git.ErrNothing {
-				return err
-			}
-			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
+			if err := rootGit.CommitAndPublishPrimary(cmd.Context(), remote, msg, planRel, docRel); err != nil && err != git.ErrNothing {
 				return err
 			}
 			fmt.Printf("filed %s %s [TODO] (doc %s)\n", subName, id, docRel)
@@ -538,10 +532,7 @@ func taskBlockCmd() *cobra.Command {
 			}
 			msg := fmt.Sprintf("plan: block %s on %s\n\nBeehive: %s plan", id, dep, id)
 			paths := append([]string{planRel}, linkRels...)
-			if err := rootGit.CommitPaths(cmd.Context(), msg, paths...); err != nil && err != git.ErrNothing {
-				return err
-			}
-			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
+			if err := rootGit.CommitAndPublishPrimary(cmd.Context(), remote, msg, paths...); err != nil && err != git.ErrNothing {
 				return err
 			}
 			fmt.Printf("%s %s now depends on %s\n", subName, id, dep)
@@ -864,10 +855,7 @@ func taskDeferCmd() *cobra.Command {
 			if r := strings.Join(strings.Fields(reason), " "); r != "" {
 				msg += "\nReason: " + r
 			}
-			if err := rootGit.CommitPaths(cmd.Context(), msg, planRel); err != nil && err != git.ErrNothing {
-				return err
-			}
-			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
+			if err := rootGit.CommitAndPublishPrimary(cmd.Context(), remote, msg, planRel); err != nil && err != git.ErrNothing {
 				return err
 			}
 			fmt.Printf("%s %s deferred until %s (defer %d/%d)\n", subName, t.ID, nb.Format(time.RFC3339), t.Defers, plan.MaxDefers)
@@ -929,10 +917,10 @@ func mutatePlanTask(cmd *cobra.Command, subArg string, mut func(*plan.Plan) (str
 	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
 		return err
 	}
-	if err := rootGit.CommitPaths(cmd.Context(), subject, planRel); err != nil && err != git.ErrNothing {
+	if err := rootGit.CommitAndPublishPrimary(cmd.Context(), remote, subject, planRel); err != nil && err != git.ErrNothing {
 		return err
 	}
-	return rootGit.PublishPrimaryMain(cmd.Context(), remote)
+	return nil
 }
 
 // taskReopenCmd returns a terminal task (a false-DONE, a stuck NEEDS-REVIEW, an

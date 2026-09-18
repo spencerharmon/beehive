@@ -128,10 +128,7 @@ func submoduleRemoteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := rootGit.CommitPaths(cmd.Context(), "submodule remote: "+args[0]+" -> "+args[1], ".gitmodules"); err != nil && err != git.ErrNothing {
-				return err
-			}
-			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
+			if err := rootGit.CommitAndPublishPrimary(cmd.Context(), remote, "submodule remote: "+args[0]+" -> "+args[1], ".gitmodules"); err != nil && err != git.ErrNothing {
 				return err
 			}
 			fmt.Printf("%s remote set to %s\n", rel, args[1])
@@ -262,14 +259,11 @@ func syncSubmodule(ctx context.Context, root, sm string) error {
 	if err := g.HardReset(ctx, "origin/"+branch); err != nil {
 		return err
 	}
-	if err := rootGit.CommitPaths(ctx, "submodule sync: "+sm+" -> "+branch+" tip\n\nBeehive: submodule-sync "+sm, rel); err != nil && err != git.ErrNothing {
+	if err := rootGit.CommitAndPublishPrimary(ctx, remote, "submodule sync: "+sm+" -> "+branch+" tip\n\nBeehive: submodule-sync "+sm, rel); err != nil && err != git.ErrNothing {
 		return err
 	}
-	// Publish the bump to the hive remote so it is not stranded on local main
-	// (the other half of the invariant: write on a fresh base, then push remote).
-	if err := rootGit.PublishPrimaryMain(ctx, remote); err != nil {
-		return err
-	}
+	// The bump is published push-before-advance (CommitAndPublishPrimary), so it is
+	// never stranded on local main by a crash between commit and push.
 	head, _ := g.Run(ctx, "rev-parse", "--short", "HEAD")
 	fmt.Printf("%s on %s at %s\n", rel, branch, head)
 	return nil
@@ -283,10 +277,11 @@ func syncSubmodule(ctx context.Context, root, sm string) error {
 // beehived's dirty-tree heal (`git reset --hard HEAD`), which silently discards
 // the staged-but-uncommitted mutation (the 2026-07-29 runcible/runcible-configs
 // orphan-gitlink loss). This wraps the mutation in the SAME
-// SyncMainFromRemote-before -> CommitPaths -> PublishPrimaryMain-after shape
+// SyncMainFromRemote-before -> CommitAndPublishPrimary-after shape
 // syncSubmodule/submoduleRemoteCmd already use, so the commit lands in the same
 // function call immediately after the mutation — no window for a heal to race it
-// — and the base is fresh so the commit can never fork against a stale local main.
+// — and CommitAndPublishPrimary publishes push-before-advance so the commit can
+// never fork against, or be stranded on, a stale local main.
 func submoduleAddCmd() *cobra.Command {
 	var name, branch string
 	c := &cobra.Command{
@@ -308,10 +303,7 @@ func submoduleAddCmd() *cobra.Command {
 				return err
 			}
 			rel := filepath.Join("submodules", added)
-			if err := rootGit.CommitPaths(cmd.Context(), "submodule add: "+added, ".gitmodules", rel); err != nil && err != git.ErrNothing {
-				return err
-			}
-			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
+			if err := rootGit.CommitAndPublishPrimary(cmd.Context(), remote, "submodule add: "+added, ".gitmodules", rel); err != nil && err != git.ErrNothing {
 				return err
 			}
 			fmt.Printf("added submodule %s tracking %s (dormant; author ROI.md to activate)\n", added, branch)
@@ -347,10 +339,7 @@ func submoduleLinkCmd() *cobra.Command {
 			}
 			pathA := filepath.Join("submodules", args[0], repo.LinksFile)
 			pathB := filepath.Join("submodules", args[1], repo.LinksFile)
-			if err := rootGit.CommitPaths(cmd.Context(), "submodule link: "+args[0]+" <-> "+args[1], pathA, pathB); err != nil && err != git.ErrNothing {
-				return err
-			}
-			if err := rootGit.PublishPrimaryMain(cmd.Context(), remote); err != nil {
+			if err := rootGit.CommitAndPublishPrimary(cmd.Context(), remote, "submodule link: "+args[0]+" <-> "+args[1], pathA, pathB); err != nil && err != git.ErrNothing {
 				return err
 			}
 			fmt.Printf("linked %s <-> %s\n", args[0], args[1])

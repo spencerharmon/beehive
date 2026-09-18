@@ -182,11 +182,8 @@ func Update(ctx context.Context, root string, clobber bool, confirm Confirm) ([]
 		}
 	}
 	if len(commitPaths) > 0 {
-		if err := g.CommitPaths(ctx, "beehive instruction update", commitPaths...); err != nil && err != git.ErrNothing {
-			return results, fmt.Errorf("commit instruction update: %w", err)
-		}
-		if err := g.PublishPrimaryMain(ctx, remote); err != nil {
-			return results, fmt.Errorf("publish instruction update: %w", err)
+		if err := g.CommitAndPublishPrimary(ctx, remote, "beehive instruction update", commitPaths...); err != nil && err != git.ErrNothing {
+			return results, fmt.Errorf("commit+publish instruction update: %w", err)
 		}
 	}
 	return results, nil
