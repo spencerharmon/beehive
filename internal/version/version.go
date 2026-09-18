@@ -9,6 +9,8 @@
 // and warn when the deployed binaries are stale.
 package version
 
+import "strings"
+
 // Version is the release SEMVER the binary was cut from (e.g. "v1.4.2"), stamped
 // at build time by the release/deploy path via:
 //
@@ -55,6 +57,13 @@ func String() string {
 	default:
 		return "beehive dev"
 	}
+}
+
+// UI is the compact version label for the web frontend: the same real stamps as
+// String but without the "beehive " brand prefix (the page already brands
+// itself), e.g. "v0.3.2 (abc123def456)", the release or commit alone, or "dev".
+func UI() string {
+	return strings.TrimPrefix(String(), "beehive ")
 }
 
 // Release returns the stamped release semver and whether one is present. ok is

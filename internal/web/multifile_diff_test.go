@@ -16,7 +16,7 @@ import (
 // data layer is actually wired to the UI (the reason the prior attempt was
 // rejected).
 func TestDiffFileBoxRendersOneCollapsibleBoxPerFile(t *testing.T) {
-	tmpl, err := template.ParseFS(tmplFS, "templates/*.html")
+	tmpl, err := template.New("").Funcs(templateFuncs()).ParseFS(tmplFS, "templates/*.html")
 	if err != nil {
 		t.Fatalf("parse templates: %v", err)
 	}

@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/artifacts"
 	"github.com/spencerharmon/beehive/internal/editor"
@@ -532,81 +533,190 @@ func topLoopers(prefix string, byTask map[string]int) []string {
 	return out
 }
 
-// dancePruneEmptySessions deletes recorded session transcripts that captured zero
-// turns (see isEmptyTranscript) across every submodule's sessions/ dir. These are
-// pure clutter — no content is lost — but the report NAMES the looping task(s)
-// generating them, because pruning treats the symptom: until that task stops
-// being re-selected into empty passes, new empties keep accruing. Destructive: it
-// removes tracked files and publishes, so apply is confirm-gated, recomputes the
-// set under the git lock, and commits+pushes atomically via publishMainLocked.
+// orphanedStubMinAge guards orphaned-stub pruning: a stub younger than this is
+// kept even if its branch isn't visible, so a just-started session (whose branch
+// may not have landed in the primary repo's refs yet) is never nuked. Observed
+// orphans are hours-to-months old, so an hour is amply conservative.
+const orphanedStubMinAge = time.Hour
+
+// liveSessionBranches returns the set of session-branch names that still exist
+// (local heads or remote-tracking). A session's transcript streams to its branch
+// `<sm>-<epoch>-<n>-session`; while that branch lives the session may be in
+// flight and its stub's content may yet land, so its stub must NOT be pruned.
+// Remote-tracking names are recorded both raw (`origin/<b>`) and stripped (`<b>`)
+// so a plain stub branch matches regardless of which ref carries it.
+func (s *Server) liveSessionBranches(ctx context.Context) (map[string]bool, error) {
+	out, err := s.git.Run(ctx, "for-each-ref", "--format=%(refname:short)", "refs/heads/", "refs/remotes/")
+	if err != nil {
+		return nil, err
+	}
+	live := map[string]bool{}
+	for _, ln := range strings.Split(out, "\n") {
+		b := strings.TrimSpace(ln)
+		if b == "" {
+			continue
+		}
+		live[b] = true
+		if i := strings.IndexByte(b, '/'); i >= 0 {
+			live[b[i+1:]] = true // strip the remote prefix (origin/<b> -> <b>)
+		}
+	}
+	return live, nil
+}
+
+// orphanedStubsIn returns the session-stub files in dir whose referenced branch
+// no longer exists (absent from live) AND that are older than minAge. Such a stub
+// is dead: the session ended without the final transcript ever replacing the stub
+// and the branch it streamed to is gone, so the content is unrecoverable and the
+// stub is pure clutter. A live-branch stub (still streaming) and a too-new stub
+// are both kept. byTask tallies the task ids so the report names what generated
+// them, exactly as the empty-transcript path does.
+func orphanedStubsIn(dir string, live map[string]bool, minAge time.Duration) (files []string, byTask map[string]int, err error) {
+	ents, rerr := os.ReadDir(dir)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return nil, map[string]int{}, nil
+		}
+		return nil, nil, rerr
+	}
+	byTask = map[string]int{}
+	cutoff := time.Now().Add(-minAge)
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return nil, nil, rerr
+		}
+		branch, ok := repo.ParseSessionStub(string(b))
+		if !ok {
+			continue // not a stub
+		}
+		if live[branch] {
+			continue // still streaming: keep
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			return nil, nil, ierr
+		}
+		if info.ModTime().After(cutoff) {
+			continue // too new: a just-started session, keep
+		}
+		files = append(files, p)
+		byTask[emptyTranscriptTaskID(e.Name())]++
+	}
+	sort.Strings(files)
+	return files, byTask, nil
+}
+
+// dancePruneEmptySessions deletes DEAD session files across every submodule's
+// sessions/ dir: (1) recorded transcripts that captured zero turns (see
+// isEmptyTranscript) and (2) orphaned stubs whose session branch is gone (see
+// orphanedStubsIn) — in both cases no recoverable content is lost. Live streaming
+// stubs and real transcripts are never touched. The report NAMES the looping
+// task(s) generating the empties, because pruning treats the symptom: until that
+// task stops being re-selected into empty passes, new dead files keep accruing.
+// Destructive: it removes tracked files and publishes, so apply is confirm-gated,
+// recomputes the set under the git lock, and commits+pushes atomically via
+// publishMainLocked.
 func (s *Server) dancePruneEmptySessions() *dance {
 	return &dance{
 		Name:        "prune-empty-sessions",
 		Title:       "Prune empty session transcripts",
-		Summary:     "Delete recorded session transcripts that captured zero turns (a header with an empty body) across every submodule's sessions/. No content is lost. Streaming stubs and real transcripts are never touched. The report names the looping task(s) generating the empties — pruning is symptom-only until that task is fixed.",
+		Summary:     "Delete DEAD session files across every submodule's sessions/: zero-turn transcripts (a header with an empty body) and orphaned stubs (a streaming stub whose session branch is gone, so its transcript will never land). No recoverable content is lost. Live streaming stubs and real transcripts are never touched. The report names the looping task(s) generating them — pruning is symptom-only until that task is fixed.",
 		Destructive: true,
 		plan: func(ctx context.Context) (dancePlan, error) {
 			subs, err := s.repo.Submodules()
 			if err != nil {
 				return dancePlan{}, err
 			}
+			live, err := s.liveSessionBranches(ctx)
+			if err != nil {
+				return dancePlan{}, err
+			}
 			var p dancePlan
-			total := 0
+			totalEmpty, totalOrphan := 0, 0
 			for _, sm := range subs {
 				files, byTask, err := emptyTranscriptsIn(sm.SessionsDir())
 				if err != nil {
 					return dancePlan{}, err
 				}
-				if len(files) == 0 {
-					continue
+				ofiles, obyTask, err := orphanedStubsIn(sm.SessionsDir(), live, orphanedStubMinAge)
+				if err != nil {
+					return dancePlan{}, err
 				}
-				total += len(files)
-				p.Actions = append(p.Actions, danceAction{
-					Op:     "remove",
-					Target: filepath.ToSlash(filepath.Join("submodules", sm.Name, "sessions")),
-					Detail: fmt.Sprintf("%d zero-turn (no-content) transcript(s)", len(files)),
-				})
-				p.Report = append(p.Report, topLoopers("submodules/"+sm.Name+":", byTask)...)
+				sessRel := filepath.ToSlash(filepath.Join("submodules", sm.Name, "sessions"))
+				if len(files) > 0 {
+					totalEmpty += len(files)
+					p.Actions = append(p.Actions, danceAction{
+						Op:     "remove",
+						Target: sessRel,
+						Detail: fmt.Sprintf("%d zero-turn (no-content) transcript(s)", len(files)),
+					})
+					p.Report = append(p.Report, topLoopers("submodules/"+sm.Name+":", byTask)...)
+				}
+				if len(ofiles) > 0 {
+					totalOrphan += len(ofiles)
+					p.Actions = append(p.Actions, danceAction{
+						Op:     "remove",
+						Target: sessRel,
+						Detail: fmt.Sprintf("%d orphaned stub(s) (session branch gone)", len(ofiles)),
+					})
+					p.Report = append(p.Report, topLoopers("submodules/"+sm.Name+" orphan-stub:", obyTask)...)
+				}
 			}
-			if total == 0 {
-				p.Report = append(p.Report, "no empty session transcripts")
+			if totalEmpty+totalOrphan == 0 {
+				p.Report = append(p.Report, "no empty transcripts or orphaned stubs")
 			} else {
-				p.Report = append(p.Report, fmt.Sprintf("%d empty transcript(s) total — pruning is symptom-only; fix the looping task(s) above so new empties stop accruing", total))
+				p.Report = append(p.Report, fmt.Sprintf("%d empty transcript(s) + %d orphaned stub(s) total — pruning is symptom-only; fix the looping task(s) above so new ones stop accruing", totalEmpty, totalOrphan))
 			}
 			return p, nil
 		},
 		apply: func(ctx context.Context) (danceResult, error) {
-			// Under the primary-checkout lock: recompute the empty set live, remove
-			// each file, then commit+push atomically (publishMainLocked, since we hold
-			// gitMu) so the deletion converges and never races a concurrent publish.
+			// Under the primary-checkout lock: recompute the dead set live, remove each
+			// file, then commit+push atomically (publishMainLocked, since we hold gitMu)
+			// so the deletion converges and never races a concurrent publish.
 			s.gitMu.Lock()
 			defer s.gitMu.Unlock()
 			subs, err := s.repo.Submodules()
 			if err != nil {
 				return danceResult{}, err
 			}
+			live, err := s.liveSessionBranches(ctx)
+			if err != nil {
+				return danceResult{}, err
+			}
 			var res danceResult
-			removed := 0
+			removedEmpty, removedOrphan := 0, 0
 			for _, sm := range subs {
 				files, _, err := emptyTranscriptsIn(sm.SessionsDir())
 				if err != nil {
 					return danceResult{}, err
 				}
-				if len(files) == 0 {
-					continue
+				ofiles, _, err := orphanedStubsIn(sm.SessionsDir(), live, orphanedStubMinAge)
+				if err != nil {
+					return danceResult{}, err
 				}
-				for _, f := range files {
+				for _, f := range append(append([]string{}, files...), ofiles...) {
 					if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 						return danceResult{}, err
 					}
 				}
-				removed += len(files)
-				res.Done = append(res.Done, fmt.Sprintf("removed %d empty transcript(s) from submodules/%s/sessions", len(files), sm.Name))
+				if len(files) > 0 {
+					removedEmpty += len(files)
+					res.Done = append(res.Done, fmt.Sprintf("removed %d empty transcript(s) from submodules/%s/sessions", len(files), sm.Name))
+				}
+				if len(ofiles) > 0 {
+					removedOrphan += len(ofiles)
+					res.Done = append(res.Done, fmt.Sprintf("removed %d orphaned stub(s) from submodules/%s/sessions", len(ofiles), sm.Name))
+				}
 			}
-			if removed == 0 {
-				return danceResult{Done: []string{"no empty session transcripts to prune"}}, nil
+			if removedEmpty+removedOrphan == 0 {
+				return danceResult{Done: []string{"no empty transcripts or orphaned stubs to prune"}}, nil
 			}
-			if err := s.publishMainLocked(ctx, fmt.Sprintf("frontend: prune %d empty session transcript(s)", removed)); err != nil {
+			if err := s.publishMainLocked(ctx, fmt.Sprintf("frontend: prune %d empty transcript(s) + %d orphaned stub(s)", removedEmpty, removedOrphan)); err != nil {
 				return danceResult{}, err
 			}
 			return res, nil

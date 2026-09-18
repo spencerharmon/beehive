@@ -26,6 +26,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spencerharmon/beehive/internal/secrets"
 	"github.com/spencerharmon/beehive/internal/submod"
+	"github.com/spencerharmon/beehive/internal/version"
 )
 
 //go:embed templates/*.html
@@ -164,9 +165,19 @@ type Server struct {
 	promHistRun bool
 }
 
+// templateFuncs is the FuncMap every template parse (the live server and tests)
+// must register so layout.html's footer resolves {{version}}.
+func templateFuncs() template.FuncMap {
+	return template.FuncMap{
+		// version renders the running binary's real build stamp (release + short
+		// commit, or "dev" when unstamped) for the page footer. No args, no state.
+		"version": version.UI,
+	}
+}
+
 // New builds a Server over the beehive repo at root.
 func New(r *repo.Repo, cfg config.Config) (*Server, error) {
-	t, err := template.ParseFS(tmplFS, "templates/*.html")
+	t, err := template.New("").Funcs(templateFuncs()).ParseFS(tmplFS, "templates/*.html")
 	if err != nil {
 		return nil, err
 	}

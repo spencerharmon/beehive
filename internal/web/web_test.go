@@ -25,6 +25,7 @@ import (
 	"github.com/spencerharmon/beehive/internal/instruct"
 	"github.com/spencerharmon/beehive/internal/links"
 	"github.com/spencerharmon/beehive/internal/repo"
+	"github.com/spencerharmon/beehive/internal/version"
 	"github.com/spencerharmon/beehive/prompts"
 )
 
@@ -82,6 +83,16 @@ func renderTmpl(t *testing.T, s *Server, name string, data interface{}) string {
 		t.Fatalf("render %s: %v", name, err)
 	}
 	return b.String()
+}
+
+// TestFooterShowsVersion locks the running build stamp onto every full page (the
+// layout footer). Unstamped test binaries report the honest "dev".
+func TestFooterShowsVersion(t *testing.T) {
+	s, _ := setup(t)
+	page := get(t, s, "/").Body.String()
+	if !strings.Contains(page, "pagefoot") || !strings.Contains(page, "beehive "+version.UI()) {
+		t.Fatalf("footer must show the version %q:\n%s", version.UI(), page[len(page)-400:])
+	}
 }
 
 // TestScrollPreserveScriptEmbedded locks that the save/restore script ships on a

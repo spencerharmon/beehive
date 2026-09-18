@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spencerharmon/beehive/internal/plan"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -340,6 +342,33 @@ func TestSkillPruneEmptySessionsConfirmGateAndApply(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sessDir, other), []byte("# random notes\n\nnot a session\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Orphaned-stub cases. Need a commit so branches can exist.
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-qm", "seed"}} {
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if err := c.Run(); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	// (i) An OLD stub whose branch is gone => dead => must be PRUNED.
+	orphanStub := "bee-loop-1780000000-8.md"
+	if err := os.WriteFile(filepath.Join(sessDir, orphanStub), []byte(repo.SessionStub("alpha-1780000000-8-session")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(filepath.Join(sessDir, orphanStub), old, old)
+	// (ii) An OLD stub whose branch STILL EXISTS => still streaming => must be KEPT.
+	liveBranchStub := "bee-loop-1780000100-7.md"
+	liveBranch := "alpha-1780000100-7-session"
+	if err := os.WriteFile(filepath.Join(sessDir, liveBranchStub), []byte(repo.SessionStub(liveBranch)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(filepath.Join(sessDir, liveBranchStub), old, old)
+	bc := exec.Command("git", "branch", liveBranch)
+	bc.Dir = root
+	if err := bc.Run(); err != nil {
+		t.Fatalf("git branch: %v", err)
+	}
 	exists := func(n string) bool {
 		_, err := os.Stat(filepath.Join(sessDir, n))
 		return err == nil
@@ -398,6 +427,12 @@ func TestSkillPruneEmptySessionsConfirmGateAndApply(t *testing.T) {
 	}
 	if !exists(other) {
 		t.Fatal("confirmed apply must KEEP a non-transcript .md")
+	}
+	if exists(orphanStub) {
+		t.Fatal("confirmed apply must PRUNE an old orphaned stub (branch gone)")
+	}
+	if !exists(liveBranchStub) {
+		t.Fatal("confirmed apply must KEEP a stub whose session branch still exists")
 	}
 }
 

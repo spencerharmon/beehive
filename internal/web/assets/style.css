@@ -287,6 +287,19 @@ small, .small { font-size: var(--text-sm); }
    room. Opt in per page via the header's .Wide flag (layout.html). */
 .container-wide { max-width: none; }
 
+/* page footer: the running build version, muted, centered under the content. */
+.pagefoot {
+  max-width: 66rem;
+  margin: 0 auto;
+  padding: var(--space-4) var(--space-5) var(--space-6);
+  text-align: center;
+}
+.pagefoot .version {
+  font-size: 0.8rem;
+  color: var(--muted, #888);
+  font-variant-numeric: tabular-nums;
+}
+
 /* Cards ------------------------------------------------------------------ */
 .cards {
   display: grid;
