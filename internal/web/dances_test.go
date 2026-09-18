@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,7 +46,7 @@ func TestDancesRenderOnHygienePage(t *testing.T) {
 		t.Fatalf("hygiene page: got %d", w.Code)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"cleanup-stale", "gc", "resources", "infra-conventions", "repair-plan", "Dry-run", "Dances", "Hive hygiene"} {
+	for _, want := range []string{"cleanup-stale", "gc", "resources", "infra-conventions", "repair-plan", "prune-empty-sessions", "Dry-run", "Dances", "Hive hygiene"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("hygiene page missing %q:\n%s", want, body)
 		}
@@ -296,6 +297,91 @@ func TestSkillRepairPlanFixesCorruptStamp(t *testing.T) {
 	}
 	if len(tk.Body) == 0 || tk.Body[0] != "body stays" {
 		t.Fatalf("body corrupted: %v", tk.Body)
+	}
+}
+
+// TestSkillPruneEmptySessionsConfirmGateAndApply proves the prune dance lists
+// only zero-turn transcripts (naming the looping task), refuses to mutate without
+// confirm, and on confirm removes exactly the empties while keeping a real
+// transcript and a live streaming stub.
+func TestSkillPruneEmptySessionsConfirmGateAndApply(t *testing.T) {
+	s, root := setup(t)
+	sessDir := filepath.Join(root, "submodules", "alpha", "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Two zero-turn transcripts for one looping task (header, empty ## user body).
+	empty := "# session %s\n\nsubmodule: alpha · kind: work · branch: bee-loop · model: m\n\n## user\n\n"
+	emptyFiles := []string{"bee-loop-1783000000-1.md", "bee-loop-1783000005-2.md"}
+	for _, n := range emptyFiles {
+		if err := os.WriteFile(filepath.Join(sessDir, n), []byte(fmt.Sprintf(empty, n)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A real transcript (must be KEPT) and a live streaming stub (must be KEPT).
+	real := "bee-real-1783000010-3.md"
+	if err := os.WriteFile(filepath.Join(sessDir, real), []byte("# session r\n\n## user\ndo it\n## assistant\ndone\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stub := "bee-live-1783000020-4.md"
+	if err := os.WriteFile(filepath.Join(sessDir, stub), []byte(repo.SessionStub("alpha-1783000020-4-session")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exists := func(n string) bool {
+		_, err := os.Stat(filepath.Join(sessDir, n))
+		return err == nil
+	}
+
+	// (a) Dry-run: a remove action for alpha's sessions naming the count + the
+	// looping task; mutates nothing.
+	dry := postForm(t, s, "/dances/prune-empty-sessions/plan", url.Values{})
+	if dry.Code != http.StatusOK {
+		t.Fatalf("plan: got %d", dry.Code)
+	}
+	db := dry.Body.String()
+	for _, want := range []string{"remove", "bee-loop", "symptom-only"} {
+		if !strings.Contains(db, want) {
+			t.Fatalf("dry-run missing %q:\n%s", want, db)
+		}
+	}
+	for _, n := range emptyFiles {
+		if !exists(n) {
+			t.Fatalf("dry-run must not remove %q", n)
+		}
+	}
+
+	// (b) Unconfirmed apply: refuses, mutates nothing.
+	gate := postForm(t, s, "/dances/prune-empty-sessions/apply", url.Values{})
+	if gate.Code != http.StatusOK {
+		t.Fatalf("unconfirmed apply: got %d want 200", gate.Code)
+	}
+	if !strings.Contains(gate.Body.String(), "Confirmation required") {
+		t.Fatalf("unconfirmed apply must ask to confirm:\n%s", gate.Body.String())
+	}
+	for _, n := range emptyFiles {
+		if !exists(n) {
+			t.Fatalf("unconfirmed apply must not remove %q", n)
+		}
+	}
+
+	// (c) Confirmed apply: removes exactly the empties, keeps real + stub.
+	done := postForm(t, s, "/dances/prune-empty-sessions/apply", url.Values{"confirm": {"on"}})
+	if done.Code != http.StatusOK {
+		t.Fatalf("confirmed apply: got %d body=%s", done.Code, done.Body)
+	}
+	if !strings.Contains(done.Body.String(), "applied") {
+		t.Fatalf("confirmed apply must report applied:\n%s", done.Body.String())
+	}
+	for _, n := range emptyFiles {
+		if exists(n) {
+			t.Fatalf("confirmed apply must remove empty %q", n)
+		}
+	}
+	if !exists(real) {
+		t.Fatal("confirmed apply must KEEP the real transcript")
+	}
+	if !exists(stub) {
+		t.Fatal("confirmed apply must KEEP the live streaming stub")
 	}
 }
 

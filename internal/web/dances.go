@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/spencerharmon/beehive/internal/artifacts"
@@ -285,6 +286,7 @@ func (s *Server) dances() *danceRegistry {
 	add(s.danceResources())
 	add(s.danceInfraConventions())
 	add(s.danceRepairPlan())
+	add(s.dancePruneEmptySessions())
 	return reg
 }
 
@@ -395,6 +397,205 @@ func (s *Server) danceRepairPlan() *dance {
 				return danceResult{Done: []string{"no PLAN.md needed empty-stamp repair"}}, nil
 			}
 			if err := s.publishMain(ctx, "frontend: repair corrupt PLAN.md empty stamps"); err != nil {
+				return danceResult{}, err
+			}
+			return res, nil
+		},
+	}
+}
+
+// isEmptyTranscript reports whether a session .md is a recorded transcript that
+// captured ZERO turns: a header (`# session …`, the metadata line, `## user`)
+// with a whitespace-only body. That is the artifact a pass which spawned but
+// produced no work leaves behind; a task stuck in a re-selection loop accretes
+// thousands of them (observed live: one flux task, ~6200 empty transcripts over
+// two months). A live/abandoned streaming STUB (still pointing at its session
+// branch) is NOT empty — its content may yet land — so stubs are excluded, as are
+// any transcript carrying a real turn after `## user`.
+func isEmptyTranscript(content string) bool {
+	if strings.TrimSpace(content) == "" {
+		return true
+	}
+	if _, isStub := repo.ParseSessionStub(content); isStub {
+		return false
+	}
+	// Everything after the FIRST `## ` heading (the `## user` turn) must be blank.
+	// A real transcript has the injected task context and/or `## assistant` turns
+	// there; a zero-turn pass has nothing.
+	idx := strings.Index(content, "\n## ")
+	if idx < 0 {
+		return false // no turn heading at all: unrecognized shape, do not touch
+	}
+	rest := content[idx+1:]
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[nl+1:]
+	} else {
+		rest = ""
+	}
+	return strings.TrimSpace(rest) == ""
+}
+
+// emptyTranscriptsIn returns, for one submodule's sessions dir, the absolute
+// paths of every zero-turn transcript and a per-task tally (task id -> count)
+// keyed by stripping the `-<epoch>-<n>.md` suffix off each filename. Read-only.
+func emptyTranscriptsIn(dir string) (files []string, byTask map[string]int, err error) {
+	ents, derr := os.ReadDir(dir)
+	if derr != nil {
+		if os.IsNotExist(derr) {
+			return nil, nil, nil
+		}
+		return nil, nil, derr
+	}
+	byTask = map[string]int{}
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return nil, nil, rerr
+		}
+		if !isEmptyTranscript(string(b)) {
+			continue
+		}
+		files = append(files, p)
+		byTask[emptyTranscriptTaskID(e.Name())]++
+	}
+	sort.Strings(files)
+	return files, byTask, nil
+}
+
+// emptyTranscriptTaskID strips the `-<10-digit-epoch>-<n>.md` session suffix off
+// a transcript filename to recover the task id it belongs to, so the report can
+// name the looping task driving the empties (the root cause a prune won't fix).
+func emptyTranscriptTaskID(name string) string {
+	id := strings.TrimSuffix(name, ".md")
+	// trailing "-<digits>" (the intra-second counter)
+	if i := strings.LastIndexByte(id, '-'); i >= 0 && allDigits(id[i+1:]) {
+		id = id[:i]
+	}
+	// trailing "-<digits>" (the epoch)
+	if i := strings.LastIndexByte(id, '-'); i >= 0 && allDigits(id[i+1:]) {
+		id = id[:i]
+	}
+	return id
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// topLoopers renders the up-to-3 highest-count task ids from a tally as report
+// lines, so an operator sees WHICH task is generating the empties.
+func topLoopers(prefix string, byTask map[string]int) []string {
+	type kv struct {
+		id string
+		n  int
+	}
+	kvs := make([]kv, 0, len(byTask))
+	for id, n := range byTask {
+		kvs = append(kvs, kv{id, n})
+	}
+	sort.Slice(kvs, func(i, j int) bool {
+		if kvs[i].n != kvs[j].n {
+			return kvs[i].n > kvs[j].n
+		}
+		return kvs[i].id < kvs[j].id
+	})
+	var out []string
+	for i, e := range kvs {
+		if i >= 3 {
+			break
+		}
+		out = append(out, fmt.Sprintf("%s loop: %d × %s", prefix, e.n, e.id))
+	}
+	return out
+}
+
+// dancePruneEmptySessions deletes recorded session transcripts that captured zero
+// turns (see isEmptyTranscript) across every submodule's sessions/ dir. These are
+// pure clutter — no content is lost — but the report NAMES the looping task(s)
+// generating them, because pruning treats the symptom: until that task stops
+// being re-selected into empty passes, new empties keep accruing. Destructive: it
+// removes tracked files and publishes, so apply is confirm-gated, recomputes the
+// set under the git lock, and commits+pushes atomically via publishMainLocked.
+func (s *Server) dancePruneEmptySessions() *dance {
+	return &dance{
+		Name:        "prune-empty-sessions",
+		Title:       "Prune empty session transcripts",
+		Summary:     "Delete recorded session transcripts that captured zero turns (a header with an empty body) across every submodule's sessions/. No content is lost. Streaming stubs and real transcripts are never touched. The report names the looping task(s) generating the empties — pruning is symptom-only until that task is fixed.",
+		Destructive: true,
+		plan: func(ctx context.Context) (dancePlan, error) {
+			subs, err := s.repo.Submodules()
+			if err != nil {
+				return dancePlan{}, err
+			}
+			var p dancePlan
+			total := 0
+			for _, sm := range subs {
+				files, byTask, err := emptyTranscriptsIn(sm.SessionsDir())
+				if err != nil {
+					return dancePlan{}, err
+				}
+				if len(files) == 0 {
+					continue
+				}
+				total += len(files)
+				p.Actions = append(p.Actions, danceAction{
+					Op:     "remove",
+					Target: filepath.ToSlash(filepath.Join("submodules", sm.Name, "sessions")),
+					Detail: fmt.Sprintf("%d zero-turn (no-content) transcript(s)", len(files)),
+				})
+				p.Report = append(p.Report, topLoopers("submodules/"+sm.Name+":", byTask)...)
+			}
+			if total == 0 {
+				p.Report = append(p.Report, "no empty session transcripts")
+			} else {
+				p.Report = append(p.Report, fmt.Sprintf("%d empty transcript(s) total — pruning is symptom-only; fix the looping task(s) above so new empties stop accruing", total))
+			}
+			return p, nil
+		},
+		apply: func(ctx context.Context) (danceResult, error) {
+			// Under the primary-checkout lock: recompute the empty set live, remove
+			// each file, then commit+push atomically (publishMainLocked, since we hold
+			// gitMu) so the deletion converges and never races a concurrent publish.
+			s.gitMu.Lock()
+			defer s.gitMu.Unlock()
+			subs, err := s.repo.Submodules()
+			if err != nil {
+				return danceResult{}, err
+			}
+			var res danceResult
+			removed := 0
+			for _, sm := range subs {
+				files, _, err := emptyTranscriptsIn(sm.SessionsDir())
+				if err != nil {
+					return danceResult{}, err
+				}
+				if len(files) == 0 {
+					continue
+				}
+				for _, f := range files {
+					if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+						return danceResult{}, err
+					}
+				}
+				removed += len(files)
+				res.Done = append(res.Done, fmt.Sprintf("removed %d empty transcript(s) from submodules/%s/sessions", len(files), sm.Name))
+			}
+			if removed == 0 {
+				return danceResult{Done: []string{"no empty session transcripts to prune"}}, nil
+			}
+			if err := s.publishMainLocked(ctx, fmt.Sprintf("frontend: prune %d empty session transcript(s)", removed)); err != nil {
 				return danceResult{}, err
 			}
 			return res, nil

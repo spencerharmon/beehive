@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/spencerharmon/beehive/internal/git"
+	"github.com/spencerharmon/beehive/internal/plan"
 )
 
 // CruftItem is one flagged piece of git cruft within a class: its identifier
@@ -186,15 +187,62 @@ func scanHygiene(ctx context.Context, root string, g *git.Repo) (Hygiene, error)
 	if err != nil {
 		return Hygiene{}, err
 	}
+	corruptPlans, err := scanCorruptPlans(root)
+	if err != nil {
+		return Hygiene{}, err
+	}
 	return Hygiene{
 		Classes: []CruftClass{
 			{Key: "worktrees", Title: "Stale worktrees", Items: worktrees},
 			{Key: "gitlinks", Title: "Orphan submodule gitlinks", Items: orphans},
 			{Key: "checkouts", Title: "Stale submodule checkouts", Items: checkouts},
 			{Key: "remotes", Title: "Unexpected remotes", Items: remotes},
+			{Key: "corrupt-plan", Title: "Corrupt PLAN.md", Items: corruptPlans},
 		},
 		Packs: scanPacks(ctx, root, g, declared),
 	}, nil
+}
+
+// scanCorruptPlans flags every submodule PLAN.md that no longer parses — a NUL
+// byte (a runner write killed mid-flush), a duplicate task-ID heading (an
+// interrupted status flip), or any other malformed metadata. It reuses the
+// canonical plan.Parse (hardened to reject NUL/duplicate outright), so a class-7
+// finding here is exactly what the runner's handoff gate and every consumer now
+// fail closed on. READ-ONLY: it never rewrites a plan. Repair is deliberately
+// left to the operator (or the repair-plan dance, for the empty-stamp subclass),
+// because collapsing a duplicate heading is a which-card-is-authoritative
+// judgement, not a mechanical fix. Runner >= v0.2.0 prevents this at the source;
+// this surfaces plans corrupted by an older runner or a hand-edit.
+func scanCorruptPlans(root string) ([]CruftItem, error) {
+	base := filepath.Join(root, "submodules")
+	ents, err := os.ReadDir(base)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var items []CruftItem
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		rel := filepath.Join("submodules", e.Name(), "PLAN.md")
+		b, rerr := os.ReadFile(filepath.Join(root, rel))
+		if rerr != nil {
+			if os.IsNotExist(rerr) {
+				continue
+			}
+			return nil, rerr
+		}
+		if _, perr := plan.Parse(string(b)); perr != nil {
+			items = append(items, CruftItem{
+				Name:   filepath.ToSlash(rel),
+				Detail: perr.Error() + " — repair per skills/repair-plan.md",
+			})
+		}
+	}
+	return items, nil
 }
 
 // scanPacks stats the object-store (.git/objects/pack) health of every managed repo

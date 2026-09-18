@@ -5447,6 +5447,17 @@ func seedHygieneCruft(t *testing.T, root string) (driftHEAD string) {
 	orphan := strings.Repeat("3", 40)
 	hygGit(t, root, "update-index", "--add", "--cacheinfo", "160000,"+recorded+",submodules/drift/repo")
 	hygGit(t, root, "update-index", "--add", "--cacheinfo", "160000,"+orphan+",submodules/orphan/worktrees/bee-x")
+
+	// A corrupt PLAN.md (duplicate task heading) in its own submodule (corrupt-plan
+	// class). Kept off alpha so the valid-plan fixtures other tests rely on stand.
+	badPlan := filepath.Join(root, "submodules", "badplan")
+	if err := os.MkdirAll(badPlan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(badPlan, repo.PlanFile), []byte(
+		"<!-- Beehive-ROI: abc123 -->\n# Plan\n\n"+
+			"## dup [TODO] <!-- attempts=0 deps= -->\nfirst\n\n"+
+			"## dup [NEEDS-HUMAN] <!-- attempts=0 deps= -->\nstranded twin\n"), 0o644)
 	return driftHEAD
 }
 
@@ -5478,6 +5489,7 @@ func TestHygieneScanAllClasses(t *testing.T) {
 		{"gitlinks", 1, []string{"submodules/orphan/worktrees/bee-x"}},
 		{"checkouts", 1, []string{"submodules/drift/repo"}},
 		{"remotes", 1, []string{"weird"}},
+		{"corrupt-plan", 1, []string{"submodules/badplan/PLAN.md"}},
 	}
 	for _, c := range cases {
 		cl, ok := byKey[c.key]
