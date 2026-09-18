@@ -333,6 +333,20 @@ func TestSkillPruneEmptySessionsConfirmGateAndApply(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sessDir, real), []byte("# session r\n\n## user\ndo it\n## assistant\ndone\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A warning-ONLY transcript (runner 'check failed' notice, no agent turn) is
+	// no-work clutter and must PRUNE.
+	warnOnly := "bee-fail-1783000012-5.md"
+	if err := os.WriteFile(filepath.Join(sessDir, warnOnly), []byte(
+		"# session "+warnOnly+"\n\nsubmodule: alpha · kind: work · branch: bee-fail · model: m\n\n## ⚠️ warning\ntask fail left TODO but the completion check failed — left for review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	emptyFiles = append(emptyFiles, warnOnly)
+	// A transcript with REAL agent work AND a warning must be KEPT (not warning-only).
+	workWarn := "bee-workwarn-1783000013-6.md"
+	if err := os.WriteFile(filepath.Join(sessDir, workWarn), []byte(
+		"# session "+workWarn+"\n\n## user\ndo it\n## assistant\ntried\n## ⚠️ warning\nleft for review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	stub := "bee-live-1783000020-4.md"
 	if err := os.WriteFile(filepath.Join(sessDir, stub), []byte(repo.SessionStub("alpha-1783000020-4-session")), 0o644); err != nil {
 		t.Fatal(err)
@@ -421,6 +435,9 @@ func TestSkillPruneEmptySessionsConfirmGateAndApply(t *testing.T) {
 	}
 	if !exists(real) {
 		t.Fatal("confirmed apply must KEEP the real transcript")
+	}
+	if !exists(workWarn) {
+		t.Fatal("confirmed apply must KEEP a transcript with real agent work + a warning")
 	}
 	if !exists(stub) {
 		t.Fatal("confirmed apply must KEEP the live streaming stub")

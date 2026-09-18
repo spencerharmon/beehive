@@ -447,6 +447,43 @@ func isEmptyTranscript(content string) bool {
 	return strings.TrimSpace(rest) == ""
 }
 
+// isWarningOnlyTranscript reports whether a session .md recorded NO agent work,
+// only a runner-emitted notice — the shape a work pass leaves when it ends with
+// its task still TODO and the completion check fails: header + metadata + a lone
+// `## ⚠️ warning` (`task <id> left TODO but the completion check failed — left
+// for review`) and no `## user`/`## assistant` turn at all. Its only information
+// (that the task's check failed) is already durable in the task's PLAN status and
+// attempts= tag, so no agent work is lost by pruning it — it is the same no-work
+// clutter class as an empty transcript. A transcript that ALSO carries a real
+// agent turn (`## assistant`, or a `## user` task-context block) is NOT
+// warning-only and is kept: the criterion is a `## ` heading present but NONE of
+// them a `## user`/`## assistant` agent turn. Stubs and non-transcripts excluded.
+func isWarningOnlyTranscript(content string) bool {
+	if _, isStub := repo.ParseSessionStub(content); isStub {
+		return false
+	}
+	if !strings.HasPrefix(strings.TrimLeft(content, " \t\r\n\ufeff"), "# session ") {
+		return false // not a recognized session transcript: never ours to touch
+	}
+	sawHeading, sawNotice := false, false
+	for _, ln := range strings.Split(content, "\n") {
+		if !strings.HasPrefix(ln, "## ") {
+			continue
+		}
+		sawHeading = true
+		h := strings.TrimSpace(strings.TrimPrefix(ln, "## "))
+		// An agent turn disqualifies it — real work was recorded.
+		if h == "user" || h == "assistant" || strings.HasPrefix(h, "user ") || strings.HasPrefix(h, "assistant ") {
+			return false
+		}
+		if strings.Contains(h, "warning") {
+			sawNotice = true
+		}
+	}
+	// At least one heading, none an agent turn, and a runner warning present.
+	return sawHeading && sawNotice
+}
+
 // emptyTranscriptsIn returns, for one submodule's sessions dir, the absolute
 // paths of every zero-turn transcript and a per-task tally (task id -> count)
 // keyed by stripping the `-<epoch>-<n>.md` suffix off each filename. Read-only.
@@ -469,6 +506,38 @@ func emptyTranscriptsIn(dir string) (files []string, byTask map[string]int, err 
 			return nil, nil, rerr
 		}
 		if !isEmptyTranscript(string(b)) {
+			continue
+		}
+		files = append(files, p)
+		byTask[emptyTranscriptTaskID(e.Name())]++
+	}
+	sort.Strings(files)
+	return files, byTask, nil
+}
+
+// warningOnlyTranscriptsIn returns, for one submodule's sessions dir, the
+// absolute paths of every warning-only (no-agent-work) transcript (see
+// isWarningOnlyTranscript) and a per-task tally, keyed like emptyTranscriptsIn.
+// Read-only.
+func warningOnlyTranscriptsIn(dir string) (files []string, byTask map[string]int, err error) {
+	ents, derr := os.ReadDir(dir)
+	if derr != nil {
+		if os.IsNotExist(derr) {
+			return nil, map[string]int{}, nil
+		}
+		return nil, nil, derr
+	}
+	byTask = map[string]int{}
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return nil, nil, rerr
+		}
+		if !isWarningOnlyTranscript(string(b)) {
 			continue
 		}
 		files = append(files, p)
@@ -612,20 +681,21 @@ func orphanedStubsIn(dir string, live map[string]bool, minAge time.Duration) (fi
 }
 
 // dancePruneEmptySessions deletes DEAD session files across every submodule's
-// sessions/ dir: (1) recorded transcripts that captured zero turns (see
-// isEmptyTranscript) and (2) orphaned stubs whose session branch is gone (see
-// orphanedStubsIn) — in both cases no recoverable content is lost. Live streaming
-// stubs and real transcripts are never touched. The report NAMES the looping
-// task(s) generating the empties, because pruning treats the symptom: until that
-// task stops being re-selected into empty passes, new dead files keep accruing.
-// Destructive: it removes tracked files and publishes, so apply is confirm-gated,
-// recomputes the set under the git lock, and commits+pushes atomically via
-// publishMainLocked.
+// sessions/ dir, in three no-recoverable-content classes: (1) zero-turn
+// transcripts (see isEmptyTranscript); (2) warning-only transcripts that recorded
+// no agent work, only a runner "completion check failed" notice (see
+// isWarningOnlyTranscript); and (3) orphaned stubs whose session branch is gone
+// (see orphanedStubsIn). Live streaming stubs and any transcript with a real
+// agent turn are never touched. The report NAMES the looping/failing task(s)
+// generating them, because pruning treats the symptom: until those tasks are
+// fixed, new dead files keep accruing. Destructive: it removes tracked files and
+// publishes, so apply is confirm-gated, recomputes the set under the git lock,
+// and commits+pushes atomically via publishMainLocked.
 func (s *Server) dancePruneEmptySessions() *dance {
 	return &dance{
 		Name:        "prune-empty-sessions",
 		Title:       "Prune empty session transcripts",
-		Summary:     "Delete DEAD session files across every submodule's sessions/: zero-turn transcripts (a header with an empty body) and orphaned stubs (a streaming stub whose session branch is gone, so its transcript will never land). No recoverable content is lost. Live streaming stubs and real transcripts are never touched. The report names the looping task(s) generating them — pruning is symptom-only until that task is fixed.",
+		Summary:     "Delete DEAD session files across every submodule's sessions/: zero-turn transcripts (a header with an empty body), warning-only transcripts (a pass that recorded no agent work, only a runner 'completion check failed' notice), and orphaned stubs (a streaming stub whose session branch is gone). No recoverable agent work is lost. Live streaming stubs and any transcript with a real agent turn are never touched. The report names the looping/failing task(s) generating them — pruning is symptom-only until those tasks are fixed.",
 		Destructive: true,
 		plan: func(ctx context.Context) (dancePlan, error) {
 			subs, err := s.repo.Submodules()
@@ -637,9 +707,13 @@ func (s *Server) dancePruneEmptySessions() *dance {
 				return dancePlan{}, err
 			}
 			var p dancePlan
-			totalEmpty, totalOrphan := 0, 0
+			totalEmpty, totalWarn, totalOrphan := 0, 0, 0
 			for _, sm := range subs {
 				files, byTask, err := emptyTranscriptsIn(sm.SessionsDir())
+				if err != nil {
+					return dancePlan{}, err
+				}
+				wfiles, wbyTask, err := warningOnlyTranscriptsIn(sm.SessionsDir())
 				if err != nil {
 					return dancePlan{}, err
 				}
@@ -657,6 +731,15 @@ func (s *Server) dancePruneEmptySessions() *dance {
 					})
 					p.Report = append(p.Report, topLoopers("submodules/"+sm.Name+":", byTask)...)
 				}
+				if len(wfiles) > 0 {
+					totalWarn += len(wfiles)
+					p.Actions = append(p.Actions, danceAction{
+						Op:     "remove",
+						Target: sessRel,
+						Detail: fmt.Sprintf("%d warning-only (no-work) transcript(s)", len(wfiles)),
+					})
+					p.Report = append(p.Report, topLoopers("submodules/"+sm.Name+" check-fail:", wbyTask)...)
+				}
 				if len(ofiles) > 0 {
 					totalOrphan += len(ofiles)
 					p.Actions = append(p.Actions, danceAction{
@@ -667,10 +750,10 @@ func (s *Server) dancePruneEmptySessions() *dance {
 					p.Report = append(p.Report, topLoopers("submodules/"+sm.Name+" orphan-stub:", obyTask)...)
 				}
 			}
-			if totalEmpty+totalOrphan == 0 {
-				p.Report = append(p.Report, "no empty transcripts or orphaned stubs")
+			if totalEmpty+totalWarn+totalOrphan == 0 {
+				p.Report = append(p.Report, "no dead session files (empty, warning-only, or orphaned stub)")
 			} else {
-				p.Report = append(p.Report, fmt.Sprintf("%d empty transcript(s) + %d orphaned stub(s) total — pruning is symptom-only; fix the looping task(s) above so new ones stop accruing", totalEmpty, totalOrphan))
+				p.Report = append(p.Report, fmt.Sprintf("%d empty + %d warning-only transcript(s) + %d orphaned stub(s) total — pruning is symptom-only; fix the task(s) above so new ones stop accruing", totalEmpty, totalWarn, totalOrphan))
 			}
 			return p, nil
 		},
@@ -689,9 +772,13 @@ func (s *Server) dancePruneEmptySessions() *dance {
 				return danceResult{}, err
 			}
 			var res danceResult
-			removedEmpty, removedOrphan := 0, 0
+			removedEmpty, removedWarn, removedOrphan := 0, 0, 0
 			for _, sm := range subs {
 				files, _, err := emptyTranscriptsIn(sm.SessionsDir())
+				if err != nil {
+					return danceResult{}, err
+				}
+				wfiles, _, err := warningOnlyTranscriptsIn(sm.SessionsDir())
 				if err != nil {
 					return danceResult{}, err
 				}
@@ -699,7 +786,8 @@ func (s *Server) dancePruneEmptySessions() *dance {
 				if err != nil {
 					return danceResult{}, err
 				}
-				for _, f := range append(append([]string{}, files...), ofiles...) {
+				all := append(append(append([]string{}, files...), wfiles...), ofiles...)
+				for _, f := range all {
 					if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 						return danceResult{}, err
 					}
@@ -708,15 +796,19 @@ func (s *Server) dancePruneEmptySessions() *dance {
 					removedEmpty += len(files)
 					res.Done = append(res.Done, fmt.Sprintf("removed %d empty transcript(s) from submodules/%s/sessions", len(files), sm.Name))
 				}
+				if len(wfiles) > 0 {
+					removedWarn += len(wfiles)
+					res.Done = append(res.Done, fmt.Sprintf("removed %d warning-only transcript(s) from submodules/%s/sessions", len(wfiles), sm.Name))
+				}
 				if len(ofiles) > 0 {
 					removedOrphan += len(ofiles)
 					res.Done = append(res.Done, fmt.Sprintf("removed %d orphaned stub(s) from submodules/%s/sessions", len(ofiles), sm.Name))
 				}
 			}
-			if removedEmpty+removedOrphan == 0 {
-				return danceResult{Done: []string{"no empty transcripts or orphaned stubs to prune"}}, nil
+			if removedEmpty+removedWarn+removedOrphan == 0 {
+				return danceResult{Done: []string{"no dead session files to prune"}}, nil
 			}
-			if err := s.publishMainLocked(ctx, fmt.Sprintf("frontend: prune %d empty transcript(s) + %d orphaned stub(s)", removedEmpty, removedOrphan)); err != nil {
+			if err := s.publishMainLocked(ctx, fmt.Sprintf("frontend: prune %d empty + %d warning-only transcript(s) + %d orphaned stub(s)", removedEmpty, removedWarn, removedOrphan)); err != nil {
 				return danceResult{}, err
 			}
 			return res, nil
