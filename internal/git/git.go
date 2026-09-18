@@ -807,6 +807,61 @@ func (r *Repo) PublishPrimaryMain(ctx context.Context, remote string) error {
 	return fmt.Errorf("git: publish primary main exhausted retries")
 }
 
+// ReconcileMainFork heals a divergence between local primary main and remote/main
+// that ff-only pull cannot cross. It is the authoritative background counterpart
+// to the viewer's ff-only pullMain (which DELIBERATELY never merges, so it can
+// only follow a clean fast-forward and records a fork without crossing it). When
+// the two anchors have diverged (a true fork) OR local main is AHEAD of remote (a
+// commit stranded on local by the direct-on-primary crash window before its push
+// landed), this MERGES remote into local (SyncMainFromRemote) and PUBLISHES the
+// union back to remote (PublishPrimaryMain), so both anchors converge and no
+// committed artifact is dropped from either line.
+//
+// It only acts on an ACTUAL divergence: when local main equals remote, or is a
+// clean fast-forward BEHIND remote, it returns (false,nil) and leaves the ff to
+// pullMain — it never authors a spurious merge commit on the healthy
+// fast-forward path. A merge CONFLICT (e.g. both lines edited the same PLAN.md
+// task) is returned, never swallowed, so the caller surfaces it loudly and the
+// fork awaits resolution instead of rotting silently frozen. remote=="" (a
+// local-only hive: local main is the sole authority) is a no-op.
+//
+// The soundness of this recovery — that merge-healing every reachable fork
+// preserves all committed work and always re-converges — is model-checked in
+// specs/MainConvergeCrash.tla (the heal_fixed configuration).
+func (r *Repo) ReconcileMainFork(ctx context.Context, remote string) (healed bool, err error) {
+	if remote == "" {
+		return false, nil
+	}
+	if err := r.Fetch(ctx, remote, "main"); err != nil {
+		return false, err
+	}
+	local, err := r.RevParse(ctx, "HEAD")
+	if err != nil {
+		return false, err
+	}
+	rem, err := r.RevParse(ctx, "FETCH_HEAD")
+	if err != nil {
+		return false, err
+	}
+	if local == rem {
+		return false, nil // already converged
+	}
+	// Local strictly behind remote on a clean fast-forward line: the healthy case
+	// ff-only pullMain owns. Do not author a merge here.
+	if anc, aerr := r.IsAncestor(ctx, local, rem); aerr == nil && anc {
+		return false, nil
+	}
+	// Diverged (fork) or local-ahead: heal by merge, then publish the union. Both
+	// steps surface a conflict/error rather than swallowing it.
+	if err := r.SyncMainFromRemote(ctx, remote); err != nil {
+		return false, err
+	}
+	if err := r.PublishPrimaryMain(ctx, remote); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // isDirtyTreeRejection reports whether a push to a local checked-out branch was
 // refused because updateInstead found the target working tree dirty (versus a
 // non-fast-forward race or a permission/protection rejection).

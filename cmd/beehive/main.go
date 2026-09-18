@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/spencerharmon/beehive/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -18,7 +19,14 @@ func main() {
 		Short:         "beehive deterministic CLI",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// Version powers the root `--version` flag (cobra auto-registers it). The
+		// precise release+commit is stamped via -ldflags at deploy/release time
+		// (internal/version); an unstamped dev build prints "beehive dev".
+		Version: version.String(),
 	}
+	// Print exactly the version line (no "beehive version <x>" wrapper) so
+	// `beehive --version` and `beehive version` agree byte-for-byte.
+	root.SetVersionTemplate("{{.Version}}\n")
 	root.AddCommand(
 		initCmd(),
 		versionCmd(),

@@ -124,6 +124,15 @@ type Server struct {
 	lastPull time.Time
 	pullErr  error
 
+	// reconcileIvl is the cadence of the authoritative background main-fork
+	// reconcile (reconcile.go): the counterpart to the ff-only pullMain that CAN
+	// merge-heal a local/remote main divergence pullMain cannot cross. 0 uses
+	// defaultReconcileInterval; tests set it small. reconcileErr (under syncMu) is
+	// the last heal outcome — non-nil when a fork hit an unresolvable merge
+	// conflict, so a frozen fork is surfaced rather than silent.
+	reconcileIvl time.Duration
+	reconcileErr error
+
 	// streamInterval is the SSE re-read cadence for a live session transcript
 	// (sessionStream). 0 means the default (streamIvl); tests set it small to keep
 	// them fast.

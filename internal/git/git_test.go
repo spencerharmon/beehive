@@ -1297,3 +1297,177 @@ func TestRemoteContainsCommit(t *testing.T) {
 		}
 	})
 }
+
+// --- D2: ReconcileMainFork, the authoritative background fork-heal ------------
+//
+// These lock the recovery the viewer's ff-only pullMain cannot do: merge-heal a
+// local/remote main divergence (fork) and drain a local-ahead crash-window
+// commit, converging both anchors and losing nothing — while refusing to author
+// on the healthy fast-forward paths and surfacing (never swallowing) a genuinely
+// conflicting fork. Companion to specs/MainConvergeCrash.tla (heal_fixed).
+
+// A true fork (incomparable, non-conflicting content) is merged AND the union is
+// republished, so origin/main and local main converge with both sides intact.
+func TestReconcileMainForkHealsFork(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "base", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push base: %v", err)
+	}
+	b := cloneOf(t, origin, "b")
+	bTip := commitFile(t, b, "local", "b-only\n", "b-only")       // local-only line
+	remoteTip := commitFile(t, a, "remote", "remote-only\n", "r") // divergent remote line
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push remote-only: %v", err)
+	}
+
+	healed, err := b.ReconcileMainFork(ctx, "origin")
+	if err != nil {
+		t.Fatalf("ReconcileMainFork heal: %v", err)
+	}
+	if !healed {
+		t.Fatal("ReconcileMainFork reported no heal on an actual fork")
+	}
+	if c, _ := b.HasConflict(ctx); c {
+		t.Fatal("left a conflicted/merging state")
+	}
+	if !b.sharesHistory(ctx, bTip) || !b.sharesHistory(ctx, remoteTip) {
+		t.Fatalf("healed HEAD missing a side (local=%s remote=%s)", bTip, remoteTip)
+	}
+	// The union was PUBLISHED: a fresh clone of origin equals b's healed HEAD.
+	bHead, _ := b.RevParse(ctx, "HEAD")
+	c := cloneOf(t, origin, "c")
+	cHead, _ := c.RevParse(ctx, "HEAD")
+	if bHead != cHead {
+		t.Fatalf("union not republished: origin=%s local=%s", cHead, bHead)
+	}
+}
+
+// A local-ahead crash-window commit (stranded on local main, remote not advanced)
+// is drained to the remote — the exact recovery for a direct-on-primary publish
+// that committed then died before its push.
+func TestReconcileMainForkDrainsLocalAhead(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "base", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push base: %v", err)
+	}
+	b := cloneOf(t, origin, "b")
+	stranded := commitFile(t, b, "flip", "status\n", "plan flip") // committed, never pushed
+
+	healed, err := b.ReconcileMainFork(ctx, "origin")
+	if err != nil {
+		t.Fatalf("ReconcileMainFork drain: %v", err)
+	}
+	if !healed {
+		t.Fatal("ReconcileMainFork reported no heal on a local-ahead state")
+	}
+	// origin/main now carries the stranded commit (publish completed).
+	c := cloneOf(t, origin, "c")
+	cHead, _ := c.RevParse(ctx, "HEAD")
+	if cHead != stranded {
+		t.Fatalf("stranded local commit not drained to origin: origin=%s want=%s", cHead, stranded)
+	}
+}
+
+// Converged anchors: a pure no-op, no spurious merge, HEAD untouched.
+func TestReconcileMainForkConvergedIsNoop(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	tip := commitFile(t, a, "base", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push base: %v", err)
+	}
+	healed, err := a.ReconcileMainFork(ctx, "origin")
+	if err != nil {
+		t.Fatalf("converged reconcile: %v", err)
+	}
+	if healed {
+		t.Fatal("reported a heal on already-converged anchors")
+	}
+	if got, _ := a.RevParse(ctx, "HEAD"); got != tip {
+		t.Fatalf("converged reconcile moved HEAD: %s != %s", got, tip)
+	}
+}
+
+// Local strictly BEHIND remote on a clean fast-forward: reconcile leaves it to
+// the ff-only pullMain and does NOT author a merge commit.
+func TestReconcileMainForkBehindIsFFNoop(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	base := commitFile(t, a, "base", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push base: %v", err)
+	}
+	b := cloneOf(t, origin, "b") // b sits at base
+	commitFile(t, a, "ahead", "ahead\n", "ahead")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push ahead: %v", err)
+	}
+
+	healed, err := b.ReconcileMainFork(ctx, "origin")
+	if err != nil {
+		t.Fatalf("behind reconcile: %v", err)
+	}
+	if healed {
+		t.Fatal("authored on the clean fast-forward path (should defer to pullMain)")
+	}
+	if got, _ := b.RevParse(ctx, "HEAD"); got != base {
+		t.Fatalf("behind reconcile moved HEAD off base: %s != %s", got, base)
+	}
+}
+
+// local-only hive (remote==""): pure no-op.
+func TestReconcileMainForkNoRemoteIsNoop(t *testing.T) {
+	ctx := context.Background()
+	r := initRepo(t)
+	tip := commitFile(t, r, "f", "v1\n", "v1")
+	healed, err := r.ReconcileMainFork(ctx, "")
+	if err != nil || healed {
+		t.Fatalf("no-remote reconcile = (%v,%v), want (false,nil)", healed, err)
+	}
+	if got, _ := r.RevParse(ctx, "HEAD"); got != tip {
+		t.Fatalf("no-remote reconcile moved HEAD: %s != %s", got, tip)
+	}
+}
+
+// A CONFLICTING fork (both lines edited the same content) is surfaced, never
+// swallowed: err != nil, no heal, the merge is aborted (no half-merged state),
+// and nothing is force-published — origin/main is untouched, awaiting resolution.
+func TestReconcileMainForkSurfacesConflict(t *testing.T) {
+	ctx := context.Background()
+	origin := bareOrigin(t)
+	a := cloneOf(t, origin, "a")
+	commitFile(t, a, "x", "base\n", "base")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push base: %v", err)
+	}
+	b := cloneOf(t, origin, "b")
+	commitFile(t, b, "x", "b-side\n", "b edit") // same file...
+	commitFile(t, a, "x", "remote-side\n", "r edit")
+	if err := a.Push(ctx, "origin", "main"); err != nil {
+		t.Fatalf("a push remote edit: %v", err)
+	}
+	originBefore := func() string { c := cloneOf(t, origin, "peek1"); h, _ := c.RevParse(ctx, "HEAD"); return h }()
+
+	healed, err := b.ReconcileMainFork(ctx, "origin")
+	if err == nil {
+		t.Fatal("conflicting fork did not surface an error (silently swallowed)")
+	}
+	if healed {
+		t.Fatal("reported a heal on a conflicting fork")
+	}
+	if c, _ := b.HasConflict(ctx); c {
+		t.Fatal("left a half-merged conflicted state (merge not aborted)")
+	}
+	after := func() string { c := cloneOf(t, origin, "peek2"); h, _ := c.RevParse(ctx, "HEAD"); return h }()
+	if after != originBefore {
+		t.Fatalf("origin/main mutated on a conflicting fork: before=%s after=%s", originBefore, after)
+	}
+}

@@ -38,9 +38,12 @@ jobs:
       - name: cross-compile static binaries + checksums
         run: |
           mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}"        # the vX.Y.Z tag that triggered this release
+          SHA="${GITHUB_SHA}"
+          LDFLAGS="-s -w -X github.com/spencerharmon/beehive/internal/version.Version=${VERSION} -X github.com/spencerharmon/beehive/internal/version.SHA=${SHA}"
           for bin in beehive beehived honeybee; do
             CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-              go build -trimpath -o dist/$bin-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/$bin
+              go build -trimpath -ldflags "$LDFLAGS" -o dist/$bin-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/$bin
           done
           # hash only the component binaries (never the sums file itself)
           (cd dist && sha256sum beehive-* beehived-* honeybee-* > SHA256SUMS-${{ matrix.goos }}-${{ matrix.goarch }})

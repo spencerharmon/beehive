@@ -39,6 +39,18 @@ CASES=(
     "MainConvergence|MainConvergence_conflict_fixed.cfg|pass"
     "MainConvergence|MainConvergence_conflictloop_buggy.cfg|fail"
     "MainConvergence|MainConvergence_conflictloss_buggy.cfg|fail"
+    # MainConvergeCrash: the crash-window fidelity layer MainConvergence.tla missed
+    # (its PublishConverging advanced BOTH anchors atomically, a primitive git
+    # lacks). Decomposes the direct-on-primary publish into its real ordered steps
+    # (CommitPaths advances LOCAL, then push advances REMOTE) with a crash between.
+    # buggy: current ordering forks (LocalNeverAhead/Reconcilable violated) -- the
+    # 2026-09-16 pillar incident. fixed: reorder (push before advancing local) makes
+    # the fork unreachable. heal_fixed: the SHIPPED defense (D2) -- beehived's
+    # bidirectional reconcile merge-heal recovers every reachable fork with no loss
+    # and always re-converges, even on the current (buggy) ordering.
+    "MainConvergeCrash|MainConvergeCrash_buggy.cfg|fail"
+    "MainConvergeCrash|MainConvergeCrash_fixed.cfg|pass"
+    "MainConvergeCrash|MainConvergeCrash_heal_fixed.cfg|pass"
     "SubmodulePointer|SubmodulePointer_fixed.cfg|pass"
     "SubmodulePointer|SubmodulePointer_buggy.cfg|fail"
     "TaskStatus|TaskStatus_fixed.cfg|pass"

@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 
@@ -12,13 +13,20 @@ import (
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/repo"
 	"github.com/spencerharmon/beehive/internal/swarm"
+	"github.com/spencerharmon/beehive/internal/version"
 	"github.com/spencerharmon/beehive/internal/web"
 )
 
 func main() {
 	root := flag.String("repo", ".", "beehive repo root")
 	addr := flag.String("addr", ":8955", "listen address")
+	showVersion := flag.Bool("version", false, "print the precise beehive version (release + commit) and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
 
 	// Resolve the registry the daemon serves: a present host repos.yaml (a
 	// validated multi-repo registry) or, on a bare single-host install, a
@@ -43,6 +51,12 @@ func main() {
 	if err := s.RecoverEditors(context.Background()); err != nil {
 		log.Printf("editor recovery: %v", err)
 	}
+	// Launch the authoritative background main-fork reconcilers (one per served
+	// repo). The viewer's pullMain is ff-only and cannot cross a fork; these
+	// merge-heal a local/remote main divergence so a crash-window (or external)
+	// fork can never freeze local main permanently. Runs for the life of the
+	// daemon; ListenAndServe below never returns on the happy path.
+	s.StartMainReconcilers(context.Background())
 	// Also finish any session transcripts a failed finalize left as stubs on main
 	// while their real transcript sits on a kept stream branch (the finalize
 	// regression's backlog), for every served repo. Idempotent and best-effort: it

@@ -45,6 +45,10 @@ func run() error {
 	root := "."
 	debug := false
 	for _, a := range os.Args[1:] {
+		if a == "--version" || a == "-version" {
+			fmt.Println(version.String())
+			os.Exit(0)
+		}
 		if a == "--debug" {
 			debug = true
 			continue
