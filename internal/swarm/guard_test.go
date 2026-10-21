@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -102,6 +103,19 @@ func TestGuardGate_NoRegistryAtBaselineIsZeroOverhead(t *testing.T) {
 	hint, err := r.guardGate(context.Background(), guardSel(selectt.Work), t.TempDir(), t.TempDir(), "main")
 	if err != nil || hint != "" {
 		t.Fatalf("absent baseline GUARDS.md must allow, got hint=%q err=%v", hint, err)
+	}
+}
+
+func TestGuardGate_UnresolvedBaselineFailsClosed(t *testing.T) {
+	for _, outcome := range []verifyOutcome{{exitErr: true, out: "unknown revision"}, {}} {
+		t.Run(fmt.Sprintf("exit-error=%v", outcome.exitErr), func(t *testing.T) {
+			git := baseGitFixture("infrastructure/phantom-library-helm/helmrelease-green.yaml\n")
+			git["merge-base HEAD main"] = outcome
+			r := newGuardRunner(git, true, nil)
+			if hint, err := r.guardGate(context.Background(), guardSel(selectt.Work), t.TempDir(), t.TempDir(), "main"); err == nil || !strings.Contains(err.Error(), "baseline") {
+				t.Fatalf("unresolved baseline must fail closed: hint=%q err=%v", hint, err)
+			}
+		})
 	}
 }
 

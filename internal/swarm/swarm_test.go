@@ -4373,6 +4373,9 @@ type gateRec struct {
 
 func (gr *gateRec) run(ctx context.Context, dir, name string, args ...string) (verifyOutcome, error) {
 	gr.calls = append(gr.calls, gateCall{dir: dir, name: name, args: append([]string(nil), args...)})
+	if name == "git" && len(args) > 0 && args[0] == "merge-base" {
+		return verifyOutcome{out: "bee-T1\n"}, nil // resolved, guard-free fixture baseline
+	}
 	if gr.resp != nil {
 		return gr.resp(name, args)
 	}

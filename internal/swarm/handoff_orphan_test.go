@@ -344,7 +344,7 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 			if tc.name == "guard-refused-no-prefetch" {
 				// The remote task branch exists, but its tracking ref is absent
 				// locally: the guard baseline must still be resolved, not skipped.
-				_, _ = wg.Run(ctx, "update-ref", "-d", "refs/remotes/origin/bee-T1")
+				handoffOrphanGit(t, wg, "update-ref", "-d", "refs/remotes/origin/bee-T1")
 				if out, err := wg.Run(ctx, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/bee-T1"); err == nil {
 					t.Fatalf("fixture: tracking ref must be absent, got %s", out)
 				}
@@ -357,6 +357,14 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 			}
 			sha := handoffOrphanGit(t, wg, "rev-parse", "HEAD")
 			tree := handoffOrphanGit(t, wg, "rev-parse", "HEAD^{tree}")
+			if tc.name == "guard-refused-no-prefetch" {
+				if out, err := wg.Run(ctx, "push", "origin", "bee-T1"); err == nil || (!strings.Contains(err.Error(), "fetch first") && !strings.Contains(err.Error(), "non-fast-forward")) {
+					t.Fatalf("expected a rejected plain push: %s %v", out, err)
+				}
+				if out, err := wg.Run(ctx, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/bee-T1"); err == nil {
+					t.Fatalf("rejected push must not populate tracking ref: %s", out)
+				}
+			}
 			for _, pair := range [][2]string{{oldSHA, sha}, {sha, oldSHA}} {
 				if tc.name == "guard-refused-no-prefetch" {
 					break // oldSHA is deliberately not fetched; divergence is by construction

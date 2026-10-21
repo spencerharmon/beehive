@@ -70,13 +70,19 @@ func (r *Runner) guardGate(ctx context.Context, sel *selectt.Selection, checkout
 			if err != nil || rv.exitErr || strings.TrimSpace(rv.out) == "" {
 				return "", fmt.Errorf("guard gate: baseline %s exists on the remote but does not resolve in %s; refusing (fail closed)", baseRef, checkoutDir)
 			}
+		} else {
+			// A new task has no published task ref yet. Do not use a stale
+			// tracking ref left behind by an earlier, deleted attempt.
+			baseRef = branch
 		}
 	}
-	base := baseRef
-	if mb, err := r.runVerify(ctx, checkoutDir, "git", "merge-base", "HEAD", baseRef); err == nil && !mb.exitErr {
-		if s := strings.TrimSpace(mb.out); s != "" {
-			base = s
-		}
+	mb, err := r.runVerify(ctx, checkoutDir, "git", "merge-base", "HEAD", baseRef)
+	if err != nil {
+		return "", fmt.Errorf("guard gate: resolving baseline %s in %s: %w", baseRef, checkoutDir, err)
+	}
+	base := strings.TrimSpace(mb.out)
+	if mb.exitErr || base == "" {
+		return "", fmt.Errorf("guard gate: resolving baseline %s in %s failed; refusing (fail closed): %s", baseRef, checkoutDir, base)
 	}
 
 	// Baseline GUARDS.md. Absent at baseline => no guards => allow (zero overhead).
