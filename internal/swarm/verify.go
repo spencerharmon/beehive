@@ -229,9 +229,10 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	// a bad-object pointer that strands every later review/arbitration (observed
 	// live: chat-editor-fullwidth-panel-layout flipped NEEDS-REVIEW with a local-only
 	// commit, went bad-object, then burned review→arbitration→NEEDS-HUMAN, 2026-07-22).
-	// git.Repo.RemoteContainsCommit fetches remote/<branch> and asks
-	// `merge-base --is-ancestor sha remote/<branch>`, so an unpushed local commit is
-	// REFUSED with the fix-forward "push bee-<taskid> to origin" prompt. A remote-less
+	// git.Repo.RemoteContainsCommit fetches remote/<branch> and checks ancestry.
+	// A divergent prior attempt is reconciled by the runner BEFORE this decision,
+	// otherwise the gate would block the very source publication that repairs it.
+	// Ordinary unpushed work is still refused. A remote-less
 	// local-sharing hive (rem=="") falls back to local existence, which IS durable
 	// there (one shared object database). `commits=none` (len 0) trivially passes; the
 	// clean-checkout gate above already guards an undeclared uncommitted change.
@@ -240,25 +241,10 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	// branch, and stamps the resulting sha — durable by construction. At gate time that
 	// merge does not exist yet and the task still carries the worker's stale tag, so
 	// skip reachability here for those kinds. Work (and any other writer) must have
-	// already pushed the commits it names on its own pass branch.
-	if len(ct.Commits) > 0 && sel.Kind != selectt.Review && sel.Kind != selectt.Arbitrate {
-		if !checkoutExists {
-			return commitsUnreachableFailPrompt(sel.Submodule.Name, ct.Commits[0], ct.Commits), nil
-		}
-		sg := git.New(checkoutDir)
-		rem, err := sg.Remote(ctx)
-		if err != nil {
-			return "", fmt.Errorf("verify gate: resolving submodule %s remote in %s: %w", sel.Submodule.Name, checkoutDir, err)
-		}
-		for _, sha := range ct.Commits {
-			ok, err := sg.RemoteContainsCommit(ctx, rem, branch, sha)
-			if err != nil {
-				return "", fmt.Errorf("verify gate: checking commit %s durability on %s/%s: %w", sha, rem, branch, err)
-			}
-			if !ok {
-				return commitsUnreachableFailPrompt(sel.Submodule.Name, sha, ct.Commits), nil
-			}
-		}
+	// pushed the commits it names on its own pass branch, except for runner-owned
+	// orphan recovery after a non-fast-forward rejection.
+	if len(ct.Commits) > 0 && sel.Kind == selectt.Work && !checkoutExists {
+		return commitsUnreachableFailPrompt(sel.Submodule.Name, ct.Commits[0], ct.Commits), nil
 	}
 
 	// (4.5) Approved-check-framework gate. When this handoff carries a declared
@@ -287,6 +273,13 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	// before it can ever reach review. Infra failure fails closed (returns an error).
 	if sel.Kind == selectt.Work && checkoutExists {
 		if hint, err := r.guardGate(ctx, sel, checkoutDir, hiveAbs, branch); err != nil || hint != "" {
+			return hint, err
+		}
+	}
+	// Reconciliation changes the task ref, so run mutation guards first against
+	// the pre-publication diff, not against the identical local and remote tips.
+	if len(ct.Commits) > 0 && sel.Kind == selectt.Work && checkoutExists {
+		if hint, err := r.gateCommitDurability(ctx, sel, git.New(checkoutDir), branch, ct.Commits, wtAbs != ""); err != nil || hint != "" {
 			return hint, err
 		}
 	}
@@ -320,6 +313,132 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 		}
 	}
 	return "", nil
+}
+
+// gateCommitDurability repairs only the orphan-reclaim exception to the agent's
+// push contract. It never publishes ordinary local-only work, and never counts a
+// successful local reconciliation as durability without verifying the remote.
+func (r *Runner) gateCommitDurability(ctx context.Context, sel *selectt.Selection, sg *git.Repo, branch string, commits []string, privateWorktree bool) (string, error) {
+	rem, err := sg.Remote(ctx)
+	if err != nil {
+		return "", fmt.Errorf("verify gate: resolving submodule remote: %w", err)
+	}
+	var unpublished string
+	for _, sha := range commits {
+		exists, err := sg.CommitReachable(ctx, rem, branch, sha)
+		if err != nil {
+			return "", fmt.Errorf("verify gate: locating commit %s: %w", sha, err)
+		}
+		if !exists {
+			return commitsUnreachableFailPrompt(sel.Submodule.Name, sha, commits), nil
+		}
+		ok, err := sg.RemoteContainsCommit(ctx, rem, branch, sha)
+		if err != nil {
+			return "", fmt.Errorf("verify gate: checking commit %s durability on %s/%s: %w", sha, rem, branch, err)
+		}
+		if !ok {
+			unpublished = sha
+		}
+	}
+	if unpublished == "" {
+		return "", nil
+	}
+
+	// Require a live, genuinely divergent task branch, not a missing branch or
+	// an ordinary local-ahead commit. Validate the entire declared set before any
+	// push, so an unrelated local object cannot ride along with orphan recovery.
+	remoteTip, err := sg.LsRemoteBranch(ctx, rem, branch)
+	if err != nil {
+		return "", fmt.Errorf("verify gate: reading %s/%s: %w", rem, branch, err)
+	}
+	if privateWorktree && remoteTip != "" {
+		if err := sg.Fetch(ctx, rem, branch); err != nil {
+			return "", fmt.Errorf("verify gate: fetching orphan candidate: %w", err)
+		}
+		localTip, err := sg.RevParse(ctx, branch)
+		if err != nil {
+			return "", err
+		}
+		remoteTip, err = sg.RevParse(ctx, rem+"/"+branch)
+		if err != nil {
+			return "", err
+		}
+		remoteAncestor, err := sg.IsAncestor(ctx, remoteTip, localTip)
+		if err != nil {
+			return "", err
+		}
+		localAncestor, err := sg.IsAncestor(ctx, localTip, remoteTip)
+		if err != nil {
+			return "", err
+		}
+		if !remoteAncestor && !localAncestor {
+			for _, sha := range commits {
+				ok, err := sg.IsAncestor(ctx, sha, localTip)
+				if err != nil {
+					return "", err
+				}
+				if !ok {
+					return fmt.Sprintf("Handoff gate FAILED: commit %s exists locally but is not on task branch %s. Preserve the truthful commits tag; the runner cannot publish an unrelated history as this task.", sha, branch), nil
+				}
+			}
+			// Unlike the general race hint, publication must fail CLOSED if the
+			// published claim cannot be read. An unknown owner is not a dead orphan.
+			if r.Publish != nil {
+				ref := "main"
+				if r.Remote != "" {
+					if err := r.Git.Fetch(ctx, r.Remote, "main"); err != nil {
+						return "", fmt.Errorf("verify gate: confirming orphan ownership: %w", err)
+					}
+					ref = r.Remote + "/main"
+				}
+				body, err := r.Git.Show(ctx, ref, "submodules/"+sel.Submodule.Name+"/"+repo.PlanFile)
+				if err != nil {
+					return "", fmt.Errorf("verify gate: reading published orphan claim: %w", err)
+				}
+				p, err := plan.Parse(body)
+				if err != nil {
+					return "", fmt.Errorf("verify gate: parsing published orphan claim: %w", err)
+				}
+				owner := p.Find(sel.Task.ID)
+				if owner == nil || r.Session == "" || owner.Session != r.Session || !owner.Active(r.now(), r.TTL) {
+					return "Handoff gate FAILED: current session does not hold a fresh published claim; orphan publication was not attempted.", nil
+				}
+			}
+			if err := sg.PushBranchReconciled(ctx, rem, branch); err != nil {
+				return fmt.Sprintf("Handoff gate FAILED: commit %s exists locally, but runner-owned orphan reconciliation could not publish %s/%s: %v. Keep the truthful SHAs; do not force-push or reconcile the orphan yourself. If the runner created a local reconciliation commit, a normal plain push can now publish it. Durability must be confirmed before handoff.", unpublished, rem, branch, err), nil
+			}
+			for _, sha := range commits {
+				ok, err := sg.RemoteContainsCommit(ctx, rem, branch, sha)
+				if err != nil {
+					return "", fmt.Errorf("verify gate: checking reconciled commit %s: %w", sha, err)
+				}
+				if !ok {
+					return fmt.Sprintf("Handoff gate FAILED: commit %s exists locally but is still absent from %s/%s after runner-owned reconciliation. Keep the truthful SHAs; remote durability is not established.", sha, rem, branch), nil
+				}
+			}
+			return "", nil
+		}
+	}
+
+	// Diagnostics only: another branch is not the review source and therefore
+	// cannot satisfy this gate, even though its objects are durable on the remote.
+	branches, err := sg.ListRemoteBranches(ctx, rem, "*")
+	if err != nil {
+		return "", fmt.Errorf("verify gate: locating unpublished commit: %w", err)
+	}
+	for _, other := range branches {
+		if other == branch {
+			continue
+		}
+		ok, err := sg.RemoteContainsCommit(ctx, rem, other, unpublished)
+		if err != nil {
+			return "", fmt.Errorf("verify gate: checking alternate branch %s: %w", other, err)
+		}
+		if ok {
+			return fmt.Sprintf("Handoff gate FAILED: commit %s exists on the wrong remote branch %s/%s, not the review source %s/%s. Plain-push %s to %s; keep the truthful SHAs. A divergent task branch is reconciled by the runner, never by an agent force-push.", unpublished, rem, other, rem, branch, branch, rem), nil
+		}
+	}
+	return fmt.Sprintf("Handoff gate FAILED: commit %s exists locally but is unpushed to %s (required review branch %s). Plain-push %s to %s and retain the truthful commits tag and doc header; do not fabricate replacement SHAs or commits=none.", unpublished, rem, branch, branch, rem), nil
 }
 
 // docRecordsCheck reports whether a change doc carries a non-empty `Beehive-Check:`
@@ -495,8 +614,9 @@ func revertedFlipPrompt(hint string, working plan.Status) string {
 // asks the agent to write one), and it never rewrites the doc's prose — only its
 // first-line Beehive-Commits header, and only when that header is absent or
 // disagrees with the actual commits= tag. The submodule commit+push itself
-// remains the agent's (landSourceBranch already owns pushing the branch once the
-// task is accepted; this function only reconciles the BOOKKEEPING artifacts that
+// remains the agent's, except for the gate's runner-owned orphan recovery
+// (landSourceBranch also ensures publication after acceptance). This function
+// only reconciles the BOOKKEEPING artifacts that
 // describe commits already made). Scoped to Work with a code worktree — Review
 // and Arbitrate author their OWN terminal merge as their defining act, a
 // different shape not covered here (mirrors the explicit boundary
@@ -802,11 +922,10 @@ func commitsMismatchFailPrompt(docPath string, plan, doc []string) string {
 func commitsUnreachableFailPrompt(sm, sha string, commits []string) string {
 	return fmt.Sprintf(
 		"Handoff gate FAILED: commit %[2]s referenced by this task (commits=%[3]s) does NOT exist "+
-			"in submodule %[1]s — a flip may never reference a phantom/bad-object commit. Either "+
-			"CREATE the commit (commit your work to the submodule and push the bee-<taskid> branch to "+
-			"its origin THIS session) or UPDATE the `commits=` tag and the doc's Beehive-Commits "+
-			"header to the REAL commit sha(s), then COMMIT the corrected PLAN.md + doc to the hive "+
-			"branch. Then the gate re-runs automatically (leave the status as-is).",
+			"in submodule %[1]s after checking the task branch: the commit object is missing, not merely "+
+			"absent from the required remote branch. Recover the actual commit from its publishing ref "+
+			"or checkout. Preserve truthful SHAs; do not fabricate a replacement or commits=none to bypass "+
+			"the gate. A missing object cannot be accepted for review.",
 		sm, sha, commitsTagValue(commits))
 }
 

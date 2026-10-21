@@ -2698,8 +2698,7 @@ func (r *Runner) pushSourceBranch(ctx context.Context, wg *git.Repo, branch stri
 // demoteUnpushed, returning (warning, true, nil) so the caller reports the pass
 // as NOT completed instead of a phantom done — the runner must never leave a
 // task NEEDS-REVIEW pointing at a commit no reviewer can reach (session-
-// audit-003 F-LIVE). A nil wg (Review/Arbitrate/Bootstrap/Reconcile;
-// pushSourceBranch's own no-op) returns ("", false, nil) same as a clean push.
+// audit-003 F-LIVE). Non-Work passes and a nil wg return ("", false, nil).
 // A push failure on a task that is NOT (or no longer) NEEDS-REVIEW — outside
 // this guard's owned shape, e.g. an agent set a terminal status other than
 // NEEDS-REVIEW, or a peer already resolved it — returns (warning, false, nil):
@@ -2710,6 +2709,9 @@ func (r *Runner) pushSourceBranch(ctx context.Context, wg *git.Repo, branch stri
 // through to report the pass complete in that case would be the exact
 // phantom-done this guard exists to prevent.
 func (r *Runner) landSourceBranch(ctx context.Context, sel *selectt.Selection, wg *git.Repo, branch string) (warning string, demoted bool, err error) {
+	if sel.Kind != selectt.Work {
+		return "", false, nil
+	}
 	w := r.pushSourceBranch(ctx, wg, branch)
 	if w == "" {
 		return "", false, nil
