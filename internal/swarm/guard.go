@@ -46,6 +46,31 @@ func (r *Runner) guardGate(ctx context.Context, sel *selectt.Selection, checkout
 	baseRef := branch
 	if rem != "" {
 		baseRef = rem + "/" + branch
+		// Refresh the tracking ref BEFORE resolving the baseline: a pass branch that
+		// exists on the remote but whose local tracking ref is absent/stale would
+		// otherwise resolve to nothing, read as "no GUARDS.md", and silently allow a
+		// protected change. If the remote has the branch, the baseline MUST resolve
+		// or the gate fails closed.
+		ls, err := r.runVerify(ctx, checkoutDir, "git", "ls-remote", "--heads", rem, "refs/heads/"+branch)
+		if err != nil {
+			return "", fmt.Errorf("guard gate: probing %s/%s in %s: %w", rem, branch, checkoutDir, err)
+		}
+		if ls.exitErr {
+			return "", fmt.Errorf("guard gate: `git ls-remote %s %s` failed in %s: %s", rem, branch, checkoutDir, strings.TrimSpace(ls.out))
+		}
+		if strings.TrimSpace(ls.out) != "" {
+			fe, err := r.runVerify(ctx, checkoutDir, "git", "fetch", "--quiet", rem, "+refs/heads/"+branch+":refs/remotes/"+rem+"/"+branch)
+			if err != nil {
+				return "", fmt.Errorf("guard gate: fetching baseline %s in %s: %w", baseRef, checkoutDir, err)
+			}
+			if fe.exitErr {
+				return "", fmt.Errorf("guard gate: fetching baseline %s failed in %s: %s", baseRef, checkoutDir, strings.TrimSpace(fe.out))
+			}
+			rv, err := r.runVerify(ctx, checkoutDir, "git", "rev-parse", "--verify", "--quiet", baseRef+"^{commit}")
+			if err != nil || rv.exitErr || strings.TrimSpace(rv.out) == "" {
+				return "", fmt.Errorf("guard gate: baseline %s exists on the remote but does not resolve in %s; refusing (fail closed)", baseRef, checkoutDir)
+			}
+		}
 	}
 	base := baseRef
 	if mb, err := r.runVerify(ctx, checkoutDir, "git", "merge-base", "HEAD", baseRef); err == nil && !mb.exitErr {

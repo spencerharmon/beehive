@@ -307,6 +307,7 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 		wantErr bool
 	}{
 		{"guard-refused", "protected-file", false},
+		{"guard-refused-no-prefetch", "protected-file", false},
 		{"missing-plan", "reading published orphan claim", true},
 		{"corrupt-plan", "parsing published orphan claim", true},
 		{"missing-task", "fresh published claim", false},
@@ -320,7 +321,7 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 			r, sel, wtDir, root, _ := durabilityFixture(t, true, false)
 			wg := git.New(wtDir)
 			origin := handoffOrphanGit(t, wg, "remote", "get-url", "origin")
-			if tc.name == "guard-refused" {
+			if strings.HasPrefix(tc.name, "guard-refused") {
 				handoffOrphanWrite(t, filepath.Join(wtDir, "GUARDS.md"), "## protected-file\nProtects: f\nCommand: sh guards/refuse.sh\n")
 				if err := os.MkdirAll(filepath.Join(wtDir, "guards"), 0o755); err != nil {
 					t.Fatal(err)
@@ -340,7 +341,16 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 			}
 			oldSHA := handoffOrphanGit(t, old, "rev-parse", "HEAD")
 			handoffOrphanGit(t, old, "push", "origin", "bee-T1")
-			handoffOrphanGit(t, wg, "fetch", "origin", "bee-T1")
+			if tc.name == "guard-refused-no-prefetch" {
+				// The remote task branch exists, but its tracking ref is absent
+				// locally: the guard baseline must still be resolved, not skipped.
+				_, _ = wg.Run(ctx, "update-ref", "-d", "refs/remotes/origin/bee-T1")
+				if out, err := wg.Run(ctx, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/bee-T1"); err == nil {
+					t.Fatalf("fixture: tracking ref must be absent, got %s", out)
+				}
+			} else {
+				handoffOrphanGit(t, wg, "fetch", "origin", "bee-T1")
+			}
 			handoffOrphanWrite(t, filepath.Join(wtDir, "f"), "current attempt\n")
 			if err := wg.Commit(ctx, "current attempt"); err != nil {
 				t.Fatal(err)
@@ -348,6 +358,9 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 			sha := handoffOrphanGit(t, wg, "rev-parse", "HEAD")
 			tree := handoffOrphanGit(t, wg, "rev-parse", "HEAD^{tree}")
 			for _, pair := range [][2]string{{oldSHA, sha}, {sha, oldSHA}} {
+				if tc.name == "guard-refused-no-prefetch" {
+					break // oldSHA is deliberately not fetched; divergence is by construction
+				}
 				if ok, err := wg.IsAncestor(ctx, pair[0], pair[1]); err != nil || ok {
 					t.Fatalf("fixture must diverge: ancestor=%v err=%v", ok, err)
 				}
