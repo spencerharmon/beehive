@@ -20,6 +20,15 @@ Submodule has ROI.md, no PLAN.md. Bootstrap PLAN.md from intent.
   PLAN.md (with its design doc under that submodule's docs/), register the link
   (`beehive submodule link <this> <other>`), and depend on it as `deps=<other-sm>:<taskid>`.
 - Status each new task TODO. Add a terse design doc per non-trivial task under docs/.
+- **Standing daily measurement is explicit recurrence, not repeated defer.** When ROI calls for
+  ongoing daily checks, give the TODO a real registered `Check:` and an explicit
+  `recurrence=24h` header token. For an existing published TODO, the supported adoption command is
+  `beehive task recur <sm> <id> --every 24h`. Do not infer recurrence from names or retry history.
+  A successful `beehive task cycle <sm> <id>` keeps it TODO, records `cycles=N`, `last_cycle`,
+  `cycle_session`, and schedules `not_before` 24h later. It preserves `defers` (even `defers=12`).
+  Cycles measure clean tracked-tip code; code changes still need review. Recurrence does NOT satisfy
+  downstream DONE deps: model finite delivery/acceptance separately from ongoing measurement.
+  See `docs/standing-task-recurrence.md`; convergence waits remain bounded `task defer` operations.
 - **Give every task a definition of done.** Lower the ROI's success criteria into a machine check per
   task: `beehive task add <sm> <id> --check '<cmd>'` (exit 0 asserts the task's REAL effect),
   `--verify-after-merge '<cmd>'` for a merge-gated effect, or `--check-none` (justified in the body) for

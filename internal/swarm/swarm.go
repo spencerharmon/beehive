@@ -128,6 +128,9 @@ type Runner struct {
 	// so peers can tell a task is actively held (session + fresh heartbeat) versus
 	// free. Must match the token main used for the initial Claim.
 	Session string
+	// Snapshot accepted before publication; conflict resolution must not silently
+	// replace a successful cycle with an older plan and still report completion.
+	acceptedCycle *plan.Task
 	// Publish, when set, advances main to this honeybee's worktree branch and
 	// pushes (conflict-free merge of distinct files). Called after each heartbeat
 	// and at session end so peers converge "as we go". Nil in tests = local only.
@@ -2168,6 +2171,31 @@ func (r *Runner) mainAdvanced(ctx context.Context, sel *selectt.Selection) (bool
 	}
 	switch sel.Kind {
 	case selectt.Bootstrap, selectt.Reconcile:
+	case selectt.Work:
+		expected := r.acceptedCycle
+		b, err := os.ReadFile(sel.Submodule.PlanPath())
+		if err != nil {
+			return false, err
+		}
+		p, err := plan.Parse(string(b))
+		if err != nil {
+			return false, err
+		}
+		t := p.Find(sel.Task.ID)
+		if expected != nil {
+			t = expected
+		}
+		if t == nil || t.Cycles == sel.Task.Cycles {
+			return true, nil
+		}
+		ref := "main"
+		if r.Remote != "" {
+			if err := r.Git.Fetch(ctx, r.Remote, "main"); err != nil {
+				return false, err
+			}
+			ref = r.Remote + "/main"
+		}
+		return r.cycleRecordedAt(sel, t, ref)
 	default:
 		return true, nil
 	}
@@ -2336,6 +2364,10 @@ func (r *Runner) workChecklist(sel *selectt.Selection, branch string) ([]complet
 	// error (fail-loud, never a silent complete) on a phantom dep, so a work pass can
 	// never wedge its task behind a dependency that will never appear.
 	if t.Status == plan.StatusTODO {
+		if t.Cycles != sel.Task.Cycles {
+			recorded, err := r.cycleRecorded(sel, t)
+			return []completionItem{{"successful recurring cycle and next run committed with current-session evidence", recorded}}, err
+		}
 		yielded, err := r.taskYieldedBlocked(sel, p, t)
 		if err != nil {
 			return nil, err
@@ -2431,6 +2463,9 @@ func (r *Runner) taskYieldedBlocked(sel *selectt.Selection, p *plan.Plan, t *pla
 	// MaxDefers the effect is treated as non-converging and the pass must fail loud
 	// so the next pass escalates to NEEDS-HUMAN instead of deferring forever.
 	if !t.NotBefore.IsZero() && t.NotBefore.After(r.now()) {
+		if t.Recurrence != 0 && (t.Defers != sel.Task.Defers+1 || !t.NotBefore.After(sel.Task.NotBefore)) {
+			return false, fmt.Errorf("standing task %s must record a successful cycle or a new bounded defer, not merely move not_before", t.ID)
+		}
 		if t.Defers > plan.MaxDefers {
 			return false, fmt.Errorf("work pass self-deferred task %s past the defer cap (deferred %d times, max %d): its effect has not converged — escalate to NEEDS-HUMAN (`beehive task human`) with the concrete blocker instead of deferring again", t.ID, t.Defers, plan.MaxDefers)
 		}
@@ -3551,10 +3586,18 @@ func (r *Runner) revertGatedFlip(ctx context.Context, sel *selectt.Selection, ab
 	if t == nil {
 		return fmt.Errorf("revert gated flip: task %q absent from %s", sel.Task.ID, planPath)
 	}
-	if t.Status == working {
+	cycle := sel.Kind == selectt.Work && t.Status == plan.TODO && t.Cycles != sel.Task.Cycles
+	if t.Status == working && !cycle {
 		return nil // already reverted (idempotent)
 	}
 	rejected := t.Status
+	if cycle {
+		r.acceptedCycle = nil
+		// Roll back an UNACCEPTED measurement, not historical successful cycles.
+		t.Cycles, t.LastCycle, t.CycleSession = sel.Task.Cycles, sel.Task.LastCycle, sel.Task.CycleSession
+		t.NotBefore = sel.Task.NotBefore
+		t.Claim(r.Session, r.now())
+	}
 	t.Status = working
 	if err := plan.WriteFile(planPath, p); err != nil {
 		return fmt.Errorf("revert gated flip: writing %s: %w", planPath, err)

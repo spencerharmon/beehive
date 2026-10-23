@@ -6,6 +6,24 @@
 > to pick the change up. The code is correct the instant you commit; the observable
 > result lags. It is NOT for ordinary "I'm unsure it works" — that is just testing.
 
+## Standing success is not a defer
+
+For an explicitly opted-in `recurrence=24h` standing TODO whose daily measurement
+is ready, run `beehive task cycle <sm> <id>` in the owning pass. It executes the
+registered `Check:` on a clean tracked-tip code worktree, appends measured output
+to the standard change doc, and commits PLAN + doc locally; the runner publishes.
+Success records `cycles=N`, `last_cycle`, and `cycle_session`, keeps TODO, releases
+the claim, and sets `not_before` 24h later using the runner clock. Failure is not a
+successful cycle. There is no caller-supplied `--until` or fake passed flag.
+
+Adopt a standing TODO via `beehive task recur <sm> <id> --every 24h`, never by
+reopening/resetting it. Adoption and cycles preserve `defers`, including
+`defers=12`. A cycle neither consumes nor replenishes the bounded convergence
+defer budget below. Do not turn a failed check into a cycle or use recurrence to
+evade the defer cap. Code changes still need normal review; cycles are only for
+measurement on clean tracked code. A recurring TODO does not satisfy downstream
+DONE deps. See `docs/standing-task-recurrence.md`.
+
 ## FIRST: is the wait PASSIVE, or must you ACT?
 
 Before you defer anything, answer one question: **will the effect appear on its
@@ -81,14 +99,11 @@ Then:
 - File a DISTINCT follow-on validation task in `PLAN.md` that `deps=` the landing
   task (so it can't run until the change is in), optionally `not_before=` a
   timestamp past expected convergence once that stamp is available in your install.
-- Write that task to **re-defer rather than block** if it runs and the system still
-  hasn't converged: it checks, and if not yet converged it re-files/re-defers
-  instead of failing or spinning. Verification is thus decoupled from the landing
-  pass without ever wedging a pass on an async wait.
-
-This companions the `not_before` runner stamp but does not depend on it: if that
-stamp isn't shipped yet, drop the `not_before=` and rely on `deps=` plus the
-re-defer behavior — it degrades gracefully.
+- If it runs before passive convergence, use `beehive task defer <sm> <id> --until
+  <time> --reason <why>` to re-check later, within the existing bounded defer cap.
+  Never re-file/reset a task to evade that cap. Diagnose non-convergence and file
+  buildable prerequisites; escalate only a genuine human-only blocker. Successful
+  daily standing measurements use `task cycle`, not this convergence-wait path.
 
 ### NEVER escalate merely because verification is async
 

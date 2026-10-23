@@ -138,6 +138,10 @@ func (c *Claimer) Claim(ctx context.Context, taskID string, ts time.Time) error 
 	if t.Active(c.now(), c.TTL) && t.Session != c.Session {
 		return ErrLost // a live bee already holds it
 	}
+	// A selection made before another pass re-armed must not claim that cycle.
+	if t.Status == plan.StatusTODO && !t.NotBeforeReached(c.now()) {
+		return ErrLost
+	}
 	t.Claim(c.Session, ts)
 	if err := c.save(p); err != nil {
 		return err
@@ -178,8 +182,14 @@ func (c *Claimer) verify(ctx context.Context, taskID string) error {
 // Heartbeat re-stamps taskID for this turn. It first pulls main (to observe a
 // competitor or a resolution), then: if the task left `from` status it is
 // ErrResolved; if another live session owns it it is ErrLost; otherwise we
-// re-stamp, commit, and publish (a publish conflict is ErrLost).
+// re-stamp, commit, and publish (a publish conflict is ErrLost). A completed
+// cycle owned by this session is a no-op, leaving validation to the runner.
 func (c *Claimer) Heartbeat(ctx context.Context, taskID string, from plan.Status, ts time.Time) error {
+	unlock, err := c.Git.LockWorktree(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	ts = ts.UTC().Truncate(time.Second)
 	if err := c.syncMain(ctx); err != nil {
 		if errors.Is(err, git.ErrConflict) {
@@ -200,6 +210,12 @@ func (c *Claimer) Heartbeat(ctx context.Context, taskID string, from plan.Status
 	}
 	if t.Session != "" && t.Session != c.Session && t.Active(c.now(), c.TTL) {
 		return ErrLost // another live bee took it while we were away
+	}
+	if t.Status == plan.StatusTODO && c.Session != "" && t.CycleSession == c.Session && t.Cycles > 0 && !t.LastCycle.IsZero() {
+		// CompleteCycle releases the claim without changing TODO. Do not reclaim
+		// it or publish its evidence before RecordCycle and the runner finish.
+		// ErrResolved would let the turn-boundary caller finish prematurely.
+		return nil
 	}
 	t.Claim(c.Session, ts)
 	if err := c.save(p); err != nil {

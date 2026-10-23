@@ -114,6 +114,10 @@ every turn. Your requirements:
   of it. A work task that must defer its own re-check (or the runner on a failed-but-retryable check)
   sets/refreshes `not_before` on its task; you never wait/sleep inside a turn for it. Same layer as
   dep-gating and claim/heartbeat — the selector, not the agent, enforces it.
+- An explicit `recurrence=24h` marks a standing daily measurement obligation. Successful cycles record
+  `cycles=N`, `last_cycle`, and `cycle_session`, then gate the next selection with `not_before` 24h
+  later. The task stays TODO: a cycle does NOT satisfy downstream DONE dependencies. Existing `defers`
+  history is preserved, including `defers=12`; recurrence is not a reset or an unlimited defer budget.
 
 ## The runner does this — don't redo it
 A deterministic runner wraps your turn-loop and OWNS everything below; never reproduce, re-run, or
@@ -169,6 +173,18 @@ gate enforces — do not reproduce them by hand. The only legal edges, each owne
   <t> --reason ...`. Bounded: past the defer cap it must escalate to NEEDS-HUMAN, not defer again. (This
   is the passive-convergence case only — see "Deployed ≠ loaded": if a bounded ACTION of yours produces
   the effect, do it now, do not defer.)
+- `TODO -> TODO` (successful standing cycle) - ONLY for explicit `recurrence=24h`, run
+  `beehive task cycle <sm> <id>` in the owning pass. It resolves the hive/code worktrees, requires
+  the actual non-primary hive branch to match the task claim, and runs the registered `Check:` on
+  clean code at the tracked tip. It appends measured output to the standard change doc and commits
+  PLAN + doc atomically on the local hive branch; the runner publishes. Success rearms TODO for 24h
+  later without consuming or resetting defers. Failure records no successful cycle. No `--until` or
+  fake passed flag exists. This is measurement-only: local code changes, including clean unreviewed
+  commits, still require NEEDS-REVIEW. Never hide changes to make a cycle eligible. Adoption is
+  `beehive task recur <sm> <id> --every 24h`, not reopening or resetting a capped task; see
+  `docs/standing-task-recurrence.md`. The runner independently rechecks before accepting the cycle;
+  a rejected handoff restores its pre-pass cycle state for repair and retry. Stop after the cycle
+  commit just as after a terminal handoff; the runner owns publication and pass completion.
 - `NEEDS-REVIEW → DONE` — review approved (`beehive task status <sm> <id> DONE`, NO `--commits`).
   **Gated on the task's definition of done:** the RUNNER performs the submodule merge, runs the
   task's `Check:` on the MERGED tree, REFUSES the flip (reverts it to NEEDS-REVIEW) unless it exits 0 (or

@@ -132,6 +132,57 @@ func (t *Task) SetVerifyAfterMerge(cmd string) error {
 	return nil
 }
 
+// EnableRecurrence opts a TODO with a real Check into daily cycles without
+// changing its claim, scheduling gate, counters, or history.
+func (t *Task) EnableRecurrence(every time.Duration) error {
+	if every != 24*time.Hour {
+		return fmt.Errorf("plan: only 24h recurrence is supported")
+	}
+	if t.Status != StatusTODO {
+		return fmt.Errorf("plan: only a TODO task may enable recurrence; %s is %s", t.ID, t.Status)
+	}
+	if t.CheckNone || strings.TrimSpace(t.Check()) == "" {
+		return fmt.Errorf("plan: recurring task %s requires a Check command", t.ID)
+	}
+	t.Recurrence = every
+	return nil
+}
+
+func validCycleSession(session string) bool {
+	return len(strings.Fields(session)) == 1 && strings.TrimSpace(session) == session && !strings.ContainsAny(session, "<>\x00")
+}
+
+// CompleteCycle records a successful check and rearms a standing TODO, releasing
+// its claim. The caller must have run the Check successfully. Defers is unchanged.
+func (t *Task) CompleteCycle(session string, now time.Time) error {
+	if t.Status != StatusTODO || t.Recurrence != 24*time.Hour {
+		return fmt.Errorf("plan: task %s must be an opted-in recurring TODO", t.ID)
+	}
+	if t.CheckNone || strings.TrimSpace(t.Check()) == "" {
+		return fmt.Errorf("plan: recurring task %s requires a Check command", t.ID)
+	}
+	if !validCycleSession(session) || session != t.Session || session == t.CycleSession {
+		return fmt.Errorf("plan: task %s cycle requires a new owning session", t.ID)
+	}
+	last := now.UTC().Truncate(time.Second)
+	next := last.Add(t.Recurrence)
+	if now.IsZero() || last.IsZero() || last.Year() < 0 || last.Year() > 9999 || next.Year() > 9999 {
+		return fmt.Errorf("plan: task %s cycle time must be nonzero and RFC3339 representable", t.ID)
+	}
+	if !t.NotBeforeReached(now) || !t.LastCycle.IsZero() && !last.After(t.LastCycle) {
+		return fmt.Errorf("plan: task %s cycle is not due or does not advance last_cycle", t.ID)
+	}
+	if t.Cycles < 0 || t.Cycles == int(^uint(0)>>1) {
+		return fmt.Errorf("plan: task %s cycle counter cannot be incremented", t.ID)
+	}
+	t.Cycles++
+	t.LastCycle = last
+	t.CycleSession = session
+	t.NotBefore = next
+	t.Release()
+	return nil
+}
+
 // Defer records a convergence-wait self-defer: it sets not_before to until (the
 // wall-clock the task becomes selectable again) and increments the defer counter
 // that MaxDefers bounds. It is the mutation behind `beehive task defer` and the
@@ -144,6 +195,9 @@ func (t *Task) Defer(until, now time.Time) error {
 	}
 	if t.Status != StatusTODO {
 		return fmt.Errorf("plan: only a TODO task may be deferred; %s is %s", t.ID, t.Status)
+	}
+	if t.Defers >= MaxDefers {
+		return fmt.Errorf("plan: task %s reached the defer limit (%d)", t.ID, MaxDefers)
 	}
 	t.NotBefore = until
 	t.Defers++
@@ -191,11 +245,16 @@ func (t *Task) ReplaceVerifyAfterMerge(cmd string) error {
 }
 
 // SetCheckNone records an explicit, justified absence of a machine check (clears
-// any `Check:` body first, since the two are mutually exclusive). Behind
+// any `Check:` body first, since the two are mutually exclusive). Recurring tasks
+// require a Check and are rejected without mutation. Behind
 // `beehive task set-check --check-none`.
-func (t *Task) SetCheckNone() {
+func (t *Task) SetCheckNone() error {
+	if t.Recurrence != 0 {
+		return fmt.Errorf("plan: recurring task %s requires a Check command", t.ID)
+	}
 	t.removeBodyField(checkPrefix)
 	t.CheckNone = true
+	return nil
 }
 
 // RemoveDep deletes a dependency from the task, returning whether it was present.

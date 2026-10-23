@@ -31,6 +31,8 @@ func taskCmd() *cobra.Command {
 	c.AddCommand(taskBlockCmd())
 	c.AddCommand(taskCheckCmd())
 	c.AddCommand(taskDeferCmd())
+	c.AddCommand(taskRecurCmd())
+	c.AddCommand(taskCycleCmd())
 	c.AddCommand(taskReopenCmd())
 	c.AddCommand(taskSetCheckCmd())
 	c.AddCommand(taskRetargetDepCmd())
@@ -914,7 +916,7 @@ func mutatePlanTask(cmd *cobra.Command, subArg string, mut func(*plan.Plan) (str
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(planPath, []byte(p.String()), 0o644); err != nil {
+	if err := plan.WriteFile(planPath, p); err != nil {
 		return err
 	}
 	if err := rootGit.CommitAndPublishPrimary(cmd.Context(), remote, subject, planRel); err != nil && err != git.ErrNothing {
@@ -1011,7 +1013,9 @@ func taskSetCheckCmd() *cobra.Command {
 				var subject string
 				switch {
 				case checkNone:
-					t.SetCheckNone()
+					if err := t.SetCheckNone(); err != nil {
+						return "", err
+					}
 					subject = "set check=none on " + t.ID
 				case strings.TrimSpace(vam) != "":
 					if err := t.ReplaceVerifyAfterMerge(vam); err != nil {

@@ -129,8 +129,18 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 		return "", err
 	}
 	t := p.Find(sel.Task.ID)
-	if t == nil || !gatedHandoff(sel.Kind, t.Status) {
+	cycle := t != nil && sel.Kind == selectt.Work && t.Status == plan.TODO && t.Cycles != sel.Task.Cycles
+	if t == nil || (!gatedHandoff(sel.Kind, t.Status) && !cycle) {
 		return "", nil
+	}
+	if cycle {
+		ok, err := r.cycleRecorded(sel, t)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "Recurring cycle requires committed current-session check evidence and its matching re-arm; run beehive task cycle.", nil
+		}
 	}
 
 	// The submodule checkout this pass may have committed into: the code worktree
@@ -156,6 +166,19 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	if checkoutExists {
 		if hint, err := r.gateCleanCheckout(ctx, checkoutDir); err != nil || hint != "" {
 			return hint, err
+		}
+	}
+	if cycle {
+		sha, err := git.New(checkoutDir).Run(ctx, "rev-parse", "HEAD")
+		if err != nil {
+			return "", err
+		}
+		tracked, err := git.New(hiveAbs).Run(ctx, "rev-parse", "HEAD:submodules/"+sel.Submodule.Name+"/repo")
+		if err != nil {
+			return "", err
+		}
+		if sha != tracked {
+			return "Recurring cycle cannot include new code commits; hand code changes off for review.", nil
 		}
 	}
 
@@ -262,6 +285,24 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 			return hint, nil
 		}
 	}
+	if cycle {
+		sha, err := git.New(checkoutDir).Run(ctx, "rev-parse", "HEAD")
+		if err != nil {
+			return "", err
+		}
+		if cycleReceiptSHA(docShow.out, ct) != sha {
+			return "Recurring cycle evidence names different code from the checked worktree.", nil
+		}
+		// A receipt is an audit artifact, not proof that an agent ran the check.
+		// Recheck at acceptance so failed measurements cannot authorize re-arming.
+		out, err := r.runCheckIn(ctx, sel, ct.Check(), checkoutDir)
+		if err != nil || out.exitErr {
+			return fmt.Sprintf("Recurring cycle check FAILED; cycle was not accepted: %v\n%s", err, out.out), nil
+		}
+		if hint, err := r.gateCleanCheckout(ctx, checkoutDir); err != nil || hint != "" {
+			return hint, err
+		}
+	}
 
 	// (4.6) Diff-scoped mutation guards. Independently of the DoD check, the submodule
 	// may declare GUARDS.md (internal/guards): policy commands that REFUSE a change
@@ -311,6 +352,10 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 		if !docRecordsCheck(docShow.out) {
 			return reviewCheckUnrecordedFailPrompt(docPath, t.ID), nil
 		}
+	}
+	if cycle {
+		accepted := *ct
+		r.acceptedCycle = &accepted
 	}
 	return "", nil
 }

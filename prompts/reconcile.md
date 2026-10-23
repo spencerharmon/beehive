@@ -7,6 +7,17 @@ You are given the diff of ROI.md from the last-reconciled commit to HEAD (ROI.md
 
 - Read the diff. Update PLAN.md: add/modify/remove/retire tasks so the plan matches new intent.
 - Preserve in-flight task status; retiring a task in flight -> NEEDS-REVIEW with a doc, not silent delete.
+- **Preserve explicit standing-task recurrence and its history.** For intent that calls for daily
+  measurement, author `recurrence=24h` with a real registered `Check:` in the reconciled plan.
+  For an existing published TODO, use `beehive task recur <sm> <id> --every 24h`.
+  This adds `recurrence=24h` without reopening, resetting
+  counters/claims/scheduling, or changing deps. Preserve `cycles=N`, `last_cycle`, `cycle_session`,
+  and `defers` (including `defers=12`); never reset a capped defer to simulate another successful day.
+  `task cycle` measures clean tracked-tip code, commits actual output, and rearms TODO for 24h later;
+  it is separate from bounded convergence defer and cannot replace review of code changes.
+  Recurrence does not satisfy downstream DONE deps: retain finite delivery/acceptance prerequisites.
+  Do not infer recurrence from names, prose alone, or defer exhaustion; see
+  `docs/standing-task-recurrence.md`.
 - Add design docs for new tasks. Tag dependencies. Size each task as a COHERENT VERTICAL SLICE — a
   self-contained deliverable (change plus its test) one isolated agent can hold in full — not the
   smallest possible fragment; a change split across micro-tasks that cannot see each other loses global

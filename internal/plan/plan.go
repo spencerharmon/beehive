@@ -142,6 +142,13 @@ type Task struct {
 	// spaced re-check/retry) a task or the runner may set/refresh on itself. Zero
 	// means no gate. Serialized as `not_before=<RFC3339>` in the header comment.
 	NotBefore time.Time
+	// Recurrence opts a standing task into daily successful-check cycles; zero
+	// disables recurrence. Cycle history is independent of the defer counter and
+	// survives subsequent status or not_before changes.
+	Recurrence   time.Duration
+	Cycles       int
+	LastCycle    time.Time
+	CycleSession string
 	// ReviewCommit, when non-empty, is the submodule commit sha a completed Work
 	// pass handed to review — the exact commit its NEEDS-REVIEW gitlink bump
 	// points at, recorded DURABLY on the task by the runner (Claimer.
@@ -274,6 +281,13 @@ func Parse(s string) (*Plan, error) {
 		if t.CheckNone && t.Check() != "" {
 			return nil, fmt.Errorf("plan: task %s declares both `check=none` and a `Check:` body command — pick one", t.ID)
 		}
+		if t.Recurrence != 0 && (t.CheckNone || strings.TrimSpace(t.Check()) == "") {
+			return nil, fmt.Errorf("plan: recurring task %s requires a Check command", t.ID)
+		}
+		if t.Cycles == 0 && (!t.LastCycle.IsZero() || t.CycleSession != "") ||
+			t.Cycles > 0 && (t.Recurrence == 0 || t.LastCycle.IsZero() || t.CycleSession == "") {
+			return nil, fmt.Errorf("plan: inconsistent cycle history for %s", t.ID)
+		}
 	}
 	p.Header = trimTrailingBlank(p.Header)
 	return p, nil
@@ -348,6 +362,29 @@ func parseHeader(m []string) (*Task, error) {
 				return nil, fmt.Errorf("plan: bad defers %q for %s", v, t.ID)
 			}
 			t.Defers = n
+		case "recurrence":
+			d, err := time.ParseDuration(v)
+			if err != nil || d != 24*time.Hour {
+				return nil, fmt.Errorf("plan: bad recurrence %q for %s (only 24h is supported)", v, t.ID)
+			}
+			t.Recurrence = d
+		case "cycles":
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("plan: bad cycles %q for %s", v, t.ID)
+			}
+			t.Cycles = n
+		case "last_cycle":
+			ts, err := time.Parse(time.RFC3339, v)
+			if err != nil || ts.IsZero() || ts.UTC().Year() < 0 || ts.UTC().Year() > 9999 {
+				return nil, fmt.Errorf("plan: bad last_cycle %q for %s", v, t.ID)
+			}
+			t.LastCycle = ts
+		case "cycle_session":
+			if !validCycleSession(v) {
+				return nil, fmt.Errorf("plan: bad cycle_session %q for %s", v, t.ID)
+			}
+			t.CycleSession = v
 		case "category":
 			// Stored verbatim; validity is enforced at the write/completion
 			// boundary (RequestHuman, the CLI, the runner completion checks), not
@@ -453,6 +490,22 @@ func (t *Task) header() string {
 	}
 	if t.Defers > 0 {
 		meta += fmt.Sprintf(" defers=%d", t.Defers)
+	}
+	if t.Recurrence != 0 {
+		if t.Recurrence == 24*time.Hour {
+			meta += " recurrence=24h"
+		} else {
+			meta += " recurrence=" + t.Recurrence.String()
+		}
+	}
+	if t.Cycles != 0 {
+		meta += fmt.Sprintf(" cycles=%d", t.Cycles)
+	}
+	if !t.LastCycle.IsZero() {
+		meta += " last_cycle=" + t.LastCycle.UTC().Format(time.RFC3339)
+	}
+	if t.CycleSession != "" {
+		meta += " cycle_session=" + t.CycleSession
 	}
 	return fmt.Sprintf("## %s [%s] <!-- %s -->", t.ID, t.Status, meta)
 }
