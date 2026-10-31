@@ -14,6 +14,9 @@ import (
 // paths and --checkout override inactive/update=none settings, never follow remote
 // branch tips, and refuse local changes that would be overwritten.
 func (r *Repo) PrepareNestedSubmodules(ctx context.Context) error {
+	if err := r.rejectHiddenNestedIndexState(ctx); err != nil {
+		return err
+	}
 	// update uses the index, not HEAD. Reject authored pins/configuration before
 	// it can move a checkout, and inspect all initialized descendants first.
 	staged, err := r.Run(ctx, "diff", "--cached", "--raw", "--ignore-submodules=none")
@@ -87,6 +90,9 @@ func (r *Repo) PrepareNestedSubmodules(ctx context.Context) error {
 // DeinitNestedSubmodules removes only clean derived checkouts before a topology
 // change. Non-force deinit alone does not protect edits in deeper descendants.
 func (r *Repo) DeinitNestedSubmodules(ctx context.Context) error {
+	if err := r.rejectHiddenNestedIndexState(ctx); err != nil {
+		return err
+	}
 	out, err := r.Run(ctx, "submodule", "foreach", "--quiet", "--recursive",
 		"git status --porcelain --untracked-files=all --ignored --ignore-submodules=all && git diff --cached --name-only --ignore-submodules=none")
 	if err != nil {
@@ -123,6 +129,9 @@ func (r *Repo) DeinitNestedSubmodules(ctx context.Context) error {
 // PrepareCleanNestedCheckout repairs derived pin drift only when the parent has
 // no authored changes. It never treats staged gitlinks as disposable state.
 func (r *Repo) PrepareCleanNestedCheckout(ctx context.Context) error {
+	if err := r.rejectHiddenNestedIndexState(ctx); err != nil {
+		return err
+	}
 	if err := r.removeObsoleteNestedCheckouts(ctx); err != nil {
 		return err
 	}
@@ -139,4 +148,26 @@ func (r *Repo) PrepareCleanNestedCheckout(ctx context.Context) error {
 		}
 	}
 	return r.PrepareNestedSubmodules(ctx)
+}
+
+// Status/diff and even non-force deinit trust assume-unchanged/skip-worktree.
+// Inspect the entire initialized tree before any mutation, including the parent
+// index that supplies .gitmodules and gitlinks. Do not clear agent-owned flags.
+func (r *Repo) rejectHiddenNestedIndexState(ctx context.Context) error {
+	for _, args := range [][]string{
+		{"ls-files", "-v", "-z"},
+		{"submodule", "foreach", "--quiet", "--recursive", "git ls-files -v -z"},
+	} {
+		out, err := r.Run(ctx, args...)
+		if err != nil {
+			return fmt.Errorf("inspect nested index state in %s: %w", r.Dir, err)
+		}
+		for _, entry := range strings.Split(out, "\x00") {
+			// -v lowercases assume-unchanged entries; S marks skip-worktree.
+			if entry != "" && (entry[0] == 'S' || entry[0] >= 'a' && entry[0] <= 'z') {
+				return fmt.Errorf("refusing hidden index state in %s or its nested checkouts (assume-unchanged/skip-worktree): %q", r.Dir, entry)
+			}
+		}
+	}
+	return nil
 }
