@@ -1355,6 +1355,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					// NEEDS-REVIEW/TODO and re-prompts; infra error is fail-closed. No-op for
 					// other kinds/flips.
 					if mh, revertTo, merr := r.finalizeReviewMerge(ctx, sel, wtAbs, absRoot); merr != nil {
+						merr = r.failClosedReviewMerge(ctx, sel, absRoot, workingStatus, merr)
 						if ferr := finish(""); ferr != nil {
 							return res, errors.Join(merr, ferr)
 						}
@@ -1587,6 +1588,7 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				// to revert to (NEEDS-REVIEW / TODO) and pushes nothing; an infra error is
 				// fail-closed. No-op for Work, Bootstrap/Reconcile, and non-approve flips.
 				if mh, revertTo, merr := r.finalizeReviewMerge(ctx, sel, wtAbs, absRoot); merr != nil {
+					merr = r.failClosedReviewMerge(ctx, sel, absRoot, workingStatus, merr)
 					if ferr := finish(""); ferr != nil {
 						return res, errors.Join(merr, ferr)
 					}
@@ -3572,6 +3574,19 @@ func (r *Runner) deleteSourceBranch(ctx context.Context, sub repo.Submodule, bra
 // reads `working`, e.g. a peer/prior turn already reverted it); a read/parse
 // failure or a task that vanished under us is reported so the caller fails
 // closed rather than silently leaving a terminal status in place.
+// failClosedReviewMerge durably reverts an approval whose runner-owned merge
+// could not even be attempted (infrastructure failure: e.g. an unavailable
+// nested gitlink) to the pass's working review/arbitration status BEFORE
+// finish publishes the hive branch, so a DONE never lands without its check
+// and merge. It is not a source rejection: attempts are untouched.
+func (r *Runner) failClosedReviewMerge(ctx context.Context, sel *selectt.Selection, absRoot string, working plan.Status, merr error) error {
+	if rerr := r.revertGatedFlip(ctx, sel, absRoot, working); rerr != nil {
+		return errors.Join(merr, rerr)
+	}
+	sel.Task.Status = working
+	return merr
+}
+
 func (r *Runner) revertGatedFlip(ctx context.Context, sel *selectt.Selection, absRoot string, working plan.Status) error {
 	planPath := sel.Submodule.PlanPath()
 	b, err := os.ReadFile(planPath)

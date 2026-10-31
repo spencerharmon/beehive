@@ -35,6 +35,8 @@ type nestedCheckFixture struct {
 	sel                        *selectt.Selection
 	root, wt, origin, marker   string
 	pin, childPin, implementer string
+	// unavailable mode: nested remote dir and the unpublished pin's repository.
+	nested, missing, missingPin string
 }
 
 // Both levels have a newer remote tip than their gitlink. Updating with --remote
@@ -123,12 +125,17 @@ func newNestedCheckFixture(t *testing.T, policy bool, unavailable bool) *nestedC
 	if unavailable {
 		// A real commit in an unrelated object store, absent from the declared
 		// nested remote: cloning succeeds, but fetching this exact gitlink fails.
-		missing := t.TempDir()
-		gitInit(t, missing)
+		// It descends from the valid pin so publishing it later restores a
+		// dependency the real check accepts.
+		missing := filepath.Join(t.TempDir(), "missing")
+		nestedCheckGit(t, code, "clone", "-q", nested, missing)
+		gitConfig(t, missing)
+		nestedCheckGit(t, missing, "checkout", "-q", f.pin)
 		nestedCheckWrite(t, filepath.Join(missing, "unpublished.txt"), "unavailable\n")
 		nestedCheckGit(t, missing, "add", "unpublished.txt")
 		nestedCheckGit(t, missing, "commit", "-qm", "unpublished nested pin")
 		pin = nestedCheckGit(t, missing, "rev-parse", "HEAD")
+		f.nested, f.missing, f.missingPin = nested, missing, pin
 	}
 	nestedCheckGit(t, impl, "update-index", "--cacheinfo", "160000,"+pin+",nested")
 	nestedCheckGit(t, impl, "add", "expected.txt")
