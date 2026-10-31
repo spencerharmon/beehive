@@ -239,13 +239,27 @@ func (r *Runner) finalizeReviewMerge(ctx context.Context, sel *selectt.Selection
 		return "", "", fmt.Errorf("review-merge: resolving merge sha: %w", err)
 	}
 
-	// (3) DoD check on the MERGED tree, before any push.
-	if check := cur.Check(); check != "" && !cur.CheckNone {
+	// (3) Prepare and check each MERGED revision before pushing it, including a
+	// new revision produced by folding in a concurrent tracked-branch advance.
+	checkMerged := func() (string, plan.Status, error) {
+		check := cur.Check()
+		if check == "" || cur.CheckNone {
+			return "", "", nil
+		}
 		o, cerr := r.runCheckIn(ctx, sel, check, wtAbs)
+		if cerr != nil || o.exitErr {
+			// Resetting only the parent leaves prepared dependencies at the rejected
+			// merge's pins, making the next attempt look like uncommitted work.
+			if err := wtg.HardReset(ctx, preHead); err != nil {
+				return "", "", fmt.Errorf("review-merge: restoring pre-check revision: %w", err)
+			}
+			if err := wtg.PrepareNestedSubmodules(ctx); err != nil {
+				return "", "", fmt.Errorf("review-merge: restoring pre-check nested pins: %w", err)
+			}
+		}
 		if cerr != nil {
 			var pv policyViolationError
 			if errors.As(cerr, &pv) {
-				_ = wtg.HardReset(ctx, preHead) // discard the merge
 				return checkPolicyFailPrompt(sel.Task.ID, check, cerr), revertTo, nil
 			}
 			return "", "", fmt.Errorf("review-merge: running DoD check for %s: %w", sel.Task.ID, cerr)
@@ -253,9 +267,12 @@ func (r *Runner) finalizeReviewMerge(ctx context.Context, sel *selectt.Selection
 		if o.exitErr {
 			// Discard the pending merge — it never reaches the tracked origin (on ANY
 			// path: reset to the captured pre-merge HEAD).
-			_ = wtg.HardReset(ctx, preHead)
 			return checkFailPrompt(sel.Task.ID, check, o.out), revertTo, nil
 		}
+		return "", "", nil
+	}
+	if hint, status, err := checkMerged(); hint != "" || err != nil {
+		return hint, status, err
 	}
 
 	// (4) Push the merge to the tracked branch. HEAD contains the tracked tip we
@@ -276,6 +293,9 @@ func (r *Runner) finalizeReviewMerge(ctx context.Context, sel *selectt.Selection
 				}
 				if mergeSHA, err = wtg.RevParse(ctx, "HEAD"); err != nil {
 					return "", "", fmt.Errorf("review-merge: resolving re-merged sha: %w", err)
+				}
+				if hint, status, err := checkMerged(); hint != "" || err != nil {
+					return hint, status, err
 				}
 			}
 			if perr2 := wtg.Push(ctx, rem, "HEAD:refs/heads/"+tracked); perr2 != nil {

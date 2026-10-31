@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,15 +26,8 @@ func (e policyViolationError) Unwrap() error { return e.err }
 // fails CLOSED), and the command runs inside filesystem confinement scoped to the
 // task's OWN submodule checkout (writable) plus its LINKED submodule checkouts and
 // the operator-declared read paths (read-only). It returns the same verifyOutcome
-// the gate/injection consume. legacyDir is the working directory used ONLY on the
-// no-policy path (nil CheckPolicy — tests and un-wired callers), preserving the
-// historical bare `sh -c` behavior byte-for-byte.
+// the gate/injection consume. legacyDir resolves relative checkout/read paths.
 func (r *Runner) runCheck(ctx context.Context, sel *selectt.Selection, check, legacyDir string) (verifyOutcome, error) {
-	if r.CheckPolicy == nil {
-		// Legacy path: no policy configured (tests / not wired). Byte-identical to the
-		// historical gate call — a bare shell in legacyDir, no validation, no sandbox.
-		return r.runVerify(ctx, legacyDir, "sh", "-c", check)
-	}
 	cwd := sel.Submodule.RepoDir()
 	if !filepath.IsAbs(cwd) {
 		cwd = filepath.Join(legacyDir, cwd)
@@ -46,9 +40,6 @@ func (r *Runner) runCheck(ctx context.Context, sel *selectt.Selection, check, le
 // about to push) instead of the submodule's tracked checkout. Same policy/sandbox
 // semantics as runCheck; the legacy (no-policy) path runs a bare shell in cwd.
 func (r *Runner) runCheckIn(ctx context.Context, sel *selectt.Selection, check, cwd string) (verifyOutcome, error) {
-	if r.CheckPolicy == nil {
-		return r.runVerify(ctx, cwd, "sh", "-c", check)
-	}
 	return r.runCheckAt(ctx, sel, check, cwd, cwd)
 }
 
@@ -56,8 +47,22 @@ func (r *Runner) runCheckIn(ctx context.Context, sel *selectt.Selection, check, 
 // denylist (a violation fails CLOSED), resolve the sandbox binds for cwd, and run
 // under confinement. base is the directory used to resolve relative read paths.
 func (r *Runner) runCheckAt(ctx context.Context, sel *selectt.Selection, check, cwd, base string) (verifyOutcome, error) {
-	if err := r.CheckPolicy.Validate(check); err != nil {
-		return verifyOutcome{}, policyViolationError{err: err}
+	if r.CheckPolicy != nil {
+		if err := r.CheckPolicy.Validate(check); err != nil {
+			return verifyOutcome{}, policyViolationError{err: err}
+		}
+	}
+	// Never let Git ascend from an empty gitlink directory to the hive checkout.
+	if !isSourceCheckout(ctx, cwd) {
+		return verifyOutcome{}, fmt.Errorf("prepare task check: no source checkout at %s", cwd)
+	}
+	// Preparation errors are infrastructure failures, not failed tests: recovery
+	// must never reopen valid work because its private dependencies were empty.
+	if err := git.New(cwd).PrepareNestedSubmodules(ctx); err != nil {
+		return verifyOutcome{}, err
+	}
+	if r.CheckPolicy == nil {
+		return r.runVerify(ctx, cwd, "sh", "-c", check)
 	}
 	rw, ro := CheckBinds(ctx, r.Repo, r.Links, sel.Submodule, cwd, base, r.CheckPolicy.ReadPaths)
 	pl, err := r.CheckPolicy.Argv(check, cwd, rw, ro)
