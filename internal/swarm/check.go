@@ -30,8 +30,14 @@ func (e policyViolationError) Unwrap() error { return e.err }
 // historical bare `sh -c` behavior byte-for-byte.
 func (r *Runner) runCheck(ctx context.Context, sel *selectt.Selection, check, legacyDir string) (verifyOutcome, error) {
 	if r.CheckPolicy == nil {
-		// Legacy path: no policy configured (tests / not wired). Byte-identical to the
-		// historical gate call — a bare shell in legacyDir, no validation, no sandbox.
+		// Keep the legacy command cwd, but prepare only the target, never the hive.
+		cwd := sel.Submodule.RepoDir()
+		if !filepath.IsAbs(cwd) {
+			cwd = filepath.Join(legacyDir, cwd)
+		}
+		if err := git.New(cwd).PrepareNestedSubmodules(ctx); err != nil {
+			return verifyOutcome{}, err
+		}
 		return r.runVerify(ctx, legacyDir, "sh", "-c", check)
 	}
 	cwd := sel.Submodule.RepoDir()
@@ -47,6 +53,9 @@ func (r *Runner) runCheck(ctx context.Context, sel *selectt.Selection, check, le
 // semantics as runCheck; the legacy (no-policy) path runs a bare shell in cwd.
 func (r *Runner) runCheckIn(ctx context.Context, sel *selectt.Selection, check, cwd string) (verifyOutcome, error) {
 	if r.CheckPolicy == nil {
+		if err := git.New(cwd).PrepareNestedSubmodules(ctx); err != nil {
+			return verifyOutcome{}, err
+		}
 		return r.runVerify(ctx, cwd, "sh", "-c", check)
 	}
 	return r.runCheckAt(ctx, sel, check, cwd, cwd)
@@ -58,6 +67,9 @@ func (r *Runner) runCheckIn(ctx context.Context, sel *selectt.Selection, check, 
 func (r *Runner) runCheckAt(ctx context.Context, sel *selectt.Selection, check, cwd, base string) (verifyOutcome, error) {
 	if err := r.CheckPolicy.Validate(check); err != nil {
 		return verifyOutcome{}, policyViolationError{err: err}
+	}
+	if err := git.New(cwd).PrepareNestedSubmodules(ctx); err != nil {
+		return verifyOutcome{}, err
 	}
 	rw, ro := CheckBinds(ctx, r.Repo, r.Links, sel.Submodule, cwd, base, r.CheckPolicy.ReadPaths)
 	pl, err := r.CheckPolicy.Argv(check, cwd, rw, ro)

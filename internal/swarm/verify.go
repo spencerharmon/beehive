@@ -164,6 +164,34 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	// all (a pass that touched no submodule code — reachability below still holds
 	// any referenced commit to account, so a `commits=none` handoff is consistent).
 	if checkoutExists {
+		if wtAbs != "" && (sel.Kind == selectt.Review || sel.Kind == selectt.Arbitrate) {
+			if _, err := os.Stat(filepath.Join(checkoutDir, ".gitmodules")); err == nil {
+				// A non-recursive premerge leaves clean nested HEADs at old pins.
+				// Reject authored files and staged gitlinks before reconciling pins,
+				// at every depth. Only unstaged nested HEAD drift is runner-owned.
+				for _, args := range [][]string{
+					{"diff", "--cached", "--name-only", "--ignore-submodules=none"},
+					{"status", "--porcelain", "--ignore-submodules=all"},
+					{"submodule", "foreach", "--quiet", "--recursive", "git diff --cached --name-only --ignore-submodules=none && git status --porcelain --ignore-submodules=all"},
+				} {
+					o, err := r.runVerify(ctx, checkoutDir, "git", args...)
+					if err != nil {
+						return "", fmt.Errorf("verify gate: checking nested source cleanliness: %w", err)
+					}
+					if o.exitErr {
+						return "", fmt.Errorf("verify gate: checking nested source cleanliness: %s", o.out)
+					}
+					if strings.TrimSpace(o.out) != "" {
+						return dirtyTreeFailPrompt(o.out), nil
+					}
+				}
+				if err := git.New(checkoutDir).PrepareNestedSubmodules(ctx); err != nil {
+					return "", err
+				}
+			} else if !os.IsNotExist(err) {
+				return "", fmt.Errorf("verify gate: inspecting nested source: %w", err)
+			}
+		}
 		if hint, err := r.gateCleanCheckout(ctx, checkoutDir); err != nil || hint != "" {
 			return hint, err
 		}

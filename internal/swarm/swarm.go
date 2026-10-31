@@ -852,6 +852,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		}
 	}
 
+	if wtAbs != "" {
+		if err := git.New(wtAbs).PrepareNestedSubmodules(ctx); err != nil {
+			return res, err
+		}
+	}
+
 	// Context preamble: shipped in the binary (NOT the on-disk AGENTS.md, which is
 	// frozen at `beehive init` time), so it stays accurate as the tool evolves. It
 	// is kind-specific: a Work agent gets the code-worktree handoff; a Review or
@@ -1134,6 +1140,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 	recCtx, recStop := context.WithCancel(ctx)
 	recDone := make(chan struct{})
 	go func() { rec.loop(recCtx); close(recDone) }()
+	// A failed gate reversion returns without finish(), which would publish the
+	// unaccepted flip. Stop the recorder on that fail-closed path too.
+	defer func() {
+		recStop()
+		<-recDone
+	}()
 
 	cl := &claim.Claimer{
 		Repo: r.Repo, Sub: sel.Submodule, Git: r.Git, TTL: r.TTL, Now: r.Now,
@@ -1329,6 +1341,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					// merge pushes anything (a gate-rejected handoff must not land code on the
 					// tracked origin).
 					if hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch); gerr != nil {
+						if rerr := r.revertGatedFlip(ctx, sel, absRoot, workingStatus); rerr != nil {
+							return res, errors.Join(gerr, rerr)
+						}
 						if ferr := finish(""); ferr != nil {
 							return res, errors.Join(gerr, ferr)
 						}
@@ -1339,9 +1354,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 						// the rejected terminal value) so the heartbeat/publish path carries
 						// only the legitimate non-terminal status. Tell the agent both facts.
 						if rerr := r.revertGatedFlip(ctx, sel, absRoot, workingStatus); rerr != nil {
-							if ferr := finish(""); ferr != nil {
-								return res, errors.Join(rerr, ferr)
-							}
 							return res, rerr
 						}
 						sel.Task.Status = workingStatus
@@ -1355,15 +1367,15 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					// NEEDS-REVIEW/TODO and re-prompts; infra error is fail-closed. No-op for
 					// other kinds/flips.
 					if mh, revertTo, merr := r.finalizeReviewMerge(ctx, sel, wtAbs, absRoot); merr != nil {
+						if rerr := r.revertGatedFlip(ctx, sel, absRoot, workingStatus); rerr != nil {
+							return res, errors.Join(merr, rerr)
+						}
 						if ferr := finish(""); ferr != nil {
 							return res, errors.Join(merr, ferr)
 						}
 						return res, merr
 					} else if mh != "" {
 						if rerr := r.revertGatedFlip(ctx, sel, absRoot, revertTo); rerr != nil {
-							if ferr := finish(""); ferr != nil {
-								return res, errors.Join(rerr, ferr)
-							}
 							return res, rerr
 						}
 						sel.Task.Status = revertTo
@@ -1556,6 +1568,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			// still land the implementer's code on the tracked origin.
 			hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch)
 			if gerr != nil {
+				if rerr := r.revertGatedFlip(ctx, sel, absRoot, workingStatus); rerr != nil {
+					return res, errors.Join(gerr, rerr)
+				}
 				if ferr := finish(""); ferr != nil {
 					return res, errors.Join(gerr, ferr)
 				}
@@ -1570,9 +1585,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				// that its premature flip was reverted, so it re-requests once the
 				// substance exists instead of thrashing.
 				if rerr := r.revertGatedFlip(ctx, sel, absRoot, workingStatus); rerr != nil {
-					if ferr := finish(""); ferr != nil {
-						return res, errors.Join(rerr, ferr)
-					}
 					return res, rerr
 				}
 				sel.Task.Status = workingStatus
@@ -1587,6 +1599,9 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				// to revert to (NEEDS-REVIEW / TODO) and pushes nothing; an infra error is
 				// fail-closed. No-op for Work, Bootstrap/Reconcile, and non-approve flips.
 				if mh, revertTo, merr := r.finalizeReviewMerge(ctx, sel, wtAbs, absRoot); merr != nil {
+					if rerr := r.revertGatedFlip(ctx, sel, absRoot, workingStatus); rerr != nil {
+						return res, errors.Join(merr, rerr)
+					}
 					if ferr := finish(""); ferr != nil {
 						return res, errors.Join(merr, ferr)
 					}
@@ -1594,9 +1609,6 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				} else if mh != "" {
 					done = false
 					if rerr := r.revertGatedFlip(ctx, sel, absRoot, revertTo); rerr != nil {
-						if ferr := finish(""); ferr != nil {
-							return res, errors.Join(rerr, ferr)
-						}
 						return res, rerr
 					}
 					sel.Task.Status = revertTo
