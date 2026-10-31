@@ -128,6 +128,9 @@ func (r *Runner) finalizeReviewMerge(ctx context.Context, sel *selectt.Selection
 		return "", "", nil
 	}
 	wtg := git.New(wtAbs)
+	if err := wtg.PrepareCleanNestedCheckout(ctx); err != nil {
+		return "", "", fmt.Errorf("review-merge: preparing reused nested checkout: %w", err)
+	}
 
 	// An unresolved/mid-resolution merge left by a PRIOR conflict hand-back: the
 	// worktree is dirty. Do not attempt more git plumbing on top of it — tell the
@@ -200,6 +203,11 @@ func (r *Runner) finalizeReviewMerge(ctx context.Context, sel *selectt.Selection
 	if err != nil {
 		return "", "", fmt.Errorf("review-merge: resolving tracked base %q: %w", trackedRef, err)
 	}
+	// Remove clean dependency checkouts while their paths are still registered.
+	// A merge (or a subsequent nested checkout) can remove those gitlinks entirely.
+	if err := wtg.DeinitNestedSubmodules(ctx); err != nil {
+		return "", "", fmt.Errorf("review-merge: preparing merge topology: %w", err)
+	}
 
 	// (1) Fold in a tracked-branch tip that advanced since the worktree was cut, so
 	// the eventual push is a fast-forward.
@@ -248,13 +256,22 @@ func (r *Runner) finalizeReviewMerge(ctx context.Context, sel *selectt.Selection
 		}
 		o, cerr := r.runCheckIn(ctx, sel, check, wtAbs)
 		if cerr != nil || o.exitErr {
-			// Resetting only the parent leaves prepared dependencies at the rejected
-			// merge's pins, making the next attempt look like uncommitted work.
+			checkErr := cerr
+			if checkErr == nil {
+				checkErr = errors.New(checkFailPrompt(sel.Task.ID, check, o.out))
+			} else if o.out != "" {
+				checkErr = fmt.Errorf("%w\nCheck output:\n%s", checkErr, o.out)
+			}
+			// Deinit BEFORE reset: added gitlinks disappear from the index on reset
+			// and would otherwise survive as untracked repositories, blocking retry.
+			if err := wtg.DeinitNestedSubmodules(ctx); err != nil {
+				return "", "", errors.Join(checkErr, fmt.Errorf("review-merge: restoring pre-check topology: %w", err))
+			}
 			if err := wtg.HardReset(ctx, preHead); err != nil {
-				return "", "", fmt.Errorf("review-merge: restoring pre-check revision: %w", err)
+				return "", "", errors.Join(checkErr, fmt.Errorf("review-merge: restoring pre-check revision: %w", err))
 			}
 			if err := wtg.PrepareNestedSubmodules(ctx); err != nil {
-				return "", "", fmt.Errorf("review-merge: restoring pre-check nested pins: %w", err)
+				return "", "", errors.Join(checkErr, fmt.Errorf("review-merge: restoring pre-check nested pins: %w", err))
 			}
 		}
 		if cerr != nil {
@@ -285,6 +302,9 @@ func (r *Runner) finalizeReviewMerge(ctx context.Context, sel *selectt.Selection
 				return "", "", fmt.Errorf("review-merge: re-fetching tracked branch after rejected push: %w", ferr)
 			}
 			if a, e := wtg.IsAncestor(ctx, trackedRef, "HEAD"); e == nil && !a {
+				if err := wtg.DeinitNestedSubmodules(ctx); err != nil {
+					return "", "", fmt.Errorf("review-merge: preparing retry merge topology: %w", err)
+				}
 				if merr := wtg.Merge(ctx, trackedRef); merr != nil {
 					if errors.Is(merr, git.ErrConflict) {
 						return conflictReviewHint(sel, wtAbs, tracked, "the tracked branch advanced concurrently and conflicts"), revertTo, nil

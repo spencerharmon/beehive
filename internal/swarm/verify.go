@@ -164,6 +164,13 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	// all (a pass that touched no submodule code — reachability below still holds
 	// any referenced commit to account, so a `commits=none` handoff is consistent).
 	if checkoutExists {
+		// Only repair a handed private worktree. The no-worktree fallback below
+		// observes the shared source checkout and must never materialize it.
+		if wtAbs != "" && isSourceCheckout(ctx, checkoutDir) {
+			if err := git.New(checkoutDir).PrepareCleanNestedCheckout(ctx); err != nil {
+				return "", fmt.Errorf("verify gate: preparing reused nested checkout: %w", err)
+			}
+		}
 		if hint, err := r.gateCleanCheckout(ctx, checkoutDir); err != nil || hint != "" {
 			return hint, err
 		}
