@@ -1355,7 +1355,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					// NEEDS-REVIEW/TODO and re-prompts; infra error is fail-closed. No-op for
 					// other kinds/flips.
 					if mh, revertTo, merr := r.finalizeReviewMerge(ctx, sel, wtAbs, absRoot); merr != nil {
-						merr = r.failClosedReviewMerge(ctx, sel, absRoot, workingStatus, merr)
+						merr, durable := r.failClosedReviewMerge(ctx, sel, absRoot, workingStatus, merr)
+						if !durable {
+							// The DONE may still be committed: never publish it.
+							if ferr := finishTranscript(""); ferr != nil {
+								return res, errors.Join(merr, ferr)
+							}
+							return res, merr
+						}
 						if ferr := finish(""); ferr != nil {
 							return res, errors.Join(merr, ferr)
 						}
@@ -1588,7 +1595,14 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 				// to revert to (NEEDS-REVIEW / TODO) and pushes nothing; an infra error is
 				// fail-closed. No-op for Work, Bootstrap/Reconcile, and non-approve flips.
 				if mh, revertTo, merr := r.finalizeReviewMerge(ctx, sel, wtAbs, absRoot); merr != nil {
-					merr = r.failClosedReviewMerge(ctx, sel, absRoot, workingStatus, merr)
+					merr, durable := r.failClosedReviewMerge(ctx, sel, absRoot, workingStatus, merr)
+					if !durable {
+						// The DONE may still be committed: never publish it.
+						if ferr := finishTranscript(""); ferr != nil {
+							return res, errors.Join(merr, ferr)
+						}
+						return res, merr
+					}
 					if ferr := finish(""); ferr != nil {
 						return res, errors.Join(merr, ferr)
 					}
@@ -3561,6 +3575,26 @@ func (r *Runner) deleteSourceBranch(ctx context.Context, sub repo.Submodule, bra
 	return ""
 }
 
+// failClosedReviewMerge durably reverts an approval whose runner-owned merge
+// could not even be attempted (infrastructure failure: e.g. an unavailable
+// nested gitlink) to the pass's working review/arbitration status BEFORE
+// finish publishes the hive branch, so a DONE never lands without its check
+// and merge. It is not a source rejection: attempts are untouched. durable is
+// false when the reversion could not be written AND committed; the caller must
+// then suppress task-branch publication entirely (the committed HEAD may still
+// carry the unverified DONE) and finalize only the transcript.
+func (r *Runner) failClosedReviewMerge(ctx context.Context, sel *selectt.Selection, absRoot string, working plan.Status, merr error) (err error, durable bool) {
+	if rerr := r.revertGatedFlip(ctx, sel, absRoot, working); rerr != nil {
+		return errors.Join(merr, fmt.Errorf("task branch publication suppressed: %w", rerr)), false
+	}
+	sel.Task.Status = working
+	return merr, true
+}
+
+// writePlanFile is plan.WriteFile; a seam so tests can inject a reversion
+// write failure.
+var writePlanFile = plan.WriteFile
+
 // revertGatedFlip implements REVERT-OVER-PIN: when the handoff gate rejects a
 // premature terminal flip (NEEDS-REVIEW/NEEDS-ARBITRATION/DONE/TODO the agent
 // wrote on disk without earning it), the on-disk PLAN.md status is reverted to
@@ -3574,19 +3608,6 @@ func (r *Runner) deleteSourceBranch(ctx context.Context, sub repo.Submodule, bra
 // reads `working`, e.g. a peer/prior turn already reverted it); a read/parse
 // failure or a task that vanished under us is reported so the caller fails
 // closed rather than silently leaving a terminal status in place.
-// failClosedReviewMerge durably reverts an approval whose runner-owned merge
-// could not even be attempted (infrastructure failure: e.g. an unavailable
-// nested gitlink) to the pass's working review/arbitration status BEFORE
-// finish publishes the hive branch, so a DONE never lands without its check
-// and merge. It is not a source rejection: attempts are untouched.
-func (r *Runner) failClosedReviewMerge(ctx context.Context, sel *selectt.Selection, absRoot string, working plan.Status, merr error) error {
-	if rerr := r.revertGatedFlip(ctx, sel, absRoot, working); rerr != nil {
-		return errors.Join(merr, rerr)
-	}
-	sel.Task.Status = working
-	return merr
-}
-
 func (r *Runner) revertGatedFlip(ctx context.Context, sel *selectt.Selection, absRoot string, working plan.Status) error {
 	planPath := sel.Submodule.PlanPath()
 	b, err := os.ReadFile(planPath)
@@ -3614,7 +3635,7 @@ func (r *Runner) revertGatedFlip(ctx context.Context, sel *selectt.Selection, ab
 		t.Claim(r.Session, r.now())
 	}
 	t.Status = working
-	if err := plan.WriteFile(planPath, p); err != nil {
+	if err := writePlanFile(planPath, p); err != nil {
 		return fmt.Errorf("revert gated flip: writing %s: %w", planPath, err)
 	}
 	rel, err := filepath.Rel(absRoot, planPath)
