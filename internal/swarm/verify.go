@@ -168,7 +168,7 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 		// observes the shared source checkout and must never materialize it.
 		if wtAbs != "" && isSourceCheckout(ctx, checkoutDir) {
 			if err := git.New(checkoutDir).PrepareCleanNestedCheckout(ctx); err != nil {
-				return "", fmt.Errorf("verify gate: preparing reused nested checkout: %w", err)
+				return "", handoffPrepError{fmt.Errorf("verify gate: preparing reused nested checkout: %w", err)}
 			}
 		}
 		if hint, err := r.gateCleanCheckout(ctx, checkoutDir); err != nil || hint != "" {
@@ -1041,3 +1041,13 @@ func (r *Runner) checkGroundTruth(ctx context.Context, sel *selectt.Selection, h
 			"%[1]s %[2]s `Check:` was `%[3]s`; output:\n\n%[4]s\n\n",
 		status, guidance, oneLineCheck(check), out)
 }
+
+// handoffPrepError marks a verify-gate failure to PREPARE the handed private
+// checkout (nested pins unavailable, dirty/hidden nested tracked content). The
+// terminal flip may already be committed, so callers must fail closed exactly
+// like a review-merge infrastructure error: durably revert before publishing,
+// or suppress publication when the reversion cannot be committed.
+type handoffPrepError struct{ err error }
+
+func (e handoffPrepError) Error() string { return e.err.Error() }
+func (e handoffPrepError) Unwrap() error { return e.err }

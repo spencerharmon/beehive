@@ -1329,6 +1329,17 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 					// merge pushes anything (a gate-rejected handoff must not land code on the
 					// tracked origin).
 					if hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch); gerr != nil {
+						var perr handoffPrepError
+						if errors.As(gerr, &perr) {
+							var durable bool
+							gerr, durable = r.failClosedReviewMerge(ctx, sel, absRoot, workingStatus, gerr)
+							if !durable {
+								if ferr := finishTranscript(""); ferr != nil {
+									return res, errors.Join(gerr, ferr)
+								}
+								return res, gerr
+							}
+						}
 						if ferr := finish(""); ferr != nil {
 							return res, errors.Join(gerr, ferr)
 						}
@@ -1564,6 +1575,18 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 			// still land the implementer's code on the tracked origin.
 			hint, gerr := r.verifyGate(ctx, sel, wtAbs, absRoot, res.Branch)
 			if gerr != nil {
+				var perr handoffPrepError
+				if errors.As(gerr, &perr) {
+					var durable bool
+					gerr, durable = r.failClosedReviewMerge(ctx, sel, absRoot, workingStatus, gerr)
+					if !durable {
+						// The terminal flip may still be committed: never publish it.
+						if ferr := finishTranscript(""); ferr != nil {
+							return res, errors.Join(gerr, ferr)
+						}
+						return res, gerr
+					}
+				}
 				if ferr := finish(""); ferr != nil {
 					return res, errors.Join(gerr, ferr)
 				}
