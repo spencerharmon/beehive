@@ -393,6 +393,80 @@ func TestCheckRefusesEmptySourceCheckout(t *testing.T) {
 	}
 }
 
+func TestTaskCheckPreparesFreshAndReusedNestedWorktree(t *testing.T) {
+	f := newNestedCheckFixture(t, false, false)
+	ctx := context.Background()
+	code := f.sel.Submodule.RepoDir()
+	otherHead := nestedCheckGit(t, code, "rev-parse", "HEAD")
+	otherPins := nestedCheckGit(t, code, "submodule", "status", "--recursive")
+	wt := filepath.Join(t.TempDir(), "task")
+	nestedCheckGit(t, code, "worktree", "add", "--detach", wt, "HEAD")
+	entries, err := os.ReadDir(filepath.Join(wt, "nested"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("fresh task worktree must have empty nested source: %v %v", entries, err)
+	}
+	check := f.task(t).Check()
+	// Negative control: this same real check cannot pass on empty dependencies.
+	if o, err := realRunVerify(ctx, wt, "sh", "-c", check); err != nil || !o.exitErr {
+		t.Fatalf("unprepared check must fail: %+v %v", o, err)
+	}
+	nestedCheckGit(t, wt, "fetch", "origin", "bee-R1")
+	for _, revision := range []string{"HEAD", f.implementer, f.implementer} {
+		nestedCheckGit(t, wt, "checkout", "--detach", revision)
+		parent := nestedCheckGit(t, wt, "rev-parse", "HEAD")
+		o, err := f.r.runCheckIn(ctx, f.sel, check, wt)
+		if err != nil || o.exitErr {
+			t.Fatalf("prepared task check at %s failed: %+v %v", revision, o, err)
+		}
+		if got := nestedCheckGit(t, wt, "rev-parse", "HEAD"); got != parent {
+			t.Fatalf("preparation moved parent: %s -> %s", parent, got)
+		}
+		if got := nestedCheckGit(t, wt, "status", "--porcelain"); got != "" {
+			t.Fatalf("preparation left stale pins: %s", got)
+		}
+	}
+	f.assertPins(t, wt)
+	if got := nestedCheckGit(t, code, "rev-parse", "HEAD"); got != otherHead {
+		t.Errorf("preparation moved original parent: %s -> %s", otherHead, got)
+	}
+	if got := nestedCheckGit(t, code, "submodule", "status", "--recursive"); got != otherPins {
+		t.Errorf("preparation changed original nested checkout: %s -> %s", otherPins, got)
+	}
+}
+
+// Opt-in operational probe: clone without dependencies, then execute the supplied
+// check through the runner's real preparation and sandbox boundary. No task state
+// or existing checkout is modified; ordinary CI uses the local fixtures above.
+func TestLiveNestedTaskCheck(t *testing.T) {
+	url := os.Getenv("BEEHIVE_NESTED_CHECK_REPOSITORY")
+	if url == "" {
+		t.Skip("set BEEHIVE_NESTED_CHECK_REPOSITORY and BEEHIVE_NESTED_CHECK_COMMAND")
+	}
+	check := os.Getenv("BEEHIVE_NESTED_CHECK_COMMAND")
+	if check == "" {
+		t.Fatal("BEEHIVE_NESTED_CHECK_COMMAND is required")
+	}
+	root := t.TempDir()
+	wt := filepath.Join(root, "source")
+	nestedCheckGit(t, root, "clone", "--no-recurse-submodules", url, wt)
+	parent := nestedCheckGit(t, wt, "rev-parse", "HEAD")
+	before := nestedCheckGit(t, wt, "submodule", "status")
+	if !strings.Contains(before, "-") {
+		t.Fatalf("probe requires initially uninitialized nested source: %s", before)
+	}
+	t.Logf("fresh parent %s; initial nested status:\n%s", parent, before)
+	r := &Runner{CheckPolicy: &checkpolicy.Policy{Sandbox: checkpolicy.SandboxAuto}}
+	o, err := r.runCheckIn(context.Background(), &selectt.Selection{}, check, wt)
+	t.Logf("Check: %s\n%s", check, o.out)
+	if err != nil || o.exitErr {
+		t.Fatalf("runner-prepared check failed: %+v %v", o, err)
+	}
+	if got := nestedCheckGit(t, wt, "rev-parse", "HEAD"); got != parent {
+		t.Fatalf("preparation moved parent: %s -> %s", parent, got)
+	}
+	t.Logf("prepared nested status:\n%s", nestedCheckGit(t, wt, "submodule", "status", "--recursive"))
+}
+
 func TestReviewMergePushRetryRechecksNestedPins(t *testing.T) {
 	for _, policy := range []bool{false, true} {
 		t.Run(fmt.Sprintf("policy=%t", policy), func(t *testing.T) {
