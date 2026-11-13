@@ -43,6 +43,7 @@ func main() {
 		lintCmd(),
 		auditCmd(),
 		instructionCmd(),
+		alertmanagerCmd(),
 	)
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "beehive:", err)

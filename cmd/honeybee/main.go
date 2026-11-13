@@ -77,6 +77,11 @@ func run() error {
 		return err
 	}
 	primary := git.New(primaryRoot)
+	// Repo-local outcome evidence for the swarm-health alerts (beehived reads it;
+	// recording is local-file-only and can never change this pass's behavior).
+	// Pre-session outcomes are attributed to this process id.
+	health := newHealth(ctx, primaryRoot)
+	preSession := fmt.Sprintf("honeybee-pid-%d", os.Getpid())
 	remote, err := primary.Remote(ctx)
 	if err != nil {
 		return err
@@ -111,6 +116,8 @@ func run() error {
 		mode = "remote-sharing"
 	}
 	if healed, herr := primary.EnsureCleanCheckout(ctx); herr != nil {
+		herr = fmt.Errorf("dirty-tree heal: %w", herr)
+		health.preflight(preSession, herr)
 		return fmt.Errorf("preflight: %s checkout at %s is dirty and cannot be reset to a clean projection of HEAD (%w); aborting before starting the agent — investigate the honeybee/beehived process or protocol", mode, primaryRoot, herr)
 	} else if healed {
 		fmt.Fprintf(os.Stderr, "honeybee: WARNING preflight reset a dirty %s checkout at %s to HEAD before starting; a dirty live checkout is not normal and signals a honeybee/beehived protocol or process bug (or a rogue model writing outside its worktree)\n", mode, primaryRoot)
@@ -134,6 +141,7 @@ func run() error {
 			if c.AbortsOnRemoteFailure() {
 				// Remote-sharing pull failure: work done without being able to catch up is
 				// invalid, so this is fatal at startup (no LLM is started).
+				health.preflight(preSession, fmt.Errorf("pull %s main: %w", remote, err))
 				return fmt.Errorf("preflight: %s cannot pull %s main (%w); aborting before starting the agent", mode, remote, err)
 			}
 			// abort_on_remote_failure=false: the operator's escape hatch for a remote
@@ -153,8 +161,11 @@ func run() error {
 	}
 	baseMain, err := primary.RevParse(ctx, base)
 	if err != nil {
-		return fmt.Errorf("resolve %s: %w", base, err)
+		err = fmt.Errorf("resolve %s: %w", base, err)
+		health.preflight(preSession, err)
+		return err
 	}
+	health.preflight(preSession, nil)
 
 	// Select once on the primary checkout to learn which submodule we'll work, so
 	// the worktrees can be named <submodule>-<epoch> and are easy for an operator
@@ -252,7 +263,7 @@ func run() error {
 		return err
 	}
 	gitRepo := git.New(wtPath)
-	publish := func(ctx context.Context) error {
+	publish := health.wrapPublish(wtBranch, func(ctx context.Context) error {
 		if err := gitRepo.PublishToMain(ctx, remote); err != nil {
 			return err
 		}
@@ -266,7 +277,7 @@ func run() error {
 			}
 		}
 		return nil
-	}
+	})
 	sessGit := git.New(sessPath)
 	sessPublish := func(ctx context.Context) error { return sessGit.PublishToMain(ctx, remote) }
 	// When the hive has a remote, push the isolated session branch to it on every
@@ -484,6 +495,7 @@ func run() error {
 				eff.AgentURL, eff.Model, sel.Kind, wtPath, remote)
 		}
 		res, err := runner.Run(ctx, sel, honeybeeProtocol(primaryRoot), firstPrompt(sel))
+		health.pass(sel.Submodule.Name, session, res, err)
 		if err != nil {
 			return err
 		}

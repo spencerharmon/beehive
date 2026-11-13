@@ -20,25 +20,36 @@
 // When a task leaves NEEDS-HUMAN its alert is sent once with endsAt = now; a
 // failed resolution is retained and retried until delivered.
 //
-// Restart/recovery: the notifier keeps no persistent state. On start it
-// reconciles from the repository: every currently-committed NEEDS-HUMAN task is
-// (re)fired immediately (Alertmanager merges it into the existing alert by
-// fingerprint). A task that left NEEDS-HUMAN while beehived was down is resolved
+// Restart/recovery: on start the notifier reconciles from the repository:
+// every currently-desired alert is (re)fired immediately (Alertmanager merges it
+// into the existing alert by fingerprint). With StatePath set (beehived sets it
+// to <git-common-dir>/beehive/alertmanager-sent.json) the last delivered firing
+// set is reloaded, so an alert whose condition cleared while beehived was down
+// is explicitly resolved on the first tick; without it, such an alert resolves
 // by expiry of the endsAt its last refresh carried (<= 4*Refresh later).
+//
+// Sources: BeehiveNeedsHuman (committed PLAN.md) plus BeehiveSwarmWedged and
+// BeehivePassFailing (repo-local pass outcome evidence, see health.go), all
+// through this one emitter.
 package alertmanager
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/spencerharmon/beehive/internal/fsatomic"
 )
 
 // Alert is one Alertmanager v2 postable alert.
@@ -133,6 +144,11 @@ type Notifier struct {
 	MinBackoff time.Duration
 	MaxBackoff time.Duration
 	Logf       func(format string, args ...any)
+	// StatePath, when set, persists the firing set after each delivery so a
+	// restarted (or one-shot) notifier still sends an explicit endsAt=now for an
+	// alert whose condition cleared while it was not running. Best-effort: a
+	// load/save failure is logged and never blocks delivery.
+	StatePath string
 
 	mu       sync.Mutex
 	active   map[string]Alert // key -> last firing alert (startsAt preserved)
@@ -166,6 +182,7 @@ func (n *Notifier) defaults() {
 		n.active = map[string]Alert{}
 		n.resolve = map[string]Alert{}
 		n.dirty = true // first tick after (re)start always reconciles
+		n.loadState()
 	}
 }
 
@@ -246,7 +263,49 @@ func (n *Notifier) Tick(ctx context.Context) error {
 	n.dirty = false
 	n.lastSent = now
 	n.resolve = map[string]Alert{}
+	n.saveState()
 	return nil
+}
+
+func (n *Notifier) loadState() {
+	if n.StatePath == "" {
+		return
+	}
+	b, err := os.ReadFile(n.StatePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	var prev []Alert
+	if err == nil {
+		err = json.Unmarshal(b, &prev)
+	}
+	if err != nil {
+		n.Logf("alertmanager: load notifier state %s: %v", n.StatePath, err)
+		return
+	}
+	for _, a := range prev {
+		n.active[Key(a.Labels)] = a
+	}
+}
+
+func (n *Notifier) saveState() {
+	if n.StatePath == "" {
+		return
+	}
+	list := make([]Alert, 0, len(n.active))
+	for _, a := range n.active {
+		list = append(list, a)
+	}
+	sort.Slice(list, func(i, j int) bool { return Key(list[i].Labels) < Key(list[j].Labels) })
+	b, err := json.Marshal(list)
+	if err == nil {
+		if err = os.MkdirAll(filepath.Dir(n.StatePath), 0o755); err == nil {
+			err = fsatomic.WriteFile(n.StatePath, b, 0o644)
+		}
+	}
+	if err != nil {
+		n.Logf("alertmanager: save notifier state %s: %v", n.StatePath, err)
+	}
 }
 
 // Run ticks every interval until ctx is done. interval should be well under
