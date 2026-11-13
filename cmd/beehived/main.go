@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/spencerharmon/beehive/internal/alertmanager"
 	"github.com/spencerharmon/beehive/internal/config"
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/repo"
@@ -20,6 +21,7 @@ import (
 func main() {
 	root := flag.String("repo", ".", "beehive repo root")
 	addr := flag.String("addr", ":8955", "listen address")
+	externalURL := flag.String("external-url", "", "beehived's external base URL, used as Alertmanager generatorURL (optional)")
 	showVersion := flag.Bool("version", false, "print the precise beehive version (release + commit) and exit")
 	flag.Parse()
 
@@ -62,6 +64,17 @@ func main() {
 	// regression's backlog), for every served repo. Idempotent and best-effort: it
 	// promotes only what it can source from a surviving branch, never fabricates,
 	// and never stops the daemon from serving.
+	// Optional outbound-only Alertmanager notifications (alertmanager_url in
+	// config.yaml), derived from committed repo state; asynchronous, never on a
+	// pass path. Unset = disabled with one startup log line per repo.
+	for _, e := range reg.Repos {
+		cfg, err := config.Resolve(e.Root, "")
+		if err != nil {
+			log.Printf("alertmanager: resolve config for %s: %v", e.Name, err)
+			continue
+		}
+		alertmanager.Start(context.Background(), cfg.AlertmanagerURL, e.Root, e.Name, *externalURL)
+	}
 	for _, e := range reg.Repos {
 		sweepSessions(context.Background(), e.Root)
 	}

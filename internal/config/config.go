@@ -141,6 +141,14 @@ type Config struct {
 	// interval. 0 = the 2s default. Ignored on a single-host repo (no remote).
 	SessionPullSeconds int `yaml:"session_pull_seconds"`
 
+	// AlertmanagerURL is the OPTIONAL base URL of a Prometheus Alertmanager
+	// (e.g. https://alertmanager.example.com). When set, beehived POSTs
+	// Alertmanager v2 alerts (<base>/api/v2/alerts) derived from COMMITTED repo
+	// state (today: NEEDS-HUMAN tasks). It is the one narrow outbound-only
+	// exception to the repo-only rule: Alertmanager is never read back, never a
+	// data source, and never on a honeybee pass path. Empty = disabled.
+	AlertmanagerURL string `yaml:"alertmanager_url"`
+
 	// Tags DECLARES config-driven session tags for the /stats tag model
 	// (stats-tag-model): extra key->value labels attached, on read, to any session
 	// whose built-in FACET matches. It is an OPEN, three-level map
@@ -390,6 +398,9 @@ func merge(base, over Config) Config {
 	out.BuildEnv = mergeEnv(base.BuildEnv, over.BuildEnv)
 	if over.SessionPullSeconds != 0 {
 		out.SessionPullSeconds = over.SessionPullSeconds
+	}
+	if over.AlertmanagerURL != "" {
+		out.AlertmanagerURL = over.AlertmanagerURL
 	}
 	if over.AbortOnRemoteFailure != nil {
 		out.AbortOnRemoteFailure = over.AbortOnRemoteFailure

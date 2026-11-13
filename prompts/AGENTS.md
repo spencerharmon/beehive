@@ -22,6 +22,13 @@ lock. The repo's job is to hold, per target, the *intent* (`ROI.md`), the derive
 
 The repo root is a beehive repo; each tracked target lives at `submodules/<name>/`.
 
+**Repo-only state, one outbound-only exception.** All swarm state lives in git.
+The single exception is OPTIONAL Alertmanager notification: when `config.yaml`
+sets `alertmanager_url`, `beehived` POSTs v2 alerts (e.g. `BeehiveNeedsHuman`)
+derived from COMMITTED repo state to `<base>/api/v2/alerts`. It is outbound-only:
+never read back, never a data source, never on a pass path (a slow/down receiver
+is retried in the background and cannot block or fail a pass). Unset = disabled.
+
 ## Editing files — NEVER edit the live checkout
 
 > This is the step agents miss most. Read `skills/shared-checkout-edits.md` BEFORE
