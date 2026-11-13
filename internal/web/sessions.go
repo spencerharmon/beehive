@@ -348,6 +348,7 @@ func commitLinksFor(sm repo.Submodule, shas []string) []commitLink {
 	}
 	return out
 }
+
 // (pageload-sessions-pagination): the sessions/ directory grows without limit as
 // a hive runs, so rendering EVERY session per paint makes load cost scale with
 // total session count. The list is windowed to one page of this many sessions
@@ -488,20 +489,13 @@ func (s *Server) sessionView(w http.ResponseWriter, r *http.Request) {
 // bare dir) let it resolve sm's PLAN.md for the claim half and bound the
 // recency gate for the stub half.
 func (s *Server) sessionLive(ctx context.Context, sm repo.Submodule, id string, now time.Time, ttl time.Duration) bool {
-	return s.sessionLiveAt(ctx, s.headSHA(ctx), sm, id, now, ttl)
+	p, _ := s.planView(s.headSHA(ctx), sm.PlanPath(), now, ttl)
+	return s.sessionLiveClaimed(ctx, sm, id, claimedSessions(p), now, ttl)
 }
 
-// sessionLiveAt is sessionLive with the beehive repo HEAD resolved by the CALLER
-// and passed in, so a page that tests MANY sessions in one render (the plan
-// view calls it per claimed task row) resolves HEAD with a single `git
-// rev-parse` and shares it, exactly as headSHA's contract intends — instead of
-// re-spawning rev-parse per session, which made the plan page scale a git
-// subprocess per claim and dominated its render (pageload-plan-page-budget).
-// head is used only as the parse-cache key (identical to what s.headSHA(ctx)
-// would return within one request), so the liveness verdict is unchanged.
-func (s *Server) sessionLiveAt(ctx context.Context, head string, sm repo.Submodule, id string, now time.Time, ttl time.Duration) bool {
-	p, _ := s.planView(head, sm.PlanPath(), now, ttl)
-	if claimedSessions(p)[id] {
+// sessionLiveClaimed shares a request's projected claims across per-row probes.
+func (s *Server) sessionLiveClaimed(ctx context.Context, sm repo.Submodule, id string, claimed map[string]bool, now time.Time, ttl time.Duration) bool {
+	if claimed[id] {
 		return true
 	}
 	raw, err := os.ReadFile(filepath.Join(sm.SessionsDir(), id+".md"))

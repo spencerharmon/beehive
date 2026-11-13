@@ -768,7 +768,7 @@ func (s *Server) subViews(ctx context.Context, now time.Time, ttl time.Duration)
 					v.Human++
 				}
 			}
-			v.Bees = len(s.activeHoneybeesLive(ctx, sm, p, live, now, ttl))
+			v.Bees = len(s.activeHoneybeesLive(ctx, head, sm, p, live, now, ttl))
 			v.Working = v.Bees > 0
 		}
 		// Env badge: the submodule's own blue/green deploy state via the typed
@@ -1158,12 +1158,13 @@ func (s *Server) planViewData(ctx context.Context, sm repo.Submodule) (Plan, err
 	// this fix) re-introduced the exact O(rows * sessions-on-disk) directory
 	// traffic pageload-plan-page-budget already gated against.
 	transcripts := newClaimTranscriptIndex(sm.SessionsDir())
+	claimed := claimedSessions(p)
 	for i := range p.Items {
 		it := &p.Items[i]
 		if it.Session == "" {
 			continue
 		}
-		it.Running = s.sessionLiveAt(ctx, head, sm, it.Session, now, ttl)
+		it.Running = s.sessionLiveClaimed(ctx, sm, it.Session, claimed, now, ttl)
 		if it.Running {
 			// Linking the raw claim id 404s/polls "(waiting for session
 			// output…)" forever, since that filename never exists on disk.

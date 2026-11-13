@@ -228,7 +228,7 @@ func (s *Server) computeStats(ctx context.Context) (subs []subStat, total subSta
 		// FRESH every request here, never memoized. A PLAN.md parse error leaves
 		// it 0 rather than failing the whole page (mirrors subViews' resilience).
 		if p, perr := s.planView(head, sm.PlanPath(), now, ttl); perr == nil {
-			st.ActiveNow = len(s.activeHoneybeesLive(ctx, sm, p, live, now, ttl))
+			st.ActiveNow = len(s.activeHoneybeesLive(ctx, head, sm, p, live, now, ttl))
 		}
 		// delivery-traceability: link each DONE task to the hive commit that
 		// flipped it (half a) and its submodule code/doc (half b) — see

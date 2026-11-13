@@ -86,7 +86,7 @@ func streamBranchForClaim(session string) string { return session + "-session" }
 // claimedSessions below for the claim half plus its own targeted stub read —
 // see sessionLive/sessionInfos), never a re-derived rule of its own.
 func (s *Server) activeHoneybees(ctx context.Context, sm repo.Submodule, p Plan) []activeHoneybee {
-	return s.activeHoneybeesLive(ctx, sm, p, nil, time.Now(), s.ttl())
+	return s.activeHoneybeesLive(ctx, s.headSHA(ctx), sm, p, nil, time.Now(), s.ttl())
 }
 
 // activeHoneybeesLive is activeHoneybees with the live-stream-branch set passed
@@ -99,7 +99,7 @@ func (s *Server) activeHoneybees(ctx context.Context, sm repo.Submodule, p Plan)
 // caller (or a test) takes; a non-nil (possibly empty) set is used verbatim.
 // now/ttl bound the recency gate the self-resolved set applies (see
 // sessionBranchSet) and are ignored when a set is passed in.
-func (s *Server) activeHoneybeesLive(ctx context.Context, sm repo.Submodule, p Plan, live map[string]bool, now time.Time, ttl time.Duration) []activeHoneybee {
+func (s *Server) activeHoneybeesLive(ctx context.Context, head string, sm repo.Submodule, p Plan, live map[string]bool, now time.Time, ttl time.Duration) []activeHoneybee {
 	seen := map[string]bool{}
 	// claimedBranch holds the STREAM branch of every active claim, so pass 2 can
 	// recognize a claimed pass's OWN transcript stub (which references that same
@@ -116,58 +116,41 @@ func (s *Server) activeHoneybeesLive(ctx context.Context, sm repo.Submodule, p P
 			out = append(out, activeHoneybee{Session: it.Session, TaskID: it.ID, Branch: br})
 		}
 	}
-	ents := scanSessionDir(sm.SessionsDir())
-	if len(ents) == 0 {
-		return out // no sessions/ dir yet (a fresh/bootstrap-pending submodule): claims only
-	}
-	// Collect the stub candidates first, then read+classify their bounded
-	// prefixes in PARALLEL. On a mature hive the sessions/ dir accumulates many
-	// orphaned stubs (finished passes whose branch is gone but whose stub file
-	// lingers), and reading those hundreds of small files SERIALLY was a
-	// per-request page-load cost (this runs fresh every dashboard/stats render —
-	// it is time-dependent, so it is never memoized).
+	// Only the raw file classification is HEAD-stable. Claims and branch
+	// liveness (including deduplication) must be applied fresh below.
 	type cand struct{ id, branch string }
-	var probe []string
-	for _, e := range ents {
-		id := e.ID
-		if seen[id] {
-			continue // already counted via its fresh PLAN claim, above
+	cands, _ := cachedView(head, s.cache, "active-candidates:"+sm.Name, func() ([]cand, error) {
+		var probe []string
+		for _, e := range scanSessionDir(sm.SessionsDir()) {
+			if e.Size <= stubProbeBytes {
+				probe = append(probe, e.ID)
+			}
 		}
-		// A stub is a tiny placeholder (repo.SessionStub — well under
-		// stubProbeBytes); a finished transcript is a durable multi-KB body. The
-		// parallel scan already carries each file's size, so skip one FAR too big
-		// to be a stub without opening it at all — in a mature hive almost every
-		// session is a large finished transcript, so this reduces the per-file
-		// work to the (already parallelized) stat and keeps this whole-sessions-
-		// dir scan (hot on the dashboard/stats/sessions pages) off page-load.
-		if e.Size > stubProbeBytes {
-			continue // too large to be a stub: a finished transcript
+		// Read bounded prefixes in parallel; never pin a transient read failure
+		// in the cache, but retain successfully classified candidates this time.
+		type result struct {
+			branch string
+			err    error
 		}
-		probe = append(probe, id)
-	}
-	if len(probe) == 0 {
-		return out
-	}
-	// Read only a bounded prefix of each candidate (its stub marker is the FIRST
-	// line) and let ParseSessionStub decide — never the whole file — fanned
-	// across the worker pool. "" branch marks a non-stub (durable transcript).
-	branches := parallelMap(probe, func(id string) string {
-		raw, err := readFilePrefix(filepath.Join(sm.SessionsDir(), id+".md"), stubProbeBytes)
-		if err != nil {
-			return ""
+		branches := parallelMap(probe, func(id string) result {
+			raw, err := readFilePrefix(filepath.Join(sm.SessionsDir(), id+".md"), stubProbeBytes)
+			if err != nil {
+				return result{err: err}
+			}
+			branch, _ := repo.ParseSessionStub(string(raw))
+			return result{branch: branch}
+		})
+		var cands []cand
+		var loadErr error
+		for i, r := range branches {
+			if r.err != nil {
+				loadErr = r.err
+			} else if r.branch != "" {
+				cands = append(cands, cand{id: probe[i], branch: r.branch})
+			}
 		}
-		branch, isStub := repo.ParseSessionStub(string(raw))
-		if !isStub {
-			return ""
-		}
-		return branch
+		return cands, loadErr
 	})
-	var cands []cand
-	for i, id := range probe {
-		if branches[i] != "" {
-			cands = append(cands, cand{id: id, branch: branches[i]})
-		}
-	}
 	if len(cands) == 0 {
 		return out
 	}
@@ -183,7 +166,7 @@ func (s *Server) activeHoneybeesLive(ctx context.Context, sm repo.Submodule, p P
 		// it is already counted via the claim above, so skip it here — otherwise the
 		// same honeybee counts twice. Only a genuinely CLAIMLESS live stub
 		// (Bootstrap/Reconcile) with a recent branch is a new honeybee.
-		if claimedBranch[c.branch] {
+		if seen[c.id] || claimedBranch[c.branch] {
 			continue
 		}
 		if live[c.branch] {
@@ -284,7 +267,6 @@ func (s *Server) sessionBranchSet(ctx context.Context, rem string, now time.Time
 	}
 	return set
 }
-
 
 // stubProbeBytes bounds how much of a session file readFilePrefix pulls to
 // decide stub-ness. A stub is repo.SessionStub — a single HTML-comment marker
