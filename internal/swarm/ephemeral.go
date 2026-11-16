@@ -67,12 +67,12 @@ func SpawnEphemeralAgent(ctx context.Context, agentCmd string, log io.Writer) (*
 	if strings.TrimSpace(agentCmd) == "" {
 		agentCmd = "opencode"
 	}
-	dataDir, err := os.MkdirTemp("", "beehive-opencode-")
+	dataDir, err := newEphemeralDataDir(log)
 	if err != nil {
-		return nil, fmt.Errorf("ephemeral agent: create temp data dir: %w", err)
+		return nil, err
 	}
 	if err := seedAgentAuth(dataDir); err != nil {
-		_ = os.RemoveAll(dataDir)
+		_ = removeEphemeralDataDir(dataDir)
 		return nil, fmt.Errorf("ephemeral agent: %w", err)
 	}
 
@@ -86,7 +86,7 @@ func SpawnEphemeralAgent(ctx context.Context, agentCmd string, log io.Writer) (*
 
 	pr, pw, err := os.Pipe()
 	if err != nil {
-		_ = os.RemoveAll(dataDir)
+		_ = removeEphemeralDataDir(dataDir)
 		return nil, fmt.Errorf("ephemeral agent: pipe: %w", err)
 	}
 	cmd.Stdout = pw
@@ -94,7 +94,7 @@ func SpawnEphemeralAgent(ctx context.Context, agentCmd string, log io.Writer) (*
 	if err := cmd.Start(); err != nil {
 		pr.Close()
 		pw.Close()
-		_ = os.RemoveAll(dataDir)
+		_ = removeEphemeralDataDir(dataDir)
 		return nil, fmt.Errorf("ephemeral agent: start %q: %w", agentCmd, err)
 	}
 	// The parent must drop its write end so that when the child exits, the read
@@ -192,7 +192,12 @@ func (ea *EphemeralAgent) Close() error {
 		}
 	}
 	if ea.dataDir != "" {
-		return os.RemoveAll(ea.dataDir)
+		if err := removeEphemeralDataDir(ea.dataDir); err != nil {
+			if ea.log != nil {
+				fmt.Fprintf(ea.log, "ephemeral agent: remove data dir %s: %v\n", ea.dataDir, err)
+			}
+			return err
+		}
 	}
 	return nil
 }
