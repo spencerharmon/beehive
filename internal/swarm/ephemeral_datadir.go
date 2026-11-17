@@ -13,12 +13,13 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/spencerharmon/beehive/internal/fsremove"
 )
 
 const (
@@ -96,33 +97,8 @@ func processAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-// removeEphemeralDataDir deletes dir, escalating past the two cases plain
-// os.RemoveAll cannot handle: read-only trees (Go module cache) and rootless
-// podman storage owned by sub-UIDs, which only `podman unshare` can delete.
+// removeEphemeralDataDir deletes dir, including read-only module caches and
+// rootless podman storage (see fsremove).
 func removeEphemeralDataDir(dir string) error {
-	err := os.RemoveAll(dir)
-	if err == nil {
-		return nil
-	}
-	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, werr error) error {
-		if werr == nil && d.IsDir() {
-			_ = os.Chmod(p, 0o700)
-		}
-		return nil
-	})
-	if err = os.RemoveAll(dir); err == nil {
-		return nil
-	}
-	podman, lerr := exec.LookPath("podman")
-	if lerr != nil {
-		return err
-	}
-	out, uerr := exec.Command(podman, "unshare", "rm", "-rf", "--", dir).CombinedOutput()
-	if _, serr := os.Stat(dir); errors.Is(serr, fs.ErrNotExist) {
-		return nil
-	}
-	if uerr != nil {
-		return fmt.Errorf("%v; podman unshare rm: %v: %s", err, uerr, strings.TrimSpace(string(out)))
-	}
-	return err
+	return fsremove.All(dir)
 }

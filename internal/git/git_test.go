@@ -1612,3 +1612,45 @@ func TestCommitAndPublishPrimaryROIGuard(t *testing.T) {
 		t.Fatalf("ROI-guard path mutated origin: %s != %s", remoteHead, tip)
 	}
 }
+
+// A pass's tests can leave content `git worktree remove --force` cannot delete
+// (here: a read-only Go module cache dir). WorktreeRemove must still leave
+// nothing behind and keep the worktree unregistered, so a later WorktreeAdd at
+// the same path succeeds.
+func TestWorktreeRemoveDeletesUndeletableLeftovers(t *testing.T) {
+	r := initRepo(t)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(r.Dir, "f"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Run(ctx, "add", "f"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Run(ctx, "commit", "-qm", "init"); err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(t.TempDir(), "wt")
+	if err := r.WorktreeAdd(ctx, wt, "bee-x", "main"); err != nil {
+		t.Fatal(err)
+	}
+	mod := filepath.Join(wt, "gomod", "example.com", "m@v1.0.0")
+	if err := os.MkdirAll(mod, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mod, "go.mod"), []byte("module m\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(mod, 0o555); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.WorktreeRemove(ctx, wt); err != nil {
+		t.Fatalf("WorktreeRemove: %v", err)
+	}
+	if _, err := os.Lstat(wt); !os.IsNotExist(err) {
+		t.Fatalf("worktree dir still present: %v", err)
+	}
+	if err := r.WorktreeAdd(ctx, wt, "bee-x", "main"); err != nil {
+		t.Fatalf("re-add at same path: %v", err)
+	}
+}

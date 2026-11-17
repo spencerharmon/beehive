@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/spencerharmon/beehive/internal/fsremove"
 )
 
 // ErrConflict is returned when a merge produces conflicts.
@@ -1290,15 +1292,28 @@ func (r *Repo) LastCommit(ctx context.Context, path string) (string, error) {
 // idempotent: any stale worktree at dir or pre-existing branch from a crashed
 // run is pruned/discarded first so a honeybee can always claim a fresh tree.
 func (r *Repo) WorktreeAdd(ctx context.Context, dir, branch, base string) error {
-	_, _ = r.Run(ctx, "worktree", "remove", "--force", dir)
-	_, _ = r.Run(ctx, "worktree", "prune")
+	_ = r.WorktreeRemove(ctx, dir)
 	_, _ = r.Run(ctx, "branch", "-D", branch)
 	_, err := r.Run(ctx, "worktree", "add", "-b", branch, dir, base)
 	return err
 }
 
 // WorktreeRemove removes the worktree at dir, force-discarding changes.
+// `git worktree remove --force` gives up on files it cannot delete (read-only Go
+// module caches, sub-UID-owned rootless-podman storage from a pass's tests) after
+// it has already unregistered the worktree, stranding a multi-GB untracked tree.
+// Whatever git leaves behind is deleted with fsremove.All, then stale worktree
+// metadata is pruned. Success means dir no longer exists.
 func (r *Repo) WorktreeRemove(ctx context.Context, dir string) error {
-	_, err := r.Run(ctx, "worktree", "remove", "--force", dir)
-	return err
+	_, gitErr := r.Run(ctx, "worktree", "remove", "--force", dir)
+	if _, err := os.Lstat(dir); err == nil {
+		if err := fsremove.All(dir); err != nil {
+			return fmt.Errorf("remove worktree %s: %w", dir, err)
+		}
+	}
+	_, _ = r.Run(ctx, "worktree", "prune")
+	if _, err := os.Lstat(dir); err == nil {
+		return fmt.Errorf("remove worktree %s: still present (git: %v)", dir, gitErr)
+	}
+	return nil
 }
