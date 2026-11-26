@@ -2,7 +2,18 @@
 # No fixtures, POSTs, invented failures, or resolution of real alerts.
 # jq -e -s --arg instance <registry-name> -f tests/alertmanager-production-refresh.jq
 
-def timestamp: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+# Alertmanager renders RFC3339 with fractional seconds and the server's zone
+# offset (e.g. 2026-11-26T04:32:48.501-06:00); fromdateiso8601 accepts only
+# whole-second UTC "Z", so normalise explicitly and fail closed on anything else.
+def timestamp:
+  . as $raw
+  | (capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.(?<f>[0-9]+))?(?<z>Z|(?<sign>[+-])(?<hh>[0-9]{2}):(?<mm>[0-9]{2}))$")
+     // error("unparseable timestamp: \($raw)"))
+  | ((.d + "Z") | fromdateiso8601)
+    + (if .f then ("0." + .f | tonumber) else 0 end)
+    - (if .z == "Z" then 0
+       else (if .sign == "-" then -1 else 1 end) * ((.hh | tonumber) * 3600 + (.mm | tonumber) * 60)
+       end);
 def identity: .labels | to_entries | sort_by(.key);
 def valid:
   type == "array" and length > 0
@@ -28,7 +39,7 @@ else
         startsAt: $s[1][$i].startsAt,
         firstEndsAt: $s[0][$i].endsAt,
         secondEndsAt: $s[1][$i].endsAt,
-        advanceSeconds: (($s[1][$i].endsAt | timestamp) - ($s[0][$i].endsAt | timestamp))
+        advanceSeconds: (((($s[1][$i].endsAt | timestamp) - ($s[0][$i].endsAt | timestamp)) * 1000 | round) / 1000)
       }]
     end
 end
