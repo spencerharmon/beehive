@@ -66,14 +66,10 @@ func main() {
 	// and never stops the daemon from serving.
 	// Optional outbound-only Alertmanager notifications (alertmanager_url in
 	// config.yaml), derived from committed repo state; asynchronous, never on a
-	// pass path. Unset = disabled with one startup log line per repo.
+	// pass path. The same loop reloads committed global config every 15s,
+	// including when unset, so a config-only publish needs no daemon restart.
 	for _, e := range reg.Repos {
-		cfg, err := config.Resolve(e.Root, "")
-		if err != nil {
-			log.Printf("alertmanager: resolve config for %s: %v", e.Name, err)
-			continue
-		}
-		alertmanager.Start(context.Background(), cfg.AlertmanagerURL, e.Root, e.Name, *externalURL)
+		alertmanager.Start(context.Background(), e.Root, e.Name, *externalURL)
 	}
 	for _, e := range reg.Repos {
 		sweepSessions(context.Background(), e.Root)
