@@ -4373,8 +4373,8 @@ type gateRec struct {
 
 func (gr *gateRec) run(ctx context.Context, dir, name string, args ...string) (verifyOutcome, error) {
 	gr.calls = append(gr.calls, gateCall{dir: dir, name: name, args: append([]string(nil), args...)})
-	if name == "git" && len(args) > 0 && args[0] == "merge-base" {
-		return verifyOutcome{out: "bee-T1\n"}, nil // resolved, guard-free fixture baseline
+	if name == "git" && len(args) > 0 && args[0] == "rev-parse" {
+		return realRunVerify(ctx, dir, name, args...) // real pinned guard baseline/candidate
 	}
 	if gr.resp != nil {
 		return gr.resp(name, args)
@@ -4440,8 +4440,10 @@ func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 		{dir: wantRoot, name: "git", args: []string{"show", "HEAD:submodules/sm/docs/bee-T1-T1.md"}},
 		// (4.6) diff-scoped mutation guards: probe the BASELINE registry (committed-read
 		// plumbing, not a toolchain check). Absent GUARDS.md here => no guards => allow.
-		{dir: wtDir, name: "git", args: []string{"merge-base", "HEAD", "bee-T1"}},
-		{dir: wtDir, name: "git", args: []string{"show", "bee-T1:GUARDS.md"}},
+		{dir: wtDir, name: "git", args: []string{"rev-parse", "--verify", "--quiet", r.workGuardBase + "^{commit}"}},
+		{dir: wtDir, name: "git", args: []string{"rev-parse", "--verify", "--quiet", "refs/heads/bee-T1^{commit}"}},
+		{dir: wtDir, name: "git", args: []string{"rev-parse", "--verify", "--quiet", "HEAD^{commit}"}},
+		{dir: wtDir, name: "git", args: []string{"show", r.workGuardBase + ":GUARDS.md"}},
 	}
 	if !reflect.DeepEqual(gr.calls, want) {
 		t.Fatalf("the uniform gate must run status (worktree) -> show PLAN.md -> ls-tree -> show doc (all committed-artifact/protocol checks, no toolchain check):\n got %+v\nwant %+v", gr.calls, want)
@@ -5033,7 +5035,8 @@ func durabilityFixture(t *testing.T, withRemote, push bool) (r *Runner, sel *sel
 		}
 		return verifyOutcome{}, nil // git status --porcelain: clean
 	}}
-	r = &Runner{Repo: rp, Git: g, MaxTurns: 5, TTL: time.Hour, RunVerify: gr.run}
+	r = &Runner{Repo: rp, Git: g, MaxTurns: 5, TTL: time.Hour, RunVerify: gr.run,
+		workGuardBase: handoffOrphanGit(t, rg, "rev-parse", "HEAD")}
 	return
 }
 

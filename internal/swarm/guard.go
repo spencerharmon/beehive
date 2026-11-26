@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/guards"
 	selectt "github.com/spencerharmon/beehive/internal/select"
 )
@@ -19,13 +18,14 @@ import (
 // gates whether the CHANGE is allowed to land at all — judged against live release
 // state the runner itself never models (which blue/green color is active, whether a
 // canary step is mid-flight, ...). The runner stays strategy-agnostic: it computes
-// the committed diff of the pass branch vs the merge-base it forked from, and for
+// the committed diff of the pass branch vs its pinned pre-work baseline, and for
 // every guard whose Protects glob intersects a changed file, runs that guard's
 // command and enforces its exit code (0 = allow, non-zero = refuse + fix-forward).
 //
 // TAMPER ANCHOR: both GUARDS.md and the guard command are materialized from the
-// MERGE-BASE (the reviewed baseline the pass forked from), never the bee branch. A
-// bee's edit to guard code is therefore inert for its OWN pass — a changed/weakened
+// pre-work source SHA (the reviewed baseline the pass forked from), never a mutable
+// task ref or its merge-base with HEAD. A bee's edit to guard code is therefore
+// inert for its OWN pass — a changed/weakened
 // guard governs only later passes, after it lands and is reviewed. You never grade
 // your own exam with a key you edited mid-exam.
 //
@@ -34,58 +34,32 @@ import (
 // refuses or the registry is malformed; a non-nil error on an infra failure the
 // caller fails closed on.
 func (r *Runner) guardGate(ctx context.Context, sel *selectt.Selection, checkoutDir, hiveAbs, branch string) (string, error) {
-	// Resolve the baseline the pass forked from. Prefer the remote tracking branch
-	// (origin/<branch>) so the anchor is the last PUBLISHED tip, not a local ref a
-	// bee could move; fall back to the local branch name.
-	rem := ""
-	if g := git.New(checkoutDir); g != nil {
-		if rr, err := g.Remote(ctx); err == nil {
-			rem = strings.TrimSpace(rr)
-		}
+	// Run pins the source SHA before handing the worktree to the agent. Both
+	// scope and guard code use that SAME anchor, across pushes, fix-forward turns
+	// and runner-owned orphan reclamation. No commits= tag can bypass this diff.
+	if r.workGuardBase == "" {
+		return "", fmt.Errorf("guard gate: missing pre-work baseline; refusing (fail closed)")
 	}
-	baseRef := branch
-	if rem != "" {
-		baseRef = rem + "/" + branch
-		// Refresh the tracking ref BEFORE resolving the baseline: a pass branch that
-		// exists on the remote but whose local tracking ref is absent/stale would
-		// otherwise resolve to nothing, read as "no GUARDS.md", and silently allow a
-		// protected change. If the remote has the branch, the baseline MUST resolve
-		// or the gate fails closed.
-		ls, err := r.runVerify(ctx, checkoutDir, "git", "ls-remote", "--heads", rem, "refs/heads/"+branch)
-		if err != nil {
-			return "", fmt.Errorf("guard gate: probing %s/%s in %s: %w", rem, branch, checkoutDir, err)
-		}
-		if ls.exitErr {
-			return "", fmt.Errorf("guard gate: `git ls-remote %s %s` failed in %s: %s", rem, branch, checkoutDir, strings.TrimSpace(ls.out))
-		}
-		if strings.TrimSpace(ls.out) != "" {
-			fe, err := r.runVerify(ctx, checkoutDir, "git", "fetch", "--quiet", rem, "+refs/heads/"+branch+":refs/remotes/"+rem+"/"+branch)
-			if err != nil {
-				return "", fmt.Errorf("guard gate: fetching baseline %s in %s: %w", baseRef, checkoutDir, err)
-			}
-			if fe.exitErr {
-				return "", fmt.Errorf("guard gate: fetching baseline %s failed in %s: %s", baseRef, checkoutDir, strings.TrimSpace(fe.out))
-			}
-			rv, err := r.runVerify(ctx, checkoutDir, "git", "rev-parse", "--verify", "--quiet", baseRef+"^{commit}")
-			if err != nil || rv.exitErr || strings.TrimSpace(rv.out) == "" {
-				return "", fmt.Errorf("guard gate: baseline %s exists on the remote but does not resolve in %s; refusing (fail closed)", baseRef, checkoutDir)
-			}
-		} else {
-			// A new task has no published task ref yet. Do not use a stale
-			// tracking ref left behind by an earlier, deleted attempt.
-			baseRef = branch
-		}
-	}
-	mb, err := r.runVerify(ctx, checkoutDir, "git", "merge-base", "HEAD", baseRef)
+	base, err := r.guardRevision(ctx, checkoutDir, "baseline", r.workGuardBase)
 	if err != nil {
-		return "", fmt.Errorf("guard gate: resolving baseline %s in %s: %w", baseRef, checkoutDir, err)
+		return "", err
 	}
-	base := strings.TrimSpace(mb.out)
-	if mb.exitErr || base == "" {
-		return "", fmt.Errorf("guard gate: resolving baseline %s in %s failed; refusing (fail closed): %s", baseRef, checkoutDir, base)
+	candidate, err := r.guardRevision(ctx, checkoutDir, "candidate", "refs/heads/"+branch)
+	if err != nil {
+		return "", err
 	}
+	head, err := r.guardRevision(ctx, checkoutDir, "checkout", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	// Publication delivers the local task branch, not an arbitrary detached HEAD
+	// the agent may have checked out. Never grade one tree and publish another.
+	if head != candidate {
+		return fmt.Sprintf("Handoff gate FAILED: mutation guard candidate %s (%s) differs from checkout HEAD %s. Return the worktree to the task branch before handoff; no source was published.", branch, candidate, head), nil
+	}
+	r.logConcise("[honeybee] mutation guard %s: baseline=%s candidate=%s branch=%s\n", sel.Submodule.Name, base, candidate, branch)
 
-	// Baseline GUARDS.md. Absent at baseline => no guards => allow (zero overhead).
+	// Baseline GUARDS.md. Absent at baseline => no guard commands to execute.
 	gs, err := r.runVerify(ctx, checkoutDir, "git", "show", base+":"+guards.GuardsFile)
 	if err != nil {
 		return "", fmt.Errorf("guard gate: reading baseline %s in %s: %w", guards.GuardsFile, checkoutDir, err)
@@ -101,13 +75,14 @@ func (r *Runner) guardGate(ctx context.Context, sel *selectt.Selection, checkout
 		return "", nil
 	}
 
-	// Committed diff base..HEAD (changed file paths, repo-relative).
-	df, err := r.runVerify(ctx, checkoutDir, "git", "diff", "--name-only", base, "HEAD")
+	// Compare trees directly to the pinned baseline, not a recomputed merge-base
+	// (which could hide a reset or move backwards into an orphan's old history).
+	df, err := r.runVerify(ctx, checkoutDir, "git", "diff", "--name-only", base, candidate)
 	if err != nil {
-		return "", fmt.Errorf("guard gate: diffing %s..HEAD in %s: %w", base, checkoutDir, err)
+		return "", fmt.Errorf("guard gate: diffing %s..%s in %s: %w", base, candidate, checkoutDir, err)
 	}
 	if df.exitErr {
-		return "", fmt.Errorf("guard gate: `git diff --name-only %s HEAD` failed in %s: %s", base, checkoutDir, strings.TrimSpace(df.out))
+		return "", fmt.Errorf("guard gate: diff %s..%s failed in %s: %s", base, candidate, checkoutDir, strings.TrimSpace(df.out))
 	}
 	changed := splitNonEmptyLines(df.out)
 	triggered := reg.Triggered(changed)
@@ -127,8 +102,15 @@ func (r *Runner) guardGate(ctx context.Context, sel *selectt.Selection, checkout
 	}
 	// Full patch, for guards that inspect hunks (written into the workspace).
 	patchPath := filepath.Join(ws, ".beehive-guard-patch")
-	if pd, err := r.runVerify(ctx, checkoutDir, "git", "diff", base, "HEAD"); err == nil && !pd.exitErr {
-		_ = os.WriteFile(patchPath, []byte(pd.out), 0o644)
+	pd, err := r.runVerify(ctx, checkoutDir, "git", "diff", base, candidate)
+	if err != nil {
+		return "", fmt.Errorf("guard gate: reading candidate patch: %w", err)
+	}
+	if pd.exitErr {
+		return "", fmt.Errorf("guard gate: reading candidate patch failed: %s", strings.TrimSpace(pd.out))
+	}
+	if err := os.WriteFile(patchPath, []byte(pd.out), 0o644); err != nil {
+		return "", fmt.Errorf("guard gate: writing candidate patch: %w", err)
 	}
 
 	for i := range triggered {
@@ -142,6 +124,20 @@ func (r *Runner) guardGate(ctx context.Context, sel *selectt.Selection, checkout
 		}
 	}
 	return "", nil
+}
+
+// guardRevision resolves an explicit commit, failing closed rather than treating
+// a missing baseline/candidate as a guard-free tree.
+func (r *Runner) guardRevision(ctx context.Context, dir, role, ref string) (string, error) {
+	o, err := r.runVerify(ctx, dir, "git", "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("guard gate: resolving %s %s: %w", role, ref, err)
+	}
+	sha := strings.TrimSpace(o.out)
+	if o.exitErr || sha == "" {
+		return "", fmt.Errorf("guard gate: unresolved %s %s in %s; refusing (fail closed): %s", role, ref, dir, sha)
+	}
+	return sha, nil
 }
 
 // materializeBaselineGuards extracts every file under guards/ plus GUARDS.md AS OF

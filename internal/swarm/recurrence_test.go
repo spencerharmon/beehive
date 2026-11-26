@@ -115,6 +115,7 @@ func TestMeasurement(t *testing.T) {
 	r := &Runner{
 		Repo: &repo.Repo{Root: root}, Git: g, Session: task.Session,
 		Now: func() time.Time { return now }, TTL: time.Hour, MaxTurns: 2,
+		workGuardBase: sha,
 	}
 	return &cycleFixture{runner: r, sel: &selectt.Selection{Kind: selectt.Work, Submodule: sub, Task: task}, code: code, sha: sha}
 }

@@ -51,20 +51,49 @@ an empty-matching regex.
 
 At the uniform handoff gate (`verifyGate`), for a **Work** pass, on the turn a
 terminal flip is committed — behind the existing per-turn completion check, NOT a
-per-turn watcher. The runner computes the committed diff of the pass branch vs the
-merge-base it forked from and fires **only** the guards whose `Protects:` glob
-intersects a changed file. A pass that touches no protected path runs no guard; a
-submodule with no `GUARDS.md` has zero overhead. A violating Work change is blocked
-here, before it can ever reach review.
+per-turn watcher. Before creating the Work worktree, the runner pins the source
+SHA after syncing to the configured tracked branch (the recorded source HEAD for
+local-only repos). The gate compares this **immutable pre-work baseline** with the
+local `refs/heads/bee-<task>` candidate. Candidate and checkout HEAD must agree;
+missing revisions or a mismatch fail closed. Logs identify the exact baseline,
+candidate and task branch for attribution.
 
-## Tamper anchor — merge-base; trusted code / untrusted data
+Only guards whose `Protects:` glob intersects a changed file execute. An empty
+code delivery runs no guard command, regardless of its `commits=` tag. Conversely,
+`commits=none` cannot exempt a real protected diff. A violating Work change is
+blocked here, before it can reach review or runner-owned orphan publication.
 
-`GUARDS.md` and the guard `Command` are materialized from the **merge-base** (the
-reviewed baseline the pass forked from), never the bee branch. A bee's edit to guard
-code is therefore **inert for its own pass**; a changed/weakened guard governs only
-later passes, after it lands and is reviewed. You never grade your own exam with a
-key you edited mid-exam. (Pair this with a `guard-the-guards` stub whose `Protects:`
-is `GUARDS.md, guards/**`, forcing guard-code changes into review.)
+## Tamper anchor — pinned pre-work SHA; trusted code / untrusted data
+
+`GUARDS.md` and the guard `Command` are materialized from that **same pre-work
+SHA**, never the candidate or a mutable task ref. A bee's edit to guard code is
+therefore **inert for its own pass**; a changed/weakened guard governs only later
+passes, after it lands and is reviewed. You never grade your own exam with a key
+you edited mid-exam. (Pair this with a `guard-the-guards` stub whose `Protects:` is
+`GUARDS.md, guards/**`, forcing guard-code changes into review.)
+
+Do not use `merge-base HEAD origin/bee-<task>` as this anchor. A stale attempt may
+fork before unrelated reviewed protected changes and a guard update, attributing
+both to an actually empty new delivery. Conversely, a current attempt already
+pushed to that ref makes its merge-base equal HEAD and hides the entire diff.
+Local task refs have the same problem. The pinned SHA survives pushes, remote
+tracking-ref changes, fix-forward turns and orphan reconciliation unchanged; even
+a reset of HEAD is compared directly to the pinned tree, not a new merge-base.
+
+Orphan reclamation remains runner-owned and occurs **after** guard approval. It
+retains the candidate tree and preserves stale history as ancestry via the
+existing non-forced `PushBranchReconciled` protocol. The obsolete attempt's tree
+and guard code never become the candidate or the trust anchor.
+
+### Runner regression
+
+`CGO_ENABLED=0 go test ./internal/swarm -run 'TestMutationGuardWorkHandoff|TestHandoffOrphan|TestGuardGate' -count=1`
+uses disposable real repositories and real guard scripts, with no live service
+required. The full Work turn/handoff/publication test proves an empty current
+delivery supersedes a stale protected attempt without importing its tree; real
+protected diffs, already-pushed diffs, false `commits=none` and in-pass guard
+removal/weakening still refuse using the pre-work guard. Temporary repositories
+are test-owned and removed automatically.
 
 ## The ABI the runner hands a guard
 

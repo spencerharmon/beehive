@@ -331,6 +331,9 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			// This helper-level fixture creates the reviewed baseline itself; Run
+			// captures the same immutable SHA before handing a real agent its tree.
+			r.workGuardBase = handoffOrphanGit(t, wg, "rev-parse", "HEAD")
 			oldDir := filepath.Join(t.TempDir(), "old-attempt")
 			handoffOrphanGit(t, wg, "clone", "--no-local", "-q", "--branch", "bee-T1", wtDir, oldDir)
 			old := gitConfig(t, oldDir)
@@ -342,8 +345,8 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 			oldSHA := handoffOrphanGit(t, old, "rev-parse", "HEAD")
 			handoffOrphanGit(t, old, "push", "origin", "bee-T1")
 			if tc.name == "guard-refused-no-prefetch" {
-				// The remote task branch exists, but its tracking ref is absent
-				// locally: the guard baseline must still be resolved, not skipped.
+				// The remote task branch exists, but its tracking ref is absent.
+				// Guard scope/trust must be independent of that disposable ref.
 				handoffOrphanGit(t, wg, "update-ref", "-d", "refs/remotes/origin/bee-T1")
 				if out, err := wg.Run(ctx, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/bee-T1"); err == nil {
 					t.Fatalf("fixture: tracking ref must be absent, got %s", out)

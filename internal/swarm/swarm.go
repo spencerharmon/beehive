@@ -282,6 +282,11 @@ type Runner struct {
 	// guard's allow/refuse outcome. See guard.go.
 	RunGuard func(ctx context.Context, cwd string, env []string, name string, args ...string) (verifyOutcome, error)
 
+	// workGuardBase is the immutable reviewed source SHA captured BEFORE Work
+	// starts. Never derive guard trust/scope from the reusable bee task ref: it
+	// may name a stale remote attempt, or already contain this pass's edits.
+	workGuardBase string
+
 	// CheckPolicy is the sandbox/policy for a task's `Check:` DoD command (command
 	// denylist + filesystem confinement scoped to the task's submodule and its
 	// LINKED submodules). Nil = legacy path: the check runs as a bare `sh -c` in the
@@ -633,6 +638,7 @@ func branchFor(sel *selectt.Selection) string {
 // Run executes the loop for one selection. It claims work tasks, creates a
 // worktree (Work only), runs turns until completion or caps, and tidies up.
 func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first string) (Result, error) {
+	r.workGuardBase = ""
 	res := Result{Branch: branchFor(sel)}
 	absRoot, err := filepath.Abs(r.Repo.Root)
 	if err != nil {
@@ -828,7 +834,12 @@ func (r *Runner) Run(ctx context.Context, sel *selectt.Selection, system, first 
 		if err := r.syncWorktreeBase(ctx, wg, sel.Submodule, absRoot); err != nil {
 			return res, err
 		}
-		if err := wg.WorktreeAdd(ctx, wtAbs, res.Branch, "HEAD"); err != nil {
+		base, err := wg.RevParse(ctx, "HEAD")
+		if err != nil || base == "" {
+			return res, fmt.Errorf("capture Work mutation-guard baseline: sha=%q err=%v", base, err)
+		}
+		r.workGuardBase = base
+		if err := wg.WorktreeAdd(ctx, wtAbs, res.Branch, base); err != nil {
 			return res, fmt.Errorf("worktree add: %w", err)
 		}
 		// Populate the sibling submodule checkouts this task's cross-deps name, so the

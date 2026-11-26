@@ -316,7 +316,7 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 	// touching a protected path under conditions the runner cannot model (which
 	// blue/green color is live, a mid-flight canary step, ...). A guard fires only
 	// when the committed diff intersects its Protects glob; it is judged from the
-	// merge-base baseline (tamper-proof) against LIVE release state. Scoped to Work —
+	// pinned pre-work baseline (tamper-proof) against LIVE release state. Scoped to Work —
 	// the kind that AUTHORS the submodule diff; a violating change is blocked here
 	// before it can ever reach review. Infra failure fails closed (returns an error).
 	if sel.Kind == selectt.Work && checkoutExists {
@@ -324,8 +324,10 @@ func (r *Runner) verifyGate(ctx context.Context, sel *selectt.Selection, wtAbs, 
 			return hint, err
 		}
 	}
-	// Reconciliation changes the task ref, so run mutation guards first against
-	// the pre-publication diff, not against the identical local and remote tips.
+	// Guard the actual local candidate BEFORE any orphan publication. Reclaim
+	// preserves that candidate's tree, never imports the orphan's protected edits.
+	// Even a no-code handoff takes this path; landSourceBranch then reclaims its
+	// stale task ref. Neither that ref nor commits=none chooses the guard baseline.
 	if len(ct.Commits) > 0 && sel.Kind == selectt.Work && checkoutExists {
 		if hint, err := r.gateCommitDurability(ctx, sel, git.New(checkoutDir), branch, ct.Commits, wtAbs != ""); err != nil || hint != "" {
 			return hint, err

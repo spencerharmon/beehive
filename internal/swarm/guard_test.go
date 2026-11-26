@@ -33,19 +33,22 @@ func (f fakeGit) run(_ context.Context, _ string, name string, args ...string) (
 
 func baseGitFixture(changed string) fakeGit {
 	return fakeGit{
-		"merge-base HEAD main":                    {out: "BASE\n"},
-		"show BASE:GUARDS.md":                     {out: guardTestRegistry},
-		"diff --name-only BASE HEAD":              {out: changed},
-		"diff BASE HEAD":                          {out: "--- patch ---\n"},
-		"ls-tree -r BASE -- guards GUARDS.md":     {out: "100755 blob abc\tguards/active-color-frozen.sh\n100644 blob def\tGUARDS.md\n"},
-		"show BASE:guards/active-color-frozen.sh": {out: "#!/bin/sh\nexit 0\n"},
-		"show BASE:GUARDS.md ":                    {out: guardTestRegistry},
+		"rev-parse --verify --quiet BASE^{commit}":            {out: "BASE\n"},
+		"rev-parse --verify --quiet HEAD^{commit}":            {out: "CANDIDATE\n"},
+		"rev-parse --verify --quiet refs/heads/main^{commit}": {out: "CANDIDATE\n"},
+		"show BASE:GUARDS.md":                                 {out: guardTestRegistry},
+		"diff --name-only BASE CANDIDATE":                     {out: changed},
+		"diff BASE CANDIDATE":                                 {out: "--- patch ---\n"},
+		"ls-tree -r BASE -- guards GUARDS.md":                 {out: "100755 blob abc\tguards/active-color-frozen.sh\n100644 blob def\tGUARDS.md\n"},
+		"show BASE:guards/active-color-frozen.sh":             {out: "#!/bin/sh\nexit 0\n"},
+		"show BASE:GUARDS.md ":                                {out: guardTestRegistry},
 	}
 }
 
 func newGuardRunner(git fakeGit, guardExit bool, capture *[]string) *Runner {
 	return &Runner{
-		RunVerify: git.run,
+		RunVerify:     git.run,
+		workGuardBase: "BASE",
 		RunGuard: func(_ context.Context, _ string, env []string, _ string, _ ...string) (verifyOutcome, error) {
 			if capture != nil {
 				*capture = env
@@ -110,10 +113,42 @@ func TestGuardGate_UnresolvedBaselineFailsClosed(t *testing.T) {
 	for _, outcome := range []verifyOutcome{{exitErr: true, out: "unknown revision"}, {}} {
 		t.Run(fmt.Sprintf("exit-error=%v", outcome.exitErr), func(t *testing.T) {
 			git := baseGitFixture("infrastructure/phantom-library-helm/helmrelease-green.yaml\n")
-			git["merge-base HEAD main"] = outcome
+			git["rev-parse --verify --quiet BASE^{commit}"] = outcome
 			r := newGuardRunner(git, true, nil)
 			if hint, err := r.guardGate(context.Background(), guardSel(selectt.Work), t.TempDir(), t.TempDir(), "main"); err == nil || !strings.Contains(err.Error(), "baseline") {
 				t.Fatalf("unresolved baseline must fail closed: hint=%q err=%v", hint, err)
+			}
+		})
+	}
+}
+
+func TestGuardGate_MissingAnchorFailsClosed(t *testing.T) {
+	r := newGuardRunner(baseGitFixture(""), false, nil)
+	r.workGuardBase = ""
+	if hint, err := r.guardGate(context.Background(), guardSel(selectt.Work), t.TempDir(), t.TempDir(), "main"); err == nil || !strings.Contains(err.Error(), "missing pre-work baseline") {
+		t.Fatalf("must not derive a missing anchor from a mutable ref: hint=%q err=%v", hint, err)
+	}
+}
+
+func TestGuardGate_CandidateMismatchFailsClosed(t *testing.T) {
+	git := baseGitFixture("") // even a clean HEAD may hide a protected task-branch tree
+	git["rev-parse --verify --quiet HEAD^{commit}"] = verifyOutcome{out: "OTHER"}
+	r := newGuardRunner(git, false, nil)
+	hint, err := r.guardGate(context.Background(), guardSel(selectt.Work), t.TempDir(), t.TempDir(), "main")
+	if err != nil || !strings.Contains(hint, "candidate main (CANDIDATE) differs from checkout HEAD OTHER") {
+		t.Fatalf("must not grade HEAD then publish a different branch: hint=%q err=%v", hint, err)
+	}
+}
+
+func TestGuardGate_UnreadableCandidateDiffFailsClosed(t *testing.T) {
+	for _, command := range []string{"diff --name-only BASE CANDIDATE", "diff BASE CANDIDATE"} {
+		t.Run(command, func(t *testing.T) {
+			git := baseGitFixture("infrastructure/phantom-library-helm/helmrelease-green.yaml\n")
+			git[command] = verifyOutcome{exitErr: true, out: "broken diff"}
+			captured := []string{}
+			r := newGuardRunner(git, false, &captured)
+			if hint, err := r.guardGate(context.Background(), guardSel(selectt.Work), t.TempDir(), t.TempDir(), "main"); err == nil || !strings.Contains(err.Error(), "broken diff") || len(captured) != 0 {
+				t.Fatalf("must not run guard with missing diff/patch: hint=%q err=%v env=%v", hint, err, captured)
 			}
 		})
 	}
