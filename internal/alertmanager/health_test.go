@@ -165,8 +165,21 @@ func TestHealthAlertsResolveThroughNotifierAcrossRestart(t *testing.T) {
 	}
 }
 
-// Recording never touches the network: a hung receiver cannot delay it, and a
-// Tick against it is bounded by the client timeout.
+// heldPoster deliberately ignores cancellation: only the test can finish the
+// delivery. A notifier timeout therefore cannot mask recording waiting on Tick.
+type heldPoster struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *heldPoster) Post(context.Context, []Alert) error {
+	close(p.entered)
+	<-p.release
+	return nil
+}
+
+// Recording never waits for delivery. Test that ordering separately from the
+// real HTTP timeout, so disk/fsync latency is not racing a network deadline.
 func TestSlowReceiverNeverBlocksRecording(t *testing.T) {
 	h := newHive(t)
 	h.commitPlan("sm", planResolved)
@@ -175,22 +188,96 @@ func TestSlowReceiverNeverBlocksRecording(t *testing.T) {
 	defer close(rcv.block)
 	clk := newClock()
 	for i := 0; i < WedgedThreshold; i++ {
-		_ = freshRecorder(t, h.root, clk).Preflight("p", errors.New("x"))
+		if err := freshRecorder(t, h.root, clk).Preflight("p", errors.New("x")); err != nil {
+			t.Fatal(err)
+		}
 	}
-	n, _ := NewHiveNotifier(context.Background(), rcv.srv.URL, h.root, "hive", "")
-	n.Now, n.Logf, n.Timeout = clk.Now, quiet, 200*time.Millisecond
-	done := make(chan error, 1)
-	go func() { done <- n.Tick(context.Background()) }()
-	start := time.Now()
-	if err := freshRecorder(t, h.root, clk).Pass("z", "s", false, errors.New("y")); err != nil {
-		t.Fatal(err)
+	newNotifier := func(t *testing.T) *Notifier {
+		t.Helper()
+		n, err := NewHiveNotifier(context.Background(), rcv.srv.URL, h.root, "hive", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		n.Now, n.Logf, n.Timeout = clk.Now, quiet, 200*time.Millisecond
+		return n
 	}
-	if time.Since(start) > 150*time.Millisecond {
-		t.Fatal("recording waited on the receiver")
-	}
-	if err := <-done; err == nil {
-		t.Fatal("hung receiver must surface as a bounded delivery error")
-	}
+
+	t.Run("recording-before-delivery", func(t *testing.T) {
+		n := newNotifier(t)
+		p := &heldPoster{entered: make(chan struct{}), release: make(chan struct{})}
+		n.Poster = p
+		done := make(chan struct{})
+		var tickErr error
+		go func() {
+			tickErr = n.Tick(context.Background())
+			close(done)
+		}()
+		defer func() {
+			close(p.release)
+			<-done
+			if tickErr != nil {
+				t.Errorf("released delivery: %v", tickErr)
+			}
+		}()
+
+		// These generous guards diagnose deadlocks, not recorder performance.
+		select {
+		case <-p.entered:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Tick never entered delivery")
+		}
+		recorded := make(chan error, 1)
+		go func() {
+			r, err := NewRecorder(context.Background(), h.root)
+			if err == nil {
+				r.Now = clk.Now
+				err = r.Pass("z", "s", false, errors.New("y"))
+			}
+			recorded <- err
+		}()
+		select {
+		case err := <-recorded:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("recording waited on the blocked delivery")
+		}
+		// release is still open, so Tick cannot have returned, even if its
+		// timeout has already elapsed. Confirm Pass actually persisted too.
+		select {
+		case <-done:
+			t.Fatal("Tick returned before delivery was released")
+		default:
+		}
+		hp, err := HealthPath(context.Background(), h.root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := LoadHealth(hp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Passes["z"].Consecutive != 1 || st.Passes["z"].LastSession != "s" {
+			t.Fatalf("pass not recorded during blocked delivery: %+v", st.Passes["z"])
+		}
+	})
+
+	t.Run("bounded-delivery-error", func(t *testing.T) {
+		n := newNotifier(t) // real HTTP client, receiver remains blocked
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- n.Tick(ctx) }()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("hung receiver must surface as a bounded delivery error, got %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("hung receiver did not time out")
+		}
+	})
 }
 
 func TestPersistFailureSurfaces(t *testing.T) {
