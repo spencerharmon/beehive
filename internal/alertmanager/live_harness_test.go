@@ -82,6 +82,7 @@ func TestLiveHarnessFailsOnMissingPrerequisite(t *testing.T) {
 type fakeAM struct {
 	mu     sync.Mutex
 	alerts map[string]map[string]any
+	posts  []map[string]any
 }
 
 var filterRE = regexp.MustCompile(`^(\w+)="(.*)"$`)
@@ -101,6 +102,7 @@ func (f *fakeAM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, a := range in {
+			f.posts = append(f.posts, a)
 			lb := map[string]string{}
 			for k, v := range a["labels"].(map[string]any) {
 				lb[k] = v.(string)
@@ -144,7 +146,7 @@ func TestLiveHarnessPassesAgainstFakeAlertmanager(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds binaries")
 	}
-	for _, b := range []string{"go", "git", "curl", "jq"} {
+	for _, b := range []string{"go", "git", "curl", "python3"} {
 		if _, err := exec.LookPath(b); err != nil {
 			t.Skip(b + " unavailable for the in-process harness run")
 		}
@@ -159,6 +161,35 @@ func TestLiveHarnessPassesAgainstFakeAlertmanager(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Assert the harness actually exercised ALL families through background
+	// refresh and explicit resolution, rather than merely printing PASS after
+	// two one-shot invocations. Cleanup cannot manufacture refresh evidence.
+	for _, name := range []string{AlertNeedsHuman, AlertSwarmWedged, AlertPassFailing} {
+		var starts, firstEnd, latestEnd time.Time
+		resolved := false
+		for _, a := range f.posts {
+			if a["labels"].(map[string]any)["alertname"] != name {
+				continue
+			}
+			s, _ := time.Parse(time.RFC3339Nano, a["startsAt"].(string))
+			e, _ := time.Parse(time.RFC3339Nano, a["endsAt"].(string))
+			if starts.IsZero() {
+				starts, firstEnd = s, e
+			}
+			if !s.Equal(starts) {
+				t.Fatalf("%s startsAt changed: %v -> %v", name, starts, s)
+			}
+			if e.After(latestEnd) {
+				latestEnd = e
+			}
+			if e.Before(firstEnd) {
+				resolved = true // explicit endsAt before the original natural expiry
+			}
+		}
+		if starts.IsZero() || latestEnd.Sub(firstEnd) < 55*time.Second || !resolved {
+			t.Errorf("%s: missing firing/background refresh/explicit resolution: start=%v extension=%v resolved=%v", name, starts, latestEnd.Sub(firstEnd), resolved)
+		}
+	}
 	for _, a := range f.alerts {
 		if e, _ := time.Parse(time.RFC3339Nano, a["endsAt"].(string)); e.After(time.Now()) {
 			t.Fatalf("harness left an active alert: %v", a)
