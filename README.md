@@ -170,6 +170,11 @@ max_turns: 15
 reject_limit: 3
 ```
 
+Optional outbound-only Alertmanager notifications use `alertmanager_url` in the
+infrastructure hive's config. `beehived` reloads committed global configuration
+without a restart; see [activation and read-only verification](docs/alertmanager.md).
+No endpoint is configured by default.
+
 ## Sharing modes
 
 Components converge through git in one of two modes, **detected at runtime from

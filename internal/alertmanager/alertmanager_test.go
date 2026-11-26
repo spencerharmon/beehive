@@ -153,39 +153,6 @@ func notifier(h *hive, r *receiver, c *fakeClock) *Notifier {
 
 func labels(a map[string]any) map[string]any { return a["labels"].(map[string]any) }
 
-func TestStartDisabledWhenUnset(t *testing.T) {
-	if n := Start(context.Background(), "", t.TempDir(), "x", ""); n != nil {
-		t.Fatal("unset alertmanager_url must disable the notifier")
-	}
-}
-
-func TestStartEnabledPostsFromCommittedState(t *testing.T) {
-	h := newHive(t)
-	h.commitPlan("sm", planHuman)
-	r := newReceiver(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	start := time.Now()
-	if n := Start(ctx, r.srv.URL, h.root, "hive-a", ""); n == nil {
-		t.Fatal("set alertmanager_url must enable the notifier")
-	}
-	if time.Since(start) > time.Second {
-		t.Fatal("Start must not block")
-	}
-	deadline := time.After(10 * time.Second)
-	for r.count() == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("production wiring never POSTed")
-		default:
-			time.Sleep(10 * time.Millisecond) // polling a real goroutine, not timing logic
-		}
-	}
-	if got := labels(r.last(t)[0])["task"]; got != "t1" {
-		t.Fatalf("task label = %v", got)
-	}
-}
-
 func TestSchemaLabelsAndFire(t *testing.T) {
 	h := newHive(t)
 	h.commitPlan("sm", planHuman)

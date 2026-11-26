@@ -3,11 +3,9 @@ package alertmanager
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/url"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/spencerharmon/beehive/internal/git"
 	"github.com/spencerharmon/beehive/internal/plan"
@@ -104,6 +102,16 @@ func firstLine(s string) string {
 	return ""
 }
 
+// HiveSource is the production desired set shared by the emitter and the
+// read-only `beehive alertmanager desired` diagnostic. ref pins committed plans;
+// health evidence is read from the same repo-local store the emitter uses.
+func HiveSource(root, ref, instance, generatorBase string) Source {
+	return MultiSource(
+		NeedsHumanSource(root, ref, instance, generatorBase),
+		HealthSource(root, instance, generatorBase),
+	)
+}
+
 // NewHiveNotifier builds the production notifier for one hive: all three alert
 // families (NEEDS-HUMAN, swarm wedged, pass failing) through ONE emitter, with
 // the sent-set persisted beside the health evidence. Used by beehived and the
@@ -114,29 +122,8 @@ func NewHiveNotifier(ctx context.Context, baseURL, root, instance, generatorBase
 		return nil, err
 	}
 	return &Notifier{
-		Poster: NewClient(baseURL, DefaultTimeout),
-		Source: MultiSource(
-			NeedsHumanSource(root, "HEAD", instance, generatorBase),
-			HealthSource(root, instance, generatorBase),
-		),
+		Poster:    NewClient(baseURL, DefaultTimeout),
+		Source:    HiveSource(root, "HEAD", instance, generatorBase),
 		StatePath: filepath.Join(filepath.Dir(hp), "alertmanager-sent-"+url.PathEscape(instance)+".json"),
 	}, nil
-}
-
-// Start launches the background notifier for one hive when baseURL is set and
-// returns immediately; unset logs one line and does nothing. It never blocks the
-// caller and never touches the honeybee pass path.
-func Start(ctx context.Context, baseURL, root, instance, generatorBase string) *Notifier {
-	if strings.TrimSpace(baseURL) == "" {
-		log.Printf("alertmanager: disabled for %s (alertmanager_url unset)", instance)
-		return nil
-	}
-	n, err := NewHiveNotifier(ctx, baseURL, root, instance, generatorBase)
-	if err != nil {
-		log.Printf("alertmanager: disabled for %s: %v", instance, err)
-		return nil
-	}
-	log.Printf("alertmanager: enabled for %s -> %s/api/v2/alerts", instance, strings.TrimRight(baseURL, "/"))
-	go n.Run(ctx, 15*time.Second)
-	return n
 }
