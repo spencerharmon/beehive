@@ -4440,7 +4440,8 @@ func TestVerifyGateCleanTreeAllowsHandoff(t *testing.T) {
 		{dir: wantRoot, name: "git", args: []string{"show", "HEAD:submodules/sm/docs/bee-T1-T1.md"}},
 		// (4.6) diff-scoped mutation guards: probe the BASELINE registry (committed-read
 		// plumbing, not a toolchain check). Absent GUARDS.md here => no guards => allow.
-		{dir: wtDir, name: "git", args: []string{"merge-base", "HEAD", "bee-T1"}},
+		// The baseline is the TRACKED branch (main), never the pass's bee-T1 ref.
+		{dir: wtDir, name: "git", args: []string{"merge-base", "HEAD", "main"}},
 		{dir: wtDir, name: "git", args: []string{"show", "bee-T1:GUARDS.md"}},
 	}
 	if !reflect.DeepEqual(gr.calls, want) {

@@ -19,12 +19,15 @@ import (
 // gates whether the CHANGE is allowed to land at all — judged against live release
 // state the runner itself never models (which blue/green color is active, whether a
 // canary step is mid-flight, ...). The runner stays strategy-agnostic: it computes
-// the committed diff of the pass branch vs the merge-base it forked from, and for
+// the committed diff of the delivered candidate (HEAD) vs its merge-base with the
+// submodule's tracked (reviewed) branch — never the pass's own, possibly stale,
+// task branch (see guardBaseline) — and for
 // every guard whose Protects glob intersects a changed file, runs that guard's
 // command and enforces its exit code (0 = allow, non-zero = refuse + fix-forward).
 //
 // TAMPER ANCHOR: both GUARDS.md and the guard command are materialized from the
-// MERGE-BASE (the reviewed baseline the pass forked from), never the bee branch. A
+// MERGE-BASE with the tracked branch (the reviewed baseline), never the bee branch
+// nor a stale prior attempt of it. A
 // bee's edit to guard code is therefore inert for its OWN pass — a changed/weakened
 // guard governs only later passes, after it lands and is reviewed. You never grade
 // your own exam with a key you edited mid-exam.
@@ -34,55 +37,9 @@ import (
 // refuses or the registry is malformed; a non-nil error on an infra failure the
 // caller fails closed on.
 func (r *Runner) guardGate(ctx context.Context, sel *selectt.Selection, checkoutDir, hiveAbs, branch string) (string, error) {
-	// Resolve the baseline the pass forked from. Prefer the remote tracking branch
-	// (origin/<branch>) so the anchor is the last PUBLISHED tip, not a local ref a
-	// bee could move; fall back to the local branch name.
-	rem := ""
-	if g := git.New(checkoutDir); g != nil {
-		if rr, err := g.Remote(ctx); err == nil {
-			rem = strings.TrimSpace(rr)
-		}
-	}
-	baseRef := branch
-	if rem != "" {
-		baseRef = rem + "/" + branch
-		// Refresh the tracking ref BEFORE resolving the baseline: a pass branch that
-		// exists on the remote but whose local tracking ref is absent/stale would
-		// otherwise resolve to nothing, read as "no GUARDS.md", and silently allow a
-		// protected change. If the remote has the branch, the baseline MUST resolve
-		// or the gate fails closed.
-		ls, err := r.runVerify(ctx, checkoutDir, "git", "ls-remote", "--heads", rem, "refs/heads/"+branch)
-		if err != nil {
-			return "", fmt.Errorf("guard gate: probing %s/%s in %s: %w", rem, branch, checkoutDir, err)
-		}
-		if ls.exitErr {
-			return "", fmt.Errorf("guard gate: `git ls-remote %s %s` failed in %s: %s", rem, branch, checkoutDir, strings.TrimSpace(ls.out))
-		}
-		if strings.TrimSpace(ls.out) != "" {
-			fe, err := r.runVerify(ctx, checkoutDir, "git", "fetch", "--quiet", rem, "+refs/heads/"+branch+":refs/remotes/"+rem+"/"+branch)
-			if err != nil {
-				return "", fmt.Errorf("guard gate: fetching baseline %s in %s: %w", baseRef, checkoutDir, err)
-			}
-			if fe.exitErr {
-				return "", fmt.Errorf("guard gate: fetching baseline %s failed in %s: %s", baseRef, checkoutDir, strings.TrimSpace(fe.out))
-			}
-			rv, err := r.runVerify(ctx, checkoutDir, "git", "rev-parse", "--verify", "--quiet", baseRef+"^{commit}")
-			if err != nil || rv.exitErr || strings.TrimSpace(rv.out) == "" {
-				return "", fmt.Errorf("guard gate: baseline %s exists on the remote but does not resolve in %s; refusing (fail closed)", baseRef, checkoutDir)
-			}
-		} else {
-			// A new task has no published task ref yet. Do not use a stale
-			// tracking ref left behind by an earlier, deleted attempt.
-			baseRef = branch
-		}
-	}
-	mb, err := r.runVerify(ctx, checkoutDir, "git", "merge-base", "HEAD", baseRef)
+	base, err := r.guardBaseline(ctx, sel, checkoutDir, hiveAbs, branch)
 	if err != nil {
-		return "", fmt.Errorf("guard gate: resolving baseline %s in %s: %w", baseRef, checkoutDir, err)
-	}
-	base := strings.TrimSpace(mb.out)
-	if mb.exitErr || base == "" {
-		return "", fmt.Errorf("guard gate: resolving baseline %s in %s failed; refusing (fail closed): %s", baseRef, checkoutDir, base)
+		return "", err
 	}
 
 	// Baseline GUARDS.md. Absent at baseline => no guards => allow (zero overhead).
@@ -142,6 +99,75 @@ func (r *Runner) guardGate(ctx context.Context, sel *selectt.Selection, checkout
 		}
 	}
 	return "", nil
+}
+
+// guardBaseline resolves the TRUSTED pre-change baseline for the candidate being
+// delivered: merge-base(HEAD, <tracked branch>), where the tracked branch is the
+// submodule's reviewed branch (.gitmodules submodule.<path>.branch, default
+// "main") — the very tip a Work pass's code worktree is cut from (pinPointer-
+// ToTrackedTip). In remote mode the tracking ref is re-fetched from origin first,
+// so the anchor is the PUBLISHED reviewed tip, not a ref this pass could move.
+//
+// It deliberately NEVER anchors on the pass's own task branch (<remote>/bee-<id>).
+// That ref is a disposable per-attempt name: a stale, never-landed attempt cut from
+// an OLDER main leaves it pointing at foreign history, so merge-base(HEAD,
+// origin/bee-<id>) is that old fork point. The diff then "borrows" every reviewed
+// main change since (an actually EMPTY delivery reads as protected mutations) and
+// the guard is materialized from obsolete code (mutation-guard-no-code-stale-
+// branch: a commits=none flux handoff refused on helmrelease files by a guard
+// probing a retired hostname). Conversely, once this attempt is pushed (or the
+// runner reconciles the orphan) the task ref equals HEAD and a real protected
+// diff would read as empty. Anchoring on the tracked branch makes the diff exactly
+// what review would merge, in every one of those states.
+//
+// Any failure to resolve the baseline is fail-closed (non-nil error).
+func (r *Runner) guardBaseline(ctx context.Context, sel *selectt.Selection, checkoutDir, hiveAbs, branch string) (string, error) {
+	tracked := guardTrackedBranch(ctx, hiveAbs, sel.Submodule.Name)
+	if tracked == branch {
+		// Defensive: a pass branch named like the tracked branch would make the
+		// diff self-referential (always empty). Never a valid guard anchor.
+		return "", fmt.Errorf("guard gate: pass branch %q is the tracked branch; refusing (fail closed)", branch)
+	}
+	rem := ""
+	if g := git.New(checkoutDir); g != nil {
+		if rr, err := g.Remote(ctx); err == nil {
+			rem = strings.TrimSpace(rr)
+		}
+	}
+	baseRef := tracked
+	if rem != "" {
+		baseRef = rem + "/" + tracked
+		fe, err := r.runVerify(ctx, checkoutDir, "git", "fetch", "--quiet", rem, "+refs/heads/"+tracked+":refs/remotes/"+rem+"/"+tracked)
+		if err != nil {
+			return "", fmt.Errorf("guard gate: fetching baseline %s in %s: %w", baseRef, checkoutDir, err)
+		}
+		if fe.exitErr {
+			return "", fmt.Errorf("guard gate: fetching baseline %s failed in %s; refusing (fail closed): %s", baseRef, checkoutDir, strings.TrimSpace(fe.out))
+		}
+	}
+	mb, err := r.runVerify(ctx, checkoutDir, "git", "merge-base", "HEAD", baseRef)
+	if err != nil {
+		return "", fmt.Errorf("guard gate: resolving baseline %s in %s: %w", baseRef, checkoutDir, err)
+	}
+	base := strings.TrimSpace(mb.out)
+	if mb.exitErr || base == "" {
+		return "", fmt.Errorf("guard gate: resolving baseline %s in %s failed; refusing (fail closed): %s", baseRef, checkoutDir, base)
+	}
+	return base, nil
+}
+
+// guardTrackedBranch reads the submodule's configured tracked branch from the
+// hive's .gitmodules (the same source Runner.trackedBranch uses), defaulting to
+// "main". It reads hiveAbs directly so it never depends on a runner git handle.
+func guardTrackedBranch(ctx context.Context, hiveAbs, name string) string {
+	rel := "submodules/" + name + "/repo"
+	out, err := git.New(hiveAbs).Run(ctx, "config", "-f", filepath.Join(hiveAbs, ".gitmodules"), "--get", "submodule."+rel+".branch")
+	if err == nil {
+		if b := strings.TrimSpace(out); b != "" {
+			return b
+		}
+	}
+	return "main"
 }
 
 // materializeBaselineGuards extracts every file under guards/ plus GUARDS.md AS OF

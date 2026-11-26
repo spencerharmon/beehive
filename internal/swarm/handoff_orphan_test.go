@@ -330,6 +330,9 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 				if err := wg.Commit(ctx, "baseline mutation guard"); err != nil {
 					t.Fatal(err)
 				}
+				// The trusted baseline is the REVIEWED tracked branch: land the
+				// guard there, as review would have, so it governs this pass.
+				handoffOrphanGit(t, wg, "push", "-q", "origin", "HEAD:refs/heads/main")
 			}
 			oldDir := filepath.Join(t.TempDir(), "old-attempt")
 			handoffOrphanGit(t, wg, "clone", "--no-local", "-q", "--branch", "bee-T1", wtDir, oldDir)
@@ -345,6 +348,8 @@ func TestHandoffOrphanPublicationGate(t *testing.T) {
 				// The remote task branch exists, but its tracking ref is absent
 				// locally: the guard baseline must still be resolved, not skipped.
 				handoffOrphanGit(t, wg, "update-ref", "-d", "refs/remotes/origin/bee-T1")
+				// Likewise the tracked branch's tracking ref: the gate must fetch it.
+				_, _ = wg.Run(ctx, "update-ref", "-d", "refs/remotes/origin/main")
 				if out, err := wg.Run(ctx, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/bee-T1"); err == nil {
 					t.Fatalf("fixture: tracking ref must be absent, got %s", out)
 				}
