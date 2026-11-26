@@ -2,7 +2,18 @@
 # No fixtures, POSTs, invented failures, or resolution of real alerts.
 # jq -e -s --arg instance <registry-name> -f tests/alertmanager-production-refresh.jq
 
-def timestamp: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+# jq's fromdateiso8601 accepts only whole-second UTC Z. Alertmanager may
+# serialize a numeric RFC3339 offset; normalize the instant, not just its suffix.
+# Retain fractions so short advances and expiration checks are not rounded away.
+def timestamp:
+  (capture("^(?<date>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<fraction>\\.[0-9]+)?(?<zone>Z|(?<sign>[+-])(?<hours>[01][0-9]|2[0-3]):(?<minutes>[0-5][0-9]))$")
+    // error("invalid RFC3339 timestamp")) as $t
+  | (($t.date + "Z") | fromdateiso8601)
+    + (("0" + ($t.fraction // "")) | tonumber)
+    - (if $t.zone == "Z" then 0
+       else ((($t.hours | tonumber) * 3600 + ($t.minutes | tonumber) * 60)
+             * (if $t.sign == "+" then 1 else -1 end))
+       end);
 def identity: .labels | to_entries | sort_by(.key);
 def valid:
   type == "array" and length > 0
